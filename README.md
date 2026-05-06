@@ -1,6 +1,12 @@
 # Stock trader
 
 
+## TODO
+
+  - [ ] add Initial datamodel and migration with sqlc and migrate
+  - [ ] add migration to be automatically run on docker compose up (not overwriting persistance on the database, dont know how to manage that right now)
+
+
 ## [alpaca](https://alpaca.markets/) ([docs](https://alpaca.markets/docs/broker/get-started/))
 - IEX
 - All US stock exchanges for 99$/mo
@@ -20,8 +26,6 @@
 - 15 minutes delayed on payed plan
 - has news
 
-
-## [iex cloud](https://iexcloud.io/)
 
 ## [Tradier](https://documentation.tradier.com/brokerage-api/trading/getting-started)
 
