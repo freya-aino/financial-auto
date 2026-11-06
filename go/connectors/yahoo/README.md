@@ -1,0 +1,12 @@
+# yahoo
+
+First-wave connector: Yahoo Finance (OHLC + metadata, backfill).
+
+**Status:** spec only — no code yet.
+
+## Owns
+Connector implementation.
+
+## Governing specs
+- [10-ingestion](../../../specs/10-ingestion.md)
+- [11-source-catalog](../../../specs/11-source-catalog.md)

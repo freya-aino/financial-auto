@@ -1,0 +1,27 @@
+# secrets
+.env
+.env.*
+config/secrets.toml
+
+# rust
+target/
+
+# go
+go/bin/
+*.test
+
+# frontend
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/build/
+
+# data / local state
+data/
+*.parquet
+*.safetensors
+checkpoints/
+
+# editors / os
+.idea/
+.vscode/
+.DS_Store

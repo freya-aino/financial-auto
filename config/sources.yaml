@@ -1,0 +1,748 @@
+# Source catalog seed data — see specs/11-source-catalog.md
+# Per-source facts (transport, auth, asset classes) are UNVERIFIED first guesses.
+# status: planned | stub | live | disabled
+# capabilities: data | execution
+# transport: rest | websocket | fix | grpc | graphql | sse | socket | file | sdk | stream
+# auth: none | api_key | oauth2 | hmac | session | wallet | gateway
+version: 1
+
+sources:
+  # ── Brokers / multi-asset ───────────────────────────────────────────
+  - id: interactive_brokers
+    name: Interactive Brokers
+    category: broker
+    capabilities: [data, execution]
+    asset_classes: [equity, etf, option, future, fx, bond, crypto]
+    transport: [socket, rest]
+    auth: gateway
+    status: planned
+    tos_notes: "Market data subscriptions required per exchange."
+    notes: "Needs TWS / IB Gateway or Client Portal Gateway running locally."
+  - id: saxo
+    name: Saxo OpenAPI
+    category: broker
+    capabilities: [data, execution]
+    asset_classes: [equity, etf, option, future, fx, bond, cfd]
+    transport: [rest, websocket]
+    auth: oauth2
+    status: planned
+    tos_notes: ""
+    notes: "Simulation environment available."
+  - id: alpaca
+    name: Alpaca (trading)
+    category: broker
+    capabilities: [execution, data]
+    asset_classes: [equity, etf, option, crypto]
+    transport: [rest, websocket]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "Paper trading endpoint; US-centric."
+  - id: tastytrade
+    name: Tastytrade
+    category: broker
+    capabilities: [execution, data]
+    asset_classes: [equity, option, future, crypto]
+    transport: [rest, websocket]
+    auth: session
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: schwab
+    name: Charles Schwab
+    category: broker
+    capabilities: [execution, data]
+    asset_classes: [equity, etf, option, future]
+    transport: [rest, websocket]
+    auth: oauth2
+    status: planned
+    tos_notes: ""
+    notes: "OAuth refresh token expiry requires periodic re-auth."
+  - id: lemon
+    name: Lemon.markets
+    category: broker
+    capabilities: [execution, data]
+    asset_classes: [equity, etf]
+    transport: [rest]
+    auth: api_key
+    status: stub
+    tos_notes: ""
+    notes: "First wave. EU broker; prior code fetched XMUN instruments, venues, OHLC."
+  - id: ig
+    name: IG
+    category: broker
+    capabilities: [execution, data]
+    asset_classes: [cfd, fx, index, commodity, equity]
+    transport: [rest, stream]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "Lightstreamer-based streaming."
+  - id: oanda
+    name: OANDA
+    category: broker
+    capabilities: [execution, data]
+    asset_classes: [fx, cfd, commodity, index]
+    transport: [rest, stream]
+    auth: api_key
+    status: stub
+    tos_notes: ""
+    notes: "First wave. v20 REST + HTTP streaming; practice account for paper."
+  - id: ctrader
+    name: cTrader Open API
+    category: broker
+    capabilities: [execution, data]
+    asset_classes: [fx, cfd]
+    transport: [socket]
+    auth: oauth2
+    status: planned
+    tos_notes: ""
+    notes: "Protobuf over TCP/WebSocket."
+  - id: metatrader5
+    name: MetaTrader 5
+    category: broker
+    capabilities: [execution, data]
+    asset_classes: [fx, cfd]
+    transport: [sdk]
+    auth: session
+    status: planned
+    tos_notes: ""
+    notes: "Official API is a Python package bound to a Windows terminal; needs a Windows/Wine bridge."
+
+  # ── Crypto exchanges ────────────────────────────────────────────────
+  - id: bitvavo
+    name: Bitvavo
+    category: crypto_exchange
+    capabilities: [data, execution]
+    asset_classes: [crypto]
+    transport: [rest, websocket]
+    auth: hmac
+    status: planned
+    tos_notes: ""
+    notes: "EUR-quoted."
+  - id: kraken
+    name: Kraken
+    category: crypto_exchange
+    capabilities: [data, execution]
+    asset_classes: [crypto, crypto_derivative]
+    transport: [rest, websocket]
+    auth: hmac
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: coinbase
+    name: Coinbase Advanced Trade API
+    category: crypto_exchange
+    capabilities: [data, execution]
+    asset_classes: [crypto]
+    transport: [rest, websocket]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "JWT-based keys."
+  - id: binance
+    name: Binance
+    category: crypto_exchange
+    capabilities: [data, execution]
+    asset_classes: [crypto, crypto_derivative]
+    transport: [rest, websocket]
+    auth: hmac
+    status: planned
+    tos_notes: "Regional availability restrictions."
+    notes: ""
+  - id: bybit
+    name: Bybit
+    category: crypto_exchange
+    capabilities: [data, execution]
+    asset_classes: [crypto, crypto_derivative]
+    transport: [rest, websocket]
+    auth: hmac
+    status: planned
+    tos_notes: "Regional availability restrictions."
+    notes: ""
+  - id: okx
+    name: OKX
+    category: crypto_exchange
+    capabilities: [data, execution]
+    asset_classes: [crypto, crypto_derivative]
+    transport: [rest, websocket]
+    auth: hmac
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: bitget
+    name: Bitget
+    category: crypto_exchange
+    capabilities: [data, execution]
+    asset_classes: [crypto, crypto_derivative]
+    transport: [rest, websocket]
+    auth: hmac
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: bitstamp
+    name: Bitstamp
+    category: crypto_exchange
+    capabilities: [data, execution]
+    asset_classes: [crypto]
+    transport: [rest, websocket]
+    auth: hmac
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: bitpanda
+    name: Bitpanda
+    category: crypto_exchange
+    capabilities: [data, execution]
+    asset_classes: [crypto, equity, commodity]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "Retail API scope may be read-only; verify trading support."
+  - id: ccxt
+    name: CCXT
+    category: crypto_aggregator_lib
+    capabilities: [data, execution]
+    asset_classes: [crypto, crypto_derivative]
+    transport: [sdk]
+    auth: hmac
+    status: planned
+    tos_notes: ""
+    notes: "Library, not a venue. Go port exists; candidate generic adapter for long-tail exchanges."
+  - id: hyperliquid
+    name: Hyperliquid
+    category: dex
+    capabilities: [data, execution]
+    asset_classes: [crypto_derivative, crypto]
+    transport: [rest, websocket]
+    auth: wallet
+    status: planned
+    tos_notes: ""
+    notes: "On-chain order book; signing with wallet key."
+  - id: dydx
+    name: dYdX
+    category: dex
+    capabilities: [data, execution]
+    asset_classes: [crypto_derivative]
+    transport: [rest, websocket, grpc]
+    auth: wallet
+    status: planned
+    tos_notes: "Regional availability restrictions."
+    notes: "v4 Cosmos chain; indexer API for data."
+
+  # ── Prediction markets ──────────────────────────────────────────────
+  - id: kalshi
+    name: Kalshi
+    category: prediction_market
+    capabilities: [data, execution]
+    asset_classes: [prediction_contract]
+    transport: [rest, websocket]
+    auth: api_key
+    status: planned
+    tos_notes: "Eligibility restrictions by jurisdiction."
+    notes: ""
+  - id: polymarket
+    name: Polymarket
+    category: prediction_market
+    capabilities: [data, execution]
+    asset_classes: [prediction_contract]
+    transport: [rest, websocket]
+    auth: wallet
+    status: planned
+    tos_notes: "Eligibility restrictions by jurisdiction."
+    notes: "CLOB API + on-chain settlement."
+
+  # ── Market data vendors ─────────────────────────────────────────────
+  - id: fmp
+    name: Financial Modeling Prep (FMP)
+    category: market_data
+    capabilities: [data]
+    asset_classes: [equity, etf, fx, crypto, index, commodity, fundamentals]
+    transport: [rest, websocket]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: eodhd
+    name: EODHD
+    category: market_data
+    capabilities: [data]
+    asset_classes: [equity, etf, fx, crypto, bond, index, fundamentals]
+    transport: [rest, websocket]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: twelve_data
+    name: Twelve Data
+    category: market_data
+    capabilities: [data]
+    asset_classes: [equity, etf, fx, crypto, index]
+    transport: [rest, websocket]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: finnhub
+    name: Finnhub
+    category: market_data
+    capabilities: [data]
+    asset_classes: [equity, fx, crypto, fundamentals, news]
+    transport: [rest, websocket]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: alpha_vantage
+    name: Alpha Vantage
+    category: market_data
+    capabilities: [data]
+    asset_classes: [equity, fx, crypto, macro, fundamentals]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: "Low free-tier rate limit."
+    notes: ""
+  - id: tiingo
+    name: Tiingo
+    category: market_data
+    capabilities: [data]
+    asset_classes: [equity, etf, fx, crypto, news]
+    transport: [rest, websocket]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: marketstack
+    name: Marketstack
+    category: market_data
+    capabilities: [data]
+    asset_classes: [equity, index]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "EOD + intraday."
+  - id: alpaca_market_data
+    name: Alpaca Market Data
+    category: market_data
+    capabilities: [data]
+    asset_classes: [equity, option, crypto, news]
+    transport: [rest, websocket]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "Separate from alpaca trading entry; shares credentials."
+  - id: yahoo
+    name: Yahoo Finance (yfinance)
+    category: market_data
+    capabilities: [data]
+    asset_classes: [equity, etf, fx, crypto, index, fundamentals]
+    transport: [rest]
+    auth: none
+    status: stub
+    tos_notes: "Unofficial endpoints; personal/research use only, may break without notice."
+    notes: "First wave. Covers user's 'yfinance' entry; prior code fetched OHLC + metadata."
+  - id: dukascopy
+    name: Dukascopy
+    category: market_data
+    capabilities: [data]
+    asset_classes: [fx, cfd, commodity, index]
+    transport: [file, rest]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: "Historical tick data as compressed bi5 files."
+  - id: nasdaq_data_link
+    name: Nasdaq Data Link
+    category: market_data
+    capabilities: [data]
+    asset_classes: [equity, macro, commodity, alternative]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: "Per-dataset licensing."
+    notes: ""
+
+  # ── FX reference rates ──────────────────────────────────────────────
+  - id: frankfurter
+    name: Frankfurter.app
+    category: fx_reference
+    capabilities: [data]
+    asset_classes: [fx]
+    transport: [rest]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: "ECB reference rates mirror."
+  - id: exchangerate_host
+    name: exchangerate.host
+    category: fx_reference
+    capabilities: [data]
+    asset_classes: [fx]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "Free tier / auth model changed historically; verify."
+  - id: fixer
+    name: Fixer
+    category: fx_reference
+    capabilities: [data]
+    asset_classes: [fx]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: currencylayer
+    name: CurrencyLayer
+    category: fx_reference
+    capabilities: [data]
+    asset_classes: [fx]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: ""
+
+  # ── Crypto data / on-chain / DeFi ───────────────────────────────────
+  - id: coingecko
+    name: CoinGecko
+    category: crypto_data
+    capabilities: [data]
+    asset_classes: [crypto]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "Also used as crypto identity source (coingecko_id)."
+  - id: coinmarketcap
+    name: CoinMarketCap
+    category: crypto_data
+    capabilities: [data]
+    asset_classes: [crypto]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: coindesk_data
+    name: CoinDesk Data
+    category: crypto_data
+    capabilities: [data]
+    asset_classes: [crypto, news]
+    transport: [rest, websocket]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "Formerly CryptoCompare; verify current API surface."
+  - id: etherscan
+    name: Etherscan
+    category: onchain
+    capabilities: [data]
+    asset_classes: [onchain]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: blockscout
+    name: Blockscout
+    category: onchain
+    capabilities: [data]
+    asset_classes: [onchain]
+    transport: [rest, graphql]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: "Multi-chain explorer instances."
+  - id: dune
+    name: Dune API
+    category: onchain
+    capabilities: [data]
+    asset_classes: [onchain]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "Query-execution credits."
+  - id: the_graph
+    name: The Graph
+    category: onchain
+    capabilities: [data]
+    asset_classes: [onchain, defi]
+    transport: [graphql]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "Subgraph queries; per-query fees on decentralized network."
+  - id: defillama
+    name: DefiLlama
+    category: onchain
+    capabilities: [data]
+    asset_classes: [defi, crypto]
+    transport: [rest]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: "TVL, yields, stablecoins, DEX volumes."
+
+  # ── Macro / statistics ──────────────────────────────────────────────
+  - id: fred
+    name: FRED
+    category: macro
+    capabilities: [data]
+    asset_classes: [macro]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "Use ALFRED vintages for point-in-time."
+  - id: ecb
+    name: ECB Data Portal
+    category: macro
+    capabilities: [data]
+    asset_classes: [macro, fx, rates]
+    transport: [rest]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: "SDMX API; official EUR reference rates."
+  - id: eurostat
+    name: Eurostat
+    category: macro
+    capabilities: [data]
+    asset_classes: [macro]
+    transport: [rest]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: "SDMX/JSON-stat."
+  - id: cbs_statline
+    name: CBS StatLine
+    category: macro
+    capabilities: [data]
+    asset_classes: [macro]
+    transport: [rest]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: "Dutch statistics, OData."
+  - id: us_treasury_fiscal
+    name: US Treasury Fiscal Data
+    category: macro
+    capabilities: [data]
+    asset_classes: [macro, rates]
+    transport: [rest]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: bls
+    name: BLS
+    category: macro
+    capabilities: [data]
+    asset_classes: [macro]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: world_bank
+    name: World Bank
+    category: macro
+    capabilities: [data]
+    asset_classes: [macro]
+    transport: [rest]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: imf
+    name: IMF
+    category: macro
+    capabilities: [data]
+    asset_classes: [macro]
+    transport: [rest]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: "SDMX."
+  - id: oecd
+    name: OECD
+    category: macro
+    capabilities: [data]
+    asset_classes: [macro]
+    transport: [rest]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: "SDMX."
+  - id: dbnomics
+    name: DBnomics
+    category: macro
+    capabilities: [data]
+    asset_classes: [macro]
+    transport: [rest]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: "Aggregator of many statistical providers."
+  - id: eia
+    name: EIA API
+    category: macro
+    capabilities: [data]
+    asset_classes: [macro, commodity, energy]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: usda_quickstats
+    name: USDA QuickStats
+    category: macro
+    capabilities: [data]
+    asset_classes: [macro, commodity, agriculture]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: entsoe
+    name: ENTSO-E Transparency
+    category: macro
+    capabilities: [data]
+    asset_classes: [energy]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "European power load/generation/prices; XML."
+
+  # ── Fundamentals / filings / identifiers ────────────────────────────
+  - id: sec_edgar
+    name: SEC EDGAR
+    category: filings
+    capabilities: [data]
+    asset_classes: [filings, fundamentals]
+    transport: [rest, file]
+    auth: none
+    status: planned
+    tos_notes: "Requires declared User-Agent; fair-access rate limit."
+    notes: ""
+  - id: simfin
+    name: SimFin
+    category: fundamentals
+    capabilities: [data]
+    asset_classes: [fundamentals]
+    transport: [rest, file]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: ""
+  - id: openfigi
+    name: OpenFIGI
+    category: identifiers
+    capabilities: [data]
+    asset_classes: [reference]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "Identifier mapping (spec 12)."
+  - id: gleif
+    name: GLEIF
+    category: identifiers
+    capabilities: [data]
+    asset_classes: [reference]
+    transport: [rest, file]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: "LEI records and relationships (spec 12)."
+
+  # ── News / text ─────────────────────────────────────────────────────
+  - id: marketaux
+    name: Marketaux
+    category: news
+    capabilities: [data]
+    asset_classes: [news]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: ""
+    notes: "Entity-tagged financial news."
+  - id: newsapi
+    name: NewsAPI
+    category: news
+    capabilities: [data]
+    asset_classes: [news]
+    transport: [rest]
+    auth: api_key
+    status: planned
+    tos_notes: "Free tier limited to development use."
+    notes: ""
+  - id: gdelt
+    name: GDELT
+    category: news
+    capabilities: [data]
+    asset_classes: [news, events]
+    transport: [rest, file]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: "Global event/news graph, 15-min updates."
+  - id: hackernews
+    name: Hacker News
+    category: news
+    capabilities: [data]
+    asset_classes: [news]
+    transport: [rest]
+    auth: none
+    status: stub
+    tos_notes: ""
+    notes: "First wave. Firebase API; prior code had full blob fetch."
+  - id: google_news
+    name: Google News
+    category: news
+    capabilities: [data]
+    asset_classes: [news]
+    transport: [rest]
+    auth: none
+    status: stub
+    tos_notes: "RSS endpoints; unofficial for programmatic use."
+    notes: "First wave. Prior code fetched per search-term list."
+
+  # ── Broadcast media ─────────────────────────────────────────────────
+  - id: youtube
+    name: YouTube live/VOD finance channels
+    category: media
+    capabilities: [data]
+    asset_classes: [media]
+    transport: [rest, stream]
+    auth: api_key
+    status: planned
+    tos_notes: "Recording/downloading content governed by YouTube ToS."
+    notes: "Data API for discovery; capture tooling per spec 10 §6.6. Channel list deferred."
+  - id: earnings_webcasts
+    name: Earnings-call webcasts / audio
+    category: media
+    capabilities: [data]
+    asset_classes: [media]
+    transport: [stream, file]
+    auth: none
+    status: planned
+    tos_notes: "Per-issuer IR site terms."
+    notes: "Discovery via earnings calendars (FMP/Finnhub/EODHD)."
+  - id: central_bank_pressers
+    name: Central bank press conferences
+    category: media
+    capabilities: [data]
+    asset_classes: [media]
+    transport: [stream, file]
+    auth: none
+    status: planned
+    tos_notes: ""
+    notes: "Fed, ECB, BoE, … streams + transcripts."
