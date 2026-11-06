@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package fa.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message DecoderOutput {
+  string decoder_id = 1;
+  string genome_id = 2;
+  string family = 3; // visual.chart | visual.frame | visual.future | retrieval | text.news | text.summary | text.narrative | rnn_prior
+  string snapshot_id = 4;
+  string timescale = 5;
+  google.protobuf.Timestamp as_of = 6;
+  repeated string output_refs = 7; // Garage keys (images, text, trajectories)
+  repeated double quantiles = 8; // forecast quantiles where applicable
+  repeated Analog analogs = 9; // retrieval decoders
+}
+
+message Analog {
+  string window_id = 1;
+  google.protobuf.Timestamp window_end = 2;
+  double similarity = 3;
+  double time_distance_days = 4;
+}

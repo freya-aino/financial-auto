@@ -2,7 +2,7 @@
 
 Pluggable meta-allocators and cross-strategy netting.
 
-**Status:** spec only — no code yet.
+**Status:** implemented (v1) — risk-parity-capped and fractional-Kelly allocators, uncertainty-shrunk netting (tested).
 
 ## Owns
 `Allocator` trait and implementations.

@@ -2,7 +2,7 @@
 
 Offline training CLI: gen-0 pretraining, generation training, online adapter jobs.
 
-**Status:** spec only — no code yet.
+**Status:** skeleton — CLI validates args and prints the training plan; no training yet.
 
 ## Owns
 Training jobs pulled from the GPU priority queue.

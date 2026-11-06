@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package fa.v1;
+
+import "fa/v1/macro.proto";
+import "fa/v1/market.proto";
+import "fa/v1/media.proto";
+import "fa/v1/text.proto";
+import "google/protobuf/timestamp.proto";
+
+// Envelope wraps every canonical ingestion event (spec 10 §5.1).
+message Envelope {
+  string event_id = 1; // ULID
+  string source_id = 2; // catalog id (config/sources.yaml)
+  string instrument_id = 3; // internal UUID; empty for news/macro/media
+  google.protobuf.Timestamp event_time = 4; // when it happened in the world
+  google.protobuf.Timestamp publish_time = 5; // when the source made it available
+  google.protobuf.Timestamp ingest_time = 6; // when our ingestor received it
+  RawRef raw_ref = 7;
+  uint32 schema_version = 8;
+
+  oneof payload {
+    Trade trade = 20;
+    Quote quote = 21;
+    Bar bar = 22;
+    BookSnapshot book = 23;
+    NewsItem news = 24;
+    MediaChunk media = 25;
+    MacroObservation macro = 26;
+    OnchainEvent onchain = 27;
+    FilingEvent filing = 28;
+  }
+}
+
+// RawRef points at the archived raw payload in Garage.
+message RawRef {
+  string key = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+}

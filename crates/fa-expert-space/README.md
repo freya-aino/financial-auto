@@ -2,7 +2,7 @@
 
 MoE router, expert spaces, residual-decorrelation objective, decoder-facing contract.
 
-**Status:** spec only — no code yet.
+**Status:** partial — `ExpertView` contract, residual-correlation penalty (D-008) and router load-balance term implemented + tested.
 
 ## Owns
 `ExpertView` contract consumed by decoders and strategies.

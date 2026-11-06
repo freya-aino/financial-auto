@@ -2,7 +2,7 @@
 
 Strategy population: GP programs and neural policies producing exposure distributions.
 
-**Status:** spec only — no code yet.
+**Status:** partial — GP DSL AST + interpreter, `GpStrategy`, `Strategy`/`NeuralPolicy` traits, proto conversion (tested).
 
 ## Owns
 GP DSL interpreter, policy nets, `Strategy` trait.

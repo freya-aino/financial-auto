@@ -1,0 +1,273 @@
+//! HTTP routes (spec 50 §4). Implemented: health, services, sources, timescales, bus tap.
+//! Everything else in the catalog answers 501 with a pointer to its spec section.
+use std::{path::PathBuf, time::Duration};
+
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::{StatusCode, Uri},
+    response::{IntoResponse, Response},
+    routing::{any, get, post},
+};
+use serde_json::json;
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
+
+use crate::{bus_tap, sources, state::AppState};
+
+pub fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
+    let mut app = Router::new()
+        // 4.1 Ops
+        .route("/api/health", get(health))
+        .route("/api/services", get(services))
+        .route("/api/config/timescales", get(timescales))
+        .route("/api/services/{name}/{action}", post(not_implemented))
+        .route("/api/config/{section}", any(not_implemented))
+        .route("/api/jobs", get(not_implemented))
+        .route("/api/jobs/{id}/cancel", post(not_implemented))
+        .route("/api/gpu", get(not_implemented))
+        // 4.2 Sources & ingestion
+        .route("/api/sources", get(list_sources))
+        .route("/api/sources/{id}", get(get_source))
+        .route("/api/sources/{id}/{action}", post(not_implemented))
+        .route("/api/instruments", get(not_implemented))
+        // 4.3 Bus tap
+        .route("/ws/bus", get(bus_tap::ws_bus))
+        .route("/api/bus/streams", get(not_implemented))
+        // 4.4 Hub / graph
+        .route("/api/graph/neighborhood", get(not_implemented))
+        .route("/api/graph/query", post(not_implemented))
+        .route("/api/graph/lineage/{genome_id}", get(not_implemented))
+        // 4.5 Latent / MCMC
+        .route("/api/latent/snapshots", get(not_implemented))
+        .route("/api/latent/snapshots/{id}/{action}", post(not_implemented))
+        .route("/api/latent/{snapshot}/{view}", get(not_implemented))
+        .route("/api/mcmc/{snapshot}/graph", get(not_implemented))
+        .route("/ws/latent", get(not_implemented))
+        // 4.6 Evolution
+        .route("/api/evolution/populations", get(not_implemented))
+        .route("/api/evolution/populations/{id}/pareto", get(not_implemented))
+        .route("/api/evolution/genomes/{id}", get(not_implemented))
+        .route("/api/evolution/genomes/{id}/outputs", get(not_implemented))
+        .route("/api/evolution/runs", post(not_implemented))
+        .route("/api/evolution/runs/{id}/{action}", post(not_implemented))
+        .route("/ws/evolution", get(not_implemented))
+        // 4.7 Trading
+        .route("/api/trading/positions", get(not_implemented))
+        .route("/api/trading/orders", any(not_implemented))
+        .route("/api/trading/fills", get(not_implemented))
+        .route("/api/trading/pnl", get(not_implemented))
+        .route("/api/trading/strategies", get(not_implemented))
+        .route("/api/trading/strategies/{id}/{action}", post(not_implemented))
+        .route("/api/trading/flatten", post(not_implemented))
+        .route("/api/trading/kill-switch", post(not_implemented))
+        .route("/api/trading/kill-switch/rearm", post(not_implemented))
+        .route("/api/trading/limits", any(not_implemented))
+        .route("/api/trading/reconciliation", get(not_implemented))
+        .route("/api/audit", get(not_implemented))
+        .route("/ws/trading", get(not_implemented))
+        .route("/api/{*rest}", any(api_not_found));
+
+    if let Some(dir) = frontend.filter(|d| d.join("index.html").is_file()) {
+        let index = dir.join("index.html");
+        app = app.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)));
+    }
+
+    app.layer(CorsLayer::permissive()).layer(TraceLayer::new_for_http()).with_state(state)
+}
+
+/// 501 response naming the spec section that defines the route.
+struct NotImpl(Uri);
+
+impl IntoResponse for NotImpl {
+    fn into_response(self) -> Response {
+        let path = self.0.path().to_owned();
+        let section = spec_section(&path);
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "not_implemented", "path": path, "spec": format!("specs/50-control-api.md §{section}")})),
+        )
+            .into_response()
+    }
+}
+
+async fn not_implemented(uri: Uri) -> NotImpl {
+    NotImpl(uri)
+}
+
+fn spec_section(path: &str) -> &'static str {
+    const AREAS: [(&str, &str); 10] = [
+        ("/api/sources", "4.2"),
+        ("/api/instruments", "4.2"),
+        ("/api/bus", "4.3"),
+        ("/api/graph", "4.4"),
+        ("/api/latent", "4.5"),
+        ("/api/mcmc", "4.5"),
+        ("/ws/latent", "4.5"),
+        ("/api/evolution", "4.6"),
+        ("/ws/evolution", "4.6"),
+        ("/api/trading", "4.7"),
+    ];
+    if path.starts_with("/api/audit") || path.starts_with("/ws/trading") {
+        return "4.7";
+    }
+    AREAS.iter().find(|(p, _)| path.starts_with(p)).map_or("4.1", |(_, s)| s)
+}
+
+async fn api_not_found(uri: Uri) -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, Json(json!({"error": "not_found", "path": uri.path()})))
+}
+
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let cfg = &state.cfg;
+    let (helix, vm, pg, garage) = tokio::join!(
+        probe(&cfg.helix.url),
+        probe(&cfg.victoriametrics.url),
+        probe(&cfg.postgres.url),
+        probe(&cfg.garage.endpoint),
+    );
+    Json(json!({
+        "service": "control-api",
+        "version": env!("CARGO_PKG_VERSION"),
+        "nats": { "connected": state.nats_connected(), "url": cfg.nats.url },
+        // TCP reachability only; real health checks arrive with each client crate.
+        "dependencies": {
+            "helix": helix,
+            "victoriametrics": vm,
+            "postgres": pg,
+            "garage": garage,
+        }
+    }))
+}
+
+/// TCP reachability of `scheme://[user@]host[:port]/...`.
+async fn probe(url: &str) -> bool {
+    let Some(addr) = host_port(url) else { return false };
+    tokio::time::timeout(Duration::from_millis(300), tokio::net::TcpStream::connect(addr))
+        .await
+        .is_ok_and(|r| r.is_ok())
+}
+
+fn host_port(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split('/').next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    if authority.contains(':') {
+        return Some(authority.to_owned());
+    }
+    let port = match scheme {
+        "https" => 443,
+        "postgres" | "postgresql" => 5432,
+        "nats" => 4222,
+        _ => 80,
+    };
+    Some(format!("{authority}:{port}"))
+}
+
+async fn services(State(state): State<AppState>) -> impl IntoResponse {
+    let list: Vec<_> = state.services.read().expect("services lock").values().cloned().collect();
+    Json(json!({ "services": list, "nats_connected": state.nats_connected() }))
+}
+
+async fn timescales(State(state): State<AppState>) -> impl IntoResponse {
+    let ladder: Vec<_> = state
+        .cfg
+        .timescales
+        .iter()
+        .map(|t| json!({ "id": t.as_str(), "seconds": t.duration().as_secs() }))
+        .collect();
+    Json(json!({ "timescales": ladder }))
+}
+
+async fn list_sources(State(state): State<AppState>) -> Response {
+    match sources::load(&state.sources_path) {
+        Ok(cat) => Json(cat).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn get_source(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match sources::load(&state.sources_path) {
+        Ok(cat) => match cat.sources.into_iter().find(|s| s.id == id) {
+            Some(s) => Json(s).into_response(),
+            None => (StatusCode::NOT_FOUND, Json(json!({"error": "unknown source", "id": id}))).into_response(),
+        },
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::Body, http::Request};
+    use fa_core::config::PlatformConfig;
+    use http_body_util::BodyExt;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn app() -> Router {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config");
+        let cfg = PlatformConfig::load(format!("{root}/platform.toml")).unwrap();
+        router(AppState::new(cfg, format!("{root}/sources.yaml").into(), None), None)
+    }
+
+    async fn get_json(uri: &str) -> (StatusCode, Value) {
+        let res = app().oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let status = res.status();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn health_reports_nats_disconnected_without_client() {
+        let (s, v) = get_json("/api/health").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["nats"]["connected"], false);
+    }
+
+    #[tokio::test]
+    async fn sources_lists_catalog() {
+        let (s, v) = get_json("/api/sources").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(v["sources"].as_array().unwrap().len() >= 70);
+        let (s, v) = get_json("/api/sources/oanda").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["id"], "oanda");
+        let (s, _) = get_json("/api/sources/nope").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn timescales_follow_config() {
+        let (_, v) = get_json("/api/config/timescales").await;
+        assert_eq!(v["timescales"][0]["id"], "1s");
+        assert_eq!(v["timescales"][4]["seconds"], 604_800);
+    }
+
+    #[tokio::test]
+    async fn unimplemented_routes_return_501_with_spec_pointer() {
+        let (s, v) = get_json("/api/evolution/populations").await;
+        assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(v["spec"], "specs/50-control-api.md §4.6");
+        let (s, v) = get_json("/api/trading/positions").await;
+        assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(v["spec"], "specs/50-control-api.md §4.7");
+    }
+
+    #[tokio::test]
+    async fn unknown_api_path_is_404() {
+        let (s, _) = get_json("/api/does/not/exist/at/all").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn host_port_parsing() {
+        assert_eq!(host_port("postgres://fa:fa@127.0.0.1:5432/fa").as_deref(), Some("127.0.0.1:5432"));
+        assert_eq!(host_port("http://127.0.0.1:6969").as_deref(), Some("127.0.0.1:6969"));
+        assert_eq!(host_port("http://localhost/x").as_deref(), Some("localhost:80"));
+    }
+}

@@ -2,7 +2,7 @@
 
 Non-evolvable hard risk limits, kill switch, health halts.
 
-**Status:** spec only — no code yet.
+**Status:** implemented (v1) — position/liquidity/leverage caps, payout-quota netting, drawdown/daily-loss halt state machine (tested).
 
 ## Owns
 Pre-trade checks and halt state machine.

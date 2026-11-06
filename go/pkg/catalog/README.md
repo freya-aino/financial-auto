@@ -2,7 +2,7 @@
 
 Loads and validates `config/sources.yaml`, syncs it into Postgres.
 
-**Status:** spec only — no code yet.
+**Status:** implemented — loads and validates `config/sources.yaml` (unique ids, enum values); optional `rate_limit` field with a default when absent.
 
 ## Owns
 Catalog model and loader.

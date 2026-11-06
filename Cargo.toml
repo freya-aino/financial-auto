@@ -1,0 +1,61 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "bins/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+# internal
+fa-core = { path = "crates/fa-core" }
+fa-proto = { path = "crates/fa-proto" }
+fa-bus = { path = "crates/fa-bus" }
+fa-hub = { path = "crates/fa-hub" }
+fa-warehouse = { path = "crates/fa-warehouse" }
+fa-tsdb = { path = "crates/fa-tsdb" }
+fa-blob = { path = "crates/fa-blob" }
+fa-patterns = { path = "crates/fa-patterns" }
+fa-encoders = { path = "crates/fa-encoders" }
+fa-expert-space = { path = "crates/fa-expert-space" }
+fa-mcmc = { path = "crates/fa-mcmc" }
+fa-decoders = { path = "crates/fa-decoders" }
+fa-evolution = { path = "crates/fa-evolution" }
+fa-strategies = { path = "crates/fa-strategies" }
+fa-allocator = { path = "crates/fa-allocator" }
+fa-risk = { path = "crates/fa-risk" }
+fa-ledger = { path = "crates/fa-ledger" }
+fa-backtest = { path = "crates/fa-backtest" }
+
+# external
+anyhow = "1.0.104"
+async-nats = "0.52.0"
+axum = { version = "0.8.9", features = ["ws"] }
+bytes = "1.12.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+futures = "0.3.34"
+prost = "0.14.4"
+prost-build = "0.14.4"
+prost-types = "0.14.4"
+protox = "0.10.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.2.1"
+tower-http = { version = "0.7.1", features = ["cors", "fs", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+ulid = { version = "3.0.0", features = ["serde"] }
+uuid = { version = "1.29.0", features = ["v7", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,21 @@
+[package]
+name = "fa-decoders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+fa-core.workspace = true
+fa-expert-space.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+# ML backends are opt-in (D-004).
+[features]
+default = []
+burn = []
+candle = []

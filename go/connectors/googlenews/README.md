@@ -2,7 +2,7 @@
 
 First-wave connector: Google News (text).
 
-**Status:** spec only — no code yet.
+**Status:** stub (catalog id `google_news`) — registers, declares poll; methods return `ErrNotImplemented`. Endpoint notes in the source are unverified.
 
 ## Owns
 Connector implementation.

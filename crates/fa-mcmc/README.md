@@ -2,7 +2,7 @@
 
 Markov state graph over latent regions with Bayesian transition kernels and pluggable samplers.
 
-**Status:** spec only — no code yet.
+**Status:** implemented (v1) — Markov graph with Dirichlet posteriors + forgetting, credible intervals, conjugate path sampler, log-score calibration (tested).
 
 ## Owns
 `Sampler` trait, kernel posteriors, cross-asset priors.

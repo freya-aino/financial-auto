@@ -2,7 +2,7 @@
 
 First-wave connector: Lemon.markets (instruments, OHLC, execution).
 
-**Status:** spec only — no code yet.
+**Status:** stub — registers, declares poll + backfill; methods return `ErrNotImplemented`. Endpoint notes in the source are unverified.
 
 ## Owns
 Connector implementation.

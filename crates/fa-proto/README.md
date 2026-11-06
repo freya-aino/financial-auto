@@ -2,7 +2,7 @@
 
 Prost-generated Rust types from `proto/` (build.rs).
 
-**Status:** spec only — no code yet.
+**Status:** implemented — prost codegen via protox (no protoc needed).
 
 ## Owns
 Generated protobuf types; no hand-written logic.

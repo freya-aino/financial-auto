@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package fa.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message Heartbeat {
+  string service = 1;
+  string instance_id = 2;
+  google.protobuf.Timestamp at = 3;
+  string version = 4;
+  map<string, double> counters = 5;
+}
+
+message CtlRequest {
+  string verb = 1; // start | stop | reload | ...
+  map<string, string> args = 2;
+}
+
+message CtlReply {
+  bool ok = 1;
+  string message = 2;
+}

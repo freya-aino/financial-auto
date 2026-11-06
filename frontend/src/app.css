@@ -1,0 +1,167 @@
+:root {
+	color-scheme: dark;
+	--bg: #0d1117;
+	--bg-raised: #151b23;
+	--bg-inset: #0a0e13;
+	--border: #262f3a;
+	--text: #d6dde6;
+	--text-dim: #8592a3;
+	--accent: #4fd1a5;
+	--warn: #e6b450;
+	--danger: #f0716b;
+	--ok: #4fd1a5;
+	--mono: ui-monospace, 'JetBrains Mono', 'SFMono-Regular', Menlo, monospace;
+	--sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+	--radius: 6px;
+}
+
+@media (prefers-color-scheme: light) {
+	:root {
+		color-scheme: light;
+		--bg: #f6f8fa;
+		--bg-raised: #ffffff;
+		--bg-inset: #eef1f4;
+		--border: #d4dae1;
+		--text: #1c2430;
+		--text-dim: #5b6776;
+		--accent: #0f8a64;
+		--warn: #9a6700;
+		--danger: #c4302b;
+		--ok: #0f8a64;
+	}
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	background: var(--bg);
+	color: var(--text);
+	font: 13px/1.45 var(--sans);
+}
+
+h1,
+h2,
+h3 {
+	margin: 0;
+	font-weight: 600;
+}
+
+h1 {
+	font-size: 16px;
+}
+
+h2 {
+	font-size: 13px;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	color: var(--text-dim);
+}
+
+a {
+	color: var(--accent);
+}
+
+code,
+.mono {
+	font-family: var(--mono);
+	font-size: 12px;
+}
+
+.panel {
+	background: var(--bg-raised);
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	padding: 12px;
+	min-width: 0;
+}
+
+.panel-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	margin-bottom: 10px;
+}
+
+table {
+	width: 100%;
+	border-collapse: collapse;
+}
+
+th,
+td {
+	text-align: left;
+	padding: 4px 8px;
+	border-bottom: 1px solid var(--border);
+	vertical-align: top;
+}
+
+th {
+	color: var(--text-dim);
+	font-weight: 500;
+	position: sticky;
+	top: 0;
+	background: var(--bg-raised);
+}
+
+input,
+select,
+button {
+	font: inherit;
+	color: var(--text);
+	background: var(--bg-inset);
+	border: 1px solid var(--border);
+	border-radius: 4px;
+	padding: 3px 8px;
+}
+
+button {
+	cursor: pointer;
+}
+
+button:disabled {
+	cursor: not-allowed;
+	opacity: 0.55;
+}
+
+.badge {
+	display: inline-block;
+	padding: 0 6px;
+	border-radius: 9px;
+	font-size: 11px;
+	border: 1px solid var(--border);
+	color: var(--text-dim);
+	white-space: nowrap;
+}
+
+.badge.ok {
+	color: var(--ok);
+	border-color: var(--ok);
+}
+
+.badge.warn {
+	color: var(--warn);
+	border-color: var(--warn);
+}
+
+.badge.danger {
+	color: var(--danger);
+	border-color: var(--danger);
+}
+
+.dim {
+	color: var(--text-dim);
+}
+
+.grid {
+	display: grid;
+	gap: 12px;
+}
+
+.scroll {
+	overflow: auto;
+}

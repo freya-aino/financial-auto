@@ -2,7 +2,7 @@
 
 Shared domain types: Instrument, Venue, Timescale, Horizon, canonical event structs, ids.
 
-**Status:** spec only — no code yet.
+**Status:** implemented — ids, timescales/horizons, platform config, deterministic RNG + samplers (tested).
 
 ## Owns
 Core Rust types used by every crate.

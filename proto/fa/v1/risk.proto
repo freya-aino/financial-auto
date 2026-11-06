@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package fa.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message RiskState {
+  google.protobuf.Timestamp as_of = 1;
+  double equity_eur = 2;
+  double deployable_eur = 3; // equity minus payout quota
+  double gross_exposure_eur = 4;
+  double drawdown = 5;
+  double daily_pnl_eur = 6;
+  repeated Halt active_halts = 7;
+}
+
+message Halt {
+  string scope = 1; // portfolio | strategy:<id> | asset:<id> | venue:<id> | source:<id>
+  string reason = 2;
+  google.protobuf.Timestamp since = 3;
+  bool manual = 4;
+}

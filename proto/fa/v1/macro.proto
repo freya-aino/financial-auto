@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package fa.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message MacroObservation {
+  string series_id = 1;
+  string period = 2; // e.g. "2026-09", "2026Q3"
+  double value = 3;
+  google.protobuf.Timestamp vintage = 4; // release time of this value
+  bool revision = 5;
+}
+
+message OnchainEvent {
+  string chain = 1;
+  uint64 block = 2;
+  string tx_hash = 3;
+  string kind = 4;
+  map<string, string> fields = 5;
+}

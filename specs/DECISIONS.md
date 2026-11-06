@@ -1,0 +1,33 @@
+# Implementation decision log
+
+Decisions taken during implementation to unblock work. Each one closes or provisionally answers an open question in a spec. Every entry can be revised: change the entry, update the referenced spec, and note the date.
+
+Status: **provisional** = default chosen by the implementer, not yet reviewed; **confirmed** = reviewed by the owner.
+
+| ID | Date | Decision | Closes / affects | Status |
+|---|---|---|---|---|
+| D-001 | 2026-11-06 | ADR 0004 (NATS JetStream) and ADR 0005 (protobuf) are adopted for the scaffold. | ADR 0004, 0005 | provisional |
+| D-002 | 2026-11-06 | **Rust protobuf codegen** uses `prost-build` + `protox` (pure-Rust parser), so building Rust needs no `protoc`. **Go codegen** uses `buf generate` (via the `bufbuild/buf` Docker image if buf isn't installed). Generated Go code is **committed** in `go/pkg/bus/pb`, so Go builds need no codegen step. | 21 | provisional |
+| D-003 | 2026-11-06 | Rust: edition 2024, one workspace, shared dependency versions in `[workspace.dependencies]`. Runtime: tokio. Bus: `async-nats`. HTTP: axum. Logs: `tracing`. IDs: UUID v7 for entities, ULID for events/jobs. | 01 | provisional |
+| D-004 | 2026-11-06 | **ML backends are optional features**: `burn` and `candle` are behind cargo features (`burn`, `candle`), off by default. Traits and data contracts are backend-agnostic. Each backend is switched on when the first real model is implemented, so the default build stays fast. | 31, 32, 34, ADR 0003 | provisional |
+| D-005 | 2026-11-06 | **One `model-runtime` process for all timescales** in v1. A process per timescale is possible later without contract changes (subjects already carry the timescale). | 01 Q1 | provisional |
+| D-006 | 2026-11-06 | **GPU arbiter lives in `evo-orchestrator`** in v1 and leases the GPU to trainer, evo-workers and online adapters via `ctl.gpu.*`. | 60 Q1 | provisional |
+| D-007 | 2026-11-06 | **Region identity across retraining:** anchored training (new generation regularized toward previous region centroids), with **probe-set alignment** (fixed probe windows re-encoded, Hungarian matching on region assignment overlap) as fallback. Regions carry a `lineage_id` that survives generations; unmatched regions get a new lineage. | Blocker 1; 30, 33 | provisional |
+| D-008 | 2026-11-06 | **Expert-space loss:** default = per-expert decoder losses + λ · Σ_{i≠j} corr(r_i, r_j)², where r = next-step prediction residuals, computed over minibatch windows, plus a router load-balancing term. Alternatives remain behind the `DecorrelationLoss` trait. | Blocker 2; 32 | provisional |
+| D-009 | 2026-11-06 | **Decoder → encoder feedback:** backprop through **frozen elite decoders** (top-k per family per generation) as auxiliary losses during encoder generation training. | Blocker 3; 34, 36 | provisional |
+| D-010 | 2026-11-06 | **Media in pure Rust:** v1 uses **frozen pretrained towers in candle** (Whisper-class ASR, a text embedding model, a vision embedding model) whose embeddings feed the trainable encoders. Latent-diffusion encoders are only enabled for day/week timescales. A feasibility spike will confirm or revise this. | Blocker 4; 31 | provisional |
+| D-011 | 2026-11-06 | **Timescale ladder:** `1s, 1m, 1h, 1d, 1w`, defined in `config/platform.toml`. | 00, 31 | provisional |
+| D-012 | 2026-11-06 | **HelixDB access:** `fa-hub` calls HelixDB's HTTP query endpoints (`POST /<query_name>` with JSON) via `reqwest`, wrapped in typed functions mirroring `helix/queries.hx`. HelixDB runs via its own CLI (`helix push dev`) rather than compose, because it builds a project-specific container from the `helix/` folder. | 20, ADR 0002 | provisional |
+| D-013 | 2026-11-06 | **Postgres access:** `sqlx` with runtime-checked queries (no compile-time DB needed); migrations in `migrations/` run by `sqlx migrate` and by `control-api` on startup. | 12, 20, 42 | provisional |
+| D-014 | 2026-11-06 | **Local ports:** NATS 4222 (monitor 8222), HelixDB 6969, VictoriaMetrics 8428, Postgres 5432, Garage S3 3900 (admin 3903), control-api 7700, frontend dev 5173. | 60 | provisional |
+| D-015 | 2026-11-06 | **Frontend:** SvelteKit with `adapter-static`; in dev, vite proxies `/api` and `/ws` to `control-api`. Package manager: pnpm. Builds run via Docker (`node:22-alpine`) when node isn't installed locally. | 51 | provisional |
+| D-016 | 2026-11-06 | **Go:** one Go module `github.com/fey/financial-auto/go` (in `go/`) instead of a multi-module `go.work`. That's simpler while everything ships together; it can split later. Builds run via Docker (`golang:1.25-alpine`) when Go isn't installed locally. | 01 | provisional |
+| D-017 | 2026-11-06 | **Instrument token in subjects:** UUID in simple form (32 hex characters, no dashes). | 21 | provisional |
+| D-018 | 2026-11-06 | **Scaffold liveness path:** the `heartbeat` connector in the ingestor publishes synthetic `Trade` events every second on `md.trade.sim.<uuid>`. `model-runtime` counts them and publishes `svc.heartbeat.model-runtime`. `control-api` exposes `/api/health`, `/api/sources` and `/ws/bus`, and the frontend dashboard shows the live counters. | 01, 50, 51 | provisional |
+| D-019 | 2026-11-06 | **Task runner:** `justfile` (install with `cargo install just`). Recipes fall back to Docker for Go, Node and buf. | 60 | provisional |
+| D-020 | 2026-11-06 | **Secrets:** `config/secrets.toml` (git-ignored), with `config/secrets.example.toml` committed. Environment variables `FA_<SOURCE>_<KEY>` override it. | 60, ADR 0006 | provisional |
+| D-021 | 2026-11-06 | `ref.venue` has a `code` column (short token used in NATS subjects, e.g. `lemon`, `xetr`, `sim`). Symbol resolution joins `ref.listing` → `ref.venue.code`, valid in `[valid_from, valid_to)`. | 12, 20, 21 | provisional |
+| D-022 | 2026-11-06 | Go stays on 1.25. `nats.go` is pinned to v1.53.1 and `x/time` to v0.15.0 (newer versions require Go 1.26); unpin when moving to Go 1.26. | 01 | provisional |
+| D-023 | 2026-11-06 | Control API routes have no `/api/v1` prefix in the scaffold; the Ops view is the frontend root `/`. | 50, 51 | provisional |
+| D-024 | 2026-11-06 | HelixQL vector types are fixed in the schema, but expert spaces get their dimension at runtime. v1 stores all latent vectors in one vector type tagged with `expert_space_id`. Revisit after validating with the `helix` CLI. | 20, 32 | provisional |
+| D-025 | 2026-11-06 | Evo-orchestrator reads provisional JSON `{"score": x}` job results; NSGA-II ranking (implemented in `fa-evolution`) moves into the evo-worker → orchestrator protocol when the first real evaluation exists. | 34 | provisional |

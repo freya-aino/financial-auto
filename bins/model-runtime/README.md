@@ -2,7 +2,7 @@
 
 Live service: bus → encoders → expert spaces → regions/MCMC → decoders/strategies → signals.
 
-**Status:** spec only — no code yet.
+**Status:** skeleton running — consumes `md.trade.>`, counts, publishes heartbeat; pipeline stages are no-ops.
 
 ## Owns
 Real-time inference loop per timescale.

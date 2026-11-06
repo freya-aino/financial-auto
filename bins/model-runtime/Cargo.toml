@@ -1,0 +1,22 @@
+[package]
+name = "model-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+fa-bus.workspace = true
+fa-core.workspace = true
+fa-expert-space.workspace = true
+fa-proto.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ulid.workspace = true
+
+[lints]
+workspace = true

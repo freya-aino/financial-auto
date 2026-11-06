@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package fa.v1;
+
+import "fa/v1/market.proto";
+import "google/protobuf/timestamp.proto";
+
+enum TradingMode {
+  TRADING_MODE_UNSPECIFIED = 0;
+  TRADING_MODE_PAPER = 1;
+  TRADING_MODE_SHADOW = 2;
+  TRADING_MODE_LIVE = 3;
+}
+
+message OrderIntent {
+  string intent_id = 1; // ULID, idempotency key (spec 42)
+  string account_id = 2;
+  string instrument_id = 3;
+  Side side = 4;
+  double quantity = 5;
+  string exec_algo = 6; // market | limit | smart_limit | twap | vwap
+  optional double limit_price = 7;
+  TradingMode mode = 8;
+  repeated string strategy_ids = 9; // netted contributors
+  google.protobuf.Timestamp created_at = 10;
+}
+
+message OrderEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_ACK = 1;
+    KIND_PARTIAL_FILL = 2;
+    KIND_FILL = 3;
+    KIND_CANCELED = 4;
+    KIND_REJECTED = 5;
+  }
+  string intent_id = 1;
+  string venue_order_id = 2;
+  Kind kind = 3;
+  double fill_price = 4;
+  double fill_quantity = 5;
+  double fee = 6;
+  string fee_currency = 7;
+  google.protobuf.Timestamp event_time = 8;
+  string reason = 9;
+}

@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package fa.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message NewsItem {
+  string title = 1;
+  string body = 2; // may be empty when body_ref is set
+  string body_ref = 3; // Garage key for long bodies
+  string url = 4;
+  string language = 5;
+  string outlet = 6;
+  repeated string entities_raw = 7; // tickers / names as mentioned
+  string dedup_key = 8;
+}
+
+message FilingEvent {
+  string issuer_lei = 1;
+  string issuer_cik = 2;
+  string form_type = 3;
+  google.protobuf.Timestamp filing_time = 4;
+  string accession = 5;
+  repeated string document_refs = 6;
+}

@@ -2,7 +2,7 @@
 
 Stateless worker evaluating decoder/strategy genomes pulled from NATS work queues.
 
-**Status:** spec only — no code yet.
+**Status:** skeleton running — JetStream work-queue consumer on `jobs.evo.>`, replies FAILED/not-implemented, heartbeat.
 
 ## Owns
 Job handler for `jobs.evo.*`.

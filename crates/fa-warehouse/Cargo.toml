@@ -1,0 +1,17 @@
+[package]
+name = "fa-warehouse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+fa-core.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

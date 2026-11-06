@@ -2,7 +2,7 @@
 
 HelixDB client wrapper and typed queries (graph, vectors, lineage).
 
-**Status:** spec only — no code yet.
+**Status:** skeleton — typed HTTP client for Helix queries; query names only, no schema-specific calls yet.
 
 ## Owns
 Typed access to Helix schema in `helix/`.

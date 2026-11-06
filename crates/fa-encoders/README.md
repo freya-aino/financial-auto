@@ -2,7 +2,7 @@
 
 Expert encoder families (burn) and pretrained modality towers (candle).
 
-**Status:** spec only — no code yet.
+**Status:** skeleton — `EncoderFamily` trait, 4 family descriptors, per-timescale sizing; no models (features `burn`/`candle` off, D-004).
 
 ## Owns
 `EncoderFamily` trait and the four family implementations.

@@ -1,0 +1,71 @@
+# Local infrastructure (spec 60, ports per D-014).
+# HelixDB is NOT here: it runs via its own CLI from ../helix (D-012, see README).
+name: financial-auto
+
+services:
+  nats:
+    image: nats:2.12-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: fa
+      POSTGRES_PASSWORD: fa
+      POSTGRES_DB: fa
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fa -d fa"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.155.0
+    command:
+      - "-storageDataPath=/storage"
+      - "-retentionPeriod=100y" # per-timescale retention is enforced by our writers (spec 20)
+      - "-httpListenAddr=:8428"
+    ports:
+      - "127.0.0.1:8428:8428"
+    volumes:
+      - vm-data:/storage
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8428/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  garage:
+    image: dxflrs/garage:v2.5.0
+    ports:
+      - "127.0.0.1:3900:3900" # S3 API
+      - "127.0.0.1:3903:3903" # admin API
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    restart: unless-stopped
+
+volumes:
+  nats-data:
+  postgres-data:
+  vm-data:
+  garage-meta:
+  garage-data:

@@ -2,7 +2,7 @@
 
 First-wave connector: Hacker News (text).
 
-**Status:** spec only — no code yet.
+**Status:** stub — registers, declares poll + backfill; methods return `ErrNotImplemented`. Endpoint notes in the source are unverified.
 
 ## Owns
 Connector implementation.

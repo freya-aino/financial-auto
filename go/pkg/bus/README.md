@@ -2,7 +2,7 @@
 
 NATS publish helpers and Go protobuf types (generated into `pb/`).
 
-**Status:** spec only — no code yet.
+**Status:** implemented — subject taxonomy mirroring `crates/fa-bus/src/subjects.rs`, envelope→subject routing, protobuf `Publisher` (with `Nats-Msg-Id` for jobs), heartbeat loop + counters. Generated code in `pb/` (buf, committed; D-002).
 
 ## Owns
 Subject helpers mirrored from `fa-bus`.

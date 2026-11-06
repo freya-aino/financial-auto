@@ -2,7 +2,19 @@
 
 Automated multi-asset trading platform. Real-time multimodal market, macro, on-chain and media data is embedded by per-timescale expert encoders into decorrelated **expert spaces**. **Regions** of those latent spaces form a Markov state graph with Bayesian transitions. A population of **decoders** and **strategies** evolves over that graph, and promoted strategies trade through a meta-allocator under hard risk limits.
 
-**Status:** specification phase. No code yet. Start at [`specs/README.md`](specs/README.md).
+**Status:** scaffold. The specs are drafted and the services run end to end on a synthetic heartbeat feed; the ML, trading and connector internals are mostly typed skeletons. Start at [`specs/README.md`](specs/README.md); implementation decisions are logged in [`specs/DECISIONS.md`](specs/DECISIONS.md).
+
+## Quick start
+Needs Rust and Docker. Go, Node and buf run in Docker when not installed. Install `just` with `cargo install just`.
+
+```sh
+just up                      # NATS, Postgres, VictoriaMetrics, Garage (HelixDB: see deploy/README.md)
+just check                   # Rust + Go + frontend build/lint/test
+just fe-build                # build the UI, served by control-api
+cargo run -p control-api     # http://127.0.0.1:7700 (applies Postgres migrations on start)
+cargo run -p model-runtime
+just dev                     # prints how to run the Go ingestor with the heartbeat connector
+```
 
 ## Layout
 | Path | What |

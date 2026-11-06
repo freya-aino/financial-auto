@@ -2,7 +2,7 @@
 
 Replay engine over archived streams through the live code path; validation statistics.
 
-**Status:** spec only — no code yet.
+**Status:** partial — deflated Sharpe, PBO (CSCV), ordered replay driver (tested); cost model and pipeline replay pending.
 
 ## Owns
 Replay driver, cost model, deflated Sharpe/PBO.

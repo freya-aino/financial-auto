@@ -2,7 +2,7 @@
 
 First-wave connector: OANDA (FX streaming, execution).
 
-**Status:** spec only — no code yet.
+**Status:** stub — registers, declares stream + backfill; methods return `ErrNotImplemented`. Endpoint notes in the source are unverified.
 
 ## Owns
 Connector implementation.

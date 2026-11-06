@@ -2,7 +2,7 @@
 
 Garage S3 access: raw payload archive, media, model snapshots, checkpoints.
 
-**Status:** spec only — no code yet.
+**Status:** partial — Garage key layout implemented + tested; `BlobStore` trait with in-memory impl, S3 impl pending.
 
 ## Owns
 Content-addressed blob keys and snapshot layout.

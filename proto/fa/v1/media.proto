@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package fa.v1;
+
+enum MediaKind {
+  MEDIA_KIND_UNSPECIFIED = 0;
+  MEDIA_KIND_VIDEO = 1;
+  MEDIA_KIND_AUDIO = 2;
+  MEDIA_KIND_IMAGE = 3;
+}
+
+message MediaChunk {
+  string media_id = 1;
+  MediaKind kind = 2;
+  double segment_start_s = 3;
+  double segment_end_s = 4;
+  string blob_ref = 5; // Garage key
+  string origin_channel = 6;
+  string origin_event = 7; // e.g. "FOMC press conference 2026-11-05"
+  string transcript_ref = 8; // filled by the ASR worker
+}

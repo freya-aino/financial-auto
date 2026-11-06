@@ -2,7 +2,7 @@
 
 PostgreSQL warehouse access: reference data, catalog, fundamentals, macro vintages.
 
-**Status:** spec only — no code yet.
+**Status:** skeleton — PgPool wrapper, symbol resolution, catalog listing, point-in-time macro query (untested against a DB).
 
 ## Owns
 Repositories over `migrations/` schema.

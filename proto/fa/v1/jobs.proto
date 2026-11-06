@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package fa.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Job / JobResult envelopes for NATS work queues (spec 21 §4.3).
+message Job {
+  string job_id = 1; // ULID, also Nats-Msg-Id
+  string kind = 2; // e.g. "evo.eval.decoder", "train.encoder", "media.asr"
+  string parent_job_id = 3;
+  uint32 priority = 4; // GPU priority class (spec 60)
+  string snapshot_id = 5;
+  string genome_id = 6;
+  bytes spec = 7; // kind-specific payload
+  repeated string input_refs = 8;
+  google.protobuf.Timestamp deadline = 9;
+  uint64 budget_gpu_ms = 10;
+  string checkpoint_ref = 11;
+  uint64 seed = 12;
+}
+
+message JobResult {
+  enum Status {
+    STATUS_OK = 0;
+    STATUS_FAILED = 1;
+    STATUS_PREEMPTED = 2;
+    STATUS_BUDGET_EXCEEDED = 3;
+  }
+  string job_id = 1;
+  Status status = 2;
+  bytes result = 3;
+  repeated string output_refs = 4;
+  string checkpoint_ref = 5;
+  uint64 used_gpu_ms = 6;
+  string worker_id = 7;
+  string error = 8;
+}
+
+message JobProgress {
+  string job_id = 1;
+  float fraction = 2;
+  string message = 3;
+}

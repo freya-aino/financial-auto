@@ -2,7 +2,7 @@
 
 Runs N connectors concurrently, normalizes to canonical events, archives raw payloads, publishes to NATS.
 
-**Status:** spec only — no code yet.
+**Status:** implemented (v1) — runs enabled connectors (`-connectors`, default `heartbeat`) concurrently, normalizes, routes and publishes envelopes, per-source limiter, heartbeat counters `events.<id>` / `errors.<id>` / `unresolved.<id>`, graceful shutdown. Raw archive and JetStream streams pending.
 
 ## Owns
 Connector supervisor process.

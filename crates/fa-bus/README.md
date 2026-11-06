@@ -2,7 +2,7 @@
 
 NATS JetStream client: subject taxonomy, typed publish/subscribe, work-queue job/result envelopes.
 
-**Status:** spec only — no code yet.
+**Status:** implemented — subject taxonomy + typed pub/sub (tested subjects).
 
 ## Owns
 Subject constants, typed pub/sub, job pull loop.
