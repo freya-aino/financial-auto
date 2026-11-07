@@ -59,6 +59,11 @@ pub fn risk_halt(scope: &str) -> String {
     format!("risk.halt.{scope}")
 }
 
+/// Clears a halt for `scope` (control-api re-arm, D-030).
+pub fn risk_resume(scope: &str) -> String {
+    format!("risk.resume.{scope}")
+}
+
 pub fn jobs(kind: &str) -> String {
     format!("jobs.{kind}")
 }
