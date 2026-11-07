@@ -21,5 +21,8 @@ HelixDB project: `schema.hx` (nodes, edges, vector types) and `queries.hx` (quer
 ```sh
 cd helix
 helix check
-helix push dev   # serves POST /<query_name> on 127.0.0.1:6969
+helix push dev   # CLI flow (D-012); superseded for local runs by the compose service `helix` (D-033)
 ```
+
+## Running (D-033)
+`just up` starts HelixDB from the official standalone image `ghcr.io/helixdb/helixdb:v0.0.14` on `127.0.0.1:6969` (`/healthz`, `/readyz`, `POST /v2/query`). That image does not compile `schema.hx` / `queries.hx` into named endpoints; `fa-hub` has to move to the `/v2/query` operation-tree contract before these queries are callable.

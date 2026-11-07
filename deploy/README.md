@@ -1,6 +1,6 @@
 # deploy
 
-Local deployment: compose for NATS, VictoriaMetrics, PostgreSQL and Garage. HelixDB runs via its own CLI (D-012).
+Local deployment: one compose file for the infrastructure (NATS, HelixDB, VictoriaMetrics, PostgreSQL, Garage) and, under profile `app`, every platform service (D-026, D-033).
 
 **Status:** compose working (verified 2026-11-06: nats, postgres, victoriametrics healthy; garage up, initialized by `garage-init.sh`).
 
@@ -11,7 +11,7 @@ Local deployment: compose for NATS, VictoriaMetrics, PostgreSQL and Garage. Heli
 | postgres | `postgres:17-alpine` (user/pass/db `fa`) | 5432 | `pg_isready` |
 | victoriametrics | `victoriametrics/victoria-metrics:v1.155.0` | 8428 | `curl localhost:8428/health` |
 | garage | `dxflrs/garage:v2.5.0` | S3 3900, admin 3903 | `docker compose exec garage /garage status` |
-| HelixDB | via `helix` CLI | 6969 | see below |
+| helix | `ghcr.io/helixdb/helixdb:v0.0.14` (data in `/var/lib/helix`) | 6969 → 8080 | `curl localhost:6969/healthz` |
 
 ## Usage
 ```sh
@@ -42,7 +42,7 @@ just app-down                  # stops everything, keeps volumes
 - **Scaling workers:** `just app-scale-workers 4`, or `docker compose -f deploy/compose.yaml --profile app up -d --scale evo-worker=4`. Workers are stateless and pull jobs from a NATS work queue. For more machines later, point more `evo-worker` containers at the same NATS.
 - **Trainer:** a one-off CLI in the `tools` profile, not started by default. Run it with `just trainer pretrain --help` or `docker compose -f deploy/compose.yaml --profile tools run --rm trainer …`.
 - **GPU:** install `nvidia-container-toolkit`, then uncomment the `deploy.resources.reservations.devices` blocks on `model-runtime`, `evo-worker` and `trainer`. GPU time is still arbitrated by `evo-orchestrator` (D-006). The Rust image is CPU-only today because `burn`/`candle` are off by default (D-004); enabling CUDA will need a CUDA base image.
-- **HelixDB:** it isn't in compose (D-012). The services reach it at `host.docker.internal:6969` (mapped via `extra_hosts`), so start it on the host with the `helix` CLI. Until then, `/api/health` reports `helix: false`.
+- **HelixDB:** the `helix` service, reached at `http://helix:8080` inside compose and `127.0.0.1:6969` from the host. The image is distroless, so it has no in-container healthcheck; `control-api` only waits for it to start.
 - **No host processes:** don't run `cargo run -p control-api` at the same time, because it also binds port 7700.
 
 ## Garage first-time init
@@ -62,16 +62,8 @@ G key info fa-local --show-secret   # copy into config/secrets.toml [garage]
 ```
 `garage.toml` holds a fixed local-only `rpc_secret` and `admin_token` (ADR 0006). Don't reuse them anywhere else.
 
-## HelixDB (not in compose, D-012)
-HelixDB builds a project-specific container from `helix/` (schema + queries), so it's driven by its CLI:
-```sh
-curl -sSL https://install.helix-db.com | bash   # installs the `helix` CLI
-cd helix
-helix check          # validate schema.hx / queries.hx
-helix push dev       # build + run locally (HTTP on 6969)
-helix status
-```
-Command names follow the HelixDB docs at the time of writing. They're unverified here because the CLI isn't installed yet.
+## HelixDB (D-033)
+The standalone server image speaks `POST /v2/query` (operation-tree contract) plus `GET /healthz`, `GET /readyz` and `GET /v2/diagnostics`. `helix/schema.hx` and `helix/queries.hx` are not loaded by the image; `fa-hub` still targets the CLI-compiled `POST /<query_name>` endpoints (D-012), so its query layer has to move to `/v2/query` before Helix-backed routes work. Until then `/api/health` reports Helix reachable and nothing else uses it.
 
 ## Data
-All state lives in named volumes (`financial-auto_{nats,postgres,vm,garage-meta,garage-data}-data`). `docker compose down -v` wipes everything.
+All state lives in named volumes (`financial-auto_{nats,helix,postgres,vm,garage-meta,garage-data}-data`). `docker compose down -v` wipes everything.

@@ -27,7 +27,7 @@ just dev                     # prints how to run the Go ingestor with the heartb
 | `helix/` | HelixDB schema and queries |
 | `migrations/` | PostgreSQL warehouse + ledger schema |
 | `frontend/` | SvelteKit operator UI |
-| `deploy/` | Local compose (NATS, HelixDB, VictoriaMetrics, PostgreSQL, Garage) |
+| `deploy/` | Compose: infra (NATS, HelixDB, VictoriaMetrics, PostgreSQL, Garage) + all platform services under profile `app` |
 | `config/` | Source catalog, platform config (secrets in git-ignored `config/secrets.toml`) |
 
 Every component directory has a `README.md` linking to the specs that govern it.

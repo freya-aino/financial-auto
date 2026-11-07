@@ -1,5 +1,5 @@
 # Local infrastructure (spec 60, ports per D-014) and, under profile "app", the platform services (D-026).
-# HelixDB is NOT here: it runs via its own CLI from ../helix (D-012, see README).
+# HelixDB runs from the official standalone image (D-033); the CLI-driven `helix push dev` flow is no longer needed.
 name: financial-auto
 
 services:
@@ -33,6 +33,19 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
+
+  helix:
+    image: ghcr.io/helixdb/helixdb:v0.0.14
+    environment:
+      HELIX_DATA_DIR: /var/lib/helix # native on-disk persistence (unset together with S3_BUCKET = memory only)
+      RUST_LOG: server=info,db=info
+    ports:
+      - "127.0.0.1:6969:8080" # container listens on 8080; host port per D-014
+    volumes:
+      - helix-data:/var/lib/helix
+    # distroless image: no shell or curl, so no in-container healthcheck.
+    # From the host: curl -fsS http://127.0.0.1:6969/healthz (and /readyz).
     restart: unless-stopped
 
   victoriametrics:
@@ -81,13 +94,13 @@ services:
       RUST_LOG: info
     ports:
       - "127.0.0.1:7700:7700"
-    extra_hosts: &host-gateway
-      - "host.docker.internal:host-gateway" # HelixDB runs on the host (D-012)
     depends_on: &core-deps
       nats:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      helix:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7700/api/health"]
       interval: 10s
@@ -101,7 +114,6 @@ services:
     image: financial-auto/rust:dev
     command: ["model-runtime"]
     environment: *rust-env
-    extra_hosts: *host-gateway
     depends_on: *core-deps
     restart: unless-stopped
     # deploy:
@@ -117,7 +129,6 @@ services:
     image: financial-auto/rust:dev
     command: ["evo-worker"]
     environment: *rust-env
-    extra_hosts: *host-gateway
     depends_on: *core-deps
     restart: unless-stopped
     # Scale with: docker compose -f deploy/compose.yaml --profile app up -d --scale evo-worker=N
@@ -170,7 +181,6 @@ services:
     build: *rust-build
     entrypoint: ["trainer"]
     environment: *rust-env
-    extra_hosts: *host-gateway
     depends_on: *core-deps
     # deploy:
     #   resources:
@@ -182,6 +192,7 @@ services:
 
 volumes:
   nats-data:
+  helix-data:
   postgres-data:
   vm-data:
   garage-meta:

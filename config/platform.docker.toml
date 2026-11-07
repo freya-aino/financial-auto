@@ -1,5 +1,5 @@
 # Platform configuration for the Docker Compose app profile (D-026). Mirrors platform.toml with compose hostnames.
-# HelixDB runs outside compose (D-012) and is reached via host.docker.internal.
+# HelixDB is the compose service `helix` (D-033).
 
 timescales = ["1s", "1m", "1h", "1d", "1w"] # D-011
 
@@ -7,7 +7,7 @@ timescales = ["1s", "1m", "1h", "1d", "1w"] # D-011
 url = "nats://nats:4222"
 
 [helix]
-url = "http://host.docker.internal:6969"
+url = "http://helix:8080"
 
 [victoriametrics]
 url = "http://victoriametrics:8428"
