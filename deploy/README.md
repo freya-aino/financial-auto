@@ -20,6 +20,31 @@ just migrate   # apply migrations/ to postgres
 just down
 ```
 
+## Running the full stack (D-026)
+The application services run in compose under the `app` profile. They use two images built from the repo root:
+
+| Image | Dockerfile | Contains |
+|---|---|---|
+| `financial-auto/rust:dev` | `docker/rust.Dockerfile` | `control-api`, `model-runtime`, `evo-worker`, `trainer`, built frontend |
+| `financial-auto/go:dev` | `docker/go.Dockerfile` | `ingestor`, `broker-gateway`, `evo-orchestrator` |
+
+Inside the containers, services use `config/platform.docker.toml`, which has compose hostnames.
+
+```sh
+just app-build                 # docker compose -f deploy/compose.yaml --profile app build
+just app-up                    # infra + services; UI and API at http://127.0.0.1:7700
+just app-ps / just app-logs [service]
+just app-down                  # stops everything, keeps volumes
+```
+
+- **Default feed:** the ingestor starts only the synthetic `heartbeat` connector. To change that, edit `-connectors` in `compose.yaml`.
+- **Migrations:** `control-api` applies the Postgres migrations on startup.
+- **Scaling workers:** `just app-scale-workers 4`, or `docker compose -f deploy/compose.yaml --profile app up -d --scale evo-worker=4`. Workers are stateless and pull jobs from a NATS work queue. For more machines later, point more `evo-worker` containers at the same NATS.
+- **Trainer:** a one-off CLI in the `tools` profile, not started by default. Run it with `just trainer pretrain --help` or `docker compose -f deploy/compose.yaml --profile tools run --rm trainer …`.
+- **GPU:** install `nvidia-container-toolkit`, then uncomment the `deploy.resources.reservations.devices` blocks on `model-runtime`, `evo-worker` and `trainer`. GPU time is still arbitrated by `evo-orchestrator` (D-006). The Rust image is CPU-only today because `burn`/`candle` are off by default (D-004); enabling CUDA will need a CUDA base image.
+- **HelixDB:** it isn't in compose (D-012). The services reach it at `host.docker.internal:6969` (mapped via `extra_hosts`), so start it on the host with the `helix` CLI. Until then, `/api/health` reports `helix: false`.
+- **No host processes:** don't run `cargo run -p control-api` at the same time, because it also binds port 7700.
+
 ## Garage first-time init
 Garage needs a cluster layout, buckets and an access key before use. The script is idempotent:
 ```sh

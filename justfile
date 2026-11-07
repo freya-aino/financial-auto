@@ -30,6 +30,36 @@ garage-init:
 migrate:
     sqlx migrate run --source {{root}}/migrations --database-url {{database_url}}
 
+# ── app stack in Docker (D-026) ─────────────────────────────────────────
+
+# Build the Rust (incl. frontend) and Go service images
+app-build:
+    {{compose}} --profile app build
+
+# Start infrastructure + all platform services; UI at http://127.0.0.1:7700
+app-up:
+    {{compose}} --profile app up -d
+    {{compose}} --profile app ps
+
+# Stop everything (keeps volumes)
+app-down:
+    {{compose}} --profile app --profile tools down
+
+# Follow logs: just app-logs [service]
+app-logs *services:
+    {{compose}} --profile app logs -f --tail 100 {{services}}
+
+app-ps:
+    {{compose}} --profile app ps
+
+# Run more evaluation workers: just app-scale-workers 4
+app-scale-workers n:
+    {{compose}} --profile app up -d --scale evo-worker={{n}}
+
+# Run the trainer CLI in a container: just trainer pretrain --help
+trainer *args:
+    {{compose}} --profile tools run --rm trainer {{args}}
+
 # ── contracts ───────────────────────────────────────────────────────────
 
 # Lint protos and regenerate Go code (Rust codegen happens in fa-proto/build.rs)

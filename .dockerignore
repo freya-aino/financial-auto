@@ -1,0 +1,11 @@
+.git
+target/
+data/
+go/bin/
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/build/
+**/*.log
+config/secrets.toml
+.env
+.env.*

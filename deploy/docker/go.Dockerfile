@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1.7
+# Go services image (D-026): ingestor, broker-gateway, evo-orchestrator.
+# Build context = repo root.
+
+FROM golang:1.25-alpine AS builder
+WORKDIR /src/go
+ENV CGO_ENABLED=0 GOFLAGS=-buildvcs=false
+COPY go/go.mod go/go.sum ./
+RUN --mount=type=cache,id=fa-gomod,target=/go/pkg/mod go mod download
+COPY go/ ./
+RUN --mount=type=cache,id=fa-gomod,target=/go/pkg/mod \
+    --mount=type=cache,id=fa-gocache,target=/root/.cache/go-build \
+    go build -trimpath -ldflags="-s -w" -o /out/ ./services/...
+
+FROM gcr.io/distroless/static-debian12:nonroot
+WORKDIR /app
+COPY --from=builder /out/ /usr/local/bin/
+COPY config/sources.yaml config/sources.yaml
+ENTRYPOINT ["ingestor"]

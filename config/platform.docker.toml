@@ -1,0 +1,26 @@
+# Platform configuration for the Docker Compose app profile (D-026). Mirrors platform.toml with compose hostnames.
+# HelixDB runs outside compose (D-012) and is reached via host.docker.internal.
+
+timescales = ["1s", "1m", "1h", "1d", "1w"] # D-011
+
+[nats]
+url = "nats://nats:4222"
+
+[helix]
+url = "http://host.docker.internal:6969"
+
+[victoriametrics]
+url = "http://victoriametrics:8428"
+
+[postgres]
+url = "postgres://fa:fa@postgres:5432/fa"
+
+[garage]
+endpoint = "http://garage:3900"
+region = "garage"
+bucket_raw = "fa-raw"
+bucket_media = "fa-media"
+bucket_models = "fa-models"
+
+[control_api]
+bind = "0.0.0.0:7700"

@@ -1,4 +1,4 @@
-# Local infrastructure (spec 60, ports per D-014).
+# Local infrastructure (spec 60, ports per D-014) and, under profile "app", the platform services (D-026).
 # HelixDB is NOT here: it runs via its own CLI from ../helix (D-012, see README).
 name: financial-auto
 
@@ -62,6 +62,123 @@ services:
       - garage-meta:/var/lib/garage/meta
       - garage-data:/var/lib/garage/data
     restart: unless-stopped
+
+  # ── application services (profile "app", D-026) ─────────────────────────
+  # Build: docker compose -f deploy/compose.yaml --profile app build
+  # GPU (needs nvidia-container-toolkit): uncomment the `deploy.resources` blocks below.
+
+  control-api:
+    profiles: ["app"]
+    build: &rust-build
+      context: ..
+      dockerfile: deploy/docker/rust.Dockerfile
+    image: financial-auto/rust:dev
+    command: ["control-api"]
+    environment: &rust-env
+      FA_CONFIG: /app/config/platform.docker.toml
+      FA_SOURCES: /app/config/sources.yaml
+      FA_FRONTEND: /app/frontend/build
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:7700:7700"
+    extra_hosts: &host-gateway
+      - "host.docker.internal:host-gateway" # HelixDB runs on the host (D-012)
+    depends_on: &core-deps
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7700/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  model-runtime:
+    profiles: ["app"]
+    image: financial-auto/rust:dev
+    command: ["model-runtime"]
+    environment: *rust-env
+    extra_hosts: *host-gateway
+    depends_on: *core-deps
+    restart: unless-stopped
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  evo-worker:
+    profiles: ["app"]
+    image: financial-auto/rust:dev
+    command: ["evo-worker"]
+    environment: *rust-env
+    extra_hosts: *host-gateway
+    depends_on: *core-deps
+    restart: unless-stopped
+    # Scale with: docker compose -f deploy/compose.yaml --profile app up -d --scale evo-worker=N
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  ingestor:
+    profiles: ["app"]
+    build: &go-build
+      context: ..
+      dockerfile: deploy/docker/go.Dockerfile
+    image: financial-auto/go:dev
+    entrypoint: ["ingestor"]
+    command: ["-nats", "nats://nats:4222", "-catalog", "/app/config/sources.yaml", "-connectors", "heartbeat"]
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  broker-gateway:
+    profiles: ["app"]
+    image: financial-auto/go:dev
+    entrypoint: ["broker-gateway"]
+    command: ["-nats", "nats://nats:4222"]
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  evo-orchestrator:
+    profiles: ["app"]
+    image: financial-auto/go:dev
+    entrypoint: ["evo-orchestrator"]
+    command: ["-nats", "nats://nats:4222"]
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # One-off CLI, not started by default:
+  #   docker compose -f deploy/compose.yaml --profile tools run --rm trainer pretrain --help
+  trainer:
+    profiles: ["tools"]
+    image: financial-auto/rust:dev
+    build: *rust-build
+    entrypoint: ["trainer"]
+    environment: *rust-env
+    extra_hosts: *host-gateway
+    depends_on: *core-deps
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
 
 volumes:
   nats-data:
