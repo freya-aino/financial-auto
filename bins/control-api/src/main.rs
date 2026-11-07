@@ -2,6 +2,8 @@
 //! Local only, no auth (ADR 0006).
 
 mod bus_tap;
+mod live;
+mod live_routes;
 mod routes;
 mod sources;
 mod state;
@@ -52,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = state::AppState::new(cfg, args.sources, Some(nats));
     state.spawn_heartbeat_collector();
+    state.spawn_live_collector();
 
     let app = routes::router(state, Some(args.frontend));
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;

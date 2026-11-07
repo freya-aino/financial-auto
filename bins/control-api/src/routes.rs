@@ -1,4 +1,5 @@
-//! HTTP routes (spec 50 §4). Implemented: health, services, sources, timescales, bus tap.
+//! HTTP routes (spec 50 §4). Implemented: health, services, sources, timescales, bus tap,
+//! latent views, decoder outputs, jobs/GPU/generations, paper trading (see `live_routes`).
 //! Everything else in the catalog answers 501 with a pointer to its spec section.
 use std::{path::PathBuf, time::Duration};
 
@@ -16,7 +17,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{bus_tap, sources, state::AppState};
+use crate::{bus_tap, live_routes as lr, sources, state::AppState};
 
 pub fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
     let mut app = Router::new()
@@ -26,14 +27,15 @@ pub fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         .route("/api/config/timescales", get(timescales))
         .route("/api/services/{name}/{action}", post(not_implemented))
         .route("/api/config/{section}", any(not_implemented))
-        .route("/api/jobs", get(not_implemented))
+        .route("/api/jobs", get(lr::jobs))
         .route("/api/jobs/{id}/cancel", post(not_implemented))
-        .route("/api/gpu", get(not_implemented))
+        .route("/api/gpu", get(lr::gpu))
         // 4.2 Sources & ingestion
         .route("/api/sources", get(list_sources))
         .route("/api/sources/{id}", get(get_source))
         .route("/api/sources/{id}/{action}", post(not_implemented))
         .route("/api/instruments", get(not_implemented))
+        .route("/api/ingest/{source}/{action}", post(lr::ingest_control))
         // 4.3 Bus tap
         .route("/ws/bus", get(bus_tap::ws_bus))
         .route("/api/bus/streams", get(not_implemented))
@@ -42,12 +44,18 @@ pub fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         .route("/api/graph/query", post(not_implemented))
         .route("/api/graph/lineage/{genome_id}", get(not_implemented))
         // 4.5 Latent / MCMC
+        .route("/api/latent/timescales", get(lr::latent_timescales))
+        .route("/api/latent/timescales/{ts}/{view}", get(lr::latent_view))
+        .route("/api/decoders/outputs", get(lr::decoder_outputs))
         .route("/api/latent/snapshots", get(not_implemented))
         .route("/api/latent/snapshots/{id}/{action}", post(not_implemented))
         .route("/api/latent/{snapshot}/{view}", get(not_implemented))
         .route("/api/mcmc/{snapshot}/graph", get(not_implemented))
         .route("/ws/latent", get(not_implemented))
         // 4.6 Evolution
+        .route("/api/evolution/jobs", get(lr::jobs))
+        .route("/api/evolution/gpu", get(lr::gpu))
+        .route("/api/evolution/generations", post(lr::start_generation))
         .route("/api/evolution/populations", get(not_implemented))
         .route("/api/evolution/populations/{id}/pareto", get(not_implemented))
         .route("/api/evolution/genomes/{id}", get(not_implemented))
@@ -56,15 +64,20 @@ pub fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         .route("/api/evolution/runs/{id}/{action}", post(not_implemented))
         .route("/ws/evolution", get(not_implemented))
         // 4.7 Trading
-        .route("/api/trading/positions", get(not_implemented))
-        .route("/api/trading/orders", any(not_implemented))
-        .route("/api/trading/fills", get(not_implemented))
+        .route("/api/trading/positions", get(lr::positions))
+        .route("/api/trading/orders", get(lr::orders).post(lr::paper_order))
+        .route("/api/trading/fills", get(lr::fills))
+        .route("/api/trading/risk", get(lr::risk))
+        .route("/api/trading/signals", get(lr::signals))
+        .route("/api/trading/halt", post(lr::halt))
+        .route("/api/trading/resume", post(lr::resume))
+        .route("/api/trading/paper-order", post(lr::paper_order))
         .route("/api/trading/pnl", get(not_implemented))
         .route("/api/trading/strategies", get(not_implemented))
         .route("/api/trading/strategies/{id}/{action}", post(not_implemented))
         .route("/api/trading/flatten", post(not_implemented))
-        .route("/api/trading/kill-switch", post(not_implemented))
-        .route("/api/trading/kill-switch/rearm", post(not_implemented))
+        .route("/api/trading/kill-switch", post(lr::halt))
+        .route("/api/trading/kill-switch/rearm", post(lr::resume))
         .route("/api/trading/limits", any(not_implemented))
         .route("/api/trading/reconciliation", get(not_implemented))
         .route("/api/audit", get(not_implemented))
@@ -253,9 +266,63 @@ mod tests {
         let (s, v) = get_json("/api/evolution/populations").await;
         assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(v["spec"], "specs/50-control-api.md §4.6");
-        let (s, v) = get_json("/api/trading/positions").await;
+        let (s, v) = get_json("/api/trading/pnl").await;
         assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(v["spec"], "specs/50-control-api.md §4.7");
+    }
+
+    async fn post_json(uri: &str, body: Value) -> (StatusCode, Value) {
+        let req = Request::post(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = app().oneshot(req).await.unwrap();
+        let status = res.status();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn live_views_answer_with_empty_data() {
+        for uri in [
+            "/api/latent/timescales/1h/states",
+            "/api/latent/timescales/1h/regions",
+            "/api/latent/timescales/1h/transitions",
+            "/api/decoders/outputs?family=text",
+            "/api/evolution/jobs",
+            "/api/evolution/gpu",
+            "/api/trading/positions",
+            "/api/trading/orders",
+            "/api/trading/fills",
+            "/api/trading/risk",
+            "/api/trading/signals",
+        ] {
+            let (s, _) = get_json(uri).await;
+            assert_eq!(s, StatusCode::OK, "{uri}");
+        }
+        let (_, v) = get_json("/api/trading/risk").await;
+        assert_eq!(v["live_available"], false);
+        let (s, _) = get_json("/api/latent/timescales/1h/nope").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn live_orders_are_rejected_and_commands_need_nats() {
+        let order = json!({"instrument_id": "01900000-0000-7000-8000-000000000001", "side": "buy", "quantity": 1});
+        let mut live = order.clone();
+        live["mode"] = json!("live");
+        let (s, v) = post_json("/api/trading/paper-order", live).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap().contains("only paper"));
+        let (s, _) = post_json("/api/trading/paper-order", order).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        let (s, _) = post_json("/api/trading/halt", json!({})).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        let (s, _) = post_json("/api/evolution/generations", json!({"kind": "", "genomes": []})).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, v) = post_json("/api/ingest/oanda/start", json!({})).await;
+        assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(v["source"], "oanda");
     }
 
     #[tokio::test]

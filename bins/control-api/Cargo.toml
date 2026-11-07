@@ -8,10 +8,12 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 clap.workspace = true
 fa-bus.workspace = true
 fa-core.workspace = true
+fa-ledger.workspace = true
 fa-proto.workspace = true
 futures.workspace = true
 serde.workspace = true
@@ -22,8 +24,10 @@ tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
+fa-mcmc.workspace = true
 http-body-util = "0.1.5"
 tower = { version = "0.5.3", features = ["util"] }
 

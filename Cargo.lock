@@ -415,10 +415,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "chrono",
  "clap",
  "fa-bus",
  "fa-core",
+ "fa-ledger",
+ "fa-mcmc",
  "fa-proto",
  "futures",
  "http-body-util",
@@ -431,6 +434,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

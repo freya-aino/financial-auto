@@ -2,7 +2,7 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 use chrono::{DateTime, Utc};
@@ -11,6 +11,8 @@ use fa_core::config::PlatformConfig;
 use fa_proto::{Message, v1::Heartbeat};
 use futures::StreamExt;
 use serde::Serialize;
+
+use crate::live::{self, Live};
 
 /// Latest heartbeat seen per service (spec 50 §4.1 `/api/services`).
 #[derive(Debug, Clone, Serialize)]
@@ -28,6 +30,7 @@ pub struct AppState {
     pub sources_path: Arc<PathBuf>,
     pub nats: Option<async_nats::Client>,
     pub services: Arc<RwLock<BTreeMap<String, ServiceStatus>>>,
+    pub live: Arc<RwLock<Live>>,
 }
 
 impl AppState {
@@ -37,6 +40,7 @@ impl AppState {
             sources_path: Arc::new(sources_path),
             nats,
             services: Arc::default(),
+            live: Arc::default(),
         }
     }
 
@@ -44,6 +48,33 @@ impl AppState {
         self.nats
             .as_ref()
             .is_some_and(|c| c.connection_state() == async_nats::connection::State::Connected)
+    }
+
+    pub fn live(&self) -> RwLockReadGuard<'_, Live> {
+        self.live.read().expect("live lock")
+    }
+
+    pub fn live_mut(&self) -> RwLockWriteGuard<'_, Live> {
+        self.live.write().expect("live lock")
+    }
+
+    /// Feeds latent/decoder/jobs/signal/order/risk/trade traffic into `live`.
+    pub fn spawn_live_collector(&self) {
+        let Some(client) = self.nats.clone() else { return };
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut subs = Vec::new();
+            for subject in live::SUBJECTS {
+                match client.subscribe(subject).await {
+                    Ok(s) => subs.push(s),
+                    Err(e) => tracing::error!(subject, error = %e, "live subscription failed"),
+                }
+            }
+            let mut all = futures::stream::select_all(subs);
+            while let Some(msg) = all.next().await {
+                state.live_mut().ingest(&msg.subject, &msg.payload);
+            }
+        });
     }
 
     pub fn record_heartbeat(&self, hb: Heartbeat) {
