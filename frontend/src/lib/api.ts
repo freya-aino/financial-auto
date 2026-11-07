@@ -44,7 +44,11 @@ async function getJson<T>(path: string): Promise<T> {
 export const api = {
 	health: () => getJson<Health>('/api/health'),
 	services: () => getJson<{ services: ServiceStatus[]; nats_connected: boolean }>('/api/services'),
-	sources: () => getJson<{ version: number; sources: Source[] }>('/api/sources')
+	sources: () => getJson<{ version: number; sources: Source[] }>('/api/sources'),
+	/** `ctl.ingest.*` start/stop. The ingestor has no handler yet, so control-api answers 501 (shown to the operator). */
+	ingest: (source: string, action: 'start' | 'stop') => postJson<{ ok: boolean }>(`/api/ingest/${source}/${action}`),
+	/** Spec 50 §4.1; 501 until the orchestrator handles cancellation. */
+	cancelJob: (id: string) => postJson<{ ok: boolean }>(`/api/jobs/${id}/cancel`)
 };
 
 /** WebSocket URL for the bus tap, relative to the current origin. */
@@ -245,7 +249,7 @@ async function postJson<T>(path: string, body: unknown = {}): Promise<T> {
 		body: JSON.stringify(body)
 	});
 	const data = await res.json().catch(() => ({}));
-	if (!res.ok) throw new ApiError(res.status, data.error ?? data.reason ?? `${res.status} ${res.statusText}`);
+	if (!res.ok) throw new ApiError(res.status, data.reason ?? data.error ?? `${res.status} ${res.statusText}`);
 	return data as T;
 }
 

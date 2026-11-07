@@ -15,20 +15,24 @@
 		type LatentStateView,
 		type Region
 	} from '../../lib/api';
+	import { loadPref, savePref } from '../../lib/prefs';
 
 	let configured = $state<string[]>([]);
 	let seen = $state<string[]>([]);
-	let ts = $state('');
+	let ts = $state(loadPref('latent.ts', ''));
 	let nodes = $state<GraphNode[]>([]);
 	let edges = $state<GraphEdge[]>([]);
 	let regions = $state<Region[]>([]);
 	let states = $state<LatentStateView[]>([]);
 	let outputs = $state<DecoderOutputView[]>([]);
 	let families = $state<string[]>([]);
-	let family = $state('');
+	let family = $state(loadPref('latent.family', ''));
 	let selected = $state<string | null>(null);
 	let error = $state('');
 	let now = $state(Date.now());
+
+	$effect(() => savePref('latent.ts', ts));
+	$effect(() => savePref('latent.family', family));
 
 	const timescales = $derived([...new Set([...configured, ...seen])]);
 	const selectedRows = $derived(edges.filter((e) => e.from === selected).sort((a, b) => b.mean - a.mean));

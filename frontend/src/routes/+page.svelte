@@ -2,8 +2,9 @@
 	import { onMount } from 'svelte';
 	import BusTap from '../lib/BusTap.svelte';
 	import ViewHeader from '../lib/ViewHeader.svelte';
-	import Planned from '../lib/Planned.svelte';
+	import JobsGpu from '../lib/JobsGpu.svelte';
 	import { api, type ServiceStatus, type Source } from '../lib/api';
+	import { loadPref, savePref } from '../lib/prefs';
 
 	let services = $state<ServiceStatus[]>([]);
 	let servicesError = $state('');
@@ -11,10 +12,24 @@
 	let sourcesError = $state('');
 	let now = $state(Date.now());
 
-	let category = $state('');
-	let status = $state('');
-	let capability = $state('');
+	let category = $state(loadPref('ops.category', ''));
+	let status = $state(loadPref('ops.status', ''));
+	let capability = $state(loadPref('ops.capability', ''));
 	let query = $state('');
+	let ingestMsg = $state<Record<string, { ok: boolean; text: string }>>({});
+
+	$effect(() => savePref('ops.category', category));
+	$effect(() => savePref('ops.status', status));
+	$effect(() => savePref('ops.capability', capability));
+
+	async function ingest(id: string, action: 'start' | 'stop') {
+		try {
+			await api.ingest(id, action);
+			ingestMsg = { ...ingestMsg, [id]: { ok: true, text: `${action} requested` } };
+		} catch (e) {
+			ingestMsg = { ...ingestMsg, [id]: { ok: false, text: e instanceof Error ? e.message : String(e) } };
+		}
+	}
 
 	const categories = $derived([...new Set(sources.map((s) => s.category))].sort());
 	const statuses = $derived([...new Set(sources.map((s) => s.status))].sort());
@@ -85,15 +100,7 @@
 			</tbody>
 		</table>
 	</section>
-	<Planned
-		title="Jobs & GPU"
-		items={[
-			'Work-queue jobs by priority class (live > adapters > evolution > training)',
-			'Running job, preemptions, cancel',
-			'GPU arbiter state (D-006)'
-		]}
-		endpoints={['GET /api/jobs', 'GET /api/gpu']}
-	/>
+	<JobsGpu />
 </div>
 
 <BusTap />
@@ -122,7 +129,7 @@
 	<div class="scroll catalog">
 		<table>
 			<thead>
-				<tr><th>id</th><th>name</th><th>category</th><th>status</th><th>capabilities</th><th>assets</th><th>transport</th><th>auth</th><th>notes</th></tr>
+				<tr><th>id</th><th>name</th><th>category</th><th>status</th><th>capabilities</th><th>assets</th><th>transport</th><th>auth</th><th>ingest</th><th>notes</th></tr>
 			</thead>
 			<tbody>
 				{#each filtered as s (s.id)}
@@ -137,6 +144,17 @@
 						<td class="dim">{s.asset_classes.join(', ')}</td>
 						<td class="dim">{s.transport.join(', ')}</td>
 						<td class="dim">{s.auth}</td>
+						<td class="ingest">
+							{#if s.capabilities.includes('data') && s.status !== 'planned'}
+								<button onclick={() => ingest(s.id, 'start')} disabled={s.status === 'disabled'}>start</button>
+								<button onclick={() => ingest(s.id, 'stop')}>stop</button>
+								{#if ingestMsg[s.id]}
+									<span class="badge" class:ok={ingestMsg[s.id].ok} class:warn={!ingestMsg[s.id].ok} title={ingestMsg[s.id].text}>{ingestMsg[s.id].ok ? 'sent' : 'not yet: ' + ingestMsg[s.id].text.slice(0, 60)}</span>
+								{/if}
+							{:else}
+								<span class="dim">—</span>
+							{/if}
+						</td>
 						<td class="dim notes">{s.notes}</td>
 					</tr>
 				{/each}
@@ -177,5 +195,14 @@
 
 	.notes {
 		max-width: 360px;
+	}
+
+	.ingest {
+		white-space: nowrap;
+	}
+
+	.ingest button {
+		font-size: 11px;
+		padding: 1px 6px;
 	}
 </style>

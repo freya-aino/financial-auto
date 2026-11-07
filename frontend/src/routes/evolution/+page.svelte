@@ -5,6 +5,7 @@
 	import Scatter from '../../lib/Scatter.svelte';
 	import ViewHeader from '../../lib/ViewHeader.svelte';
 	import { ago, live, poll, short, type GpuStatus, type JobView } from '../../lib/api';
+	import { loadPref, savePref } from '../../lib/prefs';
 
 	const STATUSES = ['queued', 'running', 'ok', 'failed', 'preempted', 'budget_exceeded'] as const;
 
@@ -12,12 +13,15 @@
 	let jobs = $state<JobView[]>([]);
 	let objectives = $state<string[]>([]);
 	let gpu = $state<GpuStatus | null>(null);
-	let kindFilter = $state('');
+	let kindFilter = $state(loadPref('evo.kind', ''));
 	let error = $state('');
 	let now = $state(Date.now());
 
-	let xObj = $state('');
-	let yObj = $state('');
+	let xObj = $state(loadPref('evo.x', ''));
+	let yObj = $state(loadPref('evo.y', ''));
+	$effect(() => savePref('evo.kind', kindFilter));
+	$effect(() => savePref('evo.x', xObj));
+	$effect(() => savePref('evo.y', yObj));
 	// Objectives where lower is better; everything else is maximised (spec 34).
 	const MINIMISE = new Set(['reconstruction', 'compute_cost', 'crps', 'nll', 'loss']);
 

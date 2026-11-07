@@ -2,17 +2,17 @@
 
 SvelteKit 3 (Svelte 5, runes) + TypeScript operator UI, built as a static SPA with `adapter-static` and served by `control-api` (D-015).
 
-**Status:** all four v1 views implemented against live control-api data (polled every 2 s). Paper trading only: the LIVE control is permanently disabled (D-029). `pnpm check` (0 errors, 0 warnings) and `pnpm build` verified 2026-11-07. Without producers, each panel shows which bus subject would fill it; `cargo run -p control-api --example demo_publisher` fills every view with synthetic data.
+**Status:** all four v1 views and the global chrome (spec 51 §6.1) implemented against live control-api data (polled every 2 s). Paper trading only: the LIVE control is permanently disabled (D-029). The kill switch is reachable from every page (top bar, confirm dialog, result taken from the API response). View preferences (timescale, filters, objective pickers) persist in `localStorage`. `pnpm check` (0 errors, 0 warnings) and `pnpm build` verified 2026-11-07. Without producers, each panel shows which bus subject would fill it; `cargo run -p control-api --example demo_publisher` fills every view with synthetic data.
 
 ## Views
 | Route | View | State |
 |---|---|---|
-| `/` | Ops: services (heartbeats, polled every 2 s), live bus tap with msg/s and dropped counters, source catalog with search + category/status/capability filters | live |
+| `/` | Ops: services (heartbeats, polled every 2 s); Jobs & GPU (queue by priority class, running jobs with cancel, arbiter state); live bus tap with msg/s and dropped counters; source catalog with search + category/status/capability filters and per-source ingest start/stop (501 from the API until the ingestor handles `ctl.ingest.*`, shown inline) | live |
 | `/latent/` | Latent & Graph: timescale selector; region transition graph (SVG, circular layout, edge width = posterior mean, 90% interval in tooltip, click to pin a region); region table with lineage/status/occupancy; expert states per instrument (router weights, region per expert, ‖μ‖, σ̄); decoder-output feed with family filter, forecast quantile strips, retrieval analogs with similarity and time distance | live |
 | `/evolution/` | Evolution Lab: job counts per kind × status; GPU arbiter (from orchestrator heartbeat); start-generation form (`ctl.evo.start`); Pareto scatter with objective pickers and non-dominated points highlighted (falls back to a score histogram); recent jobs with progress bars | live |
 | `/trading/` | Trading Desk: PAPER badge, LIVE disabled; working kill switch (prompt for reason) + resume; equity / deployable / exposure / drawdown / P&L tiles (risk service if reporting, else paper book); positions; manual paper order ticket; active halts; orders & fills; strategy signals as exposure mean ± σ bars | live |
 
-Top bar: NATS state and dependency reachability from `/api/health`, polled every 5 s.
+Top bar on every page: PAPER mode badge, equity and P&L (risk service if reporting, else paper book), active-halt count, NATS state and dependency dots from `/api/health` (5 s), and the kill switch / resume (`/api/trading/risk` every 2 s). The bar turns red while the portfolio is halted.
 
 Deviation from spec 51's route list: Ops lives at `/` rather than `/ops`, and sources/bus are panels on it rather than sub-routes. Splitting them later is cheap.
 

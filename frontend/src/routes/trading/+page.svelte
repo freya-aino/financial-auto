@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Empty from '../../lib/Empty.svelte';
+	import KillSwitch from '../../lib/KillSwitch.svelte';
 	import ViewHeader from '../../lib/ViewHeader.svelte';
 	import {
 		ago,
@@ -23,9 +24,6 @@
 	let signals = $state<SignalView[]>([]);
 	let error = $state('');
 	let now = $state(Date.now());
-
-	let killBusy = $state(false);
-	let killMsg = $state('');
 
 	// manual paper order ticket
 	let oInst = $state('');
@@ -68,37 +66,6 @@
 		}
 	}
 
-	async function kill() {
-		const reason = prompt('KILL SWITCH: halt the whole portfolio. Reason?', 'manual kill switch');
-		if (reason === null) return;
-		killBusy = true;
-		killMsg = '';
-		try {
-			await live.halt(reason);
-			killMsg = 'portfolio halted';
-			await refresh();
-		} catch (e) {
-			killMsg = e instanceof Error ? e.message : String(e);
-		} finally {
-			killBusy = false;
-		}
-	}
-
-	async function resume() {
-		if (!confirm('Re-arm trading for the portfolio?')) return;
-		killBusy = true;
-		killMsg = '';
-		try {
-			await live.resume();
-			killMsg = 'portfolio resumed';
-			await refresh();
-		} catch (e) {
-			killMsg = e instanceof Error ? e.message : String(e);
-		} finally {
-			killBusy = false;
-		}
-	}
-
 	async function submitOrder(ev: SubmitEvent) {
 		ev.preventDefault();
 		oBusy = true;
@@ -136,14 +103,7 @@
 		<button class="live" disabled title="no live broker connected">LIVE</button>
 		<span class="dim">Kill switch: halts the portfolio and blocks manual orders (spec 40).</span>
 	</div>
-	<div class="actions">
-		{#if killMsg}<span class="badge">{killMsg}</span>{/if}
-		{#if risk?.portfolio_halted}
-			<span class="badge danger">PORTFOLIO HALTED</span>
-			<button onclick={resume} disabled={killBusy}>Resume</button>
-		{/if}
-		<button class="kill" onclick={kill} disabled={killBusy || risk?.portfolio_halted}>KILL SWITCH</button>
-	</div>
+	<KillSwitch {risk} onchanged={refresh} />
 </div>
 
 <div class="tiles">
@@ -297,8 +257,7 @@
 	.killbar.halted {
 		background: color-mix(in srgb, var(--danger) 12%, var(--bg-raised));
 	}
-	.modes,
-	.actions {
+	.modes {
 		display: flex;
 		align-items: center;
 		gap: 8px;
@@ -311,14 +270,6 @@
 	.live {
 		font-size: 11px;
 		letter-spacing: 0.06em;
-	}
-	.kill {
-		background: var(--danger);
-		color: #fff;
-		border: none;
-		font-weight: 700;
-		letter-spacing: 0.08em;
-		padding: 8px 18px;
 	}
 	.tiles {
 		display: grid;
