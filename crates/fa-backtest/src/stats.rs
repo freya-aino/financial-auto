@@ -45,14 +45,35 @@ fn erf(x: f64) -> f64 {
 
 /// Inverse standard normal CDF (Acklam's rational approximation).
 pub fn norm_ppf(p: f64) -> f64 {
-    let a = [-3.969_683_028_665_376e1, 2.209_460_984_245_205e2, -2.759_285_104_469_687e2, 1.383_577_518_672_69e2, -3.066_479_806_614_716e1, 2.506_628_277_459_239];
-    let b = [-5.447_609_879_822_406e1, 1.615_858_368_580_409e2, -1.556_989_798_598_866e2, 6.680_131_188_771_972e1, -1.328_068_155_288_572e1];
-    let c = [-7.784_894_002_430_293e-3, -3.223_964_580_411_365e-1, -2.400_758_277_161_838, -2.549_732_539_343_734, 4.374_664_141_464_968, 2.938_163_982_698_783];
+    let a = [
+        -3.969_683_028_665_376e1,
+        2.209_460_984_245_205e2,
+        -2.759_285_104_469_687e2,
+        1.383_577_518_672_69e2,
+        -3.066_479_806_614_716e1,
+        2.506_628_277_459_239,
+    ];
+    let b = [
+        -5.447_609_879_822_406e1,
+        1.615_858_368_580_409e2,
+        -1.556_989_798_598_866e2,
+        6.680_131_188_771_972e1,
+        -1.328_068_155_288_572e1,
+    ];
+    let c = [
+        -7.784_894_002_430_293e-3,
+        -3.223_964_580_411_365e-1,
+        -2.400_758_277_161_838,
+        -2.549_732_539_343_734,
+        4.374_664_141_464_968,
+        2.938_163_982_698_783,
+    ];
     let d = [7.784_695_709_041_462e-3, 3.224_671_290_700_398e-1, 2.445_134_137_142_996, 3.754_408_661_907_416];
     let pl = 0.02425;
     if p < pl {
         let q = (-2.0 * p.ln()).sqrt();
-        (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+        (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
+            / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
     } else if p <= 1.0 - pl {
         let q = p - 0.5;
         let r = q * q;
@@ -76,7 +97,9 @@ pub fn probabilistic_sharpe(r: &[f64], sr_benchmark: f64) -> f64 {
 /// under the null (true SR = 0).
 pub fn expected_max_sharpe(n_trials: usize, var_sr: f64) -> f64 {
     let n = n_trials.max(2) as f64;
-    var_sr.sqrt() * ((1.0 - EULER_GAMMA) * norm_ppf(1.0 - 1.0 / n) + EULER_GAMMA * norm_ppf(1.0 - 1.0 / (n * std::f64::consts::E)))
+    var_sr.sqrt()
+        * ((1.0 - EULER_GAMMA) * norm_ppf(1.0 - 1.0 / n)
+            + EULER_GAMMA * norm_ppf(1.0 - 1.0 / (n * std::f64::consts::E)))
 }
 
 /// Deflated Sharpe ratio: PSR against the expected max Sharpe of `n_trials` trials.
@@ -96,7 +119,8 @@ pub fn pbo_cscv(perf: &[Vec<f64>], s: usize) -> f64 {
         return f64::NAN;
     }
     let block = t / s;
-    let blocks: Vec<std::ops::Range<usize>> = (0..s).map(|i| i * block..if i == s - 1 { t } else { (i + 1) * block }).collect();
+    let blocks: Vec<std::ops::Range<usize>> =
+        (0..s).map(|i| i * block..if i == s - 1 { t } else { (i + 1) * block }).collect();
     let score = |rows: &[usize], trial: usize| -> f64 {
         let r: Vec<f64> = rows.iter().map(|&i| perf[i][trial]).collect();
         sharpe(&r)

@@ -698,10 +698,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "fa-backtest",
+ "fa-blob",
  "fa-bus",
  "fa-core",
+ "fa-decoders",
  "fa-proto",
  "futures",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -723,6 +727,7 @@ name = "fa-backtest"
 version = "0.1.0"
 dependencies = [
  "fa-core",
+ "fa-decoders",
  "serde",
  "thiserror",
 ]
@@ -769,6 +774,7 @@ dependencies = [
  "fa-core",
  "fa-expert-space",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -810,6 +816,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -866,6 +873,7 @@ dependencies = [
  "fa-proto",
  "serde",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -1701,7 +1709,10 @@ dependencies = [
  "clap",
  "fa-bus",
  "fa-core",
+ "fa-encoders",
  "fa-expert-space",
+ "fa-mcmc",
+ "fa-patterns",
  "fa-proto",
  "futures",
  "tokio",
@@ -2269,6 +2280,31 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "risk-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "fa-allocator",
+ "fa-bus",
+ "fa-core",
+ "fa-ledger",
+ "fa-proto",
+ "fa-risk",
+ "fa-strategies",
+ "futures",
+ "serde",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+ "uuid",
 ]
 
 [[package]]
@@ -2889,6 +2925,27 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "strategy-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "fa-bus",
+ "fa-core",
+ "fa-proto",
+ "fa-strategies",
+ "futures",
+ "serde",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+ "uuid",
+]
 
 [[package]]
 name = "stringprep"

@@ -25,19 +25,21 @@ func MdBook(venue, inst string) string {
 	return fmt.Sprintf("md.book.%s.%s", venue, SubjectToken(inst))
 }
 
-func NewsItem(source string) string          { return "news.item." + source }
-func MediaChunk(source string) string        { return "media.chunk." + source }
-func MacroObs(source, series string) string  { return fmt.Sprintf("macro.obs.%s.%s", source, series) }
-func OnchainEvent(chain string) string       { return "onchain.event." + chain }
-func FilingEvent(source string) string       { return "filing.event." + source }
-func LatentState(ts, instrument string) string { return fmt.Sprintf("latent.state.%s.%s", ts, instrument) } // D-039
-func LatentRegion(ts string) string          { return "latent.region." + ts }
-func LatentTransition(ts string) string      { return "latent.transition." + ts }
-func DecoderOutput(family string) string     { return "decoder.output." + family }
-func SignalExposure(strategy string) string  { return "signal.exposure." + strategy }
-func OrderIntent(account string) string      { return "order.intent." + account }
-func OrderApproved(account string) string    { return "order.approved." + account }
-func OrderEvent(account string) string       { return "order.event." + account }
+func NewsItem(source string) string         { return "news.item." + source }
+func MediaChunk(source string) string       { return "media.chunk." + source }
+func MacroObs(source, series string) string { return fmt.Sprintf("macro.obs.%s.%s", source, series) }
+func OnchainEvent(chain string) string      { return "onchain.event." + chain }
+func FilingEvent(source string) string      { return "filing.event." + source }
+func LatentState(ts, instrument string) string {
+	return fmt.Sprintf("latent.state.%s.%s", ts, instrument)
+}                                           // D-039
+func LatentRegion(ts string) string         { return "latent.region." + ts }
+func LatentTransition(ts string) string     { return "latent.transition." + ts }
+func DecoderOutput(family string) string    { return "decoder.output." + family }
+func SignalExposure(strategy string) string { return "signal.exposure." + strategy }
+func OrderIntent(account string) string     { return "order.intent." + account }
+func OrderApproved(account string) string   { return "order.approved." + account }
+func OrderEvent(account string) string      { return "order.event." + account }
 
 const RiskState = "risk.state"
 

@@ -122,7 +122,8 @@ pub async fn start_generation(State(s): State<AppState>, Json(body): Json<StartG
         return err(StatusCode::BAD_REQUEST, "kind and at least one genome are required");
     }
     let mut args =
-        vec![("kind", body.kind.trim().to_owned()), ("snapshot_id", body.snapshot_id), ("genomes", genomes.join(","))];
+        // newline-separated so kv (`;`) and JSON (`,`) genomes survive transport (D-044)
+        vec![("kind", body.kind.trim().to_owned()), ("snapshot_id", body.snapshot_id), ("genomes", genomes.join("\n"))];
     if let Some(v) = body.eta {
         args.push(("eta", v.to_string()));
     }

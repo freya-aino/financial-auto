@@ -1,6 +1,8 @@
-//! Backtest & validation statistics (spec 41): deflated Sharpe ratio, PBO via CSCV,
-//! and the replay driver interface (replay runs through the live code path).
+//! Backtest & validation (spec 41): deflated Sharpe ratio, PBO via CSCV, the replay driver
+//! interface (replay runs through the live code path), and [`eval`], the sequential
+//! point-in-time scorer for series decoders used by `evo-worker`.
 
+pub mod eval;
 pub mod stats;
 
 /// A replay source drives the same pipeline as live, in event-time order with

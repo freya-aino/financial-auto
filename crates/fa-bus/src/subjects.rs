@@ -88,6 +88,13 @@ pub fn heartbeat(service: &str) -> String {
     format!("svc.heartbeat.{service}")
 }
 
+/// GPU arbiter protocol (spec 60, D-006): request/reply `acquire` (args `lease_id`, `class`, `mem_mb` → reply
+/// `granted` | `queued`) and `release` (`lease_id`); notifications `granted` / `preempt` carry the lease id.
+pub const CTL_GPU_ACQUIRE: &str = "ctl.gpu.acquire";
+pub const CTL_GPU_RELEASE: &str = "ctl.gpu.release";
+pub const CTL_GPU_GRANTED: &str = "ctl.gpu.granted";
+pub const CTL_GPU_PREEMPT: &str = "ctl.gpu.preempt";
+
 pub fn ctl(service: &str, verb: &str) -> String {
     format!("ctl.{service}.{verb}")
 }

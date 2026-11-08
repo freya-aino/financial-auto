@@ -80,6 +80,13 @@ pub fn decoder_artifact(family: &str, decoder_id: &str, name: &str) -> ObjectKey
     ObjectKey { bucket: buckets::ARTIFACTS, key: format!("decoders/{family}/{decoder_id}/{name}") }
 }
 
+/// Evaluation report of one evo job: `fa-artifacts/evals/<generation_id>/<job_id>.json`
+/// (`generation_id` = `Job.parent_job_id`, or `adhoc` when empty).
+pub fn eval_report(generation_id: &str, job_id: &str) -> ObjectKey {
+    let generation = if generation_id.is_empty() { "adhoc" } else { generation_id };
+    ObjectKey { bucket: buckets::ARTIFACTS, key: format!("evals/{generation}/{job_id}.json") }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {
     #[error("not found: {0}/{1}")]
@@ -134,8 +141,13 @@ mod tests {
 
     #[test]
     fn model_layouts() {
-        assert_eq!(snapshot(Timescale::Hour, "fsq_hybrid", 3, "weights.mpk").key, "snapshots/1h/fsq_hybrid/3/weights.mpk");
+        assert_eq!(
+            snapshot(Timescale::Hour, "fsq_hybrid", 3, "weights.mpk").key,
+            "snapshots/1h/fsq_hybrid/3/weights.mpk"
+        );
         assert_eq!(checkpoint("job1", 7).key, "job1/000007");
+        assert_eq!(eval_report("", "j1").key, "evals/adhoc/j1.json");
+        assert_eq!(eval_report("gen1", "j1").bucket, "fa-artifacts");
         assert_eq!(media("youtube", "m1", MediaPart::Frames, "0001.jpg").key, "youtube/m1/frames/0001.jpg");
     }
 

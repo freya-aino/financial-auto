@@ -133,7 +133,13 @@ func main() {
 		return "released", nil
 	})
 	handle(bus.Ctl("evo", "start"), func(r *fav1.CtlRequest) (string, error) {
-		genomes := strings.Split(r.Args["genomes"], ",")
+		// Genomes are newline-separated (D-044): kv genomes contain ';' and JSON genomes contain ','.
+		var genomes []string
+		for _, g := range strings.Split(r.Args["genomes"], "\n") {
+			if g = strings.TrimSpace(g); g != "" {
+				genomes = append(genomes, g)
+			}
+		}
 		eta, _ := strconv.Atoi(r.Args["eta"])
 		minB, _ := strconv.ParseUint(r.Args["min_budget_ms"], 10, 64)
 		maxB, _ := strconv.ParseUint(r.Args["max_budget_ms"], 10, 64)

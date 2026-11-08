@@ -1,4 +1,13 @@
 //! Decoder population members: families, trait, and scoring functions (spec 34).
+//!
+//! - [`genome`]: the concrete, deterministic genome encoding of the baseline families.
+//! - [`baseline`]: CPU-only point-in-time series decoders (quantile forecaster, analog
+//!   retrieval) built from a genome; used by `evo-worker` for `evo.eval.decoder` jobs.
+//! - Scoring primitives: CRPS (ensemble + quantile), pinball loss, time-discounted analog
+//!   weighting.
+
+pub mod baseline;
+pub mod genome;
 
 use fa_expert_space::ExpertView;
 use serde::{Deserialize, Serialize};
@@ -58,7 +67,7 @@ pub struct DecodeOutput {
     pub artifact_refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Analog {
     pub window_id: String,
     pub similarity: f64,
@@ -164,7 +173,8 @@ mod tests {
 
     #[test]
     fn recent_analogs_dominate() {
-        let a = |sim, dt, out| Analog { window_id: String::new(), similarity: sim, time_distance_days: dt, outcome: out };
+        let a =
+            |sim, dt, out| Analog { window_id: String::new(), similarity: sim, time_distance_days: dt, outcome: out };
         let f = analog_forecast(&[a(0.9, 1.0, 1.0), a(0.9, 3650.0, -1.0)], 365.0).unwrap();
         assert!(f > 0.99);
         assert_eq!(analog_forecast(&[a(0.0, 1.0, 1.0)], 365.0), None);
