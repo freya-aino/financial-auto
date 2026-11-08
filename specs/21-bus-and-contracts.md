@@ -35,7 +35,7 @@ Define how components talk: NATS JetStream subjects and streams for live data an
 | `macro.obs.<source>.<series>` | `Envelope{MacroObservation}` | |
 | `onchain.event.<chain>` | `Envelope{OnchainEvent}` | |
 | `filing.event.<source>` | `Envelope{FilingEvent}` | |
-| `latent.state.<timescale>.<snapshot>` | `LatentState` | model-runtime → strategies, UI |
+| `latent.state.<timescale>.<instrument>` | `LatentState` (carries `snapshot_id`) | model-runtime → strategies, UI (D-039) |
 | `latent.region.<timescale>` | `RegionEvent` (created/merged/split) | |
 | `latent.transition.<timescale>` | `TransitionUpdate` | MCMC → strategies, UI |
 | `decoder.output.<family>` | `DecoderOutput` (refs) | evo/runtime → UI, strategies |

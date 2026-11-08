@@ -1,7 +1,32 @@
-//! Expert spaces: decoder-facing contract and the cross-expert decorrelation objective (spec 32, D-008).
+//! Expert spaces: decoder-facing contract, router stage and the cross-expert decorrelation
+//! objective (spec 32, D-008).
+//!
+//! The [`Router`] trait is the stage boundary between the encoder and the regions/MCMC
+//! stages. [`EvidenceSoftmaxRouter`] is the pure-Rust baseline used while the learned MoE
+//! gate is unavailable (D-004).
+
+pub mod router;
 
 use fa_core::Timescale;
+pub use router::{Evidence, EvidenceSoftmaxRouter, Router, softmax};
 use serde::{Deserialize, Serialize};
+
+/// Capacity of one expert space (spec 32 §4.1 tunables).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpertSpaceConfig {
+    /// Capacity `K_max`; the active count emerges (or is fixed, for baselines).
+    pub max_experts: usize,
+    /// Manifold dimension per expert.
+    pub expert_dim: usize,
+    /// Experts active per window.
+    pub top_k: usize,
+}
+
+impl Default for ExpertSpaceConfig {
+    fn default() -> Self {
+        Self { max_experts: 16, expert_dim: 16, top_k: 2 }
+    }
+}
 
 /// Latent of one expert at one time step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +105,9 @@ pub fn pearson(a: &[f64], b: &[f64]) -> f64 {
 /// fraction of samples routed (argmax) to expert i and `p_i` its mean router probability.
 /// Equals 1.0 for perfectly balanced routing.
 pub fn router_load_balance(router_probs: &[Vec<f64>]) -> f64 {
-    let Some(n) = router_probs.first().map(Vec::len) else { return 0.0 };
+    let Some(n) = router_probs.first().map(Vec::len) else {
+        return 0.0;
+    };
     let t = router_probs.len() as f64;
     let mut f = vec![0.0; n];
     let mut p = vec![0.0; n];

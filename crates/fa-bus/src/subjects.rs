@@ -21,8 +21,9 @@ pub fn news_item(source: &str) -> String {
     format!("news.item.{source}")
 }
 
-pub fn latent_state(ts: Timescale, snapshot: &str) -> String {
-    format!("latent.state.{ts}.{snapshot}")
+/// Last token is the D-017 instrument token (32-hex UUID); the snapshot travels inside `LatentState` (D-039).
+pub fn latent_state(ts: Timescale, instrument: &str) -> String {
+    format!("latent.state.{ts}.{instrument}")
 }
 
 pub fn latent_region(ts: Timescale) -> String {

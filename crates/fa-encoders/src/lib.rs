@@ -1,8 +1,13 @@
 //! Expert encoder families and per-timescale sizing (spec 31; D-004, D-010).
 //!
 //! Families compete; each declares its latent type, region-discovery method and prior.
-//! Model code lands behind the `burn` / `candle` features.
+//! Neural model code lands behind the `burn` / `candle` features. [`baseline`] holds the
+//! deterministic statistical encoder ([`StatisticalEncoder`]) that the live runtime uses
+//! until then; it implements the same [`EncoderFamily`] contract.
 
+pub mod baseline;
+
+pub use baseline::{EXPERT_DIM, EXPERT_NAMES, MARKET_ROW_LEN, MarketBar, StatisticalEncoder};
 use fa_core::Timescale;
 use serde::{Deserialize, Serialize};
 
@@ -17,10 +22,16 @@ pub enum FamilyId {
     JepaVae,
     /// Autoencoder + latent diffusion (day/week only, D-010).
     LatentDiffusion,
+    /// Deterministic statistical features, no learned parameters ([`baseline`]).
+    StatBaseline,
 }
 
 impl FamilyId {
-    pub const ALL: [FamilyId; 4] = [Self::FsqHybrid, Self::HierVaeFlow, Self::JepaVae, Self::LatentDiffusion];
+    /// The four neural families of spec 31 plus the statistical baseline.
+    pub const ALL: [FamilyId; 5] =
+        [Self::FsqHybrid, Self::HierVaeFlow, Self::JepaVae, Self::LatentDiffusion, Self::StatBaseline];
+    /// Families that need the `burn` backend.
+    pub const NEURAL: [FamilyId; 4] = [Self::FsqHybrid, Self::HierVaeFlow, Self::JepaVae, Self::LatentDiffusion];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -28,6 +39,7 @@ impl FamilyId {
             Self::HierVaeFlow => "hier_vae_flow",
             Self::JepaVae => "jepa_vae",
             Self::LatentDiffusion => "latent_diffusion",
+            Self::StatBaseline => "stat_baseline",
         }
     }
 }
@@ -73,10 +85,41 @@ pub struct FamilyDescriptor {
 pub fn descriptors() -> Vec<FamilyDescriptor> {
     use Timescale::*;
     vec![
-        FamilyDescriptor { id: FamilyId::FsqHybrid, latent: LatentKind::Hybrid, prior: PriorKind::Codebook, region_discovery: "codebook", timescales: Timescale::LADDER.to_vec() },
-        FamilyDescriptor { id: FamilyId::HierVaeFlow, latent: LatentKind::Continuous, prior: PriorKind::FlowMatching, region_discovery: "density", timescales: Timescale::LADDER.to_vec() },
-        FamilyDescriptor { id: FamilyId::JepaVae, latent: LatentKind::Continuous, prior: PriorKind::Gaussian, region_discovery: "mapper", timescales: Timescale::LADDER.to_vec() },
-        FamilyDescriptor { id: FamilyId::LatentDiffusion, latent: LatentKind::Continuous, prior: PriorKind::Diffusion, region_discovery: "density", timescales: vec![Day, Week] },
+        FamilyDescriptor {
+            id: FamilyId::FsqHybrid,
+            latent: LatentKind::Hybrid,
+            prior: PriorKind::Codebook,
+            region_discovery: "codebook",
+            timescales: Timescale::LADDER.to_vec(),
+        },
+        FamilyDescriptor {
+            id: FamilyId::HierVaeFlow,
+            latent: LatentKind::Continuous,
+            prior: PriorKind::FlowMatching,
+            region_discovery: "density",
+            timescales: Timescale::LADDER.to_vec(),
+        },
+        FamilyDescriptor {
+            id: FamilyId::JepaVae,
+            latent: LatentKind::Continuous,
+            prior: PriorKind::Gaussian,
+            region_discovery: "mapper",
+            timescales: Timescale::LADDER.to_vec(),
+        },
+        FamilyDescriptor {
+            id: FamilyId::LatentDiffusion,
+            latent: LatentKind::Continuous,
+            prior: PriorKind::Diffusion,
+            region_discovery: "density",
+            timescales: vec![Day, Week],
+        },
+        FamilyDescriptor {
+            id: FamilyId::StatBaseline,
+            latent: LatentKind::Continuous,
+            prior: PriorKind::Gaussian,
+            region_discovery: "leader",
+            timescales: Timescale::LADDER.to_vec(),
+        },
     ]
 }
 
@@ -127,7 +170,8 @@ pub trait EncoderFamily: Send + Sync {
     fn descriptor(&self) -> &FamilyDescriptor;
     fn sizing(&self) -> ScaleSizing;
     fn snapshot_id(&self) -> &str;
-    /// Encodes one window into per-expert latents + router weights.
+    /// Encodes one window into per-expert latents. `router_weights` and region fields are
+    /// left for the router and region stages (spec 32 §6.6).
     fn encode(&self, input: &EncoderInput) -> Result<fa_expert_space::ExpertView, EncoderError>;
 }
 
@@ -136,9 +180,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn four_families_and_diffusion_restricted() {
+    fn every_family_has_a_descriptor_and_diffusion_is_restricted() {
         let d = descriptors();
-        assert_eq!(d.len(), 4);
+        assert_eq!(d.len(), FamilyId::ALL.len());
+        for f in FamilyId::ALL {
+            assert!(d.iter().any(|x| x.id == f), "{f:?}");
+        }
         let diff = d.iter().find(|f| f.id == FamilyId::LatentDiffusion).unwrap();
         assert_eq!(diff.timescales, vec![Timescale::Day, Timescale::Week]);
     }

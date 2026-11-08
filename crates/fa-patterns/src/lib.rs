@@ -1,14 +1,23 @@
 //! Latent regions: discovery trait, lineage, and region identity across retraining (spec 30, D-007).
+//!
+//! [`online`] holds the streaming leader-clustering baseline (`OnlineRegionSet`) that the
+//! live runtime uses for region discovery and membership until the family-specific
+//! density/Mapper methods exist.
+
+pub mod online;
 
 use std::collections::HashMap;
 
+pub use online::{
+    Assignment, LeaderClustering, OnlineRegionCfg, OnlineRegionDiscovery, OnlineRegionSet, RegionLifecycle,
+};
 use serde::{Deserialize, Serialize};
 
 pub type RegionId = String;
 pub type LineageId = String;
 
 /// A region of one expert space within one encoder snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Region {
     pub id: RegionId,
     /// Stable identity across generations (D-007).
@@ -29,6 +38,8 @@ pub enum DiscoveryMethod {
     Density,
     /// Mapper / topological cover.
     Mapper,
+    /// Streaming leader clustering (pure-Rust baseline, [`online`]).
+    Leader,
 }
 
 /// Region discovery; each encoder family declares its own implementation (spec 30).
