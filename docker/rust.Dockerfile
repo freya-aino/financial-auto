@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# Rust services image (D-026): control-api, model-runtime, evo-worker, trainer.
+# Rust services image (D-026): control-api, model-runtime, evo-worker, trainer, strategy-runtime, risk-engine.
 # The UI is its own image (ui.Dockerfile, D-035). Build context = repo root.
 
 # ── rust build ──────────────────────────────────────────────────────────
@@ -14,9 +14,11 @@ RUN --mount=type=cache,id=fa-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=fa-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=fa-cargo-target,target=/src/target \
     cargo build --release --locked -p control-api -p model-runtime -p evo-worker -p trainer \
+          -p strategy-runtime -p risk-engine \
     && mkdir -p /out \
     && cp target/release/control-api target/release/model-runtime \
-          target/release/evo-worker target/release/trainer /out/
+          target/release/evo-worker target/release/trainer \
+          target/release/strategy-runtime target/release/risk-engine /out/
 
 # ── runtime ─────────────────────────────────────────────────────────────
 FROM debian:trixie-slim

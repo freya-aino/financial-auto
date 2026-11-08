@@ -10,6 +10,7 @@ fa-core.workspace = true
 fa-proto.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

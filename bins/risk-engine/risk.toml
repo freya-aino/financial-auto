@@ -1,0 +1,34 @@
+# risk-engine settings (spec 40). Hard limits are loaded from here only; the bus can never
+# loosen them. Values follow the spec 40 §7 placeholders unless noted.
+
+mode = "paper"              # the only mode that exists (D-029)
+account = "paper"           # order.intent.paper / order.approved.paper / order.event.paper
+starting_cash_eur = 100000  # D-028
+allocator = "equal_weight"  # equal-risk control allocator (spec 40 §6.2); risk_parity | fractional_kelly also available
+max_strategy_weight = 0.5
+kelly_fraction = 0.25
+performance_decay = 0.95
+signal_ttl_secs = 60
+no_trade_band_frac = 0.005  # exec.no_trade_band
+min_order_eur = 25.0
+default_asset_class = "equity" # synthetic/unknown instruments are treated as equities
+volume_window_secs = 3600   # traded volume window behind the liquidity cap
+pending_ttl_secs = 10
+
+[limits]
+max_drawdown = 0.10         # risk.portfolio_max_drawdown → kill switch, manual re-arm
+max_daily_loss = 0.02       # risk.daily_loss_limit → reduce-only for the rest of the UTC day
+max_position_frac = 0.05    # risk.max_position_pct per instrument
+liquidity_k = 0.01          # |position| ≤ k × horizon volume (EUR)
+daily_payout_quota_eur = 0  # payout rule still open (spec 42 Q1)
+
+[limits.leverage_cap]       # risk.gross_leverage_cap.<class>
+equity = 1.5
+etf = 1.5
+fx = 3.0
+crypto = 1.0
+commodity = 1.0
+rates = 1.0
+index = 1.0
+derivative = 1.0
+prediction_market = 1.0

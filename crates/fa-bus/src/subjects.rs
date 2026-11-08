@@ -65,6 +65,13 @@ pub fn risk_resume(scope: &str) -> String {
     format!("risk.resume.{scope}")
 }
 
+/// Wildcards for consumers that aggregate whole families (risk-engine, control-api).
+pub const ALL_SIGNALS: &str = "signal.exposure.>";
+pub const ALL_ORDERS: &str = "order.>";
+pub const ALL_RISK_HALTS: &str = "risk.halt.>";
+pub const ALL_RISK_RESUMES: &str = "risk.resume.>";
+pub const ALL_LATENT_STATES: &str = "latent.state.>";
+
 pub fn jobs(kind: &str) -> String {
     format!("jobs.{kind}")
 }

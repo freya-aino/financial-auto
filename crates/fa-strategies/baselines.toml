@@ -1,0 +1,57 @@
+# BASELINE strategy population for the live strategy-runtime.
+#
+# Every program here is HAND-WRITTEN, NOT EVOLVED (genome_id = "baseline"). They exist so the
+# signal → allocation → risk → paper-order pipeline runs before the evolution lab produces
+# promoted strategies (spec 35 §6.4). Programs use the GP DSL in S-expression form
+# (crates/fa-strategies/src/sexpr.rs); the primitives are evaluated on price-only fallback
+# features while graph/decoder feeds are missing (crates/fa-strategies/src/features.rs).
+#
+# `instruments = []` means "every instrument seen on md.trade.>".
+instruments = []
+
+[[strategy]]
+id = "baseline-momentum-1s"
+genome_id = "baseline"
+timescale = "1s"
+steps = 5
+lookback_bars = 32
+signal = "(mul 400 analog_forecast)"
+uncertainty = "region_entropy"
+
+[[strategy]]
+id = "baseline-reversion-1s"
+genome_id = "baseline"
+timescale = "1s"
+steps = 5
+lookback_bars = 32
+signal = "(neg (mul 400 analog_forecast))"
+uncertainty = "region_entropy"
+
+[[strategy]]
+id = "baseline-pathskew-1s"
+genome_id = "baseline"
+timescale = "1s"
+steps = 10
+lookback_bars = 64
+signal = "(mul 4 (sub (path_up 3) 0.5))"
+uncertainty = "(sub 1 stay_prob)"
+
+[[strategy]]
+id = "baseline-quantile-1s"
+genome_id = "baseline"
+timescale = "1s"
+steps = 10
+lookback_bars = 64
+# asymmetry of the forecast distribution; wide interquartile range → more uncertainty
+signal = "(mul 300 (add (quantile 0.25) (quantile 0.75)))"
+uncertainty = "(mul 200 (sub (quantile 0.75) (quantile 0.25)))"
+
+[[strategy]]
+id = "baseline-regime-1m"
+genome_id = "baseline"
+timescale = "1m"
+steps = 3
+lookback_bars = 20
+step_secs = 10 # re-evaluates every 10 s although it reads 1m bars
+signal = "(if_gt stay_prob 0.55 (mul 400 analog_forecast) 0)"
+uncertainty = "(sub 1 stay_prob)"

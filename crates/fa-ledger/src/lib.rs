@@ -49,7 +49,10 @@ pub struct Ledger {
 
 impl Ledger {
     pub fn with_cash(cash_eur: f64) -> Self {
-        Self { cash_eur, ..Self::default() }
+        Self {
+            cash_eur,
+            ..Self::default()
+        }
     }
 
     /// Registers an order intent; intent ids are idempotency keys.
@@ -116,14 +119,23 @@ pub struct ReconDiff {
 
 /// Compares positions with the broker's statement; differences above `tol` are reported.
 pub fn reconcile(ours: &Ledger, broker: &BTreeMap<InstrumentId, f64>, tol: f64) -> Vec<ReconDiff> {
-    let mut keys: Vec<InstrumentId> = ours.positions.keys().chain(broker.keys()).copied().collect();
+    let mut keys: Vec<InstrumentId> = ours
+        .positions
+        .keys()
+        .chain(broker.keys())
+        .copied()
+        .collect();
     keys.sort();
     keys.dedup();
     keys.into_iter()
         .filter_map(|i| {
             let o = ours.positions.get(&i).map_or(0.0, |p| p.quantity);
             let b = broker.get(&i).copied().unwrap_or(0.0);
-            ((o - b).abs() > tol).then_some(ReconDiff { instrument: i, ours: o, broker: b })
+            ((o - b).abs() > tol).then_some(ReconDiff {
+                instrument: i,
+                ours: o,
+                broker: b,
+            })
         })
         .collect()
 }
@@ -133,7 +145,15 @@ mod tests {
     use super::*;
 
     fn fill(id: &str, inst: InstrumentId, q: f64, px: f64) -> Fill {
-        Fill { fill_id: id.into(), intent_id: "i".into(), instrument: inst, quantity: q, price: px, fx_to_eur: 1.0, fee_eur: 1.0 }
+        Fill {
+            fill_id: id.into(),
+            intent_id: "i".into(),
+            instrument: inst,
+            quantity: q,
+            price: px,
+            fx_to_eur: 1.0,
+            fee_eur: 1.0,
+        }
     }
 
     #[test]
@@ -141,7 +161,10 @@ mod tests {
         let i = InstrumentId::new();
         let mut l = Ledger::with_cash(10_000.0);
         assert!(l.apply_fill(&fill("f1", i, 10.0, 100.0)));
-        assert!(!l.apply_fill(&fill("f1", i, 10.0, 100.0)), "replayed fill ignored");
+        assert!(
+            !l.apply_fill(&fill("f1", i, 10.0, 100.0)),
+            "replayed fill ignored"
+        );
         l.apply_fill(&fill("f2", i, -10.0, 110.0));
         assert_eq!(l.positions[&i].quantity, 0.0);
         assert!((l.positions[&i].realised_eur - 100.0).abs() < 1e-9);
@@ -177,10 +200,20 @@ mod tests {
     fn idempotent_intents_and_reconciliation() {
         let mut l = Ledger::default();
         l.register_intent("x").unwrap();
-        assert_eq!(l.register_intent("x"), Err(LedgerError::DuplicateIntent("x".into())));
+        assert_eq!(
+            l.register_intent("x"),
+            Err(LedgerError::DuplicateIntent("x".into()))
+        );
         let (a, b) = (InstrumentId::new(), InstrumentId::new());
         l.apply_fill(&fill("f", a, 2.0, 1.0));
         let d = reconcile(&l, &BTreeMap::from([(a, 2.0), (b, 1.0)]), 1e-9);
-        assert_eq!(d, vec![ReconDiff { instrument: b, ours: 0.0, broker: 1.0 }]);
+        assert_eq!(
+            d,
+            vec![ReconDiff {
+                instrument: b,
+                ours: 0.0,
+                broker: 1.0
+            }]
+        );
     }
 }

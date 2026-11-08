@@ -2,6 +2,15 @@
 //!
 //! Every strategy emits a distribution over target exposure per asset. GP primitives
 //! read only graph ops, decoder outputs and portfolio state (no classic TA).
+//!
+//! - [`sexpr`]: text syntax for GP programs (`(mul 4 (sub (path_up 3) 0.5))`).
+//! - [`features`]: price-only fallback observation used by the live runtime while graph
+//!   and decoder feeds are missing.
+//! - [`population`]: `strategies.toml` definitions and the hand-written baseline set.
+
+pub mod features;
+pub mod population;
+pub mod sexpr;
 
 use fa_core::{Horizon, InstrumentId};
 use serde::{Deserialize, Serialize};
@@ -29,11 +38,18 @@ impl ExposureDistribution {
             strategy_id: self.strategy_id.clone(),
             genome_id: self.genome_id.clone(),
             horizon: format!("{}x{}", self.horizon.steps, self.horizon.timescale),
-            as_of: Some(fa_proto::Timestamp { seconds: self.as_of_ms.div_euclid(1000), nanos: (self.as_of_ms.rem_euclid(1000) * 1_000_000) as i32 }),
+            as_of: Some(fa_proto::Timestamp {
+                seconds: self.as_of_ms.div_euclid(1000),
+                nanos: (self.as_of_ms.rem_euclid(1000) * 1_000_000) as i32,
+            }),
             exposures: self
                 .exposures
                 .iter()
-                .map(|e| fa_proto::v1::AssetExposure { instrument_id: e.instrument.to_string(), mean: e.mean, stddev: e.stddev })
+                .map(|e| fa_proto::v1::AssetExposure {
+                    instrument_id: e.instrument.to_string(),
+                    mean: e.mean,
+                    stddev: e.stddev,
+                })
                 .collect(),
         }
     }
@@ -118,14 +134,22 @@ impl Expr {
             Mul(a, b) => a.eval(ctx) * b.eval(ctx),
             Div(a, b) => {
                 let d = b.eval(ctx);
-                if d.abs() < 1e-12 { 0.0 } else { a.eval(ctx) / d }
+                if d.abs() < 1e-12 {
+                    0.0
+                } else {
+                    a.eval(ctx) / d
+                }
             }
             Neg(a) => -a.eval(ctx),
             Tanh(a) => a.eval(ctx).tanh(),
             Min(a, b) => a.eval(ctx).min(b.eval(ctx)),
             Max(a, b) => a.eval(ctx).max(b.eval(ctx)),
             IfGt(a, b, c, d) => {
-                if a.eval(ctx) > b.eval(ctx) { c.eval(ctx) } else { d.eval(ctx) }
+                if a.eval(ctx) > b.eval(ctx) {
+                    c.eval(ctx)
+                } else {
+                    d.eval(ctx)
+                }
             }
         };
         if v.is_finite() { v } else { 0.0 }
@@ -136,7 +160,9 @@ impl Expr {
         match self {
             Const(_) | Graph(_) | Decoder(_) | Portfolio(_) => 1,
             Neg(a) | Tanh(a) => 1 + a.size(),
-            Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Min(a, b) | Max(a, b) => 1 + a.size() + b.size(),
+            Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Min(a, b) | Max(a, b) => {
+                1 + a.size() + b.size()
+            }
             IfGt(a, b, c, d) => 1 + a.size() + b.size() + c.size() + d.size(),
         }
     }
@@ -146,7 +172,11 @@ impl Expr {
 pub trait Strategy: Send {
     fn id(&self) -> &str;
     fn horizon(&self) -> Horizon;
-    fn step(&mut self, as_of_ms: i64, assets: &[(InstrumentId, &dyn StrategyContext)]) -> ExposureDistribution;
+    fn step(
+        &mut self,
+        as_of_ms: i64,
+        assets: &[(InstrumentId, &dyn StrategyContext)],
+    ) -> ExposureDistribution;
 }
 
 /// GP strategy: `mean = tanh(signal)`, `stddev = sigmoid(uncertainty)`.
@@ -168,7 +198,11 @@ impl Strategy for GpStrategy {
         self.horizon
     }
 
-    fn step(&mut self, as_of_ms: i64, assets: &[(InstrumentId, &dyn StrategyContext)]) -> ExposureDistribution {
+    fn step(
+        &mut self,
+        as_of_ms: i64,
+        assets: &[(InstrumentId, &dyn StrategyContext)],
+    ) -> ExposureDistribution {
         let exposures = assets
             .iter()
             .map(|(inst, ctx)| AssetExposure {
@@ -177,7 +211,13 @@ impl Strategy for GpStrategy {
                 stddev: 1.0 / (1.0 + (-self.uncertainty.eval(*ctx)).exp()),
             })
             .collect();
-        ExposureDistribution { strategy_id: self.id.clone(), genome_id: self.genome_id.clone(), horizon: self.horizon, as_of_ms, exposures }
+        ExposureDistribution {
+            strategy_id: self.id.clone(),
+            genome_id: self.genome_id.clone(),
+            horizon: self.horizon,
+            as_of_ms,
+            exposures,
+        }
     }
 }
 
@@ -241,10 +281,24 @@ mod tests {
     fn interpreter_evaluates_primitives_and_ops() {
         let ctx = Ctx { up: 0.8, pos: 0.0 };
         // 4 * (path_up(3) - 0.5)
-        let e = Expr::Mul(b(Expr::Const(4.0)), b(Expr::Sub(b(Expr::Graph(GraphOp::PathUpProb(3))), b(Expr::Const(0.5)))));
+        let e = Expr::Mul(
+            b(Expr::Const(4.0)),
+            b(Expr::Sub(
+                b(Expr::Graph(GraphOp::PathUpProb(3))),
+                b(Expr::Const(0.5)),
+            )),
+        );
         assert!((e.eval(&ctx) - 1.2).abs() < 1e-12);
-        assert_eq!(Expr::Div(b(Expr::Const(1.0)), b(Expr::Const(0.0))).eval(&ctx), 0.0);
-        let cond = Expr::IfGt(b(Expr::Portfolio(PortfolioOp::Position)), b(Expr::Const(0.0)), b(Expr::Const(1.0)), b(Expr::Const(-1.0)));
+        assert_eq!(
+            Expr::Div(b(Expr::Const(1.0)), b(Expr::Const(0.0))).eval(&ctx),
+            0.0
+        );
+        let cond = Expr::IfGt(
+            b(Expr::Portfolio(PortfolioOp::Position)),
+            b(Expr::Const(0.0)),
+            b(Expr::Const(1.0)),
+            b(Expr::Const(-1.0)),
+        );
         assert_eq!(cond.eval(&ctx), -1.0);
         assert_eq!(e.size(), 5);
     }
@@ -254,8 +308,14 @@ mod tests {
         let mut s = GpStrategy {
             id: "s1".into(),
             genome_id: "g1".into(),
-            horizon: Horizon { timescale: Timescale::Hour, steps: 2 },
-            signal: Expr::Mul(b(Expr::Const(100.0)), b(Expr::Decoder(DecoderOp::AnalogForecast))),
+            horizon: Horizon {
+                timescale: Timescale::Hour,
+                steps: 2,
+            },
+            signal: Expr::Mul(
+                b(Expr::Const(100.0)),
+                b(Expr::Decoder(DecoderOp::AnalogForecast)),
+            ),
             uncertainty: Expr::Graph(GraphOp::RegionEntropy),
         };
         let ctx = Ctx { up: 0.5, pos: 0.0 };

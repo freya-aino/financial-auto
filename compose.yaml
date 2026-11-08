@@ -142,6 +142,26 @@ services:
     #           count: 1
     #           capabilities: [gpu]
 
+  strategy-runtime:
+    profiles: ["app"]
+    image: financial-auto/rust:dev
+    command: ["strategy-runtime"]
+    environment: *rust-env # FA_STRATEGIES=<file> for a non-baseline population
+    depends_on: *core-deps
+    restart: unless-stopped
+
+  risk-engine:
+    profiles: ["app"]
+    image: financial-auto/rust:dev
+    command: ["risk-engine"]
+    environment:
+      <<: *rust-env
+      FA_RISK: /app/risk.toml
+    volumes:
+      - ./bins/risk-engine/risk.toml:/app/risk.toml:ro # limits editable without a rebuild (D-041)
+    depends_on: *core-deps
+    restart: unless-stopped
+
   evo-worker:
     profiles: ["app"]
     image: financial-auto/rust:dev
