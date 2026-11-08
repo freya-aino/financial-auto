@@ -1,6 +1,6 @@
 # docker
 
-Everything runs through Docker Compose (D-034): `compose.yaml` at the repo root covers the infrastructure (NATS, HelixDB, VictoriaMetrics, PostgreSQL, Garage) and, under profile `app`, every platform service including the built frontend (D-026, D-033). This folder holds the Dockerfiles, the Garage config and its init script.
+Everything runs through Docker Compose (D-034): `compose.yaml` at the repo root covers the infrastructure (NATS, HelixDB, VictoriaMetrics, PostgreSQL, Garage) and, under profile `app`, every platform service plus the operator UI (D-026, D-033, D-035). This folder holds the Dockerfiles, the Garage config and its init script.
 
 **Status:** compose working (verified 2026-11-06: nats, postgres, victoriametrics healthy; garage up, initialized by `garage-init.sh`).
 
@@ -21,18 +21,19 @@ just down
 ```
 
 ## Running the full stack (D-026)
-The application services run in compose under the `app` profile. They use two images built from the repo root:
+The application services run in compose under the `app` profile. They use three images built from the repo root:
 
 | Image | Dockerfile | Contains |
 |---|---|---|
-| `financial-auto/rust:dev` | `rust.Dockerfile` | `control-api`, `model-runtime`, `evo-worker`, `trainer`, built frontend |
+| `financial-auto/rust:dev` | `rust.Dockerfile` | `control-api`, `model-runtime`, `evo-worker`, `trainer` |
+| `financial-auto/ui:dev` | `ui.Dockerfile` + `nginx.conf` | SvelteKit static build on unprivileged nginx, proxying `/api` and `/ws` to `control-api` |
 | `financial-auto/go:dev` | `go.Dockerfile` | `ingestor`, `broker-gateway`, `evo-orchestrator` |
 
 Inside the containers, services use `config/platform.docker.toml`, which has compose hostnames.
 
 ```sh
 just app-build                 # docker compose --profile app build
-just app-up                    # infra + services; UI and API at http://127.0.0.1:7700
+just app-up                    # infra + services; UI at http://127.0.0.1:8080, API at http://127.0.0.1:7700
 just app-ps / just app-logs [service]
 just app-down                  # stops everything, keeps volumes
 ```
@@ -43,6 +44,7 @@ just app-down                  # stops everything, keeps volumes
 - **Trainer:** a one-off CLI in the `tools` profile, not started by default. Run it with `just trainer pretrain --help` or `docker compose --profile tools run --rm trainer …`.
 - **GPU:** install `nvidia-container-toolkit`, then uncomment the `deploy.resources.reservations.devices` blocks on `model-runtime`, `evo-worker` and `trainer`. GPU time is still arbitrated by `evo-orchestrator` (D-006). The Rust image is CPU-only today because `burn`/`candle` are off by default (D-004); enabling CUDA will need a CUDA base image.
 - **HelixDB:** the `helix` service, reached at `http://helix:8080` inside compose and `127.0.0.1:6969` from the host. The image is distroless, so it has no in-container healthcheck; `control-api` only waits for it to start.
+- **UI:** the `ui` service is the only thing serving the frontend in compose; the control-api container has no `frontend/build`, so `:7700` is API only. On the host, `cargo run -p control-api` still serves `frontend/build` when it exists.
 - **No host processes:** don't run `cargo run -p control-api` at the same time, because it also binds port 7700.
 
 ## Garage first-time init

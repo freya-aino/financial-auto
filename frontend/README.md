@@ -1,6 +1,6 @@
 # frontend
 
-SvelteKit 3 (Svelte 5, runes) + TypeScript operator UI, built as a static SPA with `adapter-static` and served by `control-api` (D-015).
+SvelteKit 3 (Svelte 5, runes) + TypeScript operator UI, built as a static SPA with `adapter-static`. In compose it is the `ui` service (nginx, `docker/ui.Dockerfile`, http://127.0.0.1:8080) proxying `/api` and `/ws` to control-api (D-035); on the host, `control-api` serves `frontend/build` directly (D-015).
 
 **Status:** all four v1 views and the global chrome (spec 51 §6.1) implemented against live control-api data (polled every 2 s). Paper trading only: the LIVE control is permanently disabled (D-029). The kill switch is reachable from every page (top bar, confirm dialog, result taken from the API response). View preferences (timescale, filters, objective pickers) persist in `localStorage`. `pnpm check` (0 errors, 0 warnings) and `pnpm build` verified 2026-11-07. Without producers, each panel shows which bus subject would fill it; `cargo run -p control-api --example demo_publisher` fills every view with synthetic data.
 

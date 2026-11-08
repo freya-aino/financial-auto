@@ -1,5 +1,5 @@
 # Everything runs through this file (D-034): local infrastructure (spec 60, ports per D-014) and,
-# under profile "app", the platform services (D-026). Images build from ./docker, context = repo root.
+# under profile "app", the platform services and the operator UI (D-026, D-035). Images build from ./docker, context = repo root.
 # HelixDB runs from the official standalone image (D-033); the CLI-driven `helix push dev` flow is no longer needed.
 name: financial-auto
 
@@ -91,7 +91,6 @@ services:
     environment: &rust-env
       FA_CONFIG: /app/config/platform.docker.toml
       FA_SOURCES: /app/config/sources.yaml
-      FA_FRONTEND: /app/frontend/build
       RUST_LOG: info
     ports:
       - "127.0.0.1:7700:7700"
@@ -108,6 +107,24 @@ services:
       timeout: 3s
       retries: 6
       start_period: 10s
+    restart: unless-stopped
+
+  ui:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: docker/ui.Dockerfile
+    image: financial-auto/ui:dev
+    ports:
+      - "127.0.0.1:8080:8080" # operator UI; proxies /api and /ws to control-api (D-035)
+    depends_on:
+      control-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
     restart: unless-stopped
 
   model-runtime:

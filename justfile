@@ -36,7 +36,7 @@ migrate:
 app-build:
     {{compose}} --profile app build
 
-# Start infrastructure + all platform services; UI at http://127.0.0.1:7700
+# Start infrastructure + all platform services; UI at http://127.0.0.1:8080, API at :7700
 app-up:
     {{compose}} --profile app up -d
     {{compose}} --profile app ps

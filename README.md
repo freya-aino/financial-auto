@@ -27,8 +27,8 @@ just dev                     # prints how to run the Go ingestor with the heartb
 | `helix/` | HelixDB schema and queries |
 | `migrations/` | PostgreSQL warehouse + ledger schema |
 | `frontend/` | SvelteKit operator UI |
-| `compose.yaml` | Everything runs through it: infra (NATS, HelixDB, VictoriaMetrics, PostgreSQL, Garage) + all platform services and the UI under profile `app` |
-| `docker/` | Dockerfiles for the Rust and Go images, Garage config and init script |
+| `compose.yaml` | Everything runs through it: infra (NATS, HelixDB, VictoriaMetrics, PostgreSQL, Garage) + all platform services and the `ui` service under profile `app` |
+| `docker/` | Dockerfiles for the Rust, Go and UI images, nginx and Garage config, Garage init script |
 | `config/` | Source catalog, platform config (secrets in git-ignored `config/secrets.toml`) |
 
 Every component directory has a `README.md` linking to the specs that govern it.

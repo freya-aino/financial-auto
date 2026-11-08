@@ -1,17 +1,6 @@
 # syntax=docker/dockerfile:1.7
-# Rust services image (D-026): control-api, model-runtime, evo-worker, trainer
-# plus the built frontend. Build context = repo root.
-
-# ── frontend ────────────────────────────────────────────────────────────
-FROM node:22-alpine AS frontend
-ENV PNPM_HOME=/pnpm COREPACK_ENABLE_DOWNLOAD_PROMPT=0
-RUN corepack enable
-WORKDIR /src/frontend
-COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN --mount=type=cache,id=fa-pnpm-store,target=/pnpm/store \
-    pnpm install --frozen-lockfile
-COPY frontend/ ./
-RUN pnpm build
+# Rust services image (D-026): control-api, model-runtime, evo-worker, trainer.
+# The UI is its own image (ui.Dockerfile, D-035). Build context = repo root.
 
 # ── rust build ──────────────────────────────────────────────────────────
 FROM rust:1.98-slim-trixie AS builder
@@ -38,10 +27,8 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /out/ /usr/local/bin/
 COPY config/platform.toml config/platform.docker.toml config/sources.yaml config/
-COPY --from=frontend /src/frontend/build frontend/build
 ENV FA_CONFIG=/app/config/platform.docker.toml \
     FA_SOURCES=/app/config/sources.yaml \
-    FA_FRONTEND=/app/frontend/build \
     RUST_LOG=info
 USER fa
 CMD ["control-api"]
