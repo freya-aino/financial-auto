@@ -51,6 +51,10 @@ pub fn gamma_forget(ts: Timescale) -> f64 {
 /// Bayesian transition tracking over one region set (spec 33 §4.1 `TransitionKernel`, hard memberships).
 pub trait TransitionModel: Send {
     fn sampler_id(&self) -> &str;
+    /// A region was created: it receives prior mass in every row (spec 33 §5).
+    fn register_region(&mut self, id: &str);
+    /// A region was retired (merged away).
+    fn retire_region(&mut self, id: &str);
     fn observe(&mut self, from: &str, to: &str);
     /// Posterior mean + credible interval of the row `from`.
     fn summarize(&mut self, from: &str) -> Vec<TransitionProb>;
@@ -74,6 +78,14 @@ impl DirichletTransitions {
 impl TransitionModel for DirichletTransitions {
     fn sampler_id(&self) -> &str {
         "conjugate"
+    }
+
+    fn register_region(&mut self, id: &str) {
+        self.graph.register_region(id);
+    }
+
+    fn retire_region(&mut self, id: &str) {
+        self.graph.retire_region(id);
     }
 
     fn observe(&mut self, from: &str, to: &str) {
@@ -194,6 +206,11 @@ impl TimescalePipeline {
             let k = e.expert_index as usize;
             let a = self.regions[k].observe(&e.mean);
             for ev in a.events {
+                match &ev {
+                    RegionLifecycle::Created { region } => self.transitions[k].register_region(&region.id),
+                    RegionLifecycle::Retired { region_id, .. } => self.transitions[k].retire_region(region_id),
+                    RegionLifecycle::Merged { .. } => {}
+                }
                 out.region_events.push(self.region_event(e.expert_index, ev));
             }
             current.push(a.region_id.clone());

@@ -4,12 +4,15 @@
 //! probabilities (Dirichlet–multinomial conjugacy). Samplers are pluggable and compete
 //! on calibration and cost.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use fa_core::rng::Rng;
 use serde::{Deserialize, Serialize};
 
 pub type RegionKey = String;
+
+/// Successor that stands for "somewhere not yet seen" (spec 33 §5: every row keeps prior mass on it).
+pub const UNKNOWN: &str = "unknown";
 
 /// Posterior of one row: Dirichlet(prior + counts) over successor regions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -32,11 +35,14 @@ pub struct MarkovGraph {
     /// Multiplicative decay applied to a row's counts on each update (1.0 = no forgetting).
     pub decay: f64,
     rows: HashMap<RegionKey, TransitionRow>,
+    /// Live regions that receive prior mass in every row even before being observed as successors.
+    #[serde(default)]
+    support: BTreeSet<RegionKey>,
 }
 
 impl MarkovGraph {
     pub fn new(prior: f64, decay: f64) -> Self {
-        Self { prior, decay, rows: HashMap::new() }
+        Self { prior, decay, rows: HashMap::new(), support: BTreeSet::new() }
     }
 
     /// Records an observed transition `from → to`.
@@ -48,6 +54,21 @@ impl MarkovGraph {
         *row.counts.entry(to.to_owned()).or_insert(0.0) += 1.0;
     }
 
+    /// Declares a live region: it gets prior mass in every row (spec 33 §5), so a row with a
+    /// single observed successor no longer collapses to a degenerate interval.
+    pub fn register_region(&mut self, id: &str) {
+        self.support.insert(id.to_owned());
+    }
+
+    /// Removes a retired region from the prior support (its observed counts are kept).
+    pub fn retire_region(&mut self, id: &str) {
+        self.support.remove(id);
+    }
+
+    pub fn support(&self) -> impl Iterator<Item = &RegionKey> {
+        self.support.iter()
+    }
+
     pub fn row(&self, from: &str) -> Option<&TransitionRow> {
         self.rows.get(from)
     }
@@ -56,12 +77,16 @@ impl MarkovGraph {
         self.rows.keys()
     }
 
-    /// Dirichlet posterior parameters for a row.
+    /// Dirichlet posterior parameters for a row: `prior` on every observed successor, every
+    /// registered live region and [`UNKNOWN`], plus the (decayed) counts. Empty for unknown rows.
     pub fn alpha(&self, from: &str) -> Vec<(RegionKey, f64)> {
-        self.rows
-            .get(from)
-            .map(|r| r.counts.iter().map(|(k, c)| (k.clone(), c + self.prior)).collect())
-            .unwrap_or_default()
+        let Some(row) = self.rows.get(from) else {
+            return Vec::new();
+        };
+        let mut keys: BTreeSet<&str> = row.counts.keys().map(String::as_str).collect();
+        keys.extend(self.support.iter().map(String::as_str));
+        keys.insert(UNKNOWN);
+        keys.into_iter().map(|k| (k.to_owned(), row.counts.get(k).copied().unwrap_or(0.0) + self.prior)).collect()
     }
 
     /// Posterior mean transition probabilities.
@@ -101,7 +126,14 @@ impl MarkovGraph {
 pub trait Sampler: Send + Sync {
     fn id(&self) -> &str;
     /// Samples `n_paths` region paths of length `steps` starting from `start`.
-    fn sample_paths(&self, g: &MarkovGraph, start: &str, steps: usize, n_paths: usize, rng: &mut Rng) -> Vec<Vec<RegionKey>>;
+    fn sample_paths(
+        &self,
+        g: &MarkovGraph,
+        start: &str,
+        steps: usize,
+        n_paths: usize,
+        rng: &mut Rng,
+    ) -> Vec<Vec<RegionKey>>;
 }
 
 /// Conjugate posterior-predictive sampler: for each path, draw one transition matrix
@@ -114,7 +146,14 @@ impl Sampler for ConjugateSampler {
         "conjugate"
     }
 
-    fn sample_paths(&self, g: &MarkovGraph, start: &str, steps: usize, n_paths: usize, rng: &mut Rng) -> Vec<Vec<RegionKey>> {
+    fn sample_paths(
+        &self,
+        g: &MarkovGraph,
+        start: &str,
+        steps: usize,
+        n_paths: usize,
+        rng: &mut Rng,
+    ) -> Vec<Vec<RegionKey>> {
         (0..n_paths)
             .map(|_| {
                 let mut drawn: HashMap<RegionKey, Vec<(RegionKey, f64)>> = HashMap::new();
@@ -187,8 +226,29 @@ mod tests {
     fn posterior_mean_is_conjugate() {
         let g = graph();
         let m: BTreeMap<_, _> = g.posterior_mean("a").into_iter().collect();
-        assert!((m["b"] - 9.0 / 12.0).abs() < 1e-12);
-        assert!((m["c"] - 3.0 / 12.0).abs() < 1e-12);
+        // successors b, c plus the implicit `unknown` share prior mass 1 each: total 10 + 3 = 13
+        assert!((m["b"] - 9.0 / 13.0).abs() < 1e-12);
+        assert!((m["c"] - 3.0 / 13.0).abs() < 1e-12);
+        assert!((m[UNKNOWN] - 1.0 / 13.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn registered_regions_keep_prior_mass_and_widen_intervals() {
+        let mut g = MarkovGraph::new(1.0, 1.0);
+        g.register_region("a");
+        g.register_region("b");
+        g.observe("a", "b");
+        let m: BTreeMap<_, _> = g.posterior_mean("a").into_iter().collect();
+        // row a: b=2, a=1, unknown=1 → b = 0.5, not 1.0
+        assert!((m["b"] - 0.5).abs() < 1e-12);
+        assert!((m["a"] - 0.25).abs() < 1e-12);
+        let mut rng = Rng::seed(5);
+        let s: BTreeMap<_, _> = g.summarize("a", 0.9, 2000, &mut rng).into_iter().collect();
+        assert!(s["b"].upper - s["b"].lower > 0.3, "interval should be wide: {:?}", s["b"]);
+        g.retire_region("a");
+        assert!(
+            !g.alpha("a").iter().any(|(k, c)| k == "a" && *c > 0.0 && !g.row("a").unwrap().counts.contains_key("a"))
+        );
     }
 
     #[test]
@@ -211,7 +271,9 @@ mod tests {
             g.observe("x", "new");
         }
         let m: BTreeMap<_, _> = g.posterior_mean("x").into_iter().collect();
-        assert!(m["new"] > 0.99);
+        // `unknown` keeps prior mass 0.01, so the ceiling is just under 0.99
+        assert!(m["new"] > 0.98, "{m:?}");
+        assert!(m["old"] < 0.01, "{m:?}");
     }
 
     #[test]
