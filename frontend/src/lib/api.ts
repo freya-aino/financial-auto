@@ -253,7 +253,7 @@ async function postJson<T>(path: string, body: unknown = {}): Promise<T> {
 	return data as T;
 }
 
-const q = (params: Record<string, string | number | boolean | undefined>) => {
+export const q = (params: Record<string, string | number | boolean | undefined>) => {
 	const s = new URLSearchParams();
 	for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== '') s.set(k, String(v));
 	const str = s.toString();

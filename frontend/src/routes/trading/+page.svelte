@@ -1,8 +1,13 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Empty from '../../lib/Empty.svelte';
+	import Gauge from '../../lib/Gauge.svelte';
 	import KillSwitch from '../../lib/KillSwitch.svelte';
+	import Sparkline from '../../lib/Sparkline.svelte';
 	import ViewHeader from '../../lib/ViewHeader.svelte';
+	import { drawdownSeries, loadHistory, pushSample, saveHistory } from '../../lib/series';
+	import { deriveStrategies, STRATEGY_ACTIONS } from '../../lib/strategies';
+	import { onBus } from '../../lib/ws.svelte';
 	import {
 		ago,
 		eur,
@@ -36,6 +41,18 @@
 
 	const figures = $derived(risk?.reported ?? risk?.paper ?? null);
 	const figuresSource = $derived(risk?.reported ? 'risk service' : 'paper book');
+
+	// Client-side history of the polled risk figures for the charts (spec 51 §6.5). The API has
+	// no /api/trading/pnl yet (501), so the ring buffer is the only source; the newest 300
+	// samples survive reloads via localStorage.
+	const history = loadHistory();
+	let samples = $state(history.toArray());
+	const times = $derived(samples.map((s) => s.t));
+	const drawdowns = $derived(drawdownSeries(samples));
+	const strategies = $derived(deriveStrategies(signals, orders, now));
+	const actionTitle = (action: string) =>
+		`POST /api/trading/strategies/{id}/${action} is not implemented yet (501, spec 50 §4.7)`;
+	const fmtPct = (v: number) => pct(v, 2);
 	const knownInstruments = $derived(
 		[
 			...new Set([
@@ -61,6 +78,18 @@
 			orders = o.orders;
 			signals = s.signals;
 			error = '';
+			const f = r.reported ?? r.paper;
+			const added = pushSample(history, {
+				t: now,
+				equity: f.equity_eur,
+				pnl: r.reported?.daily_pnl_eur ?? r.paper.pnl_eur ?? 0,
+				drawdown: f.drawdown,
+				exposure: f.gross_exposure_eur
+			});
+			if (added) {
+				samples = history.toArray();
+				saveHistory(history);
+			}
 		} catch (e) {
 			error = String(e);
 		}
@@ -91,7 +120,14 @@
 		s === 'filled' ? 'ok' : s === 'rejected' || s === 'canceled' ? 'danger' : 'warn';
 	const signed = (v: number | null | undefined) => (v === null || v === undefined ? '' : v >= 0 ? 'pos' : 'neg');
 
-	onMount(() => poll(refresh, 2000));
+	onMount(() => {
+		const stopPoll = poll(refresh, 2000);
+		const stopBus = onBus(['order.>', 'risk.>', 'signal.exposure.>'], refresh);
+		return () => {
+			stopPoll();
+			stopBus();
+		};
+	});
 </script>
 
 <ViewHeader title="Trading Desk" spec="51 §6.5" note="paper only; no live broker is connected" />
@@ -117,6 +153,79 @@
 	</div>
 	<div class="panel"><span class="dim">paper book equity / cash</span><b class="mono">{eur(equity)} <span class="dim small">/ {eur(cash)}</span></b></div>
 </div>
+
+<div class="grid charts">
+	<section class="panel">
+		<div class="panel-head"><h2>Equity & P&L</h2><span class="dim">{figuresSource}, sampled every 2 s · {samples.length} pts</span></div>
+		<Sparkline {times} values={samples.map((s) => s.equity)} format={eur} label="equity" fill />
+		<Sparkline {times} values={samples.map((s) => s.pnl)} format={eur} baseline={0} tone="signed" label={risk?.reported ? 'daily P&L' : 'P&L since start'} />
+	</section>
+	<section class="panel">
+		<div class="panel-head"><h2>Drawdown</h2><span class="dim">reported · peak-to-trough from sampled equity</span></div>
+		<Sparkline {times} values={samples.map((s) => s.drawdown)} format={fmtPct} tone="danger" label="drawdown (reported)" fill />
+		<Sparkline {times} values={drawdowns} format={fmtPct} tone="danger" label="drawdown (client, from equity samples)" />
+	</section>
+	<section class="panel">
+		<div class="panel-head"><h2>Exposure vs caps</h2><span class="dim">GET /api/trading/limits → 501; caps not reported</span></div>
+		{#if figures}
+			<div class="gauges">
+				<Gauge label="gross exposure" value={figures.gross_exposure_eur} reference={figures.equity_eur} format={eur} />
+				<Gauge label="deployable used" value={figures.equity_eur - figures.deployable_eur} reference={figures.equity_eur} format={eur} />
+				<Gauge label="drawdown" value={figures.drawdown} reference={1} format={fmtPct} />
+				{#each positions.slice(0, 6) as p (p.instrument_id)}
+					<Gauge label="{short(p.instrument_id, 10)} exposure" value={p.market_value_eur ?? p.quantity * p.avg_cost_eur} reference={figures.equity_eur} format={eur} />
+				{/each}
+			</div>
+		{:else}
+			<Empty producer="risk.state.* (risk service) or the paper book" />
+		{/if}
+	</section>
+</div>
+
+<section class="panel strategies">
+	<div class="panel-head">
+		<h2>Strategies</h2>
+		<span class="dim">derived from signal.exposure.* and order.* (strategy_ids); GET /api/trading/strategies → 501</span>
+	</div>
+	{#if strategies.length}
+		<div class="scroll tall">
+			<table>
+				<thead>
+					<tr><th>strategy</th><th>genome</th><th>horizon</th><th>last signal</th><th>instruments</th><th>mean |exposure|</th><th>largest</th><th>orders</th><th>filled</th><th>rejected</th><th>actions</th></tr>
+				</thead>
+				<tbody>
+					{#each strategies as s (s.strategy_id)}
+						<tr>
+							<td class="mono">{s.strategy_id}</td>
+							<td class="mono dim">{s.genome_id || '—'}</td>
+							<td class="mono">{s.horizon || '—'}</td>
+							<td class="mono dim">{s.last_signal_ms === null ? '—' : `${ago(new Date(now - s.last_signal_ms).toISOString(), now)} ago`}</td>
+							<td class="mono">{s.instruments}</td>
+							<td>
+								<div class="bar"><div style="width: {100 * Math.min(1, s.mean_abs_exposure)}%"></div></div>
+								<span class="mono">{s.mean_abs_exposure.toFixed(2)}</span>
+							</td>
+							<td class="mono {signed(s.max_exposure?.mean)}" title={s.max_exposure?.instrument_id}>
+								{s.max_exposure ? `${s.max_exposure.mean.toFixed(2)} ${short(s.max_exposure.instrument_id, 8)}` : '—'}
+							</td>
+							<td class="mono">{s.orders}</td>
+							<td class="mono">{s.filled}</td>
+							<td class="mono {s.rejected ? 'neg' : ''}">{s.rejected}</td>
+							<td class="actions">
+								{#each STRATEGY_ACTIONS as a}
+									<button type="button" disabled title={actionTitle(a)}>{a}</button>
+								{/each}
+							</td>
+						</tr>
+					{/each}
+				</tbody>
+			</table>
+		</div>
+		<p class="dim">Actions are disabled: <code>POST /api/trading/strategies/&#123;id&#125;/pause|resume|flatten|promote</code> answer 501 until the strategy runtime exists (spec 50 §4.7). Status, sleeve and gate checks need <code>GET /api/trading/strategies</code>.</p>
+	{:else}
+		<Empty producer="signal.exposure.* (strategy population)" />
+	{/if}
+</section>
 
 <div class="grid two">
 	<section class="panel">
@@ -290,6 +399,48 @@
 	}
 	.two {
 		grid-template-columns: repeat(auto-fill, minmax(520px, 1fr));
+	}
+	.charts {
+		grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+		margin-bottom: 12px;
+	}
+	.charts .panel {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+	.gauges {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+	.strategies {
+		margin-bottom: 12px;
+	}
+	.strategies p {
+		margin: 8px 0 0;
+	}
+	.actions {
+		white-space: nowrap;
+	}
+	.actions button {
+		font-size: 11px;
+		padding: 1px 6px;
+		margin-right: 3px;
+	}
+	.bar {
+		display: inline-block;
+		width: 70px;
+		height: 6px;
+		background: var(--bg-inset);
+		border-radius: 3px;
+		vertical-align: middle;
+		margin-right: 6px;
+	}
+	.bar > div {
+		height: 100%;
+		background: var(--accent);
+		border-radius: 3px;
 	}
 	.tall {
 		max-height: 420px;

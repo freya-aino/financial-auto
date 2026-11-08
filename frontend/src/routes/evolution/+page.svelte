@@ -5,7 +5,9 @@
 	import Scatter from '../../lib/Scatter.svelte';
 	import ViewHeader from '../../lib/ViewHeader.svelte';
 	import { ago, live, poll, short, type GpuStatus, type JobView } from '../../lib/api';
+	import { MINIMISE, nonDominated } from '../../lib/pareto';
 	import { loadPref, savePref } from '../../lib/prefs';
+	import { onBus } from '../../lib/ws.svelte';
 
 	const STATUSES = ['queued', 'running', 'ok', 'failed', 'preempted', 'budget_exceeded'] as const;
 
@@ -22,8 +24,6 @@
 	$effect(() => savePref('evo.kind', kindFilter));
 	$effect(() => savePref('evo.x', xObj));
 	$effect(() => savePref('evo.y', yObj));
-	// Objectives where lower is better; everything else is maximised (spec 34).
-	const MINIMISE = new Set(['reconstruction', 'compute_cost', 'crps', 'nll', 'loss']);
 
 	// start-generation form
 	let gKind = $state('evo.eval.decoder');
@@ -44,20 +44,14 @@
 		if (!yObj && objectives.length > 1) yObj = objectives[1];
 	});
 
-	/** Non-dominated points for the two chosen objectives. */
+	/** Scatter points with the non-dominated ones highlighted (lib/pareto.ts). */
 	const points = $derived.by(() => {
 		if (!xObj || !yObj) return [];
-		const sx = MINIMISE.has(xObj) ? -1 : 1;
-		const sy = MINIMISE.has(yObj) ? -1 : 1;
 		const pts = scored
 			.filter((j) => xObj in j.objectives && yObj in j.objectives)
 			.map((j) => ({ x: j.objectives[xObj], y: j.objectives[yObj], label: `${j.genome_id} (${short(j.job_id)})` }));
-		return pts.map((p) => ({
-			...p,
-			highlight: !pts.some(
-				(o) => sx * o.x >= sx * p.x && sy * o.y >= sy * p.y && (sx * o.x > sx * p.x || sy * o.y > sy * p.y)
-			)
-		}));
+		const front = nonDominated(pts, !MINIMISE.has(xObj), !MINIMISE.has(yObj));
+		return pts.map((p, i) => ({ ...p, highlight: front[i] }));
 	});
 
 	async function refresh() {
@@ -101,10 +95,17 @@
 
 	const statusClass = (s: string) => (s === 'ok' ? 'ok' : s === 'failed' || s === 'budget_exceeded' ? 'danger' : s === 'running' ? '' : 'warn');
 
-	onMount(() => poll(refresh, 2000));
+	onMount(() => {
+		const stopPoll = poll(refresh, 2000);
+		const stopBus = onBus('jobs.>', refresh);
+		return () => {
+			stopPoll();
+			stopBus();
+		};
+	});
 </script>
 
-<ViewHeader title="Evolution Lab" spec="51 §6.4" note="live from jobs.* and evo-orchestrator heartbeats" />
+<ViewHeader title="Evolution Lab" spec="51 §6.4" note="live from jobs.* and evo-orchestrator heartbeats; refetches on jobs.> frames" />
 {#if error}<p class="badge danger">{error}</p>{/if}
 
 <div class="grid top">

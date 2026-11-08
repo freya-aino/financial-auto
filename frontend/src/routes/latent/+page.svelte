@@ -16,6 +16,7 @@
 		type Region
 	} from '../../lib/api';
 	import { loadPref, savePref } from '../../lib/prefs';
+	import { onBus } from '../../lib/ws.svelte';
 
 	let configured = $state<string[]>([]);
 	let seen = $state<string[]>([]);
@@ -62,10 +63,17 @@
 		}
 	}
 
-	onMount(() => poll(refresh, 2000));
+	onMount(() => {
+		const stopPoll = poll(refresh, 2000);
+		const stopBus = onBus(['latent.>', 'decoder.output.>'], refresh);
+		return () => {
+			stopPoll();
+			stopBus();
+		};
+	});
 </script>
 
-<ViewHeader title="Latent & Graph" spec="51 §6.3" note="live from latent.* and decoder.output.*" />
+<ViewHeader title="Latent & Graph" spec="51 §6.3" note="live from latent.* and decoder.output.*; refetches on bus frames" />
 
 <div class="toolbar">
 	<label>

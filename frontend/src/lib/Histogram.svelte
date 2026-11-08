@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { histogram } from './histogram';
+
 	interface Props {
 		values: number[];
 		bins?: number;
@@ -6,15 +8,7 @@
 	}
 	let { values, bins = 12, label }: Props = $props();
 
-	const hist = $derived.by(() => {
-		if (!values.length) return { counts: [] as number[], lo: 0, hi: 0, max: 1 };
-		const lo = Math.min(...values);
-		const hi = Math.max(...values);
-		const w = (hi - lo || 1) / bins;
-		const counts = Array(bins).fill(0) as number[];
-		for (const v of values) counts[Math.min(bins - 1, Math.floor((v - lo) / w))]++;
-		return { counts, lo, hi, max: Math.max(...counts) };
-	});
+	const hist = $derived(histogram(values, bins));
 </script>
 
 <div class="hist" role="img" aria-label="histogram of {label}">

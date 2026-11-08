@@ -5,6 +5,7 @@
 	import { onMount } from 'svelte';
 	import KillSwitch from '../lib/KillSwitch.svelte';
 	import { api, eur, live, poll, type Health, type RiskView } from '../lib/api';
+	import { bus, onBus } from '../lib/ws.svelte';
 
 	let { children } = $props();
 
@@ -20,7 +21,9 @@
 	let risk = $state<RiskView | null>(null);
 	let riskError = $state(false);
 
+	let now = $state(Date.now());
 	const figures = $derived(risk?.reported ?? risk?.paper ?? null);
+	const retryIn = $derived(bus.nextRetryAt === null ? null : Math.max(0, Math.ceil((bus.nextRetryAt - now) / 1000)));
 	const pnl = $derived(risk?.reported?.daily_pnl_eur ?? risk?.paper.pnl_eur ?? null);
 
 	async function pollHealth() {
@@ -44,9 +47,13 @@
 	onMount(() => {
 		const stopHealth = poll(pollHealth, 5000);
 		const stopRisk = poll(pollRisk, 2000);
+		const tick = setInterval(() => (now = Date.now()), 500);
+		const stopBus = onBus('risk.>', pollRisk);
 		return () => {
 			stopHealth();
 			stopRisk();
+			stopBus();
+			clearInterval(tick);
 		};
 	});
 </script>
@@ -87,7 +94,24 @@
 			<KillSwitch {risk} compact onchanged={pollRisk} />
 		</div>
 	</header>
-	<main>
+	{#if bus.stale || healthError || riskError}
+		<div class="stale-banner" role="status">
+			{#if healthError || riskError}
+				<span class="badge danger">control-api unreachable</span>
+				<span>Figures are stale; polling continues every 2 s.</span>
+			{/if}
+			{#if bus.stale}
+				<span class="badge warn">bus {bus.status}</span>
+				<span>
+					Live updates paused, data may be stale.
+					{#if bus.status === 'connecting'}Connecting…{:else if retryIn !== null}Reconnecting in {retryIn}s (attempt {bus.attempt}).{/if}
+					{#if bus.error}<span class="dim">{bus.error}</span>{/if}
+				</span>
+				<button type="button" onclick={() => bus.reconnectNow()}>Retry now</button>
+			{/if}
+		</div>
+	{/if}
+	<main class:stale={bus.stale}>
 		{@render children()}
 	</main>
 </div>
@@ -207,5 +231,20 @@
 	main {
 		padding: 16px;
 		flex: 1;
+	}
+
+	main.stale :global(.panel) {
+		border-style: dashed;
+	}
+
+	.stale-banner {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		flex-wrap: wrap;
+		padding: 6px 16px;
+		background: color-mix(in srgb, var(--warn) 12%, var(--bg-raised));
+		border-bottom: 1px solid var(--warn);
+		font-size: 12px;
 	}
 </style>

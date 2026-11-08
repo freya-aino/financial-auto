@@ -1,50 +1,38 @@
 <script lang="ts">
-	// Live NATS tap over /ws/bus (spec 50 §4.3, 51 §6.2).
+	// Live NATS tap over the shared /ws/bus connection (spec 50 §4.3, 51 §6.2). Rows are
+	// appended once per animation frame; the socket itself is owned by `bus` (ws.svelte.ts).
 	import { onDestroy } from 'svelte';
-	import { busTapUrl, type BusFrame } from './api';
+	import type { BusFrame } from './api';
+	import { loadPref, savePref } from './prefs';
+	import { bus, frameBatcher } from './ws.svelte';
 
 	const MAX_ROWS = 200;
 
-	let subjects = $state('md.>,svc.heartbeat.>');
+	let subjects = $state(loadPref('ops.tap', 'md.>,svc.heartbeat.>'));
 	let rows = $state<BusFrame[]>([]);
-	let connected = $state(false);
 	let paused = $state(false);
 	let rate = $state(0);
-	let dropped = $state(0);
-	let error = $state('');
 
-	let ws: WebSocket | null = null;
 	let count = 0;
 	const rateTimer = setInterval(() => {
 		rate = count;
 		count = 0;
 	}, 1000);
 
-	function connect() {
-		ws?.close();
-		error = '';
+	const append = frameBatcher<BusFrame>((frames) => {
+		if (paused) return;
+		rows = [...frames.reverse(), ...rows].slice(0, MAX_ROWS);
+	});
+
+	let off: (() => void) | null = null;
+	function tap() {
+		off?.();
 		rows = [];
-		dropped = 0;
-		const sock = new WebSocket(busTapUrl(subjects));
-		ws = sock;
-		sock.onopen = () => (connected = true);
-		sock.onclose = () => {
-			if (ws === sock) connected = false;
-		};
-		sock.onerror = () => (error = 'websocket error');
-		sock.onmessage = (ev) => {
-			const msg = JSON.parse(ev.data);
-			if (msg.op === 'lagged') {
-				dropped += msg.dropped;
-				return;
-			}
-			if (msg.op === 'error') {
-				error = msg.error;
-				return;
-			}
+		savePref('ops.tap', subjects);
+		off = bus.subscribe(subjects, (f) => {
 			count++;
-			if (!paused) rows = [msg as BusFrame, ...rows].slice(0, MAX_ROWS);
-		};
+			append(f);
+		});
 	}
 
 	function summary(decoded: unknown): string {
@@ -55,10 +43,10 @@
 		return JSON.stringify(d);
 	}
 
-	connect();
+	tap();
 	onDestroy(() => {
 		clearInterval(rateTimer);
-		ws?.close();
+		off?.();
 	});
 </script>
 
@@ -68,7 +56,7 @@
 		<form
 			onsubmit={(e) => {
 				e.preventDefault();
-				connect();
+				tap();
 			}}
 		>
 			<input class="mono" bind:value={subjects} size="32" aria-label="subjects" />
@@ -76,12 +64,15 @@
 			<button type="button" onclick={() => (paused = !paused)}>{paused ? 'Resume' : 'Pause'}</button>
 		</form>
 		<div class="meters">
-			<span class="badge" class:ok={connected} class:danger={!connected}>{connected ? 'live' : 'closed'}</span>
+			<span class="badge" class:ok={bus.status === 'open'} class:warn={bus.status === 'connecting'} class:danger={bus.status === 'closed'}>
+				{bus.status}
+			</span>
 			<span class="mono">{rate} msg/s</span>
-			{#if dropped}<span class="badge warn">{dropped} dropped</span>{/if}
+			{#if bus.dropped}<span class="badge warn" title="server rate limit (200 msg/s per socket)">{bus.dropped} dropped</span>{/if}
+			<span class="dim" title="all patterns on the shared socket: {bus.patterns.join(', ')}">{bus.patterns.length} patterns</span>
 		</div>
 	</div>
-	{#if error}<p class="badge danger">{error}</p>{/if}
+	{#if bus.error}<p class="badge danger">{bus.error}</p>{/if}
 	<div class="scroll body">
 		<table class="mono">
 			<thead><tr><th>time</th><th>subject</th><th>bytes</th><th>decoded</th></tr></thead>
