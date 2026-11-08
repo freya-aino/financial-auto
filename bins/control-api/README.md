@@ -2,7 +2,7 @@
 
 axum REST + WebSocket control plane for the frontend. Local only, no auth (ADR 0006).
 
-**Status:** ops, sources, bus tap, latent views, evolution and paper trading are implemented and verified against live NATS and the compose services (2026-11-07). The live views are in-memory aggregations of bus traffic (D-032), and the paper book resets on restart (D-028). Live trading is impossible through this API (D-029).
+**Status:** ops, sources, bus tap, latent views, evolution and paper trading are implemented and verified against live NATS and the compose services (2026-11-07); ingest start/stop and job cancel verified against host-run Go services (2026-11-08). The live views are in-memory aggregations of bus traffic (D-032), and the paper book resets on restart (D-028). Live trading is impossible through this API (D-029).
 
 ## Run
 ```sh
@@ -31,8 +31,11 @@ Starts even when NATS is down: the client retries in the background, and `/api/h
 | `GET /api/trading/positions`, `/orders?fills=`, `/fills`, `/risk`, `/signals` | implemented: paper book (EUR), blotter, risk state (reported + paper), halts, latest exposure per strategy |
 | `POST /api/trading/halt` (alias `/kill-switch`), `/resume` (alias `/kill-switch/rearm`) | implemented: `risk.halt.portfolio` / `risk.resume.portfolio` (D-030) |
 | `POST /api/trading/paper-order` (alias `POST /api/trading/orders`) | implemented: `{instrument_id, side, quantity, limit_price?}`. Always PAPER; `mode` other than paper → 400; while halted → 409 (D-029) |
-| `POST /api/ingest/{source}/start\|stop` | 501 with explanation: the ingestor has no `ctl.ingest.*` handler yet |
+| `POST /api/ingest/{source}/start\|stop` | implemented: `ctl.ingest.start\|stop` request (`{source}` arg, 5 s timeout) to the ingestor; 200 `{ok, source, action, message}`, 404 unknown source / no connector, 409 already running / not running / catalog status `disabled`\|`planned`, 503 without NATS, 504 no reply |
+| `POST /api/jobs/{id}/cancel` | implemented: `ctl.evo.cancel` request to the evo-orchestrator; 200 when the job was pending (the job list then shows it `failed` with error `cancelled by operator`), 404 when no generation owns it, 503 without NATS |
 | Everything else in spec 50 §4 | `501 {"error": "not_implemented", "spec": "specs/50-control-api.md §4.x"}` |
+
+Error replies from Go services (`CtlReply{ok:false}`) are mapped by message prefix: `not_found:` → 404, `conflict:` → 409, `invalid:` → 400, else 422.
 
 Deviation from spec 50: no `/api/v1` prefix yet (the spec marks it a proposal). Paths match D-018.
 

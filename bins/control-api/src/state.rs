@@ -45,9 +45,7 @@ impl AppState {
     }
 
     pub fn nats_connected(&self) -> bool {
-        self.nats
-            .as_ref()
-            .is_some_and(|c| c.connection_state() == async_nats::connection::State::Connected)
+        self.nats.as_ref().is_some_and(|c| c.connection_state() == async_nats::connection::State::Connected)
     }
 
     pub fn live(&self) -> RwLockReadGuard<'_, Live> {
@@ -60,7 +58,9 @@ impl AppState {
 
     /// Feeds latent/decoder/jobs/signal/order/risk/trade traffic into `live`.
     pub fn spawn_live_collector(&self) {
-        let Some(client) = self.nats.clone() else { return };
+        let Some(client) = self.nats.clone() else {
+            return;
+        };
         let state = self.clone();
         tokio::spawn(async move {
             let mut subs = Vec::new();
@@ -90,7 +90,9 @@ impl AppState {
 
     /// Collects `svc.heartbeat.>` into `services`.
     pub fn spawn_heartbeat_collector(&self) {
-        let Some(client) = self.nats.clone() else { return };
+        let Some(client) = self.nats.clone() else {
+            return;
+        };
         let state = self.clone();
         tokio::spawn(async move {
             let mut sub = match client.subscribe(subjects::ALL_HEARTBEATS).await {

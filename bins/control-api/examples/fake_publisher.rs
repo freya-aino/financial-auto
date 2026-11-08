@@ -29,9 +29,7 @@ async fn main() -> anyhow::Result<()> {
             payload: Some(Payload::Trade(Trade { price: 100.0 + (n as f64).sin(), size: 1.0, ..Default::default() })),
             ..Default::default()
         };
-        client
-            .publish(fa_bus::subjects::md_trade("sim", &inst), env.encode_to_vec().into())
-            .await?;
+        client.publish(fa_bus::subjects::md_trade("sim", &inst), env.encode_to_vec().into()).await?;
         let hb = Heartbeat {
             service: "fake-publisher".into(),
             instance_id: "local".into(),
@@ -39,9 +37,7 @@ async fn main() -> anyhow::Result<()> {
             version: env!("CARGO_PKG_VERSION").into(),
             counters: [("trades_published".to_owned(), n as f64)].into(),
         };
-        client
-            .publish(fa_bus::subjects::heartbeat("fake-publisher"), hb.encode_to_vec().into())
-            .await?;
+        client.publish(fa_bus::subjects::heartbeat("fake-publisher"), hb.encode_to_vec().into()).await?;
         client.flush().await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

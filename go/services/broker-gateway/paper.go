@@ -20,17 +20,40 @@ type VenueAdapter interface {
 	Cancel(ctx context.Context, intentID string) error
 }
 
+// FeeModel prices the cost of a fill (spec 41 cost model hook). The paper
+// engine charges ZeroFee unless configured otherwise; slippage stays zero.
+type FeeModel interface {
+	// Fee returns the fee and its currency for a fill of qty at price.
+	Fee(in *fav1.OrderIntent, price, qty float64) (fee float64, currency string)
+}
+
+// ZeroFee is the default: no costs.
+type ZeroFee struct{}
+
+func (ZeroFee) Fee(*fav1.OrderIntent, float64, float64) (float64, string) { return 0, "EUR" }
+
+// BpsFee charges a flat basis-point fee on notional, floored at Min.
+type BpsFee struct {
+	Bps float64
+	Min float64
+}
+
+func (f BpsFee) Fee(_ *fav1.OrderIntent, price, qty float64) (float64, string) {
+	return max(f.Min, price*qty*f.Bps/10_000), "EUR"
+}
+
 // PaperEngine fills intents immediately at the last seen trade price.
-// Fees and slippage are zero until the cost model (spec 41) lands.
+// Slippage is zero; fees come from Fees (ZeroFee by default).
 type PaperEngine struct {
 	mu        sync.Mutex
 	lastPrice map[string]float64 // subject token -> price
 	seen      map[string]bool    // intent ids, for idempotency (spec 42)
 	now       func() time.Time
+	Fees      FeeModel
 }
 
 func NewPaperEngine() *PaperEngine {
-	return &PaperEngine{lastPrice: map[string]float64{}, seen: map[string]bool{}, now: time.Now}
+	return &PaperEngine{lastPrice: map[string]float64{}, seen: map[string]bool{}, now: time.Now, Fees: ZeroFee{}}
 }
 
 // ObserveTrade records the latest price from an md.trade.<venue>.<token> subject.
@@ -76,6 +99,6 @@ func (p *PaperEngine) Execute(in *fav1.OrderIntent) *fav1.OrderEvent {
 	}
 	ev.Kind = fav1.OrderEvent_KIND_FILL
 	ev.FillPrice, ev.FillQuantity = price, in.Quantity
-	ev.Fee, ev.FeeCurrency = 0, "EUR"
+	ev.Fee, ev.FeeCurrency = p.Fees.Fee(in, price, in.Quantity)
 	return ev
 }

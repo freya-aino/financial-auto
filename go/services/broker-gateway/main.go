@@ -23,6 +23,8 @@ const service = "broker-gateway"
 
 func main() {
 	natsURL := flag.String("nats", envOr("FA_NATS_URL", "nats://127.0.0.1:4222"), "NATS URL")
+	feeBps := flag.Float64("fee-bps", 0, "paper fee in basis points of notional (0 = zero-fee default, spec 41 cost model hook)")
+	feeMin := flag.Float64("fee-min", 0, "minimum paper fee per fill (EUR)")
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("svc", service)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -39,6 +41,9 @@ func main() {
 	go bus.RunHeartbeat(ctx, pub, service, ulid.Make().String(), "0.1.0", 5*time.Second, counters, nil)
 
 	engine := NewPaperEngine()
+	if *feeBps > 0 || *feeMin > 0 {
+		engine.Fees = BpsFee{Bps: *feeBps, Min: *feeMin}
+	}
 	if _, err := pub.NC.Subscribe(bus.AllMdTrades, func(m *nats.Msg) {
 		var e fav1.Envelope
 		if proto.Unmarshal(m.Data, &e) == nil {

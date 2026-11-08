@@ -56,7 +56,8 @@ async fn main() -> anyhow::Result<()> {
     let mut rng = Rng::seed(7);
 
     let mut prices: Vec<f64> = INSTRUMENTS.iter().map(|(_, p)| *p).collect();
-    let mut graphs: HashMap<&str, MarkovGraph> = TIMESCALES.iter().map(|t| (*t, MarkovGraph::new(0.5, 0.995))).collect();
+    let mut graphs: HashMap<&str, MarkovGraph> =
+        TIMESCALES.iter().map(|t| (*t, MarkovGraph::new(0.5, 0.995))).collect();
     // current region per (timescale, instrument)
     let mut current: HashMap<(&str, usize), usize> = HashMap::new();
     let mut equity = 100_000.0_f64;
@@ -254,7 +255,8 @@ async fn main() -> anyhow::Result<()> {
         for (idx, (id, kind, p)) in running.iter_mut().enumerate() {
             *p += 0.15 + 0.2 * rng.uniform() as f32;
             if *p < 1.0 {
-                let prog = JobProgress { job_id: id.clone(), fraction: *p, message: format!("rung {}", (*p * 4.0) as u32) };
+                let prog =
+                    JobProgress { job_id: id.clone(), fraction: *p, message: format!("rung {}", (*p * 4.0) as u32) };
                 bus.send(fa_bus::subjects::job_progress(id), &prog).await?;
                 continue;
             }

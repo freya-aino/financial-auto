@@ -22,7 +22,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 /// Subjects the collector subscribes to.
-pub const SUBJECTS: [&str; 7] = ["latent.>", "decoder.output.>", "jobs.>", "signal.exposure.>", "order.>", "risk.>", "md.trade.>"];
+pub const SUBJECTS: [&str; 7] =
+    ["latent.>", "decoder.output.>", "jobs.>", "signal.exposure.>", "order.>", "risk.>", "md.trade.>"];
 
 /// Starting cash of the in-memory paper book (D-028).
 pub const PAPER_CASH_EUR: f64 = 100_000.0;
@@ -675,7 +676,9 @@ impl Live {
         o.filled_quantity = total;
         o.fees += m.fee;
 
-        let Ok(uuid) = Uuid::parse_str(&o.instrument_id) else { return };
+        let Ok(uuid) = Uuid::parse_str(&o.instrument_id) else {
+            return;
+        };
         let signed = if o.side == "sell" { -m.fill_quantity } else { m.fill_quantity };
         let fill_id = format!(
             "{}:{}:{}",
@@ -728,10 +731,7 @@ impl Live {
     }
 
     fn marks_eur(&self) -> BTreeMap<InstrumentId, f64> {
-        self.marks
-            .iter()
-            .filter_map(|(k, v)| Uuid::parse_str(k).ok().map(|u| (InstrumentId(u), *v)))
-            .collect()
+        self.marks.iter().filter_map(|(k, v)| Uuid::parse_str(k).ok().map(|u| (InstrumentId(u), *v))).collect()
     }
 
     fn paper_equity(&self) -> f64 {
@@ -927,7 +927,8 @@ mod tests {
     #[test]
     fn job_lifecycle_and_counts() {
         let mut l = Live::default();
-        let job = Job { job_id: "j1".into(), kind: "evo.eval.decoder".into(), budget_gpu_ms: 1000, ..Default::default() };
+        let job =
+            Job { job_id: "j1".into(), kind: "evo.eval.decoder".into(), budget_gpu_ms: 1000, ..Default::default() };
         feed(&mut l, "jobs.evo.eval.decoder", &job);
         feed(&mut l, "jobs.progress.j1", &JobProgress { job_id: "j1".into(), fraction: 0.5, message: "rung 1".into() });
         let v = l.jobs_view(None, 10);

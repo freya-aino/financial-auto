@@ -28,7 +28,7 @@ pub fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         .route("/api/services/{name}/{action}", post(not_implemented))
         .route("/api/config/{section}", any(not_implemented))
         .route("/api/jobs", get(lr::jobs))
-        .route("/api/jobs/{id}/cancel", post(not_implemented))
+        .route("/api/jobs/{id}/cancel", post(lr::cancel_job))
         .route("/api/gpu", get(lr::gpu))
         // 4.2 Sources & ingestion
         .route("/api/sources", get(list_sources))
@@ -158,7 +158,9 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 
 /// TCP reachability of `scheme://[user@]host[:port]/...`.
 async fn probe(url: &str) -> bool {
-    let Some(addr) = host_port(url) else { return false };
+    let Some(addr) = host_port(url) else {
+        return false;
+    };
     tokio::time::timeout(Duration::from_millis(300), tokio::net::TcpStream::connect(addr))
         .await
         .is_ok_and(|r| r.is_ok())
@@ -186,12 +188,8 @@ async fn services(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn timescales(State(state): State<AppState>) -> impl IntoResponse {
-    let ladder: Vec<_> = state
-        .cfg
-        .timescales
-        .iter()
-        .map(|t| json!({ "id": t.as_str(), "seconds": t.duration().as_secs() }))
-        .collect();
+    let ladder: Vec<_> =
+        state.cfg.timescales.iter().map(|t| json!({ "id": t.as_str(), "seconds": t.duration().as_secs() })).collect();
     Json(json!({ "timescales": ladder }))
 }
 
@@ -272,10 +270,8 @@ mod tests {
     }
 
     async fn post_json(uri: &str, body: Value) -> (StatusCode, Value) {
-        let req = Request::post(uri)
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
+        let req =
+            Request::post(uri).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
         let res = app().oneshot(req).await.unwrap();
         let status = res.status();
         let body = res.into_body().collect().await.unwrap().to_bytes();
@@ -320,9 +316,12 @@ mod tests {
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
         let (s, _) = post_json("/api/evolution/generations", json!({"kind": "", "genomes": []})).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
-        let (s, v) = post_json("/api/ingest/oanda/start", json!({})).await;
-        assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(v["source"], "oanda");
+        let (s, _) = post_json("/api/ingest/oanda/start", json!({})).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        let (s, _) = post_json("/api/ingest/oanda/pause", json!({})).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) = post_json("/api/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAV/cancel", json!({})).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

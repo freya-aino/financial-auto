@@ -121,11 +121,8 @@ pub async fn start_generation(State(s): State<AppState>, Json(body): Json<StartG
     if body.kind.trim().is_empty() || genomes.is_empty() {
         return err(StatusCode::BAD_REQUEST, "kind and at least one genome are required");
     }
-    let mut args = vec![
-        ("kind", body.kind.trim().to_owned()),
-        ("snapshot_id", body.snapshot_id),
-        ("genomes", genomes.join(",")),
-    ];
+    let mut args =
+        vec![("kind", body.kind.trim().to_owned()), ("snapshot_id", body.snapshot_id), ("genomes", genomes.join(","))];
     if let Some(v) = body.eta {
         args.push(("eta", v.to_string()));
     }
@@ -169,21 +166,41 @@ async fn publish<M: Message>(s: &AppState, subject: String, m: &M) -> Result<(),
 
 // ------------------------------------------------------------------- ops
 
-pub async fn ingest_control(Path((source, action)): Path<(String, String)>) -> Response {
+/// Maps a service's `CtlReply` to HTTP. Error messages carry a prefix agreed with the Go
+/// services: `not_found:` → 404, `conflict:` → 409, `invalid:` → 400, anything else → 422.
+fn ctl_reply_response(r: CtlReply, ok_body: impl FnOnce(String) -> serde_json::Value) -> Response {
+    if r.ok {
+        return Json(ok_body(r.message)).into_response();
+    }
+    let status = match r.message.split(':').next().unwrap_or_default() {
+        "not_found" => StatusCode::NOT_FOUND,
+        "conflict" => StatusCode::CONFLICT,
+        "invalid" => StatusCode::BAD_REQUEST,
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    err(status, r.message)
+}
+
+/// Starts or stops a connector at runtime via the ingestor's `ctl.ingest.{start|stop}`
+/// (spec 10 §4.3). 503 without NATS, 504 when the ingestor does not answer in 5 s.
+pub async fn ingest_control(State(s): State<AppState>, Path((source, action)): Path<(String, String)>) -> Response {
     if !matches!(action.as_str(), "start" | "stop") {
         return err(StatusCode::NOT_FOUND, format!("unknown action {action:?}; use start|stop"));
     }
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "not_implemented",
-            "source": source,
-            "action": action,
-            "reason": "the ingestor does not handle ctl.ingest.* yet; restart it with -connectors to change sources",
-            "spec": "specs/10-ingestion.md §4.3",
-        })),
-    )
-        .into_response()
+    let req = CtlRequest { verb: action.clone(), args: [("source".to_owned(), source.clone())].into_iter().collect() };
+    match ctl_request(&s, subjects::ctl("ingest", &action), &req).await {
+        Ok(r) => ctl_reply_response(r, |m| json!({ "ok": true, "source": source, "action": action, "message": m })),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Cancels a pending evolution job via the orchestrator's `ctl.evo.cancel`.
+pub async fn cancel_job(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    let req = CtlRequest { verb: "cancel".into(), args: [("job_id".to_owned(), id.clone())].into_iter().collect() };
+    match ctl_request(&s, subjects::ctl("evo", "cancel"), &req).await {
+        Ok(r) => ctl_reply_response(r, |m| json!({ "ok": true, "job_id": id, "message": m })),
+        Err(e) => e.into_response(),
+    }
 }
 
 // --------------------------------------------------------------- trading
@@ -231,7 +248,12 @@ pub async fn halt(State(s): State<AppState>, body: Option<Json<HaltBody>>) -> Re
 
 /// Re-arms trading after a manual halt (`risk.resume.portfolio`, D-030).
 pub async fn resume(State(s): State<AppState>) -> Response {
-    let h = Halt { scope: "portfolio".into(), reason: "manual resume (operator UI)".into(), since: Some(now()), manual: true };
+    let h = Halt {
+        scope: "portfolio".into(),
+        reason: "manual resume (operator UI)".into(),
+        since: Some(now()),
+        manual: true,
+    };
     if let Err(e) = publish(&s, subjects::risk_resume("portfolio"), &h).await {
         return e.into_response();
     }

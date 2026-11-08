@@ -155,11 +155,17 @@ fn envelope_json(e: Envelope) -> Value {
     let payload = match e.payload {
         Some(Payload::Trade(t)) => json!({"kind": "trade", "price": t.price, "size": t.size}),
         Some(Payload::Quote(q)) => json!({"kind": "quote", "bid": q.bid_price, "ask": q.ask_price}),
-        Some(Payload::Bar(b)) => json!({"kind": "bar", "timeframe": b.timeframe, "close": b.close, "volume": b.volume}),
-        Some(Payload::Book(b)) => json!({"kind": "book", "bids": b.bids.len(), "asks": b.asks.len()}),
+        Some(Payload::Bar(b)) => {
+            json!({"kind": "bar", "timeframe": b.timeframe, "close": b.close, "volume": b.volume})
+        }
+        Some(Payload::Book(b)) => {
+            json!({"kind": "book", "bids": b.bids.len(), "asks": b.asks.len()})
+        }
         Some(Payload::News(n)) => json!({"kind": "news", "title": n.title, "outlet": n.outlet}),
         Some(Payload::Media(m)) => json!({"kind": "media", "media_id": m.media_id}),
-        Some(Payload::Macro(m)) => json!({"kind": "macro", "series_id": m.series_id, "value": m.value}),
+        Some(Payload::Macro(m)) => {
+            json!({"kind": "macro", "series_id": m.series_id, "value": m.value})
+        }
         Some(Payload::Onchain(o)) => json!({"kind": "onchain", "chain": o.chain, "event": o.kind}),
         Some(Payload::Filing(f)) => json!({"kind": "filing", "form_type": f.form_type}),
         None => Value::Null,

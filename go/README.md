@@ -1,6 +1,6 @@
 # go
 
-Single Go module `github.com/fey/financial-auto/go` (D-016): the connector framework, connectors, `ingestor`, `broker-gateway` and `evo-orchestrator`.
+Single Go module `github.com/fey/financial-auto/go` (D-016): the connector framework (`pkg/connector`, `pkg/catalog`), bus helpers (`pkg/bus`), the VictoriaMetrics writer (`pkg/tsdb`), connectors, `ingestor`, `broker-gateway` and `evo-orchestrator`.
 
 Requires Go 1.25. Dependencies are pinned to releases that still support Go 1.25; newer nats.go and x/time releases require Go 1.26.
 

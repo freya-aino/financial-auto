@@ -1,0 +1,3 @@
+# Matches the hand-formatted layout used since the scaffold.
+max_width = 120
+use_small_heuristics = "Max"

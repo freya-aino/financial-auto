@@ -1,5 +1,16 @@
 // Command ingestor runs connectors concurrently, normalizes their output to
-// canonical envelopes and publishes them on NATS (spec 10).
+// canonical envelopes, publishes them on NATS and writes trades to
+// VictoriaMetrics (spec 10, spec 20 §5.3).
+//
+// Control subjects (request/reply, CtlRequest/CtlReply):
+//
+//	ctl.ingest.start   args: source   start a catalog source's connector
+//	ctl.ingest.stop    args: source   stop it
+//	ctl.ingest.status  (no args)      reply message = comma list of running sources
+//
+// Error replies carry a prefix control-api maps to HTTP: `not_found:` (404),
+// `conflict:` (409, already running / not running / status disabled|planned),
+// anything else 422.
 package main
 
 import (
@@ -10,15 +21,18 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/oklog/ulid/v2"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/fey/financial-auto/go/pkg/bus"
+	fav1 "github.com/fey/financial-auto/go/pkg/bus/pb/fa/v1"
 	"github.com/fey/financial-auto/go/pkg/catalog"
 	"github.com/fey/financial-auto/go/pkg/connector"
+	"github.com/fey/financial-auto/go/pkg/tsdb"
 
 	_ "github.com/fey/financial-auto/go/connectors/googlenews"
 	_ "github.com/fey/financial-auto/go/connectors/hackernews"
@@ -40,7 +54,8 @@ func env(key, def string) string {
 func main() {
 	natsURL := flag.String("nats", env("FA_NATS_URL", "nats://127.0.0.1:4222"), "NATS URL")
 	catalogPath := flag.String("catalog", env("FA_CATALOG", "config/sources.yaml"), "source catalog path")
-	enabled := flag.String("connectors", env("FA_CONNECTORS", heartbeat.ID), "comma-separated connector ids to run")
+	enabled := flag.String("connectors", env("FA_CONNECTORS", heartbeat.ID), "comma-separated connector ids to run at startup")
+	tsdbURL := flag.String("tsdb-url", env("FA_TSDB_URL", "http://127.0.0.1:8428"), "VictoriaMetrics base URL for trade samples (empty disables)")
 	hbEvery := flag.Duration("heartbeat", 5*time.Second, "service heartbeat interval")
 	flag.Parse()
 
@@ -64,46 +79,95 @@ func main() {
 	instance := ulid.Make().String()
 	go bus.RunHeartbeat(ctx, pub, service, instance, "0.1.0", *hbEvery, counters, func(err error) { log.Warn("heartbeat", "err", err) })
 
+	var writer *tsdb.Writer
+	if *tsdbURL != "" {
+		writer = tsdb.New(*tsdbURL, tsdb.Options{})
+		go writer.Run(ctx, func(err error) { log.Warn("tsdb", "err", err) })
+		go func() { // mirror writer stats into heartbeat counters
+			t := time.NewTicker(time.Second)
+			defer t.Stop()
+			for {
+				st := writer.Stats()
+				counters.Set("tsdb.written", float64(st.Written))
+				counters.Set("tsdb.errors", float64(st.Errors))
+				counters.Set("tsdb.dropped", float64(st.Dropped))
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+				}
+			}
+		}()
+	}
+
 	resolver := connector.NewStaticResolver()
-	var wg sync.WaitGroup
-	for _, id := range strings.Split(*enabled, ",") {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			continue
-		}
-		src, ok := cat.ByID(id)
-		if !ok {
-			// Built-in synthetic sources (heartbeat) are not in the catalog.
-			src = catalog.Source{ID: id, Name: id, Status: "live", Auth: "none"}
-		}
-		c, err := connector.New(id)
-		if err != nil {
-			log.Error("connector", "id", id, "err", err)
-			continue
-		}
-		deps := connector.Deps{
+	deps := func(src catalog.Source) connector.Deps {
+		return connector.Deps{
 			Limiter:  connector.NewLimiter(src.Limit()),
 			Resolver: resolver,
 			Archive:  connector.NopArchive{},
 			Clock:    connector.SystemClock{},
 		}
-		if err := c.Init(ctx, connector.SourceConfig{Source: src}, deps); err != nil {
-			log.Error("init", "id", id, "err", err)
+	}
+	sup := NewSupervisor(cat, log, counters, deps, func(ctx context.Context, log *slog.Logger, c connector.Connector) {
+		run(ctx, log, c, pub, writer, counters)
+	})
+
+	for _, id := range strings.Split(*enabled, ",") {
+		if id = strings.TrimSpace(id); id == "" {
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			run(ctx, log.With("source", id), c, pub, counters)
-		}()
+		if err := sup.Start(ctx, id); err != nil {
+			log.Error("start", "id", id, "err", err)
+		}
 	}
-	log.Info("started", "connectors", connector.Registered(), "enabled", *enabled)
-	wg.Wait()
+
+	handle := func(verb string, fn func(*fav1.CtlRequest) (string, error)) {
+		_, err := pub.NC.Subscribe(bus.Ctl("ingest", verb), func(m *nats.Msg) {
+			var req fav1.CtlRequest
+			reply := &fav1.CtlReply{}
+			if err := proto.Unmarshal(m.Data, &req); err != nil {
+				reply.Message = "invalid: decode: " + err.Error()
+			} else if msg, err := fn(&req); err != nil {
+				reply.Message = err.Error()
+			} else {
+				reply.Ok, reply.Message = true, msg
+			}
+			if b, err := proto.Marshal(reply); err == nil && m.Reply != "" {
+				_ = m.Respond(b)
+			}
+		})
+		if err != nil {
+			log.Error("subscribe", "verb", verb, "err", err)
+			os.Exit(1)
+		}
+	}
+	handle("start", func(r *fav1.CtlRequest) (string, error) {
+		id := r.Args["source"]
+		if err := sup.Start(ctx, id); err != nil {
+			return "", err
+		}
+		return "started " + id, nil
+	})
+	handle("stop", func(r *fav1.CtlRequest) (string, error) {
+		id := r.Args["source"]
+		if err := sup.Stop(id); err != nil {
+			return "", err
+		}
+		return "stopped " + id, nil
+	})
+	handle("status", func(*fav1.CtlRequest) (string, error) {
+		return strings.Join(sup.Running(), ","), nil
+	})
+
+	log.Info("started", "connectors", connector.Registered(), "running", sup.Running(), "tsdb", *tsdbURL)
+	<-ctx.Done()
+	sup.Wait()
 	log.Info("stopped")
 }
 
-// run drives one connector: stream or poll, normalize, publish.
-func run(ctx context.Context, log *slog.Logger, c connector.Connector, pub *bus.Publisher, counters *bus.Counters) {
+// run drives one connector: stream or poll, normalize, publish, write to the TSDB.
+func run(ctx context.Context, log *slog.Logger, c connector.Connector, pub *bus.Publisher, writer *tsdb.Writer, counters *bus.Counters) {
 	id := c.ID()
 	norm, ok := c.(connector.Normalizer)
 	if !ok {
@@ -149,6 +213,9 @@ func run(ctx context.Context, log *slog.Logger, c connector.Connector, pub *bus.
 				continue
 			}
 			counters.Add("events."+id, 1)
+			if writer != nil {
+				writer.AddEnvelope(e, venue)
+			}
 		}
 	}
 }

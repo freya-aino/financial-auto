@@ -165,8 +165,10 @@ services:
       dockerfile: docker/go.Dockerfile
     image: financial-auto/go:dev
     entrypoint: ["ingestor"]
-    command: ["-nats", "nats://nats:4222", "-catalog", "/app/config/sources.yaml", "-connectors", "heartbeat"]
+    command: ["-nats", "nats://nats:4222", "-catalog", "/app/config/sources.yaml", "-connectors", "heartbeat", "-tsdb-url", "http://victoriametrics:8428"]
     depends_on:
+      victoriametrics:
+        condition: service_healthy
       nats:
         condition: service_healthy
     restart: unless-stopped
@@ -186,6 +188,8 @@ services:
     image: financial-auto/go:dev
     entrypoint: ["evo-orchestrator"]
     command: ["-nats", "nats://nats:4222"]
+    environment:
+      FA_GPU_MEM_MB: "24000" # reported as gpu.capacity_mb (D-031); set to the real card
     depends_on:
       nats:
         condition: service_healthy

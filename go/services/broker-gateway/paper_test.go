@@ -43,3 +43,19 @@ func TestPaperRejectsLiveAndUnmarketableLimit(t *testing.T) {
 		t.Fatal("unmarketable buy limit must cancel")
 	}
 }
+
+func TestPaperFeeModel(t *testing.T) {
+	p := NewPaperEngine()
+	p.ObserveTrade("md.trade.sim.01900000000070008000000000000001", 100)
+	if ev := p.Execute(intent("zero")); ev.Fee != 0 || ev.FeeCurrency != "EUR" {
+		t.Fatalf("default must be zero-fee: %v", ev)
+	}
+	p.Fees = BpsFee{Bps: 10, Min: 1} // 10 bps of 200 notional = 0.2 → floored to 1
+	if ev := p.Execute(intent("bps")); ev.Fee != 1 {
+		t.Fatalf("want min fee 1, got %v", ev.Fee)
+	}
+	p.Fees = BpsFee{Bps: 100}
+	if ev := p.Execute(intent("bps2")); ev.Fee != 2 {
+		t.Fatalf("want 1%% of 200 = 2, got %v", ev.Fee)
+	}
+}

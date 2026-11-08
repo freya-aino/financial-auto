@@ -68,7 +68,7 @@ type Deps struct {
 
 ### 4.3 Control
 - `jobs.ingest.backfill` work queue (21) for backfill requests from the control API / trainer.
-- `ctl.ingest.<source_id>.{start|stop|reload}` request/reply.
+- `ctl.ingest.{start|stop|status}` request/reply with arg `source` (D-036; `reload` pending).
 - `DiscoveryHook` interface: `Discover(ctx, query) ([]SourceTarget, error)` — no implementation in v1.
 
 ## 5. Data model
