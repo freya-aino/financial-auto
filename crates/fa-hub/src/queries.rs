@@ -1,0 +1,664 @@
+//! Typed queries: one function per `QUERY` in `helix/queries.hx` (same name, snake_case),
+//! translated into `/v2/query` operation trees, plus the graph reads spec 50 §4.4/§4.5 need.
+//!
+//! Conventions
+//! - `ID` parameters of the `.hx` catalog are Helix node ids (`u64`, the `$id` of a row).
+//! - Writes return the created row(s) read back in the same batch (`value_map` /
+//!   `edge_properties`), so callers get both the node id and the stored properties.
+//! - `Date` properties are written as `{"date_time": unix_ms}` and read back as RFC 3339 strings.
+//! - Uniqueness is enforced by the indexes of [`crate::schema`]; a duplicate business id fails
+//!   with [`HubError::is_unique_violation`](crate::HubError::is_unique_violation). The `upsert_*`
+//!   functions use a conditional batch (lookup → `set_property` or `add_n`) instead.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value as Json;
+
+use crate::ast::{Batch, Cond, EdgeRef, Input, NodeRef, Op, Pred, Val};
+use crate::schema::{LATENT_TENANT, edge, latent_vec_property, node};
+use crate::{HubClient, HubError, Result};
+
+// ── row types ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct Instrument {
+    #[serde(rename = "$id")]
+    pub id: u64,
+    pub instrument_id: String,
+    pub asset_class: String,
+    pub kind: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct Snapshot {
+    #[serde(rename = "$id")]
+    pub id: u64,
+    pub snapshot_id: String,
+    pub timescale: String,
+    pub encoder_family: String,
+    pub generation: u32,
+    pub garage_key: String,
+    /// `candidate | active | retired`
+    pub status: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ExpertSpace {
+    #[serde(rename = "$id")]
+    pub id: u64,
+    pub expert_space_id: String,
+    pub snapshot_id: String,
+    pub index: u32,
+    pub dim: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct LatentRegion {
+    #[serde(rename = "$id")]
+    pub id: u64,
+    pub region_id: String,
+    /// Stable across generations (D-007).
+    pub lineage_id: String,
+    pub expert_space_id: String,
+    pub method: String,
+    pub radius: f64,
+    pub density: f64,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+/// A `Transition` edge row (`edge_properties`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct Transition {
+    #[serde(rename = "$id")]
+    pub id: u64,
+    #[serde(rename = "$from")]
+    pub from: u64,
+    #[serde(rename = "$to")]
+    pub to: u64,
+    pub sampler_id: String,
+    pub count: i64,
+    pub mean: f64,
+    pub lower: f64,
+    pub upper: f64,
+    /// JSON.
+    pub kernel_params: String,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct Genome {
+    #[serde(rename = "$id")]
+    pub id: u64,
+    pub genome_id: String,
+    /// `encoder | decoder | strategy | sampler | allocator`
+    pub kind: String,
+    pub family: String,
+    /// JSON.
+    pub params: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct FitnessRecord {
+    #[serde(rename = "$id")]
+    pub id: u64,
+    pub genome_id: String,
+    pub generation: u32,
+    /// JSON: reconstruction, forecast, trading, cost.
+    pub objectives: String,
+    pub pareto_rank: u32,
+}
+
+/// A vector-search hit on `LatentVec` (`$distance`: smaller is closer; cosine).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct LatentHit {
+    #[serde(rename = "$id")]
+    pub id: u64,
+    #[serde(rename = "$distance")]
+    pub distance: f64,
+    pub expert_space_id: String,
+    /// `centroid | observation | window`
+    pub kind: String,
+    pub ref_id: String,
+    pub instrument_id: String,
+    #[serde(default)]
+    pub ts: Option<String>,
+    pub uncertainty: f64,
+}
+
+/// Any edge row as returned by `edge_properties`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct EdgeRow {
+    #[serde(rename = "$id")]
+    pub id: u64,
+    #[serde(rename = "$label")]
+    pub label: String,
+    #[serde(rename = "$from")]
+    pub from: u64,
+    #[serde(rename = "$to")]
+    pub to: u64,
+    #[serde(flatten)]
+    pub properties: serde_json::Map<String, Json>,
+}
+
+/// Any node row as returned by `value_map`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct NodeRow {
+    #[serde(rename = "$id")]
+    pub id: u64,
+    #[serde(rename = "$label")]
+    pub label: String,
+    #[serde(flatten)]
+    pub properties: serde_json::Map<String, Json>,
+}
+
+/// Regions of one expert space and the transitions among them (spec 50 `/api/mcmc/{snapshot}/graph`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+pub struct RegionGraph {
+    pub regions: Vec<LatentRegion>,
+    pub transitions: Vec<Transition>,
+}
+
+/// Subgraph around a node (spec 50 `/api/graph/neighborhood`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+pub struct Neighborhood {
+    pub nodes: Vec<NodeRow>,
+    pub edges: Vec<EdgeRow>,
+}
+
+// ── write payloads ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewInstrument {
+    pub instrument_id: String,
+    pub asset_class: String,
+    pub kind: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewSnapshot {
+    pub snapshot_id: String,
+    pub timescale: String,
+    pub encoder_family: String,
+    pub generation: u32,
+    pub garage_key: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewExpertSpace {
+    pub expert_space_id: String,
+    pub snapshot_id: String,
+    pub index: u32,
+    pub dim: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewRegion {
+    pub region_id: String,
+    pub lineage_id: String,
+    pub expert_space_id: String,
+    pub method: String,
+    pub radius: f64,
+    pub density: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewTransition {
+    pub sampler_id: String,
+    pub count: i64,
+    pub mean: f64,
+    pub lower: f64,
+    pub upper: f64,
+    pub kernel_params: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewLatent {
+    pub vector: Vec<f32>,
+    pub expert_space_id: String,
+    pub kind: String,
+    pub ref_id: String,
+    pub instrument_id: String,
+    /// Unix milliseconds.
+    pub ts_ms: i64,
+    pub uncertainty: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewGenome {
+    pub genome_id: String,
+    pub kind: String,
+    pub family: String,
+    pub params: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewFitness {
+    pub genome_id: String,
+    pub generation: u32,
+    pub objectives: String,
+    pub pareto_rank: u32,
+}
+
+fn s(v: &str) -> Input {
+    Input::Lit(Val::Str(v.to_owned()))
+}
+
+/// `add_n(label, props)` as entry `n`, read back as `row`; returns the batch to extend.
+fn add_node(batch: Batch, label: &str, props: Vec<(&str, Input)>) -> Batch {
+    batch.var("n", Op::add_n(label, props)).ret("row", Op::nodes(NodeRef::var("n")).value_map(None))
+}
+
+/// Lookup by label + unique key, read back with `value_map`.
+fn by_key(label: &str, key: &str, value: &str) -> Op {
+    Op::nodes_with_label_where(label, Pred::eq(key, value)).value_map(None)
+}
+
+impl HubClient {
+    // ── reference ───────────────────────────────────────────────────────────
+
+    /// `upsertInstrument`: a real upsert (lookup → update properties, else insert).
+    pub async fn upsert_instrument(&self, inst: &NewInstrument) -> Result<Instrument> {
+        let existing =
+            Op::nodes_with_label_where(node::INSTRUMENT, Pred::eq("instrument_id", inst.instrument_id.as_str()));
+        let updated = Op::nodes(NodeRef::var("existing"))
+            .set_property("asset_class", inst.asset_class.as_str())
+            .set_property("kind", inst.kind.as_str())
+            .set_property("name", inst.name.as_str())
+            .value_map(None);
+        let created = Op::add_n(
+            node::INSTRUMENT,
+            vec![
+                ("instrument_id", s(&inst.instrument_id)),
+                ("asset_class", s(&inst.asset_class)),
+                ("kind", s(&inst.kind)),
+                ("name", s(&inst.name)),
+            ],
+        );
+        let batch = Batch::write()
+            .named("upsert_instrument")
+            .var("existing", existing)
+            .var_if("updated", Cond::VarNotEmpty("existing".into()), updated)
+            .var_if("created", Cond::VarEmpty("existing".into()), created)
+            .var_if(
+                "created_row",
+                Cond::VarNotEmpty("created".into()),
+                Op::nodes(NodeRef::var("created")).value_map(None),
+            )
+            .returning(["updated", "created_row"]);
+        let mut resp = self.batch(&batch).await?;
+        if let Some(row) = resp.take_opt::<Instrument>("updated")? {
+            return Ok(row);
+        }
+        resp.take_one("created_row")
+    }
+
+    /// `getInstrument`
+    pub async fn get_instrument(&self, instrument_id: &str) -> Result<Option<Instrument>> {
+        let mut resp =
+            self.batch(&Batch::read().ret("row", by_key(node::INSTRUMENT, "instrument_id", instrument_id))).await?;
+        resp.take_opt("row")
+    }
+
+    // ── snapshots and expert spaces ─────────────────────────────────────────
+
+    /// `addSnapshot` (fails with a unique violation if `snapshot_id` exists).
+    pub async fn add_snapshot(&self, snap: &NewSnapshot) -> Result<Snapshot> {
+        let props = vec![
+            ("snapshot_id", s(&snap.snapshot_id)),
+            ("timescale", s(&snap.timescale)),
+            ("encoder_family", s(&snap.encoder_family)),
+            ("generation", snap.generation.into()),
+            ("garage_key", s(&snap.garage_key)),
+            ("status", s(&snap.status)),
+            ("created_at", Input::Now),
+        ];
+        let mut resp = self.batch(&add_node(Batch::write().named("add_snapshot"), node::SNAPSHOT, props)).await?;
+        resp.take_one("row")
+    }
+
+    /// `addExpertSpace`: inserts the space and the `HasSpace` edge from `snapshot`.
+    pub async fn add_expert_space(&self, snapshot: u64, space: &NewExpertSpace) -> Result<ExpertSpace> {
+        let props = vec![
+            ("expert_space_id", s(&space.expert_space_id)),
+            ("snapshot_id", s(&space.snapshot_id)),
+            ("index", space.index.into()),
+            ("dim", space.dim.into()),
+        ];
+        let batch = add_node(Batch::write().named("add_expert_space"), node::EXPERT_SPACE, props)
+            .var("edge", Op::nodes(snapshot).add_e(edge::HAS_SPACE, NodeRef::var("n"), vec![]));
+        let mut resp = self.batch(&batch).await?;
+        resp.take_one("row")
+    }
+
+    /// `listSnapshots`
+    pub async fn list_snapshots(&self) -> Result<Vec<Snapshot>> {
+        let op = Op::nodes_with_label(node::SNAPSHOT).order_by("snapshot_id", false).value_map(None);
+        let mut resp = self.batch(&Batch::read().named("list_snapshots").ret("rows", op)).await?;
+        resp.take("rows")
+    }
+
+    /// Lookup by business id (what control-api routes receive).
+    pub async fn snapshot_by_id(&self, snapshot_id: &str) -> Result<Option<Snapshot>> {
+        let mut resp =
+            self.batch(&Batch::read().ret("row", by_key(node::SNAPSHOT, "snapshot_id", snapshot_id))).await?;
+        resp.take_opt("row")
+    }
+
+    /// `snapshotSpaces`: `N<Snapshot>(snapshot)::Out<HasSpace>`
+    pub async fn snapshot_spaces(&self, snapshot: u64) -> Result<Vec<ExpertSpace>> {
+        let op = Op::nodes(snapshot).out(Some(edge::HAS_SPACE)).value_map(None);
+        let mut resp = self.batch(&Batch::read().named("snapshot_spaces").ret("rows", op)).await?;
+        resp.take("rows")
+    }
+
+    /// Set `status` on a snapshot (`promote`/`rollback` routes). Returns the updated row.
+    pub async fn set_snapshot_status(&self, snapshot: u64, status: &str) -> Result<Snapshot> {
+        let op = Op::nodes(snapshot).set_property("status", status).value_map(None);
+        let mut resp = self.batch(&Batch::write().named("set_snapshot_status").ret("row", op)).await?;
+        resp.take_one("row")
+    }
+
+    // ── regions and transitions ─────────────────────────────────────────────
+
+    /// `addRegion`: inserts the region and its `InSpace` edge to `space`.
+    pub async fn add_region(&self, space: u64, region: &NewRegion) -> Result<LatentRegion> {
+        let props = vec![
+            ("region_id", s(&region.region_id)),
+            ("lineage_id", s(&region.lineage_id)),
+            ("expert_space_id", s(&region.expert_space_id)),
+            ("method", s(&region.method)),
+            ("radius", region.radius.into()),
+            ("density", region.density.into()),
+            ("created_at", Input::Now),
+        ];
+        let batch = add_node(Batch::write().named("add_region"), node::LATENT_REGION, props)
+            .var("edge", Op::nodes(NodeRef::var("n")).add_e(edge::IN_SPACE, space, vec![]));
+        let mut resp = self.batch(&batch).await?;
+        resp.take_one("row")
+    }
+
+    /// `spaceRegions`: `N<ExpertSpace>(space)::In<InSpace>`
+    pub async fn space_regions(&self, space: u64) -> Result<Vec<LatentRegion>> {
+        let op = Op::nodes(space).r#in(Some(edge::IN_SPACE)).value_map(None);
+        let mut resp = self.batch(&Batch::read().named("space_regions").ret("rows", op)).await?;
+        resp.take("rows")
+    }
+
+    /// `addTransition`: `AddE<Transition>::From(from)::To(to)`, returned as an edge row.
+    pub async fn add_transition(&self, from: u64, to: u64, t: &NewTransition) -> Result<Transition> {
+        let props = vec![
+            ("sampler_id", s(&t.sampler_id)),
+            ("count", t.count.into()),
+            ("mean", t.mean.into()),
+            ("lower", t.lower.into()),
+            ("upper", t.upper.into()),
+            ("kernel_params", s(&t.kernel_params)),
+            ("updated_at", Input::Now),
+        ];
+        let batch = Batch::write()
+            .named("add_transition")
+            .var("e", Op::nodes(from).add_e(edge::TRANSITION, to, props))
+            .ret("row", Op::edges(EdgeRef::Var("e".into())).edge_properties());
+        let mut resp = self.batch(&batch).await?;
+        resp.take_one("row")
+    }
+
+    /// `regionTransitions`: outgoing `Transition` edges of a region.
+    pub async fn region_transitions(&self, region: u64) -> Result<Vec<Transition>> {
+        let op = Op::nodes(region).out_e(Some(edge::TRANSITION)).edge_properties();
+        let mut resp = self.batch(&Batch::read().named("region_transitions").ret("rows", op)).await?;
+        resp.take("rows")
+    }
+
+    /// `regionNeighbors`: regions reachable over one `Transition`.
+    pub async fn region_neighbors(&self, region: u64) -> Result<Vec<LatentRegion>> {
+        let op = Op::nodes(region).out(Some(edge::TRANSITION)).dedup().value_map(None);
+        let mut resp = self.batch(&Batch::read().named("region_neighbors").ret("rows", op)).await?;
+        resp.take("rows")
+    }
+
+    /// `matchRegions`: `RegionMatch{score}` edge prev → next; returns the edge id.
+    pub async fn match_regions(&self, prev: u64, next: u64, score: f64) -> Result<u64> {
+        let op = Op::nodes(prev).add_e(edge::REGION_MATCH, next, vec![("score", score.into())]);
+        let mut resp = self.batch(&Batch::write().named("match_regions").ret("e", op)).await?;
+        Ok(resp.take_one::<IdRow>("e")?.id)
+    }
+
+    /// Regions of an expert space with all transitions among them (one round trip).
+    pub async fn region_graph(&self, space: u64) -> Result<RegionGraph> {
+        let batch = Batch::read()
+            .named("region_graph")
+            .var("regions", Op::nodes(space).r#in(Some(edge::IN_SPACE)))
+            .ret("region_rows", Op::nodes(NodeRef::var("regions")).value_map(None))
+            .ret("transitions", Op::nodes(NodeRef::var("regions")).out_e(Some(edge::TRANSITION)).edge_properties());
+        let mut resp = self.batch(&batch).await?;
+        Ok(RegionGraph { regions: resp.take("region_rows")?, transitions: resp.take("transitions")? })
+    }
+
+    // ── latent vectors ──────────────────────────────────────────────────────
+
+    /// `addLatent`: a `LatentVec` node whose vector sits in `vec<dim>`. Call
+    /// [`HubClient::ensure_latent_index`](crate::HubClient::ensure_latent_index) for that
+    /// dimension once per server, or searches report `index_not_found`.
+    pub async fn add_latent(&self, latent: &NewLatent) -> Result<u64> {
+        let prop = latent_vec_property(latent.vector.len());
+        let props = vec![
+            (LATENT_TENANT, s(&latent.expert_space_id)),
+            ("kind", s(&latent.kind)),
+            ("ref_id", s(&latent.ref_id)),
+            ("instrument_id", s(&latent.instrument_id)),
+            ("ts", Input::Lit(Val::DateTime(latent.ts_ms))),
+            ("uncertainty", latent.uncertainty.into()),
+            (prop.as_str(), latent.vector.clone().into()),
+        ];
+        let mut resp =
+            self.batch(&Batch::write().named("add_latent").ret("n", Op::add_n(node::LATENT_VEC, props))).await?;
+        Ok(resp.take_one::<IdRow>("n")?.id)
+    }
+
+    /// Several latents (same or mixed dimensions) in one write batch; returns their node ids.
+    pub async fn add_latents(&self, latents: &[NewLatent]) -> Result<Vec<u64>> {
+        let mut batch = Batch::write().named("add_latents");
+        let names: Vec<String> = (0..latents.len()).map(|i| format!("n{i}")).collect();
+        for (name, l) in names.iter().zip(latents) {
+            let prop = latent_vec_property(l.vector.len());
+            let props = vec![
+                (LATENT_TENANT, s(&l.expert_space_id)),
+                ("kind", s(&l.kind)),
+                ("ref_id", s(&l.ref_id)),
+                ("instrument_id", s(&l.instrument_id)),
+                ("ts", Input::Lit(Val::DateTime(l.ts_ms))),
+                ("uncertainty", l.uncertainty.into()),
+                (prop.as_str(), l.vector.clone().into()),
+            ];
+            batch = batch.ret(name, Op::add_n(node::LATENT_VEC, props));
+        }
+        let mut resp = self.batch(&batch).await?;
+        names.iter().map(|n| Ok(resp.take_one::<IdRow>(n)?.id)).collect()
+    }
+
+    /// `searchLatent`, scoped to one expert space (the index tenant): k nearest `LatentVec`s
+    /// to `vector` by cosine distance. Caller filters by `kind` / time distance (spec 34).
+    pub async fn search_latent(&self, expert_space_id: &str, vector: &[f32], k: usize) -> Result<Vec<LatentHit>> {
+        let prop = latent_vec_property(vector.len());
+        let op =
+            Op::vector_search_nodes(node::LATENT_VEC, &prop, vector.to_vec(), k, Some(s(expert_space_id))).value_map(
+                Some(&["$id", "$distance", LATENT_TENANT, "kind", "ref_id", "instrument_id", "ts", "uncertainty"]),
+            );
+        let mut resp = self.batch(&Batch::read().named("search_latent").ret("hits", op)).await?;
+        resp.take("hits")
+    }
+
+    // ── evolution ───────────────────────────────────────────────────────────
+
+    /// `addGenome`
+    pub async fn add_genome(&self, g: &NewGenome) -> Result<Genome> {
+        let props = vec![
+            ("genome_id", s(&g.genome_id)),
+            ("kind", s(&g.kind)),
+            ("family", s(&g.family)),
+            ("params", s(&g.params)),
+            ("created_at", Input::Now),
+        ];
+        let mut resp = self.batch(&add_node(Batch::write().named("add_genome"), node::GENOME, props)).await?;
+        resp.take_one("row")
+    }
+
+    pub async fn genome_by_id(&self, genome_id: &str) -> Result<Option<Genome>> {
+        let mut resp = self.batch(&Batch::read().ret("row", by_key(node::GENOME, "genome_id", genome_id))).await?;
+        resp.take_opt("row")
+    }
+
+    /// `addLineage`: `ParentOf{op}` parent → child; returns the edge id.
+    pub async fn add_lineage(&self, parent: u64, child: u64, op: &str) -> Result<u64> {
+        let e = Op::nodes(parent).add_e(edge::PARENT_OF, child, vec![("op", op.into())]);
+        let mut resp = self.batch(&Batch::write().named("add_lineage").ret("e", e)).await?;
+        Ok(resp.take_one::<IdRow>("e")?.id)
+    }
+
+    /// `addFitness`: inserts the record and the `Scored` edge from `genome`.
+    pub async fn add_fitness(&self, genome: u64, f: &NewFitness) -> Result<FitnessRecord> {
+        let props = vec![
+            ("genome_id", s(&f.genome_id)),
+            ("generation", f.generation.into()),
+            ("objectives", s(&f.objectives)),
+            ("pareto_rank", f.pareto_rank.into()),
+        ];
+        let batch = add_node(Batch::write().named("add_fitness"), node::FITNESS_RECORD, props)
+            .var("edge", Op::nodes(genome).add_e(edge::SCORED, NodeRef::var("n"), vec![]));
+        let mut resp = self.batch(&batch).await?;
+        resp.take_one("row")
+    }
+
+    /// `genomeParents`: `N<Genome>(genome)::In<ParentOf>`
+    pub async fn genome_parents(&self, genome: u64) -> Result<Vec<Genome>> {
+        let op = Op::nodes(genome).r#in(Some(edge::PARENT_OF)).value_map(None);
+        let mut resp = self.batch(&Batch::read().named("genome_parents").ret("rows", op)).await?;
+        resp.take("rows")
+    }
+
+    /// `genomeFitness`: `N<Genome>(genome)::Out<Scored>`
+    pub async fn genome_fitness(&self, genome: u64) -> Result<Vec<FitnessRecord>> {
+        let op = Op::nodes(genome).out(Some(edge::SCORED)).value_map(None);
+        let mut resp = self.batch(&Batch::read().named("genome_fitness").ret("rows", op)).await?;
+        resp.take("rows")
+    }
+
+    /// Ancestry levels of a genome (spec 50 `/api/graph/lineage/{genome_id}`): element `i` holds
+    /// the ancestors `i + 1` `ParentOf` hops away, up to `max_depth`. Trailing empty levels are dropped.
+    pub async fn genome_ancestry(&self, genome: u64, max_depth: usize) -> Result<Vec<Vec<Genome>>> {
+        let mut batch = Batch::read().named("genome_ancestry").var("f0", Op::nodes(genome));
+        for d in 1..=max_depth {
+            let prev = format!("f{}", d - 1);
+            let name = format!("f{d}");
+            batch = batch.var(&name, Op::nodes(NodeRef::var(&prev)).r#in(Some(edge::PARENT_OF)).dedup());
+            batch = batch.ret(&format!("r{d}"), Op::nodes(NodeRef::var(&name)).value_map(None));
+        }
+        let mut resp = self.batch(&batch).await?;
+        let mut levels: Vec<Vec<Genome>> =
+            (1..=max_depth).map(|d| resp.take(&format!("r{d}"))).collect::<Result<_>>()?;
+        while levels.last().is_some_and(Vec::is_empty) {
+            levels.pop();
+        }
+        Ok(levels)
+    }
+
+    // ── generic graph reads ─────────────────────────────────────────────────
+
+    /// Nodes within `depth` hops (any edge label, both directions) of `node`, and every edge
+    /// touching the inner frontier (spec 50 `/api/graph/neighborhood`). Includes `node` itself.
+    pub async fn neighborhood(&self, node_id: u64, depth: usize) -> Result<Neighborhood> {
+        let mut batch = Batch::read()
+            .named("neighborhood")
+            .var("f0", Op::nodes(node_id))
+            .ret("n0", Op::nodes(node_id).value_map(None));
+        for d in 1..=depth {
+            let prev = format!("f{}", d - 1);
+            batch = batch
+                .var(&format!("f{d}"), Op::nodes(NodeRef::var(&prev)).both(None).dedup())
+                .ret(&format!("n{d}"), Op::nodes(NodeRef::var(format!("f{d}"))).value_map(None))
+                .ret(&format!("e{d}"), Op::nodes(NodeRef::var(&prev)).both_e(None).edge_properties());
+        }
+        let mut resp = self.batch(&batch).await?;
+        let mut out = Neighborhood::default();
+        for d in 0..=depth {
+            let rows: Vec<NodeRow> = resp.take(&format!("n{d}"))?;
+            for r in rows {
+                if !out.nodes.iter().any(|n| n.id == r.id) {
+                    out.nodes.push(r);
+                }
+            }
+            if d > 0 {
+                let rows: Vec<EdgeRow> = resp.take(&format!("e{d}"))?;
+                for r in rows {
+                    if !out.edges.iter().any(|e| e.id == r.id) {
+                        out.edges.push(r);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Count nodes with a label.
+    pub async fn count_nodes(&self, label: &str) -> Result<u64> {
+        let v = self.query(Op::nodes_with_label(label).count()).await?;
+        v.as_u64().ok_or_else(|| HubError::Shape { name: "count".into(), detail: v.to_string() })
+    }
+
+    /// Delete nodes with `label` matching `pred`, together with their incident edges.
+    pub async fn drop_nodes(&self, label: &str, pred: Pred) -> Result<()> {
+        self.query(Op::nodes_with_label_where(label, pred).drop()).await?;
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct IdRow {
+    #[serde(rename = "$id")]
+    id: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rows_deserialize_from_server_shapes() {
+        let t: Transition = serde_json::from_value(json!({
+            "$from": 2, "$id": 0, "$label": "Transition", "$to": 3, "sampler_id": "s", "count": 5,
+            "mean": 0.25, "lower": 0.1, "upper": 0.4, "kernel_params": "{}", "updated_at": "2026-11-08T17:51:51.867Z"
+        }))
+        .unwrap();
+        assert_eq!((t.from, t.to, t.count), (2, 3, 5));
+        let h: LatentHit = serde_json::from_value(json!({
+            "$distance": 0.003, "$id": 3, "expert_space_id": "sp1", "kind": "window", "ref_id": "w2",
+            "instrument_id": "BTC", "ts": "2025-11-08T16:40:00.000Z", "uncertainty": 0.1
+        }))
+        .unwrap();
+        assert_eq!(h.ref_id, "w2");
+        let n: NodeRow = serde_json::from_value(json!({ "$id": 1, "$label": "Snapshot", "status": "active" })).unwrap();
+        assert_eq!(n.properties["status"], "active");
+    }
+
+    #[test]
+    fn add_node_batch_reads_row_back() {
+        let b = add_node(Batch::write(), node::SNAPSHOT, vec![("snapshot_id", s("s1"))]).to_json();
+        let entries = &b["query"]["write"]["entries"];
+        assert_eq!(entries[0]["query"]["name"], "n");
+        assert_eq!(
+            entries[1]["query"]["root"],
+            json!({ "value_map": { "input": { "nodes": { "reference": { "var": "n" } } } } })
+        );
+        assert_eq!(b["query"]["write"]["returns"], json!(["row"]));
+    }
+}

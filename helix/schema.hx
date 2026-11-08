@@ -1,9 +1,14 @@
-// HelixDB schema (spec 20 §5.2). UNVALIDATED: written from the HelixQL docs without the
-// `helix` CLI available. Run `helix check` once the CLI is installed and fix what it reports.
+// HelixDB schema catalog (spec 20 §5.2). Human-readable source of truth for the data model;
+// the standalone server (D-033) is schemaless and infers labels/properties on write, so this
+// file is NOT loaded by HelixDB. Its executable mirror is crates/fa-hub/src/schema.rs:
+//   - every UNIQUE INDEX / INDEX line  -> node_equality index in `schema::static_indexes()`
+//   - every V:: type                  -> a `node_vector` index per dimension (`vec<dim>` property),
+//                                        partitioned by `expert_space_id` (tenant_property)
+//   - `Date DEFAULT NOW`              -> `date_time_now` expression on insert
+// Keep both in sync; run `cargo test -p fa-hub --test live` against a running server.
 //
-// Vector types are static in HelixQL, but expert spaces are created at runtime with varying
-// dims. v1 stores all latents in one `LatentVec` type and filters by `expert_space_id`.
-// Revisit with the Helix scale benchmark (spec 20 open question 2).
+// Mixed-dimension latents: one `LatentVec` label, vector stored in property `vec<dim>` with one
+// index per dim, each partitioned per expert space. (Resolves the earlier open question.)
 
 // ── Reference graph (mirrored from Postgres `ref`, spec 12) ─────────────
 N::Instrument {

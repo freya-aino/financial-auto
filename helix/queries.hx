@@ -1,5 +1,8 @@
-// HelixQL query catalog (spec 20). UNVALIDATED until `helix check` runs.
-// fa-hub wraps each query as a typed Rust function (D-012): POST /<query_name> with JSON params.
+// HelixQL query catalog (spec 20). Readable reference only: the standalone server (D-033) does
+// not compile .hx queries into endpoints. Each QUERY below is implemented as a typed function of
+// the same name (snake_case) on `fa_hub::HubClient` (crates/fa-hub/src/queries.rs), sent as a
+// `/v2/query` operation-tree batch. `ID` params are Helix node ids (u64). Verified by
+// `cargo test -p fa-hub --test live`.
 
 // ── Reference ───────────────────────────────────────────────────────────
 QUERY upsertInstrument(instrument_id: String, asset_class: String, kind: String, name: String) =>
