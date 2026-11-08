@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | draft |
 | **Maturity** | Medium-high |
-| **Owners (code)** | `proto/`, `crates/fa-proto`, `crates/fa-bus`, `go/pkg/bus`, `deploy/compose.yaml` (NATS) |
+| **Owners (code)** | `proto/`, `crates/fa-proto`, `crates/fa-bus`, `go/pkg/bus`, `compose.yaml` (NATS) |
 | **Depends on** | 10-ingestion, 20-storage, 60-ops |
 
 ## 1. Purpose

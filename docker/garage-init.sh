@@ -2,7 +2,7 @@
 # One-time Garage init: single-node layout, buckets from config/platform.toml, access key.
 # Safe to re-run: existing layout/buckets/key produce errors that are ignored.
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 G() { docker compose exec -T garage /garage "$@"; }
 
 NODE=$(G node id -q | cut -d@ -f1)

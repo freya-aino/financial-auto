@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | draft |
 | **Maturity** | Medium |
-| **Owners (code)** | `crates/fa-hub` (HelixDB), `crates/fa-tsdb` (VictoriaMetrics), `crates/fa-warehouse` (Postgres), `crates/fa-blob` (Garage S3), `helix/`, `migrations/`, `deploy/compose.yaml` |
+| **Owners (code)** | `crates/fa-hub` (HelixDB), `crates/fa-tsdb` (VictoriaMetrics), `crates/fa-warehouse` (Postgres), `crates/fa-blob` (Garage S3), `helix/`, `migrations/`, `compose.yaml` |
 | **Depends on** | 10-ingestion, 12-reference-data, 21-bus-and-contracts, 30–36 (Helix contents), 42-ledger-and-accounting |
 
 ## 1. Purpose

@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | draft |
 | **Maturity** | Medium |
-| **Owners (code)** | `deploy/`, `justfile`, `go/services/evo-orchestrator`, `bins/*` (health/metrics), `config/` |
+| **Owners (code)** | `compose.yaml`, `docker/`, `justfile`, `go/services/evo-orchestrator`, `bins/*` (health/metrics), `config/` |
 | **Depends on** | 01 Architecture, 20 Storage, 21 Bus & contracts, 36 Training lifecycle |
 
 ## 1. Purpose
@@ -25,7 +25,7 @@ Define how the platform runs on a single local workstation today and scales hori
 - Secrets only in git-ignored `config/secrets.toml` or environment variables.
 
 ## 4. Interfaces
-- `deploy/compose.yaml` services and default ports **(proposal)**:
+- `compose.yaml` services and default ports **(proposal)**:
   | Service | Port |
   |---|---|
   | nats | 4222 (client), 8222 (monitor) |

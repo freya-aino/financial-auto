@@ -2,7 +2,7 @@
 # Go, Node and buf fall back to Docker images when not installed locally (rootless Docker: no --user).
 
 root := justfile_directory()
-compose := "docker compose -f " + root + "/deploy/compose.yaml"
+compose := "docker compose -f " + root + "/compose.yaml"
 go_image := "golang:1.25-alpine"
 node_image := "node:22-alpine"
 buf_image := "bufbuild/buf:latest"
@@ -24,7 +24,7 @@ down:
 
 # One-time Garage layout, buckets and key
 garage-init:
-    {{root}}/deploy/garage-init.sh
+    {{root}}/docker/garage-init.sh
 
 # Apply Postgres migrations (needs sqlx-cli: cargo install sqlx-cli --no-default-features --features rustls,postgres)
 migrate:

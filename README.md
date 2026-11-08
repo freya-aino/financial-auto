@@ -8,7 +8,7 @@ Automated multi-asset trading platform. Real-time multimodal market, macro, on-c
 Needs Rust and Docker. Go, Node and buf run in Docker when not installed. Install `just` with `cargo install just`.
 
 ```sh
-just up                      # NATS, Postgres, VictoriaMetrics, Garage (HelixDB: see deploy/README.md)
+just up                      # NATS, HelixDB, Postgres, VictoriaMetrics, Garage (compose.yaml)
 just check                   # Rust + Go + frontend build/lint/test
 just fe-build                # build the UI, served by control-api
 cargo run -p control-api     # http://127.0.0.1:7700 (applies Postgres migrations on start)
@@ -27,7 +27,8 @@ just dev                     # prints how to run the Go ingestor with the heartb
 | `helix/` | HelixDB schema and queries |
 | `migrations/` | PostgreSQL warehouse + ledger schema |
 | `frontend/` | SvelteKit operator UI |
-| `deploy/` | Compose: infra (NATS, HelixDB, VictoriaMetrics, PostgreSQL, Garage) + all platform services under profile `app` |
+| `compose.yaml` | Everything runs through it: infra (NATS, HelixDB, VictoriaMetrics, PostgreSQL, Garage) + all platform services and the UI under profile `app` |
+| `docker/` | Dockerfiles for the Rust and Go images, Garage config and init script |
 | `config/` | Source catalog, platform config (secrets in git-ignored `config/secrets.toml`) |
 
 Every component directory has a `README.md` linking to the specs that govern it.
