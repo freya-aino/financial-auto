@@ -46,6 +46,7 @@ pub trait Evaluator {
 }
 ```
 - Work queue: `jobs.eval.request` / `jobs.eval.result` (21) with `EvalJob { candidate, replay_spec }` → `EvalReport`.
+- **Implemented today (D-044):** `fa_backtest::eval::evaluate` scores a `fa_decoders` series decoder **sequentially point-in-time** (forecast at every step using data `≤ t`, scored against the realised `h`-step log return) and returns the objective set of spec 34 §6.3 (`crps`, `crps_skill`, `coverage`, `coverage_err`, `hit_rate`, `trade_sharpe`, `trade_psr`, `compute_cost`, `n_eval`) with budget/preemption stop hooks and multi-instrument pooling. It is scoring, not walk-forward retraining. The job surface is spec 21's generic `Job` / `JobResult` on `jobs.evo.eval.decoder`, not the dedicated messages above. Deflated Sharpe and PBO (CSCV) are implemented in the crate but not yet applied across the generation's trial set; the ordered replay driver exists, the full pipeline replay (encoders → strategies → paper venue) and the per-venue cost model do not.
 - Control API: `GET /api/validation/holdout`, `GET /api/validation/reports/{candidate}`, `GET /api/validation/shadow/{strategy}`.
 
 ## 5. Data model

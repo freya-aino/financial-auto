@@ -86,6 +86,21 @@ pub enum FamilyGenes {
 - `jobs.evo.decoder.eval` → `fa.v1.EvalJob { genome, snapshot_id, data_window, budget_steps, rung }`
 - `jobs.evo.decoder.result` → `fa.v1.EvalResult { genome_id, objectives[], weights_uri, diagnostics }`
 
+**Implemented today (D-044, `bins/evo-worker`, `crates/fa-decoders`):** the generic `fa.v1.Job` / `fa.v1.JobResult` of spec 21 are used instead of dedicated messages. Job kind is `evo.eval.decoder` on `jobs.evo.eval.decoder` (work queue `JOBS_EVO`), results on `jobs.result.evo.eval.decoder`, progress on `jobs.progress.<job_id>`.
+
+### 4.4 Baseline genome encoding (implemented, D-044)
+The typed `DecoderGenome` above is the target. Until the neural families exist, a genome is a **string** parsed by `fa_decoders::genome::DecoderGenome::parse`, carried in `Job.spec` (UTF-8) or, failing that, `Job.genome_id`:
+
+| Form | Example | Notes |
+|---|---|---|
+| key/value | `forecast:h=5;lb=32;kernel=16;levels=0.1/0.5/0.9` · `retrieval:k=20;tau=30;gap=5;metric=cos` | genes separated by `;` (never `,`: `ctl.evo.start` splits genome lists on commas) |
+| JSON | `{"id":"g1","family":"retrieval","params":{"k":20,"levels":[0.2,0.8],"ts":"1m"}}` | only via `Job.spec` |
+| bare id | `g1`, a ULID | deterministic genome derived from a hash of the id (family by parity, genes jittered around defaults) |
+
+Families: `forecast` (aliases `quantile`, `rnn_prior`; outputs on `decoder.output.rnn_prior`) and `retrieval` (`analog`; outputs on `decoder.output.retrieval`). Common genes: `ts` (timescale, default `1s`), `h` horizon, `lb` lookback, `levels`, `inst`. Forecast: `kernel`, `scale`, `shrink`. Retrieval: `k`, `tau` (days), `gap` (≥ `h`, leakage guard), `metric` (`cos` | `euclid`).
+
+Result payload (`JobResult.result` JSON, protocol `evo.eval.decoder/v0`): `score` (= `crps_skill`, the orchestrator's provisional scalar, D-025), `objectives` and `directions` (keys in §6.3), `genome`, `data` (source + instruments), `budget {budget_ms, elapsed_ms, truncated}`, `stop`, `report_ref {planned, persisted}`.
+
 ## 5. Data model
 | Entity | Store | Fields |
 |---|---|---|
@@ -142,6 +157,8 @@ pub enum FamilyGenes {
 | Compute cost | Inference FLOPs + VRAM + latency (normalised) | min |
 Families without a meaningful value for an objective get a neutral value. Fronts are computed **per family** for selection, and across families for the feedback-elite choice. Overfitting control: PBO estimated across the candidate set per generation (spec 41).
 
+**Implemented today (`fa_backtest::eval`, D-044):** the baseline series decoders report `crps` (min), `crps_skill` = `1 − crps/crps_naive` vs a zero-return forecast (max), `coverage` / `coverage_err` = `|coverage − nominal|` (min), `hit_rate` (max), `trade_sharpe` and `trade_psr` of the naive sign policy net of a bp cost (max), `compute_cost` = log10 arithmetic ops per forecast (min), `n_eval`. "Reconstruction" has no value for these families. The orchestrator still ranks on the scalar `score`; NSGA-II over `objectives` (`fa-evolution`) is the pending step.
+
 ### 6.4 Budget-driven sizing
 - Input: `gpu_hours_per_generation` (per timescale share from spec 60), measured cost per candidate per rung (EMA by family/size).
 - `N_0` (initial candidates) solves `Σ_r N_0 · η^{-r} · cost_r ≤ budget`. Typical outcome: hundreds to thousands of tiny candidates at rung 0.
@@ -150,6 +167,7 @@ Families without a meaningful value for an objective get a neutral value. Fronts
 ### 6.5 Orchestration (Go ↔ Rust)
 - `evo-orchestrator` (Go) owns the generation state machine, variation operators (or delegates them to Rust via a job), rung scheduling, budget accounting and the NSGA selection call. `fa-evolution` exposes NSGA as a job so both decoders and strategies share it.
 - `evo-worker` (Rust) pulls `jobs.evo.decoder.eval`, loads the snapshot + data window, trains/evaluates and returns `EvalResult`. Workers are stateless. Scaling = more workers.
+- **Today (D-044):** the worker scores the genome **sequentially point-in-time** over an in-memory buffer of `md.trade.>` (last 50 000 trades per instrument, stopgap until VictoriaMetrics reads via `fa-tsdb` land), under `budget_gpu_ms`, holding a `ctl.gpu.*` lease (class `evolution_eval`) and returning `PREEMPTED` with a `checkpoint_ref` on `ctl.gpu.preempt`. There is no training step and no `ExpertView` conditioning yet. Eval reports are not persisted (no S3 client in `fa-blob`); the planned key is returned in `report_ref`.
 
 ### 6.6 Feedback to encoders (proposal — core blocker #3)
 At generation end, the elite set `E` (per family, top by front rank and diversity) is handed to the encoder trainer (spec 36) as a feedback term:

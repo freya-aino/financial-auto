@@ -116,6 +116,13 @@ Typed, strongly-typed GP (STGP) over expression trees. Programs evaluate once pe
 
 Constraints: max depth, max nodes, evaluation-time budget per step (cost objective).
 
+#### 4.2.1 Implemented subset and textual form (D-040)
+`crates/fa-strategies` implements the DSL as an AST + interpreter with an **S-expression** text form (`sexpr`) so programs can live in `strategies.toml` files: grammar `atom | (op arg...)`; operators `add sub mul div neg tanh min max if_gt`; primitives `stay_prob`, `(path_up k)`, `region_entropy`, `(quantile q)`, `analog_forecast`, `(score family)`, `position`, `unrealised_pnl`, `time_in_trade`. A strategy entry declares `id`, `genome_id`, `timescale`, `steps` (horizon in bars), `lookback_bars`, optional `step_secs`, and two programs `signal` (→ mean) and `uncertainty` (→ std). Outputs are clipped to `mean ∈ [-1, 1]`, `std ∈ [0, 1]`; NaN → 0 exposure (§8).
+
+**Baseline population:** `crates/fa-strategies/baselines.toml` holds hand-written programs (`genome_id = "baseline"`, **not evolved**) so the signal → allocation → risk → paper-order chain runs before evolution promotes anything (§6.4). `bins/strategy-runtime` runs them live.
+
+**Fallback observation:** until regions, transitions and decoder outputs are consumed, `features::FallbackContext` maps the primitive surface onto empirical price statistics of the strategy's own bar window: `analog_forecast` = mean log return per bar; `(quantile q)` = normal-approximation quantile of lookback returns; `(path_up k)` = share of positive k-bar windows; `stay_prob` = sign persistence (or latent region dwell when `latent.state.>` is present); `region_entropy` = latent posterior std if known, else `std / (|mean| + std)`; transition and decoder-score primitives return 0. This is a placeholder, not the semantics above. Portfolio primitives read the strategy's virtual book (last emitted exposure).
+
 ### 4.3 Neural policy (proposal)
 - **Input:** concatenation of expert latents (masked by genome), region membership embeddings, a graph summary vector (k-step predictive region distribution embedded via region embeddings), cached elite decoder outputs (quantiles, analog stats), portfolio state.
 - **Architecture genes:** MLP / small transformer over asset tokens (set-equivariant across the asset set), width, depth.
@@ -137,6 +144,7 @@ Constraints: max depth, max nodes, evaluation-time budget per step (cost objecti
 - Strategies are evaluated by `fa-backtest` replaying point-in-time inputs (expert views, graph state, decoder outputs) of the **same snapshot** over the evaluation window, at the strategy's timescale.
 - **Execution simulation:** exposure intent → target position (strategy capital) → simulated fills with the spread + slippage model, fees, funding/borrow (cost model per venue/asset class from spec 41/42).
 - Deterministic given seed + snapshot + data window.
+- **Today:** no strategy evaluation job exists. `evo-worker` evaluates decoders only (spec 34 §4.4); strategies run live in `bins/strategy-runtime` from the baseline file and are not scored or evolved.
 
 ### 6.2 Fitness (shared Pareto, proposal)
 | Objective | Definition | Direction |
