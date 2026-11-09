@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | draft |
 | **Maturity** | Medium |
-| **Owners (code)** | `compose.yaml`, `docker/`, `justfile`, `go/services/evo-orchestrator`, `bins/*` (health/metrics), `config/` |
+| **Owners (code)** | `compose.yaml`, `docker/`, `justfile`, `go/services/evo-orchestrator`, `bins/*` (health/metrics, incl. `strategy-runtime`, `risk-engine`), `config/` |
 | **Depends on** | 01 Architecture, 20 Storage, 21 Bus & contracts, 36 Training lifecycle |
 
 ## 1. Purpose
@@ -33,10 +33,11 @@ Define how the platform runs on a single local workstation today and scales hori
   | victoriametrics | 8428 |
   | postgres | 5432 |
   | garage | 3900 (S3), 3903 (admin) |
-  | control-api | 8080 |
-  | frontend (dev) | 5173 |
+  | control-api | 7700 (D-014) |
+  | ui (compose, nginx) | 8080 (D-035) |
+  | frontend (vite dev) | 5173 |
 - `justfile` recipes: `up`, `down`, `dev`, `check`, `test`, `fmt`, `proto`, `migrate`, `backup`, `restore`.
-- Every service exposes: heartbeat on `ops.heartbeat.<service>` (every 5 s), Prometheus metrics endpoint scraped by VictoriaMetrics (`vmagent` or VM scrape config), structured JSON logs to stdout.
+- Every service exposes: heartbeat on `svc.heartbeat.<service>` (every 5 s, as in 21 and the code), Prometheus metrics endpoint scraped by VictoriaMetrics (`vmagent` or VM scrape config), structured JSON logs to stdout.
 - Work-queue envelope (21): `Job { id, kind, priority_class, payload_ref (Garage key) | inline, budget, checkpoint_ref?, attempt }` → `JobResult { id, status, result_ref, metrics }`.
 
 ## 5. Data model
@@ -57,9 +58,12 @@ Define how the platform runs on a single local workstation today and scales hori
 | broker-gateway | Go | 1 per mode (paper, live) |
 | evo-orchestrator | Go | 1 |
 | model-runtime | Rust | 1 per timescale group **(proposal)** |
+| strategy-runtime | Rust | 1 (D-040) |
+| risk-engine | Rust | 1 per mode; paper only today (D-040, D-041) |
 | evo-worker | Rust | N (1 GPU worker + CPU workers today) |
 | trainer | Rust | on demand, as GPU job |
 | control-api | Rust | 1 |
+| ui | nginx | 1, compose only (D-035) |
 
 ### 6.2 GPU scheduling
 A GPU arbiter (part of `evo-orchestrator` **(proposal)**) owns the GPU lease:

@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | draft |
 | **Maturity** | Medium-high |
-| **Owners (code)** | `crates/fa-allocator`, `crates/fa-risk`, `go/services/broker-gateway`, `bins/model-runtime` (signal emission) |
+| **Owners (code)** | `crates/fa-allocator`, `crates/fa-risk`, `crates/fa-ledger` (paper book), `bins/risk-engine` (allocation, limits, halts, intents; D-040..D-042), `go/services/broker-gateway`, `bins/strategy-runtime` (signal emission) |
 | **Depends on** | 21 Bus & contracts, 35 Strategies, 41 Backtest & validation, 42 Ledger & accounting, 12 Reference data |
 
 ## 1. Purpose

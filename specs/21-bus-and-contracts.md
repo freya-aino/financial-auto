@@ -43,11 +43,14 @@ Define how components talk: NATS JetStream subjects and streams for live data an
 | `order.intent.<account>` | `OrderIntent` | allocator → risk |
 | `order.approved.<account>` | `OrderIntent` | risk → broker-gateway |
 | `order.event.<account>` | `OrderEvent` (ack/fill/cancel/reject) | broker-gateway → ledger, risk |
-| `risk.state` / `risk.halt.<scope>` | `RiskState` / `Halt` | risk → all |
+| `risk.state` / `risk.halt.<scope>` | `RiskState` / `Halt` | risk-engine → all; scopes `portfolio`, `daily_loss`, `source`, `model`, `broker` (D-042) |
+| `risk.resume.<scope>` | `Halt` (reason "manual resume") | control-api / operator → risk-engine; re-arms a halt (D-030) |
 | `jobs.<kind>` | `Job` | orchestrator/trainer → workers |
 | `jobs.result.<kind>` | `JobResult` | workers → orchestrator |
+| `jobs.progress.<job_id>` | `JobProgress` | workers → UI |
 | `ingest.health.<source>` / `ingest.gap.*` / `ingest.unresolved.*` | health events | ingestor → risk, UI |
-| `ctl.<service>.<verb>` | request/reply | control-api ↔ services |
+| `ctl.<service>.<verb>` | `CtlRequest` / `CtlReply` | control-api ↔ services; today `ctl.ingest.{start,stop,status}` (D-036), `ctl.evo.{start,cancel}` (D-037) |
+| `ctl.gpu.{acquire,release}` / `ctl.gpu.{granted,preempt}` | request/reply / notifications | workers, trainer ↔ GPU arbiter in evo-orchestrator (D-006, D-044) |
 | `ref.changed.*`, `catalog.changed.*` | change notices | |
 | `svc.heartbeat.<service>` | `Heartbeat` | all → UI |
 

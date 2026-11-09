@@ -138,8 +138,10 @@ dev:
     @echo "1. just up            # infrastructure (first time also: just garage-init && just migrate)"
     @echo "2. just control-api   # http://127.0.0.1:7700 (serves frontend/build when present)"
     @echo "3. just fe-dev        # http://127.0.0.1:5173 with hot reload"
-    @echo "4. ingestor + model-runtime: see go/services/ingestor and bins/model-runtime READMEs"
-    @echo "   (until they exist: just fake-publisher)"
+    @echo "4. go -C go run ./services/ingestor -catalog config/sources.yaml   # heartbeat feed"
+    @echo "5. cargo run -p model-runtime / strategy-runtime / risk-engine / evo-worker"
+    @echo "   Go: go -C go run ./services/broker-gateway, ./services/evo-orchestrator"
+    @echo "   (or everything in compose: just app-up; synthetic data only: just fake-publisher)"
 
 # Everything: Rust, Go, protos, frontend
 check: rust-check rust-test rust-clippy proto go-build go-test fe-install fe-build

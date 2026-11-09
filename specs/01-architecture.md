@@ -15,7 +15,7 @@ Defines the components, the boundary between Rust and Go, how data flows, and wh
 **Out of scope:** internals of each component (see the component specs).
 
 ## 3. Decisions
-- Rust: core types, ML (burn/candle), model runtime, training, evolution workers, risk, ledger, backtest, control API.
+- Rust: core types, ML (burn/candle), model runtime, strategy runtime, risk engine (allocator + limits + paper book), training, evolution workers, ledger, backtest, control API. The live path is split into three processes (`model-runtime` → `strategy-runtime` → `risk-engine`, D-040) rather than one.
 - Go: connectors + `ingestor`, `broker-gateway`, `evo-orchestrator`; VictoriaMetrics is Go as well.
 - Contracts: protobuf `fa.v1.*` ([21](21-bus-and-contracts.md)); the bus is NATS JetStream (live streams + work queues).
 - Stores: HelixDB (graph/vectors/lineage), VictoriaMetrics (time series), PostgreSQL (static records, ledger, audit), Garage S3 (blobs). See [20](20-storage.md).
@@ -37,8 +37,9 @@ Defines the components, the boundary between Rust and Go, how data flows, and wh
                                    └──┬─────────┬───────┬───┘
                 ┌──────────── Rust ───┼─────────┼───────┼────────────┐
                 │ model-runtime ◄─────┘         │       │            │
-                │   encoders → expert spaces → regions/MCMC          │
-                │   → decoders → strategies → allocator → risk ──────┼─► order.*
+                │   encoders → expert spaces → regions → latent.*    │
+                │ strategy-runtime: latent.* + md.* → GP → signal.*  │
+                │ risk-engine: signal.* → allocator → risk ─────────┼─► order.*
                 │ trainer (gen-0, generations, adapters)             │
                 │ evo-worker ◄── jobs.evo.* ────┘       │            │
                 │ control-api ◄─────────────────────────┘ (WS tap)   │
@@ -53,12 +54,15 @@ Defines the components, the boundary between Rust and Go, how data flows, and wh
 | Process | Lang | Reads | Writes |
 |---|---|---|---|
 | ingestor | Go | APIs | NATS, VM, Postgres (reference), Garage (raw) |
-| model-runtime | Rust | NATS, VM, Helix, Garage (snapshots) | NATS (`latent.*`, `signal.*`, `order.intent`), Helix |
+| model-runtime | Rust | NATS, VM, Helix, Garage (snapshots) | NATS (`latent.*`, `decoder.*`), Helix |
+| strategy-runtime | Rust | NATS `md.*`, `latent.*`, `decoder.*` | NATS `signal.exposure.*` (D-040) |
+| risk-engine | Rust | NATS `signal.*`, `order.event.*`, `md.trade.*`, `risk.halt.*` | NATS `order.intent.*`, `order.approved.*`, `risk.state`, `risk.halt.*` (D-040..D-042) |
 | trainer | Rust | VM, Garage, Helix, Postgres | Garage (snapshots), Helix (lineage) |
 | evo-orchestrator | Go | Helix (populations) | NATS `jobs.evo.*` |
 | evo-worker | Rust | NATS jobs, Garage, VM, Helix | NATS results, Garage, Helix |
 | broker-gateway | Go | NATS `order.*` | venues, NATS `order.fill`, Postgres ledger |
 | control-api | Rust | everything | config, commands on NATS |
+| ui | nginx (static SvelteKit) | control-api `/api`, `/ws` | — (D-035) |
 
 ## 5. Data model
 See [20](20-storage.md) and [21](21-bus-and-contracts.md).

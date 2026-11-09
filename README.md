@@ -12,8 +12,8 @@ just up                      # NATS, HelixDB, Postgres, VictoriaMetrics, Garage 
 just check                   # Rust + Go + frontend build/lint/test
 just fe-build                # build the UI, served by control-api
 cargo run -p control-api     # http://127.0.0.1:7700 (applies Postgres migrations on start)
-cargo run -p model-runtime
-just dev                     # prints how to run the Go ingestor with the heartbeat connector
+cargo run -p model-runtime   # likewise strategy-runtime, risk-engine, evo-worker
+just dev                     # prints the host run order; `just app-up` runs everything in compose
 ```
 
 ## Layout
@@ -21,7 +21,7 @@ just dev                     # prints how to run the Go ingestor with the heartb
 |---|---|
 | `specs/` | Specifications, ADRs, maturity overview |
 | `crates/` | Rust libraries (core, storage clients, ML, evolution, risk, ledger, backtest) |
-| `bins/` | Rust services: `model-runtime`, `trainer`, `evo-worker`, `control-api` |
+| `bins/` | Rust services: `model-runtime`, `strategy-runtime`, `risk-engine`, `evo-worker`, `control-api`, `trainer` (CLI) |
 | `go/` | Go: connector framework, connectors, `ingestor`, `broker-gateway`, `evo-orchestrator` |
 | `proto/` | Protobuf contracts shared by Rust and Go |
 | `helix/` | HelixDB schema and queries |
