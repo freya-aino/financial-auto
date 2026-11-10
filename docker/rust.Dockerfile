@@ -13,7 +13,11 @@ COPY migrations migrations
 RUN --mount=type=cache,id=fa-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=fa-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=fa-cargo-target,target=/src/target \
-    cargo build --release --locked -p control-api -p model-runtime -p evo-worker -p trainer \
+    # The target cache outlives the source tree: if it was last filled from another checkout with
+    # newer mtimes, cargo would reuse stale workspace crates. Stamping the workspace sources "now"
+    # makes them always newer than any cached artifact; registry dependencies stay cached.
+    find crates bins -type f -exec touch {} + \
+    && cargo build --release --locked -p control-api -p model-runtime -p evo-worker -p trainer \
           -p strategy-runtime -p risk-engine \
     && mkdir -p /out \
     && cp target/release/control-api target/release/model-runtime \
