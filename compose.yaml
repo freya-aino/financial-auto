@@ -228,6 +228,7 @@ services:
     environment:
       FA_GPU_MEM_MB: "24000" # reported as gpu.capacity_mb (D-031); set to the real card
       FA_SECRETS: /app/config/secrets.toml
+      FA_GARAGE_URL: http://garage:3900 # strategy promotion artifacts (D-052)
     volumes: *secrets-volume
     depends_on:
       nats:
