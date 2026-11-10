@@ -35,6 +35,8 @@ Conventions: `/api/v1/...` **(proposal: version prefix)**; JSON; time as RFC3339
 | POST | `/api/jobs/{id}/cancel` | |
 | GET | `/api/gpu` | GPU queue: running job, priority classes, utilisation |
 
+**Implemented today (D-060):** `POST /api/services/{name}/start|stop|restart` supervises compose services through the Docker Engine API (socket mounted into control-api only, project label filter). Infra services and control-api itself are refused with 409, `risk-engine` stop/restart needs `{"confirm": true}` (428 otherwise), every attempt is audited, and without a socket the routes answer `501 no_supervisor`. This closes open question 1 for compose deployments; spec 50 has no 501 routes left.
+
 ### 4.2 Sources & ingestion
 | GET | `/api/sources` | catalog (11) with status, rate-limit usage, last event |
 | GET | `/api/sources/{id}` | detail, recent errors, coverage |

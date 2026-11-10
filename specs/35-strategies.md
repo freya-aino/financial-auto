@@ -174,6 +174,8 @@ Both representations share these objectives, so they compete directly. **PBO** i
 
 **Implemented today (D-052, D-053):** the final Pareto front of a strategy generation is written to Garage as `fa-artifacts/strategies/<generation>.toml` and announced as `artifact_key`; `strategy-runtime` loads it on `ctl.strategy.reload` (validated, swapped atomically, surviving ids keep their virtual books) and honours `ctl.strategy.pause|resume`. Lifecycle status and the promotion gate live in risk-engine (spec 40 §6.6, D-051).
 
+**Since D-063:** `text_score` / `visual_score` read model-runtime's text and visual decoders, forecasts are chosen by horizon (`h:<steps>` refs), analog outcomes outside the in-memory history are priced from VictoriaMetrics between steps, and the runtime enforces spec 35 §8: step-budget and NaN streaks auto-pause a strategy, starved primitives are flagged. The population can be loaded from Garage (`latest`) at start.
+
 ### 6.5 Snapshot dependency
 Strategies are tied to the encoder snapshot they were evolved on. On a snapshot change:
 - GP programs with region literals are remapped via region lineage (spec 30);

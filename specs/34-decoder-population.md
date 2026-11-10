@@ -138,6 +138,8 @@ Result payload (`JobResult.result` JSON, protocol `evo.eval.decoder/v0`): `score
 - Output: predictive distribution per step (mixture density or quantiles).
 - Scores: **CRPS / NLL** over the trajectory; **tradeable value** = return of a fixed naive policy trading the forecast's sign/quantiles, net of costs (spec 35 cost model).
 
+**Implemented today (D-044, D-062):** CPU baselines exist for `rnn_prior` (quantile forecaster) and `retrieval` (analog retriever) as evolvable genomes in evo-worker, and for `text.news` / `text.summary` (lexicon sentiment and vocabulary novelty over `news.item.>`) and `visual.chart` / `visual.future` (breakout, trend t-statistic and range compression over bars) as fixed decoders in model-runtime. All publish `DecoderOutput` with `quantiles[0]` as the score and `inst:` / `topic:` / `kind:` / `src:` / `h:` refs. `text.narrative`, `visual.frame` and every neural decoder remain open.
+
 ### 6.2 Evolution loop (per generation, per timescale)
 1. **Seed:** elites of the previous generation + MCMC-proposed RNN pairs (spec 33 §6.5) + random immigrants (`immigrant_frac`).
 2. **Variation:** mutation (topology add/remove/resize, hyperparameter perturbation, expert-mask bit flips, family-gene perturbation) and crossover (within family; layer-block crossover; expert-mask uniform crossover).

@@ -111,6 +111,8 @@ Decision ticks are driven per timescale: a strategy on the 1h scale only re-targ
 - **Equal-risk baseline**: always running in paper as a control.
 All allocators run in parallel in paper ("allocator tournament"); their portfolio P&L is compared on the same strategy signals.
 
+**Implemented today (D-061, D-064):** `equal_weight`, `risk_parity`, `fractional_kelly` and the parametric `weighted_blend`, all expressible as an `AllocatorGenome` (`alloc:name=…;cap=…;…`). Allocators compete in a tournament (`evo.eval.allocator` replays recorded signals through allocation, netting and the cost model); the winning front is written to `fa-artifacts/allocators/<generation>.toml`, and risk-engine switches allocator at runtime via `ctl.risk.limits {set: {allocator: {name, params}}}` (audited, not persisted). Caps and concentration limits use per-instrument reference data (class, venue, provisional status).
+
 ### 6.3 Netting
 Exposures are converted to signed EUR notionals and summed per instrument. Attribution is kept: every portfolio position carries per-strategy virtual sub-positions so strategy P&L and fitness remain computable even though orders are netted. Fees/slippage of netted orders are attributed pro-rata to the strategies whose deltas caused the trade **(proposal)**.
 

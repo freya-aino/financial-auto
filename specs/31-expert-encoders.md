@@ -42,6 +42,8 @@ Expert encoders turn the multimodal, multi-asset input stream into the latent re
 
 ## 4. Interfaces
 
+**Implemented today (D-058, D-062, D-065):** only the statistical family exists. It reads connector bars (OHLCV) where a venue publishes them and trades elsewhere, is fitted by the trainer into Garage snapshots (`weights.bin` = folded normalisation statistics and gains), served by model-runtime with shadow serving and online adapters, and tuned per generation by a stated proxy search instead of a learned loss. The four neural families remain descriptors behind `EncoderFamily`.
+
 ### 4.1 Family trait (proposal)
 ```rust
 pub trait EncoderFamily: Send + Sync + 'static {

@@ -76,6 +76,8 @@ Owned by `evo-orchestrator` (Go). Each phase dispatches work-queue jobs (`jobs.t
 
 **Implemented today (D-058):** the lifecycle runs with the statistical encoder standing in for a neural model. Snapshots are Garage folders (`manifest.json`, `weights.bin` = fitted normalisation statistics, `regions.json`, `region_map.json`) mirrored as Helix `Snapshot` nodes with `SnapshotParent` edges; `bins/trainer` serves `jobs.train.pretrain|generation|adapter` from the `JOBS_TRAIN` queue with GPU leases, checkpoints and preempt/resume; region identity is carried through probe-set alignment (`lineage_id`, `RegionMatch` edges, `carried_mass`); model-runtime loads the active snapshot per timescale at start and hot-swaps on `ctl.model.reload`, which promote/rollback trigger. Open: kernel transfer on swap (spec 33 §6.6), shadow serving of two snapshots, bar metrics as training input, and of course the neural families themselves.
 
+**Since D-062 and D-065:** candidates are shadow-served next to the active snapshot (`ctl.model.shadow`, gauges `shadow.<ts>.*`), promotion is refused unless carried mass, shadow minutes and shadow region agreement pass (or an audited force), swaps transfer the Dirichlet kernel through the region map, rollback restores exactly the replaced snapshot, adapters are applied automatically and recorded as `AdapterState` nodes, and `trainer serve` schedules adapter and generation jobs.
+
 ### 6.1 Data windows (proposal)
 For each timescale, time is split (from oldest to newest):
 `[ train | validation | evaluation | embargo | LOCKED HOLDOUT | live ]`

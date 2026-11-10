@@ -90,6 +90,8 @@ Strategy virtual sub-positions are derived from `fill_attribution`.
 
 **Implemented today (D-047):** `fa-ledger::pg::PgLedger` persists intents, fills (with even strategy attribution), cash movements, position snapshots, reconciliation runs and payout quota to `ledger.*`; idempotency is DB-enforced (`ON CONFLICT DO NOTHING`, cash movements keyed by `(book, venue_id, kind, ref)`). risk-engine is the single writer, opens the `paper` book with a one-time 100 000 EUR deposit, reloads it on start, snapshots every 60 s and on halts, and reconciles the in-memory book against Postgres every 300 s into `reconciliation_run`. A diff is logged and audited; halting on diff is the pending step. FX is fixed at 1.0.
 
+**Since D-061:** accounting FX is the ECB daily reference rate, fetched by risk-engine into `ref.fx_rate` (`source_id = ecb_daily`) and applied as of the event time to marks, fills and fees; stale rates are flagged and can raise a reduce-only `fx` halt. Fills persist currency, rate, source, arrival price and slippage. Each strategy's attributed sub-book is persisted in `ledger.strategy_state.book` and restored on start. The payout reserve is the larger of the configured quota and today's `ledger.payout_quota`; booking the payout itself is still manual (open question 1).
+
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
 |---|---|---|
