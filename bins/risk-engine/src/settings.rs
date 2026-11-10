@@ -1,7 +1,7 @@
 //! Risk-engine settings (`risk.toml`). Hard limits live in `fa_risk::RiskConfig` and can only
 //! come from this file (spec 40 §6.5); nothing on the bus can loosen them.
 use fa_core::AssetClass;
-use fa_risk::RiskConfig;
+use fa_risk::{RiskConfig, strategy::PromotionGate};
 use serde::{Deserialize, Serialize};
 
 /// Starting paper cash (D-028).
@@ -37,6 +37,14 @@ pub struct Settings {
     pub snapshot_secs: u64,
     /// In-memory book vs Postgres-derived book comparison interval (`reconciliation_run`).
     pub reconcile_secs: u64,
+    /// Status given to a strategy the first time one of its signals is seen: `active` (allocated
+    /// paper capital at once, the integrated-baseline behaviour) or `shadow` (virtual book only,
+    /// needs `promote` through the gate).
+    pub new_strategy_status: String,
+    /// Virtual capital a shadow strategy's signals are tracked on (spec 41 §6.6).
+    pub shadow_sleeve_eur: f64,
+    /// Promotion gate thresholds (spec 40 §6.6, §7 `promotion.*`).
+    pub promotion: PromotionGate,
     /// Non-evolvable hard limits.
     pub limits: RiskConfig,
 }
@@ -59,6 +67,9 @@ impl Default for Settings {
             pending_ttl_secs: 10,
             snapshot_secs: 60,
             reconcile_secs: 300,
+            new_strategy_status: "active".into(),
+            shadow_sleeve_eur: 10_000.0,
+            promotion: PromotionGate::default(),
             limits: RiskConfig::default(),
         }
     }
@@ -72,6 +83,8 @@ pub enum SettingsError {
     Mode(String),
     #[error("unknown allocator `{0}`")]
     Allocator(String),
+    #[error("new_strategy_status `{0}` must be active or shadow")]
+    NewStatus(String),
 }
 
 impl Settings {
@@ -87,6 +100,9 @@ impl Settings {
         }
         if fa_allocator::by_name(&self.allocator, self.max_strategy_weight, self.kelly_fraction).is_none() {
             return Err(SettingsError::Allocator(self.allocator.clone()));
+        }
+        if !matches!(self.new_strategy_status.as_str(), "active" | "shadow") {
+            return Err(SettingsError::NewStatus(self.new_strategy_status.clone()));
         }
         Ok(())
     }
@@ -104,5 +120,13 @@ mod tests {
         assert_eq!((s.snapshot_secs, s.reconcile_secs), (60, 300));
         assert!(matches!(Settings::parse("mode = 'live'"), Err(SettingsError::Mode(_))));
         assert!(matches!(Settings::parse("allocator = 'evolved'"), Err(SettingsError::Allocator(_))));
+        assert!(matches!(Settings::parse("new_strategy_status = 'live'"), Err(SettingsError::NewStatus(_))));
+        assert_eq!(s.new_strategy_status, "active");
+        assert_eq!((s.promotion.min_shadow_days, s.promotion.min_horizons), (30.0, 20));
+        assert_eq!(
+            (s.limits.strategy_max_drawdown, s.limits.max_class_frac, s.limits.max_venue_frac),
+            (0.05, 0.40, 0.50)
+        );
+        assert_eq!(s.limits.portfolio_gross_cap, 2.0);
     }
 }

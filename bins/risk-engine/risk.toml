@@ -14,13 +14,31 @@ min_order_eur = 25.0
 default_asset_class = "equity" # synthetic/unknown instruments are treated as equities
 volume_window_secs = 3600   # traded volume window behind the liquidity cap
 pending_ttl_secs = 10
-snapshot_secs = 60          # ledger.position_snapshot cadence when [postgres] is reachable (also on halt)
-reconcile_secs = 300        # in-memory book vs Postgres-derived book → ledger.reconciliation_run
+snapshot_secs = 60          # ledger.position_snapshot + ledger.strategy_state cadence when [postgres] is reachable (also on halt)
+reconcile_secs = 300        # in-memory book vs Postgres-derived book → ledger.reconciliation_run; a diff HALTS scope `broker` (spec 42)
 
+# Strategy lifecycle (spec 40 §3, §6.6; D-051). A strategy first seen on signal.exposure.<id> gets
+# `new_strategy_status`: "active" allocates paper capital at once (baseline behaviour), "shadow"
+# tracks a virtual book only until `promote` passes the gate. Status is persisted in
+# ledger.strategy_state and controlled through ctl.risk.strategy (pause|resume|flatten|promote|shadow).
+new_strategy_status = "active"
+shadow_sleeve_eur = 10000   # virtual capital behind a shadow strategy's book (spec 41 §6.6)
+
+[promotion]                 # gate (spec 40 §6.6, §7): all must hold; unknown statistics block promotion
+min_shadow_days = 30        # promotion.min_shadow_days
+min_horizons = 20           # promotion.min_horizons completed in shadow
+min_deflated_sharpe = 0.0   # deflated Sharpe from validation.trial must exceed this (unknown when the table is absent)
+
+# Runtime changes through ctl.risk.limits / PUT /api/trading/limits may only TIGHTEN these
+# (lower every cap, raise the payout reserve); loosening needs an edit here + restart (spec 40 §6.5).
 [limits]
 max_drawdown = 0.10         # risk.portfolio_max_drawdown → kill switch, manual re-arm
+strategy_max_drawdown = 0.05 # risk.strategy_max_drawdown: attributed P&L drawdown vs sleeve → pause + flatten that strategy
 max_daily_loss = 0.02       # risk.daily_loss_limit → reduce-only for the rest of the UTC day
 max_position_frac = 0.05    # risk.max_position_pct per instrument
+max_class_frac = 0.40       # risk.max_class_pct: gross per asset class / deployable
+max_venue_frac = 0.50       # risk.max_venue_pct: gross per venue / deployable (counterparty risk)
+portfolio_gross_cap = 2.0   # risk.portfolio_gross_cap: total gross / deployable
 liquidity_k = 0.01          # |position| ≤ k × horizon volume (EUR)
 daily_payout_quota_eur = 0  # payout rule still open (spec 42 Q1)
 

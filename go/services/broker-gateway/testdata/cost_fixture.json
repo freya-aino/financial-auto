@@ -1,0 +1,319 @@
+{
+  "model": {
+    "default_k": 0.1,
+    "default_sigma": 0.02,
+    "default_adv_eur": 10000000,
+    "default_class": "equity",
+    "instruments": {
+      "01900000-0000-7000-8000-000000000001": "equity"
+    },
+    "default": {
+      "default": {
+        "commission_bps": 5,
+        "commission_min_eur": 1,
+        "spread_bps": 5,
+        "funding_bps_day": 0,
+        "borrow_bps_day": 0
+      },
+      "classes": {
+        "commodity": {
+          "commission_bps": 5,
+          "commission_min_eur": 1,
+          "spread_bps": 10,
+          "funding_bps_day": 0,
+          "borrow_bps_day": 0
+        },
+        "crypto": {
+          "commission_bps": 10,
+          "commission_min_eur": 0,
+          "spread_bps": 4,
+          "impact_k": 0.2,
+          "funding_bps_day": 1,
+          "borrow_bps_day": 0
+        },
+        "equity": {
+          "commission_bps": 5,
+          "commission_min_eur": 1,
+          "spread_bps": 5,
+          "funding_bps_day": 0,
+          "borrow_bps_day": 0.3
+        },
+        "etf": {
+          "commission_bps": 5,
+          "commission_min_eur": 1,
+          "spread_bps": 3,
+          "funding_bps_day": 0,
+          "borrow_bps_day": 0
+        },
+        "fx": {
+          "commission_bps": 0,
+          "commission_min_eur": 0,
+          "spread_bps": 1,
+          "funding_bps_day": 0.5,
+          "borrow_bps_day": 0
+        },
+        "index": {
+          "commission_bps": 5,
+          "commission_min_eur": 1,
+          "spread_bps": 2,
+          "funding_bps_day": 0,
+          "borrow_bps_day": 0
+        }
+      }
+    },
+    "venues": {
+      "sim": {
+        "default": {
+          "commission_bps": 0,
+          "commission_min_eur": 0,
+          "spread_bps": 0,
+          "impact_k": 0,
+          "funding_bps_day": 0,
+          "borrow_bps_day": 0
+        }
+      },
+      "yahoo": {
+        "classes": {
+          "crypto": {
+            "commission_bps": 10,
+            "commission_min_eur": 0,
+            "spread_bps": 10,
+            "impact_k": 0.2,
+            "funding_bps_day": 0,
+            "borrow_bps_day": 0
+          },
+          "equity": {
+            "commission_bps": 5,
+            "commission_min_eur": 1,
+            "spread_bps": 5,
+            "funding_bps_day": 0,
+            "borrow_bps_day": 0
+          }
+        }
+      }
+    }
+  },
+  "cases": [
+    {
+      "name": "crypto_large_impact",
+      "inputs": {
+        "venue": "yahoo",
+        "class": "crypto",
+        "side": "buy",
+        "price": 75000,
+        "qty": 2,
+        "spread": 0,
+        "sigma": 0.04,
+        "adv_eur": 20000000
+      },
+      "expected": {
+        "fill_price": 75089.46152422707,
+        "fee": 150.17892304845412,
+        "fee_currency": "EUR",
+        "half_spread": 37.5,
+        "impact": 51.96152422706632,
+        "slippage_bps": 11.928203230275539,
+        "notional": 150178.92304845413
+      }
+    },
+    {
+      "name": "crypto_sell_default_sigma",
+      "inputs": {
+        "venue": "yahoo",
+        "class": "crypto",
+        "side": "sell",
+        "price": 3000,
+        "qty": 10,
+        "spread": 0,
+        "sigma": 0,
+        "adv_eur": 0
+      },
+      "expected": {
+        "fill_price": 2997.842732930994,
+        "fee": 29.978427329309937,
+        "fee_currency": "EUR",
+        "half_spread": 1.5,
+        "impact": 0.6572670690061994,
+        "slippage_bps": 7.190890230020463,
+        "notional": 29978.42732930994
+      }
+    },
+    {
+      "name": "equity_buy_default_venue",
+      "inputs": {
+        "venue": "unknown",
+        "class": "equity",
+        "side": "buy",
+        "price": 100,
+        "qty": 1000,
+        "spread": 0,
+        "sigma": 0.02,
+        "adv_eur": 10000000
+      },
+      "expected": {
+        "fill_price": 100.045,
+        "fee": 50.0225,
+        "fee_currency": "EUR",
+        "half_spread": 0.025,
+        "impact": 0.020000000000000004,
+        "slippage_bps": 4.5000000000001705,
+        "notional": 100045
+      }
+    },
+    {
+      "name": "equity_quoted_spread",
+      "inputs": {
+        "venue": "yahoo",
+        "class": "equity",
+        "side": "buy",
+        "price": 200,
+        "qty": 50,
+        "spread": 0.1,
+        "sigma": 0.015,
+        "adv_eur": 50000000
+      },
+      "expected": {
+        "fill_price": 200.0542426406871,
+        "fee": 5.001356066017178,
+        "fee_currency": "EUR",
+        "half_spread": 0.05,
+        "impact": 0.004242640687119285,
+        "slippage_bps": 2.7121320343553634,
+        "notional": 10002.712132034356
+      }
+    },
+    {
+      "name": "equity_sell_default_venue",
+      "inputs": {
+        "venue": "unknown",
+        "class": "equity",
+        "side": "sell",
+        "price": 100,
+        "qty": 1000,
+        "spread": 0,
+        "sigma": 0.02,
+        "adv_eur": 10000000
+      },
+      "expected": {
+        "fill_price": 99.955,
+        "fee": 49.9775,
+        "fee_currency": "EUR",
+        "half_spread": 0.025,
+        "impact": 0.020000000000000004,
+        "slippage_bps": 4.5000000000001705,
+        "notional": 99955
+      }
+    },
+    {
+      "name": "equity_small_min_commission",
+      "inputs": {
+        "venue": "yahoo",
+        "class": "equity",
+        "side": "buy",
+        "price": 50,
+        "qty": 1,
+        "spread": 0,
+        "sigma": 0.01,
+        "adv_eur": 5000000
+      },
+      "expected": {
+        "fill_price": 50.012658113883006,
+        "fee": 1,
+        "fee_currency": "EUR",
+        "half_spread": 0.0125,
+        "impact": 0.00015811388300841897,
+        "slippage_bps": 2.531622776601239,
+        "notional": 50.012658113883006
+      }
+    },
+    {
+      "name": "fx_no_commission",
+      "inputs": {
+        "venue": "unknown",
+        "class": "fx",
+        "side": "sell",
+        "price": 1.08,
+        "qty": 100000,
+        "spread": 0,
+        "sigma": 0.006,
+        "adv_eur": 1000000000
+      },
+      "expected": {
+        "fill_price": 1.0799392657864602,
+        "fee": 0,
+        "fee_currency": "EUR",
+        "half_spread": 0.000054000000000000005,
+        "impact": 0.000006734213539827796,
+        "slippage_bps": 0.5623538290732844,
+        "notional": 107993.92657864602
+      }
+    },
+    {
+      "name": "passive_limit_commission_only",
+      "inputs": {
+        "venue": "yahoo",
+        "class": "equity",
+        "side": "buy",
+        "price": 99,
+        "qty": 100,
+        "spread": 1,
+        "sigma": 0.02,
+        "adv_eur": 1000000,
+        "passive": true
+      },
+      "expected": {
+        "fill_price": 99,
+        "fee": 4.95,
+        "fee_currency": "EUR",
+        "half_spread": 0,
+        "impact": 0,
+        "slippage_bps": 0,
+        "notional": 9900
+      }
+    },
+    {
+      "name": "sim_costless",
+      "inputs": {
+        "venue": "sim",
+        "class": "equity",
+        "side": "buy",
+        "price": 100,
+        "qty": 1000,
+        "spread": 0,
+        "sigma": 0.5,
+        "adv_eur": 1000
+      },
+      "expected": {
+        "fill_price": 100,
+        "fee": 0,
+        "fee_currency": "EUR",
+        "half_spread": 0,
+        "impact": 0,
+        "slippage_bps": 0,
+        "notional": 100000
+      }
+    },
+    {
+      "name": "unknown_class_falls_back",
+      "inputs": {
+        "venue": "yahoo",
+        "class": "prediction_market",
+        "side": "buy",
+        "price": 0.6,
+        "qty": 1000,
+        "spread": 0,
+        "sigma": 0.1,
+        "adv_eur": 100000
+      },
+      "expected": {
+        "fill_price": 0.6006147580015448,
+        "fee": 1,
+        "fee_currency": "EUR",
+        "half_spread": 0.00015,
+        "impact": 0.00046475800154489004,
+        "slippage_bps": 10.245966692414473,
+        "notional": 600.6147580015448
+      }
+    }
+  ]
+}

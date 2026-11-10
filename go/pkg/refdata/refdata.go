@@ -90,6 +90,38 @@ func (s *Store) SyncCatalog(ctx context.Context, cat *catalog.Catalog) error {
 	return nil
 }
 
+// Statuses returns catalog.source.status per id. After SyncCatalog the
+// ingestor applies them to its in-memory catalog: the YAML status is only the
+// seed, the Postgres status wins (spec 11 §8, D-054).
+func (s *Store) Statuses(ctx context.Context) (map[string]string, error) {
+	rows, err := s.Pool.Query(ctx, `select id, status from catalog.source`)
+	if err != nil {
+		return nil, fmt.Errorf("refdata: statuses: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var id, st string
+		if err := rows.Scan(&id, &st); err != nil {
+			return nil, err
+		}
+		out[id] = st
+	}
+	return out, rows.Err()
+}
+
+// SetStatus persists a source status (ctl.ingest.enable|disable).
+func (s *Store) SetStatus(ctx context.Context, id, status string) error {
+	tag, err := s.Pool.Exec(ctx, `update catalog.source set status = $2, updated_at = now() where id = $1`, id, status)
+	if err != nil {
+		return fmt.Errorf("refdata: set status: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("refdata: set status: source %q not in catalog.source", id)
+	}
+	return nil
+}
+
 func nz(a []string) []string {
 	if a == nil {
 		return []string{}
@@ -141,6 +173,10 @@ type Resolver struct {
 	timeout time.Duration
 	onErr   func(error)
 
+	// OnProvision, when set, is called after an unknown pair was provisioned
+	// (the ingestor publishes `ingest.unresolved.<source>` from it, D-054).
+	OnProvision func(sourceID, venueSymbol, instrumentID string)
+
 	mu    sync.RWMutex
 	cache map[string]string
 	// Quarantined counts provisional creations per source (for counters/tests).
@@ -181,6 +217,9 @@ func (r *Resolver) Resolve(sourceID, venueSymbol string) (string, bool) {
 		r.created[sourceID]++
 	}
 	r.mu.Unlock()
+	if created && r.OnProvision != nil {
+		r.OnProvision(sourceID, venueSymbol, id)
+	}
 	return id, true
 }
 
@@ -263,9 +302,10 @@ func (r *Resolver) resolveDB(ctx context.Context, sourceID, venueSymbol string) 
 	if _, err := tx.Exec(ctx, `insert into ref.identifier (instrument_id, scheme, value) values ($1,$2,$3) on conflict do nothing`, id, h.Scheme, venueSymbol); err != nil {
 		return "", false, fmt.Errorf("identifier: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `insert into ingest.quarantine (source_id, venue_symbol, sample_raw_ref, status) values ($1,$2,$3,'open')
-		on conflict (source_id, venue_symbol) do update set last_seen = now(), count = ingest.quarantine.count + 1`,
-		sourceID, venueSymbol, "provisional instrument "+id+" auto-created by ingestor"); err != nil {
+	if _, err := tx.Exec(ctx, `insert into ingest.quarantine (source_id, venue_symbol, sample_raw_ref, status, instrument_id) values ($1,$2,$3,'open',$4)
+		on conflict (source_id, venue_symbol) do update set last_seen = now(), count = ingest.quarantine.count + 1,
+		  instrument_id = coalesce(ingest.quarantine.instrument_id, excluded.instrument_id)`,
+		sourceID, venueSymbol, "provisional instrument "+id+" auto-created by ingestor", id); err != nil {
 		return "", false, fmt.Errorf("quarantine: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -314,6 +354,83 @@ func nullable(s string) *string {
 	return &s
 }
 
+// CursorRow is one ingest.backfill_cursor row (for ctl.ingest.status / the UI).
+type CursorRow struct {
+	SourceID     string     `json:"source_id"`
+	InstrumentID string     `json:"instrument_id,omitempty"`
+	Timescale    string     `json:"timescale"`
+	RangeStart   time.Time  `json:"range_start"`
+	RangeEnd     time.Time  `json:"range_end"`
+	Cursor       *time.Time `json:"cursor,omitempty"`
+	Status       string     `json:"status"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	// Live is true for the open-ended watermark rows (range_start = epoch).
+	Live bool `json:"live"`
+}
+
+// ListCursors returns a source's cursor rows, newest first (all sources when sourceID is "").
+func (s *Store) ListCursors(ctx context.Context, sourceID string, limit int) ([]CursorRow, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.Pool.Query(ctx, `select source_id, coalesce(instrument_id::text, ''), timescale, range_start, range_end, cursor, status, updated_at
+		from ingest.backfill_cursor where ($1 = '' or source_id = $1) order by updated_at desc limit $2`, sourceID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("refdata: cursors: %w", err)
+	}
+	defer rows.Close()
+	var out []CursorRow
+	for rows.Next() {
+		var r CursorRow
+		if err := rows.Scan(&r.SourceID, &r.InstrumentID, &r.Timescale, &r.RangeStart, &r.RangeEnd, &r.Cursor, &r.Status, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		r.Live = r.RangeStart.Equal(epoch)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// BackfillCursors implements connector.BackfillCursorStore: one row per
+// bounded range (source, instrument|null, timescale, range_start), so a
+// redelivered or restarted job resumes at `cursor` and a finished one is a no-op.
+type BackfillCursors struct{ store *Store }
+
+func NewBackfillCursors(s *Store) *BackfillCursors { return &BackfillCursors{store: s} }
+
+func (c *BackfillCursors) GetBackfill(ctx context.Context, sourceID, instrumentID, timescale string, rangeStart time.Time) (time.Time, string, bool, error) {
+	var cur *time.Time
+	var status string
+	err := c.store.Pool.QueryRow(ctx, `select cursor, status from ingest.backfill_cursor
+		where source_id = $1 and instrument_id is not distinct from $2::uuid and timescale = $3 and range_start = $4`,
+		sourceID, nullable(instrumentID), timescale, rangeStart.UTC()).Scan(&cur, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, "", false, nil
+	}
+	if err != nil {
+		return time.Time{}, "", false, err
+	}
+	if cur == nil {
+		return time.Time{}, status, true, nil
+	}
+	return cur.UTC(), status, true, nil
+}
+
+func (c *BackfillCursors) SetBackfill(ctx context.Context, sourceID, instrumentID, timescale string, rangeStart, rangeEnd, cursor time.Time, status string) error {
+	id := UUIDv5(Namespace, "backfill\x00"+sourceID+"\x00"+instrumentID+"\x00"+timescale+"\x00"+rangeStart.UTC().Format(time.RFC3339Nano))
+	var cur *time.Time
+	if !cursor.IsZero() {
+		u := cursor.UTC()
+		cur = &u
+	}
+	_, err := c.store.Pool.Exec(ctx, `insert into ingest.backfill_cursor (id, source_id, instrument_id, timescale, range_start, range_end, cursor, status)
+		values ($1,$2,$3::uuid,$4,$5,$6,$7,$8)
+		on conflict (source_id, instrument_id, timescale, range_start) do update
+		  set range_end = excluded.range_end, cursor = coalesce(excluded.cursor, ingest.backfill_cursor.cursor), status = excluded.status, updated_at = now()`,
+		id, sourceID, nullable(instrumentID), timescale, rangeStart.UTC(), rangeEnd.UTC(), cur, status)
+	return err
+}
+
 // RunLog records connector lifecycles in ingest.connector_run.
 type RunLog struct{ store *Store }
 
@@ -335,3 +452,4 @@ func (l *RunLog) End(ctx context.Context, runID, status string, events, errs int
 
 var _ connector.SymbolResolver = (*Resolver)(nil)
 var _ connector.CursorStore = (*Cursors)(nil)
+var _ connector.BackfillCursorStore = (*BackfillCursors)(nil)

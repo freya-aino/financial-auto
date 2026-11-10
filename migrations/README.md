@@ -12,5 +12,7 @@ PostgreSQL warehouse + ledger schema, in sqlx format (`<timestamp>_<name>.sql`, 
 | `…04_ingest.sql` | `ingest.quarantine/backfill_cursor/connector_run`, `wh.macro_observation` | 10, 20 |
 | `…05_ledger.sql` | `ledger.order_intent/venue_order/fill/fill_attribution/cash_movement/position_snapshot/payout_quota/reconciliation_run` | 42 |
 | `…06_audit.sql` | `audit.log` | 42 |
+| `20261110000010_ledger_indexes.sql`, `…11_cash_movement_book_key.sql` | ledger read-path indexes, cash movement idempotency key | 42, D-047 |
+| `20261110000040_quarantine_review.sql` | `ingest.quarantine.instrument_id/resolved_at/resolution` (+ backfill from `ref.listing`), search indexes on `ref.instrument.name`, `ref.identifier.value`, `ref.listing.venue_symbol` | 10 §5.3, 12 §6, D-054 |
 
 Apply with `just migrate`, which needs `sqlx-cli`: `cargo install sqlx-cli --no-default-features --features rustls,postgres`.

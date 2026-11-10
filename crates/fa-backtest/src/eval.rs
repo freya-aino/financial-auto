@@ -91,6 +91,9 @@ pub struct EvalReport {
     pub last_forecast: Option<SeriesForecast>,
     /// Timestamp (ms) of the last evaluated step.
     pub last_ts_ms: i64,
+    /// Per-step net P&L of the naive sign policy (trial registry / PBO input; not serialised).
+    #[serde(skip)]
+    pub pnl: Vec<f64>,
 }
 
 impl EvalReport {
@@ -144,6 +147,7 @@ pub fn evaluate(decoder: &dyn SeriesDecoder, series: &Series, spec: &EvalSpec) -
         elapsed_ms: 0.0,
         last_forecast: None,
         last_ts_ms: series.ts_ms.last().copied().unwrap_or(0),
+        pnl: Vec::new(),
     };
     if n <= first + h {
         rep.elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
@@ -213,6 +217,7 @@ pub fn evaluate(decoder: &dyn SeriesDecoder, series: &Series, spec: &EvalSpec) -
         rep.trade_sharpe = stats::sharpe(&pnl);
         rep.trade_psr = if pnl.len() > 2 { stats::probabilistic_sharpe(&pnl, 0.0) } else { 0.5 };
     }
+    rep.pnl = pnl;
     rep.elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
     rep
 }
@@ -243,6 +248,8 @@ pub fn pool(reports: &[EvalReport]) -> Option<EvalReport> {
     out.compute_cost = w(|r| r.compute_cost);
     out.elapsed_ms = with_data.iter().map(|r| r.elapsed_ms).sum();
     out.last_forecast = None;
+    // pooled step P&L: instruments concatenated in order (the trial registry stores block sums)
+    out.pnl = with_data.iter().flat_map(|r| r.pnl.iter().copied()).collect();
     Some(out)
 }
 
@@ -313,5 +320,6 @@ mod tests {
         assert_eq!(p.n_eval, a.n_eval + b.n_eval);
         let expect = (a.crps * a.n_eval as f64 + b.crps * b.n_eval as f64) / p.n_eval as f64;
         assert!((p.crps - expect).abs() < 1e-12);
+        assert_eq!(p.pnl.len(), a.n_eval + b.n_eval);
     }
 }

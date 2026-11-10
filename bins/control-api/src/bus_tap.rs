@@ -1,6 +1,6 @@
-//! WS `/ws/bus`: live tap of NATS subjects (spec 50 §4.3).
-use std::time::Duration;
-
+//! WS `/ws/bus`: live tap of NATS subjects (spec 50 §4.3), decoded to JSON, on the shared
+//! socket loop of `ws_routes` (bounded queue: `runtime.bus_tap.max_msgs_per_sec` frames per
+//! second per socket spread over `BUS_TICKS_PER_SEC` flushes; overflow → `{op: "lagged"}`).
 use axum::{
     extract::{
         Query, State,
@@ -8,19 +8,18 @@ use axum::{
     },
     response::Response,
 };
-use chrono::Utc;
 use fa_proto::{
     Message,
     v1::{Envelope, Heartbeat, envelope::Payload},
 };
-use futures::{SinkExt, StreamExt, stream::select_all};
+use futures::{StreamExt, stream::select_all};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::state::AppState;
-
-/// Max messages forwarded per second per socket; the rest are counted as dropped.
-const MAX_PER_SEC: u32 = 200;
+use crate::{
+    state::AppState,
+    ws_routes::{self, Coalescer, SourceItem},
+};
 
 #[derive(Debug, Deserialize)]
 pub struct TapQuery {
@@ -53,71 +52,46 @@ pub async fn ws_bus(ws: WebSocketUpgrade, State(state): State<AppState>, Query(q
     ws.on_upgrade(move |socket| tap(socket, state, patterns))
 }
 
-async fn tap(socket: WebSocket, state: AppState, patterns: Vec<String>) {
-    let (mut tx, mut rx) = socket.split();
+/// Frames per flush for a per-second budget.
+pub fn budget_per_flush(max_per_sec: u32) -> usize {
+    (max_per_sec as usize).div_ceil(ws_routes::BUS_TICKS_PER_SEC as usize).max(1)
+}
+
+async fn tap(mut socket: WebSocket, state: AppState, patterns: Vec<String>) {
     let Some(client) = state.nats.clone() else {
-        let _ = tx.send(WsMessage::text(json!({"op": "error", "error": "nats unavailable"}).to_string())).await;
+        let _ = socket.send(WsMessage::text(json!({"op": "error", "error": "nats unavailable"}).to_string())).await;
         return;
     };
-
     let mut subs = Vec::new();
     for p in &patterns {
         match client.subscribe(p.clone()).await {
             Ok(s) => subs.push(s),
             Err(e) => {
-                let _ = tx
+                let _ = socket
                     .send(WsMessage::text(json!({"op": "error", "error": e.to_string(), "subject": p}).to_string()))
                     .await;
                 return;
             }
         }
     }
-    let mut merged = select_all(subs);
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
-    let (mut seq, mut sent_this_sec, mut dropped) = (0u64, 0u32, 0u64);
-
-    loop {
-        tokio::select! {
-            msg = merged.next() => {
-                let Some(msg) = msg else { break };
-                if sent_this_sec >= MAX_PER_SEC {
-                    dropped += 1;
-                    continue;
-                }
-                sent_this_sec += 1;
-                seq += 1;
-                let frame = json!({
-                    "stream": "bus",
-                    "seq": seq,
-                    "ts": Utc::now().to_rfc3339(),
-                    "data": {
-                        "subject": msg.subject.as_str(),
-                        "size": msg.payload.len(),
-                        "decoded": decode(msg.subject.as_str(), &msg.payload),
-                    }
-                });
-                if tx.send(WsMessage::text(frame.to_string())).await.is_err() {
-                    break;
-                }
-            }
-            _ = tick.tick() => {
-                if dropped > 0 {
-                    let lag = json!({"op": "lagged", "dropped": dropped});
-                    if tx.send(WsMessage::text(lag.to_string())).await.is_err() {
-                        break;
-                    }
-                    dropped = 0;
-                }
-                sent_this_sec = 0;
-            }
-            incoming = rx.next() => {
-                match incoming {
-                    None | Some(Err(_)) | Some(Ok(WsMessage::Close(_))) => break,
-                    Some(Ok(_)) => {} // subscribe/unsubscribe ops: not yet supported
-                }
+    let max_per_sec = state.live().runtime().bus_tap.max_msgs_per_sec;
+    let (tx, rx) = ws_routes::source_channel();
+    tokio::spawn(async move {
+        let mut merged = select_all(subs);
+        while let Some(msg) = merged.next().await {
+            let subject = msg.subject.as_str();
+            let data = json!({
+                "subject": subject,
+                "size": msg.payload.len(),
+                "decoded": decode(subject, &msg.payload),
+            });
+            if tx.send(SourceItem::Frame(subject.to_owned(), data)).await.is_err() {
+                break;
             }
         }
-    }
+    });
+    let flush = ws_routes::flush_interval(ws_routes::BUS_TICKS_PER_SEC);
+    ws_routes::serve(socket, "bus", Vec::new(), rx, Coalescer::queue(budget_per_flush(max_per_sec)), flush).await;
 }
 
 const ENVELOPE_PREFIXES: [&str; 6] = ["md.", "news.", "media.", "macro.", "onchain.", "filing."];
@@ -201,6 +175,13 @@ mod tests {
     #[test]
     fn unknown_subject_is_null() {
         assert_eq!(decode("jobs.evo", b"\x01\x02"), Value::Null);
+    }
+
+    #[test]
+    fn budget_spreads_the_per_second_limit_over_flushes() {
+        assert_eq!(budget_per_flush(200), 10);
+        assert_eq!(budget_per_flush(1), 1);
+        assert_eq!(budget_per_flush(25), 2);
     }
 
     #[test]

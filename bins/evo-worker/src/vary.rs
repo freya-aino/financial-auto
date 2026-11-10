@@ -51,13 +51,13 @@ pub enum ParentSpec {
 }
 
 impl ParentSpec {
-    fn genome(&self) -> &str {
+    pub fn genome(&self) -> &str {
         match self {
             Self::Plain(g) => g,
             Self::Scored { genome, .. } => genome,
         }
     }
-    fn objectives(&self) -> Option<&BTreeMap<String, f64>> {
+    pub fn objectives(&self) -> Option<&BTreeMap<String, f64>> {
         match self {
             Self::Scored { objectives, .. } if !objectives.is_empty() => Some(objectives),
             _ => None,
@@ -89,6 +89,13 @@ pub struct VaryRequest {
     pub sigma: Option<f64>,
     #[serde(default)]
     pub crossover_prob: Option<f64>,
+    /// Strategy-only knobs (`evo.vary.strategy`): random-immigrant share, program limits.
+    #[serde(default)]
+    pub immigrant_frac: Option<f64>,
+    #[serde(default)]
+    pub max_depth: Option<usize>,
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]

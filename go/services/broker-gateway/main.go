@@ -1,5 +1,11 @@
 // Command broker-gateway executes approved order intents (spec 40). v1 runs
 // the paper engine only; live venue adapters are stubbed behind VenueAdapter.
+//
+// Subjects: `order.approved.>` in → `order.event.<account>` out; `md.trade.>` and
+// `md.quote.>` feed the marks, volatility, volume and spread behind the cost model
+// (`costs.yaml`, `-costs` / `FA_COSTS`); `order.cancel.<account>` (payload: an
+// `OrderIntent` carrying the intent id — provisional, there is no cancel proto yet)
+// cancels a resting limit order.
 package main
 
 import (
@@ -21,14 +27,30 @@ import (
 
 const service = "broker-gateway"
 
+// Subjects not yet in go/pkg/bus (D-051, provisional): quotes feed the spread, cancels pull
+// resting limit orders.
+const (
+	allMdQuotes     = "md.quote.>"
+	allOrderCancels = "order.cancel.>"
+)
+
 func main() {
 	natsURL := flag.String("nats", envOr("FA_NATS_URL", "nats://127.0.0.1:4222"), "NATS URL")
-	feeBps := flag.Float64("fee-bps", 0, "paper fee in basis points of notional (0 = zero-fee default, spec 41 cost model hook)")
-	feeMin := flag.Float64("fee-min", 0, "minimum paper fee per fill (EUR)")
+	costsPath := flag.String("costs", envOr("FA_COSTS", ""), "cost + slippage model YAML (spec 41 §6.3); built-in defaults when empty")
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("svc", service)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	costs := DefaultCostModel()
+	if *costsPath != "" {
+		m, err := LoadCostModel(*costsPath)
+		if err != nil {
+			log.Error("load costs", "err", err)
+			os.Exit(1)
+		}
+		costs = m
+	}
 
 	pub, err := bus.Connect(*natsURL, service)
 	if err != nil {
@@ -38,19 +60,41 @@ func main() {
 	defer pub.Close()
 
 	counters := bus.NewCounters()
-	go bus.RunHeartbeat(ctx, pub, service, ulid.Make().String(), "0.1.0", 5*time.Second, counters, nil)
+	go bus.RunHeartbeat(ctx, pub, service, ulid.Make().String(), "0.2.0", 5*time.Second, counters, nil)
 
-	engine := NewPaperEngine()
-	if *feeBps > 0 || *feeMin > 0 {
-		engine.Fees = BpsFee{Bps: *feeBps, Min: *feeMin}
+	engine := NewPaperEngine(costs)
+	publish := func(items []Published) {
+		for _, it := range items {
+			if err := pub.Publish(bus.OrderEvent(it.Account), it.Event); err != nil {
+				log.Warn("publish order event", "err", err)
+				continue
+			}
+			counters.Add("events."+it.Event.Kind.String(), 1)
+		}
+		counters.Set("resting", float64(engine.Resting()))
 	}
 	if _, err := pub.NC.Subscribe(bus.AllMdTrades, func(m *nats.Msg) {
 		var e fav1.Envelope
-		if proto.Unmarshal(m.Data, &e) == nil {
-			engine.ObserveTrade(m.Subject, e.GetTrade().GetPrice())
+		if proto.Unmarshal(m.Data, &e) != nil || e.GetTrade() == nil {
+			return
 		}
+		var at time.Time
+		if e.EventTime != nil {
+			at = e.EventTime.AsTime()
+		}
+		publish(engine.ObserveTrade(m.Subject, e.GetTrade().GetPrice(), e.GetTrade().GetSize(), at))
 	}); err != nil {
 		log.Error("subscribe trades", "err", err)
+		os.Exit(1)
+	}
+	if _, err := pub.NC.Subscribe(allMdQuotes, func(m *nats.Msg) {
+		var e fav1.Envelope
+		if proto.Unmarshal(m.Data, &e) == nil && e.GetQuote() != nil {
+			engine.ObserveQuote(m.Subject, e.GetQuote().GetBidPrice(), e.GetQuote().GetAskPrice())
+			counters.Add("quotes", 1)
+		}
+	}); err != nil {
+		log.Error("subscribe quotes", "err", err)
 		os.Exit(1)
 	}
 	if _, err := pub.NC.Subscribe(bus.AllOrderApproved, func(m *nats.Msg) {
@@ -64,16 +108,27 @@ func main() {
 			counters.Add("intents.duplicate", 1)
 			return
 		}
-		if err := pub.Publish(bus.OrderEvent(in.AccountId), ev); err != nil {
-			log.Warn("publish order event", "err", err)
-			return
-		}
-		counters.Add("events."+ev.Kind.String(), 1)
+		publish([]Published{{Account: in.AccountId, Event: ev}})
 	}); err != nil {
 		log.Error("subscribe intents", "err", err)
 		os.Exit(1)
 	}
-	log.Info("started", "mode", "paper")
+	if _, err := pub.NC.Subscribe(allOrderCancels, func(m *nats.Msg) {
+		var in fav1.OrderIntent
+		if err := proto.Unmarshal(m.Data, &in); err != nil || in.IntentId == "" {
+			counters.Add("errors.decode", 1)
+			return
+		}
+		if c := engine.CancelResting(in.IntentId); c != nil {
+			publish([]Published{*c})
+		} else {
+			counters.Add("cancels.unknown", 1)
+		}
+	}); err != nil {
+		log.Error("subscribe cancels", "err", err)
+		os.Exit(1)
+	}
+	log.Info("started", "mode", "paper", "costs", *costsPath)
 	<-ctx.Done()
 	log.Info("stopped")
 }

@@ -6,6 +6,8 @@ Connector interface (Stream / Poll / Backfill / Normalize), rate limiting, retri
 - `Fetcher`: rate-limited HTTP with bounded retries (429/5xx/network, exponential backoff + jitter, spec 10 §6.3), fixed `UserAgent`, per-request `Prepare` hook for auth headers.
 - `LoadSecrets` / `Secrets`: minimal reader for `config/secrets.toml` (`[garage]`, `[sources.<id>]`); `FA_<SOURCE>_<KEY>` environment variables take precedence (D-020). `SourceConfig.Secret(key)` for connectors.
 - `CursorStore` (+ `MemCursors`): persisted progress per `(source, instrument?, scope)`; Postgres implementation in `go/pkg/refdata`.
+- `BackfillCursorStore` (+ `MemBackfillCursors`): bounded backfill ranges keyed by `range_start`, used by the ingestor's `jobs.ingest.backfill` worker (D-054); Postgres implementation `refdata.BackfillCursors`.
+- `MeteredLimiter`: wraps a `RateLimiter` and measures saturation (share of wall time spent blocked in `Wait` per window) for `ingest.health.<source>`; the ingestor keeps one per source, shared by the live connector and backfill jobs.
 - `Seen`: bounded in-process de-dup set.
 - `Deps.Cursors`, `TransportMeta` keys (`endpoint`, `symbol`, `tf`, `backfill`, `url`).
 - `StaticResolver` / `NopArchive` remain the no-infrastructure fallbacks (Postgres resolver: `go/pkg/refdata`, Garage writer: `go/pkg/archive`).

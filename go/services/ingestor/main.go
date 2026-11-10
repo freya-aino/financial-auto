@@ -6,23 +6,34 @@
 //
 // Control subjects (request/reply, CtlRequest/CtlReply):
 //
-//	ctl.ingest.start   args: source   start a catalog source's connector
-//	ctl.ingest.stop    args: source   stop it
-//	ctl.ingest.status  (no args)      reply message = comma list of running sources
+//	ctl.ingest.start    args: source   start a catalog source's connector
+//	ctl.ingest.stop     args: source   stop it
+//	ctl.ingest.enable   args: source   status → live (persisted) and start
+//	ctl.ingest.disable  args: source   status → disabled (persisted) and stop
+//	ctl.ingest.backfill args: source, timescale, start, end, instruments (comma list)
+//	                    enqueues a jobs.ingest.backfill Job; reply message = job id
+//	ctl.ingest.status   (no args)      reply message = JSON {running, health, cursors, ...}
+//
+// Health (JSON, D-054): ingest.health.<source> every 5 s per running connector,
+// ingest.gap.<source> on bar gaps, ingest.unresolved.<source> on provisioned or
+// unresolvable symbols; risk.halt.source:<id> / risk.resume.source:<id> when a
+// source goes down unexpectedly and recovers.
 //
 // Error replies carry a prefix control-api maps to HTTP: `not_found:` (404),
 // `conflict:` (409, already running / not running / status disabled|planned),
-// anything else 422.
+// `invalid:` (400), anything else 422.
 package main
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -133,10 +144,16 @@ func main() {
 	// Reference data: Postgres when configured, else the in-memory resolver
 	// (which only knows what connectors add themselves — nothing, so every
 	// market symbol would be unresolved; the heartbeat connector needs none).
+	health := NewTracker(pub, func(msg string, args ...any) { log.Info(msg, args...) })
+	go health.Run(ctx, HealthInterval)
+
 	var resolver connector.SymbolResolver = connector.NewStaticResolver()
 	var cursors connector.CursorStore = connector.NewMemCursors()
+	var backfillCursors connector.BackfillCursorStore = connector.NewMemBackfillCursors()
 	var runLog RunLogger
+	var statuses StatusStore
 	var store *refdata.Store
+	var seedGaps func(context.Context, string) map[string]time.Time
 	if *pgURL != "" {
 		store, err = refdata.Open(ctx, *pgURL)
 		if err != nil {
@@ -144,29 +161,78 @@ func main() {
 			os.Exit(1)
 		}
 		defer store.Close()
+		// YAML seeds new rows; the Postgres status wins for existing ones (spec 11 §8, D-054).
 		if err := store.SyncCatalog(ctx, cat); err != nil {
 			log.Error("catalog sync", "err", err)
 			os.Exit(1)
 		}
-		resolver = refdata.NewResolver(store, nil, func(err error) { counters.Add("refdata.errors", 1); log.Warn("refdata", "err", err) })
+		if st, err := store.Statuses(ctx); err != nil {
+			log.Warn("catalog statuses", "err", err)
+		} else if changed := cat.ApplyStatuses(st); len(changed) > 0 {
+			log.Info("catalog statuses from postgres override the yaml seed", "sources", changed)
+		}
+		r := refdata.NewResolver(store, nil, func(err error) { counters.Add("refdata.errors", 1); log.Warn("refdata", "err", err) })
+		r.OnProvision = func(source, symbol, id string) {
+			counters.Add("provisioned."+source, 1)
+			health.PublishUnresolved(UnresolvedEvent{Source: source, VenueSymbol: symbol, InstrumentID: id, Reason: "provisioned as provisional instrument; review in quarantine", At: time.Now().UTC()})
+		}
+		resolver = r
 		cursors = refdata.NewCursors(store)
+		backfillCursors = refdata.NewBackfillCursors(store)
 		runLog = refdata.NewRunLog(store)
+		statuses = store
+		seedGaps = func(ctx context.Context, source string) map[string]time.Time {
+			rows, err := store.ListCursors(ctx, source, 1000)
+			if err != nil {
+				log.Warn("gap seed", "source", source, "err", err)
+				return nil
+			}
+			out := map[string]time.Time{}
+			for _, r := range rows {
+				if r.Live && r.InstrumentID != "" && r.Cursor != nil {
+					out[GapKey(r.InstrumentID, r.Timescale)] = *r.Cursor
+				}
+			}
+			return out
+		}
 	}
 
+	// One token bucket per source, shared by the live connector and backfill
+	// jobs so the catalog limit holds across both (spec 10 §6.4).
+	var limMu sync.Mutex
+	limiters := map[string]*connector.MeteredLimiter{}
+	limiterFor := func(src catalog.Source) *connector.MeteredLimiter {
+		limMu.Lock()
+		defer limMu.Unlock()
+		if l, ok := limiters[src.ID]; ok {
+			return l
+		}
+		l := connector.NewMeteredLimiter(connector.NewLimiter(src.Limit()))
+		limiters[src.ID] = l
+		return l
+	}
 	deps := func(src catalog.Source) connector.Deps {
 		return connector.Deps{
-			Limiter:  connector.NewLimiter(src.Limit()),
+			Limiter:  limiterFor(src),
 			Resolver: resolver,
 			Archive:  arch,
 			Clock:    connector.SystemClock{},
 			Cursors:  cursors,
 		}
 	}
-	sup := NewSupervisor(cat, log, counters, deps, func(ctx context.Context, log *slog.Logger, c connector.Connector) {
-		run(ctx, log, c, pub, writer, arch, counters)
-	})
+	pipe := &Pipeline{Pub: pub, Writer: writer, Archive: arch, Counters: counters, Health: health, SeedGaps: seedGaps}
+	sup := NewSupervisor(cat, log, counters, deps, pipe.Run)
 	sup.Secrets = secrets.ForSource
 	sup.RunLog = runLog
+	sup.Health = health
+	sup.Statuses = statuses
+
+	backfiller, err := NewBackfiller(ctx, pub.NC, sup, pipe, backfillCursors, runLog, log.With("worker", "backfill"), counters, instance)
+	if err != nil {
+		log.Warn("backfill work queue unavailable (jobs.ingest.backfill disabled)", "err", err)
+	} else {
+		go backfiller.Run(ctx)
+	}
 	if archWriter != nil {
 		go func() {
 			t := time.NewTicker(time.Second)
@@ -228,8 +294,60 @@ func main() {
 		}
 		return "stopped " + id, nil
 	})
+	handle("enable", func(r *fav1.CtlRequest) (string, error) {
+		id := r.Args["source"]
+		started, err := sup.Enable(ctx, id)
+		if err != nil {
+			return "", err
+		}
+		if started {
+			return "enabled and started " + id, nil
+		}
+		return "enabled " + id + " (already running)", nil
+	})
+	handle("disable", func(r *fav1.CtlRequest) (string, error) {
+		id := r.Args["source"]
+		stopped, err := sup.Disable(ctx, id)
+		if err != nil {
+			return "", err
+		}
+		if stopped {
+			return "disabled and stopped " + id, nil
+		}
+		return "disabled " + id, nil
+	})
+	handle("backfill", func(r *fav1.CtlRequest) (string, error) {
+		if backfiller == nil {
+			return "", fmt.Errorf("%w: backfill work queue unavailable (JetStream)", ErrConflict)
+		}
+		spec := BackfillSpec{Source: r.Args["source"], Timescale: r.Args["timescale"], Start: r.Args["start"], End: r.Args["end"]}
+		if inst := strings.TrimSpace(r.Args["instruments"]); inst != "" {
+			spec.Instruments = strings.Split(inst, ",")
+		}
+		raw, _ := json.Marshal(spec)
+		return backfiller.Enqueue(ctx, raw)
+	})
 	handle("status", func(*fav1.CtlRequest) (string, error) {
-		return strings.Join(sup.Running(), ","), nil
+		st := map[string]any{"running": sup.Running(), "connectors": connector.Registered(), "health": health.Frames()}
+		if store != nil {
+			sctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			if rows, err := store.ListCursors(sctx, "", 200); err == nil {
+				st["cursors"] = rows
+			}
+		}
+		limMu.Lock()
+		lim := map[string]connector.LimiterStats{}
+		for id, l := range limiters {
+			lim[id] = l.Snapshot(false)
+		}
+		limMu.Unlock()
+		st["limiters"] = lim
+		b, err := json.Marshal(st)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
 	})
 
 	log.Info("started", "connectors", connector.Registered(), "running", sup.Running(), "tsdb", *tsdbURL, "postgres", *pgURL != "", "garage", *garageURL)
@@ -243,94 +361,4 @@ func main() {
 		fcancel()
 	}
 	log.Info("stopped")
-}
-
-// run drives one connector: stream or poll, archive raw, normalize, publish, write to the TSDB.
-func run(ctx context.Context, log *slog.Logger, c connector.Connector, pub *bus.Publisher, writer *tsdb.Writer, arch connector.RawArchive, counters *bus.Counters) {
-	id := c.ID()
-	norm, ok := c.(connector.Normalizer)
-	if !ok {
-		log.Error("connector does not implement Normalizer")
-		return
-	}
-	raws := make(chan connector.RawMessage, 1024)
-	go func() {
-		defer close(raws)
-		var err error
-		switch {
-		case c.Capabilities().Stream:
-			err = c.(connector.Streamer).Stream(ctx, nil, raws)
-		case c.Capabilities().Poll:
-			err = pollLoop(ctx, c.(connector.Poller), raws)
-		default:
-			log.Warn("connector has neither stream nor poll capability")
-		}
-		if err != nil && !errors.Is(err, context.Canceled) {
-			counters.Add("errors."+id, 1)
-			log.Error("connector stopped", "err", err)
-		}
-	}()
-
-	venue := c.Capabilities().Venue
-	for raw := range raws {
-		ref, err := arch.Put(ctx, raw)
-		if err != nil {
-			counters.Add("errors."+id, 1)
-			log.Warn("archive", "err", err)
-		}
-		envs, unresolved, err := norm.Normalize(raw)
-		if err != nil {
-			counters.Add("errors."+id, 1)
-			log.Warn("normalize", "err", err)
-			continue
-		}
-		counters.Add("unresolved."+id, float64(len(unresolved)))
-		for _, u := range unresolved {
-			log.Warn("unresolved symbol", "symbol", u.VenueSymbol, "reason", u.Reason)
-		}
-		for _, e := range envs {
-			if e.RawRef == nil && ref != nil {
-				e.RawRef = ref
-			}
-			subj, err := bus.SubjectFor(e, venue)
-			if err != nil {
-				counters.Add("errors."+id, 1)
-				continue
-			}
-			if err := pub.Publish(subj, e); err != nil {
-				counters.Add("errors."+id, 1)
-				log.Warn("publish", "subject", subj, "err", err)
-				continue
-			}
-			counters.Add("events."+id, 1)
-			if writer != nil {
-				writer.AddEnvelope(e, venue)
-			}
-		}
-	}
-}
-
-func pollLoop(ctx context.Context, p connector.Poller, out chan<- connector.RawMessage) error {
-	t := time.NewTicker(p.Schedule().Interval)
-	defer t.Stop()
-	since := time.Now().UTC()
-	for {
-		msgs, err := p.Poll(ctx, connector.PollRequest{Since: since})
-		if err != nil {
-			return err
-		}
-		since = time.Now().UTC()
-		for _, m := range msgs {
-			select {
-			case out <- m:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-t.C:
-		}
-	}
 }

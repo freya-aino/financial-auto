@@ -4,22 +4,37 @@
 //! [`RiskEngine::clip_targets`] applies the caps; [`RiskEngine::gate`] applies the halt
 //! semantics on top (kill switch → flatten, daily loss → reduce-only). [`HaltScope`] maps
 //! to and from the bus scope strings of `risk.halt.<scope>` (spec 21, D-030).
+//! [`RiskConfig::check_tightens`] enforces "runtime changes may only tighten" (spec 40 §6.5).
+//! [`strategy`] holds the strategy lifecycle (`active|paused|flattening|shadow`), the
+//! per-strategy drawdown tracker and the promotion gate checklist (spec 40 §6.6).
+
+pub mod strategy;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use fa_core::{AssetClass, InstrumentId};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RiskConfig {
     /// Portfolio drawdown from peak equity that triggers flatten + halt.
     pub max_drawdown: f64,
+    /// Per-strategy drawdown of attributed P&L, as a fraction of the strategy's sleeve, that
+    /// pauses (and flattens) the strategy (spec 40 §6.5).
+    pub strategy_max_drawdown: f64,
     /// Daily loss (fraction of start-of-day equity) that stops trading for the day.
     pub max_daily_loss: f64,
     /// Max |position| per instrument as a fraction of deployable capital.
     pub max_position_frac: f64,
+    /// Max gross exposure per asset class as a fraction of deployable capital (concentration).
+    pub max_class_frac: f64,
+    /// Max gross exposure per venue as a fraction of deployable capital (counterparty risk).
+    pub max_venue_frac: f64,
     /// Max gross exposure per asset class as a multiple of deployable capital.
     pub leverage_cap: BTreeMap<AssetClass, f64>,
+    /// Portfolio-wide gross exposure cap as a multiple of deployable capital.
+    pub portfolio_gross_cap: f64,
     /// Liquidity cap: |position| ≤ k × traded volume (EUR) over the horizon.
     pub liquidity_k: f64,
     /// Capital reserved per day for payouts.
@@ -30,17 +45,57 @@ impl Default for RiskConfig {
     fn default() -> Self {
         Self {
             max_drawdown: 0.15,
+            strategy_max_drawdown: 0.05,
             max_daily_loss: 0.03,
             max_position_frac: 0.10,
+            max_class_frac: 0.40,
+            max_venue_frac: 0.50,
             leverage_cap: BTreeMap::from([
                 (AssetClass::Equity, 1.0),
                 (AssetClass::Etf, 1.0),
                 (AssetClass::Fx, 2.0),
                 (AssetClass::Crypto, 1.0),
             ]),
+            portfolio_gross_cap: 2.0,
             liquidity_k: 0.01,
             daily_payout_quota_eur: 0.0,
         }
+    }
+}
+
+impl RiskConfig {
+    /// Checks that `new` is at least as strict as `self` in every field (spec 40 §6.5: runtime
+    /// changes may only tighten; loosening needs a config change + restart). Returns the list
+    /// of fields that would loosen, empty when the change is acceptable. A leverage class that
+    /// is absent has cap 0, so adding a class loosens and removing one tightens.
+    pub fn check_tightens(&self, new: &RiskConfig) -> Vec<String> {
+        let mut bad = Vec::new();
+        let mut le = |name: &str, old: f64, new: f64| {
+            if !new.is_finite() || new < 0.0 {
+                bad.push(format!("{name}: {new} is not a valid limit"));
+            } else if new > old {
+                bad.push(format!("{name}: {old} → {new} would loosen"));
+            }
+        };
+        le("max_drawdown", self.max_drawdown, new.max_drawdown);
+        le("strategy_max_drawdown", self.strategy_max_drawdown, new.strategy_max_drawdown);
+        le("max_daily_loss", self.max_daily_loss, new.max_daily_loss);
+        le("max_position_frac", self.max_position_frac, new.max_position_frac);
+        le("max_class_frac", self.max_class_frac, new.max_class_frac);
+        le("max_venue_frac", self.max_venue_frac, new.max_venue_frac);
+        le("portfolio_gross_cap", self.portfolio_gross_cap, new.portfolio_gross_cap);
+        le("liquidity_k", self.liquidity_k, new.liquidity_k);
+        for (class, cap) in &new.leverage_cap {
+            let old = self.leverage_cap.get(class).copied().unwrap_or(0.0);
+            le(&format!("leverage_cap.{class:?}").to_lowercase(), old, *cap);
+        }
+        if !new.daily_payout_quota_eur.is_finite() || new.daily_payout_quota_eur < self.daily_payout_quota_eur {
+            bad.push(format!(
+                "daily_payout_quota_eur: {} → {} would loosen (less reserved)",
+                self.daily_payout_quota_eur, new.daily_payout_quota_eur
+            ));
+        }
+        bad
     }
 }
 
@@ -48,6 +103,8 @@ impl Default for RiskConfig {
 #[derive(Debug, Clone)]
 pub struct MarketInfo {
     pub asset_class: AssetClass,
+    /// Venue the instrument trades on (empty when unknown; still capped as one bucket).
+    pub venue: String,
     /// Traded volume in EUR over the strategy horizon.
     pub horizon_volume_eur: f64,
 }
@@ -253,7 +310,8 @@ impl RiskEngine {
         }
         let classes: BTreeSet<AssetClass> = gross.keys().copied().collect();
         for c in classes {
-            let cap = self.cfg.leverage_cap.get(&c).copied().unwrap_or(0.0) * deployable;
+            // leverage cap and concentration cap per class: the tighter one binds
+            let cap = self.cfg.leverage_cap.get(&c).copied().unwrap_or(0.0).min(self.cfg.max_class_frac) * deployable;
             let g = gross[&c];
             if g > cap {
                 let scale = if g > 0.0 { cap / g } else { 0.0 };
@@ -262,6 +320,33 @@ impl RiskEngine {
                         *v *= scale;
                     }
                 }
+            }
+        }
+        // per-venue concentration cap (counterparty risk)
+        let mut by_venue: BTreeMap<&str, f64> = BTreeMap::new();
+        for (i, v) in &clipped {
+            if let Some(m) = market.get(i) {
+                *by_venue.entry(m.venue.as_str()).or_default() += v.abs();
+            }
+        }
+        let venue_cap = self.cfg.max_venue_frac * deployable;
+        let over: Vec<(String, f64)> =
+            by_venue.iter().filter(|(_, g)| **g > venue_cap).map(|(v, g)| ((*v).to_owned(), *g)).collect();
+        for (venue, g) in over {
+            let scale = if g > 0.0 { venue_cap / g } else { 0.0 };
+            for (i, v) in clipped.iter_mut() {
+                if market.get(i).is_some_and(|m| m.venue == venue) {
+                    *v *= scale;
+                }
+            }
+        }
+        // portfolio-wide gross cap
+        let total: f64 = clipped.values().map(|v| v.abs()).sum();
+        let gross_cap = self.cfg.portfolio_gross_cap * deployable;
+        if total > gross_cap {
+            let scale = if total > 0.0 { gross_cap / total } else { 0.0 };
+            for v in clipped.values_mut() {
+                *v *= scale;
             }
         }
         clipped
@@ -288,8 +373,8 @@ mod tests {
         let (a, b) = (InstrumentId::new(), InstrumentId::new());
         let t = BTreeMap::from([(a, 5_000.0), (b, -5_000.0)]);
         let m = BTreeMap::from([
-            (a, MarketInfo { asset_class: AssetClass::Equity, horizon_volume_eur: 1e9 }),
-            (b, MarketInfo { asset_class: AssetClass::Crypto, horizon_volume_eur: 50_000.0 }),
+            (a, MarketInfo { asset_class: AssetClass::Equity, venue: "x".into(), horizon_volume_eur: 1e9 }),
+            (b, MarketInfo { asset_class: AssetClass::Crypto, venue: "x".into(), horizon_volume_eur: 50_000.0 }),
         ]);
         let c = e.clip_targets(&t, &m, 11_000.0);
         assert_eq!(c[&a], 1_000.0); // 10% of 10k deployable
@@ -300,15 +385,64 @@ mod tests {
     fn leverage_cap_scales_class() {
         let mut e = engine();
         e.cfg.max_position_frac = 10.0;
+        e.cfg.max_class_frac = 1.0; // isolate the leverage cap from the concentration cap
         e.cfg.leverage_cap.insert(AssetClass::Fx, 0.5);
         let (a, b) = (InstrumentId::new(), InstrumentId::new());
         let t = BTreeMap::from([(a, 4_000.0), (b, -6_000.0)]);
         let m: BTreeMap<_, _> = [a, b]
             .into_iter()
-            .map(|i| (i, MarketInfo { asset_class: AssetClass::Fx, horizon_volume_eur: 1e12 }))
+            .map(|i| (i, MarketInfo { asset_class: AssetClass::Fx, venue: "x".into(), horizon_volume_eur: 1e12 }))
             .collect();
         let c = e.clip_targets(&t, &m, 11_000.0);
         assert!((c[&a].abs() + c[&b].abs() - 5_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn concentration_caps_per_class_venue_and_portfolio() {
+        let mut e = engine();
+        e.cfg.max_position_frac = 10.0;
+        e.cfg.leverage_cap = BTreeMap::from([(AssetClass::Equity, 5.0), (AssetClass::Crypto, 5.0)]);
+        e.cfg.max_class_frac = 0.5; // 5 000 of 10 000 deployable per class
+        e.cfg.max_venue_frac = 0.7; // 7 000 per venue
+        e.cfg.portfolio_gross_cap = 10.0;
+        let (a, b, c) = (InstrumentId::new(), InstrumentId::new(), InstrumentId::new());
+        let m = BTreeMap::from([
+            (a, MarketInfo { asset_class: AssetClass::Equity, venue: "v1".into(), horizon_volume_eur: 1e12 }),
+            (b, MarketInfo { asset_class: AssetClass::Equity, venue: "v1".into(), horizon_volume_eur: 1e12 }),
+            (c, MarketInfo { asset_class: AssetClass::Crypto, venue: "v1".into(), horizon_volume_eur: 1e12 }),
+        ]);
+        let t = BTreeMap::from([(a, 4_000.0), (b, -4_000.0), (c, 4_000.0)]);
+        let r = e.cap_targets(&t, &m, 11_000.0);
+        // equity class 8 000 → 5 000 (a 2 500, b −2 500); crypto 4 000 stays; venue 9 000 → 7 000
+        let gross: f64 = r.values().map(|v| v.abs()).sum();
+        assert!((gross - 7_000.0).abs() < 1e-6, "venue cap binds: {r:?}");
+        assert!(r[&a] > 0.0 && r[&b] < 0.0 && (r[&a] + r[&b]).abs() < 1e-9, "class scaled proportionally");
+        e.cfg.portfolio_gross_cap = 0.3; // 3 000 total
+        let r = e.cap_targets(&t, &m, 11_000.0);
+        let gross: f64 = r.values().map(|v| v.abs()).sum();
+        assert!((gross - 3_000.0).abs() < 1e-6, "portfolio cap binds: {r:?}");
+    }
+
+    #[test]
+    fn runtime_limit_changes_may_only_tighten() {
+        let old = RiskConfig::default();
+        assert!(old.check_tightens(&old).is_empty(), "same limits are fine");
+        let mut tighter = old.clone();
+        tighter.max_drawdown = 0.05;
+        tighter.leverage_cap.remove(&AssetClass::Fx);
+        tighter.daily_payout_quota_eur = 100.0;
+        assert!(old.check_tightens(&tighter).is_empty());
+        let mut looser = old.clone();
+        looser.max_daily_loss = 0.5;
+        looser.leverage_cap.insert(AssetClass::Commodity, 1.0);
+        looser.daily_payout_quota_eur = -1.0;
+        let bad = old.check_tightens(&looser);
+        assert_eq!(bad.len(), 3, "{bad:?}");
+        assert!(bad[0].starts_with("max_daily_loss"));
+        assert!(bad.iter().any(|b| b.starts_with("leverage_cap.commodity")));
+        let mut nan = old.clone();
+        nan.liquidity_k = f64::NAN;
+        assert_eq!(old.check_tightens(&nan).len(), 1);
     }
 
     #[test]

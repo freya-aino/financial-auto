@@ -9,6 +9,8 @@
 //! result's `data.source` says so (`"victoriametrics"` vs `"md.trade.> in-memory buffer
 //! (fallback: <reason>)"`).
 
+use fa_backtest::replay::BarSeries;
+use fa_core::Timescale;
 use fa_decoders::{baseline::Series, genome::DecoderGenome};
 use fa_tsdb::{MAX_POINTS_PER_SERIES, Tsdb};
 use serde::{Deserialize, Serialize};
@@ -146,6 +148,85 @@ pub async fn load(
     Loaded { series, venues, source: src, longest }
 }
 
+/// Bars for a strategy replay (same sources and window rules as [`load`]).
+pub struct LoadedBars {
+    pub bars: Vec<BarSeries>,
+    pub source: DataSource,
+    pub longest: usize,
+    pub n_bars: usize,
+}
+
+/// Loads bar series at `timescale` for every instrument (or `instrument`) with at least
+/// `need` bars: VictoriaMetrics `fa_trade_price` resampled to the timescale (last price per
+/// bucket, stamped at the bucket close), else the in-memory buffer.
+pub async fn load_bars(
+    tsdb: Option<&Tsdb>,
+    market: &MarketBuffer,
+    timescale: Timescale,
+    instrument: Option<&str>,
+    window: &DataWindow,
+    default_hours: f64,
+    need: usize,
+) -> LoadedBars {
+    let step_ms = i64::try_from(timescale.duration().as_millis()).unwrap_or(1000);
+    let now = now_ms();
+    let (start_ms, end_ms) = window.resolve(now, default_hours, step_ms);
+    let (buf_inst, buf_trades) = market.stats();
+    let mut src = DataSource {
+        source: String::new(),
+        timescale: timescale.to_string(),
+        step_ms,
+        window_start_ms: start_ms,
+        window_end_ms: end_ms,
+        vm_url: tsdb.map(|t| t.base_url().to_owned()),
+        vm_series: 0,
+        vm_error: None,
+        buffer_instruments: buf_inst,
+        buffer_trades: buf_trades,
+    };
+    let mut longest = 0usize;
+    if let Some(vm) = tsdb {
+        match vm.trade_prices(instrument, start_ms / 1000, end_ms / 1000, fa_tsdb::step_of(timescale)).await {
+            Ok(ts) => {
+                src.vm_series = ts.len();
+                let mut bars = Vec::new();
+                for t in ts {
+                    let b = BarSeries::from_points(&t.inst, &t.venue, &t.points, step_ms);
+                    longest = longest.max(b.len());
+                    if b.len() >= need {
+                        bars.push(b);
+                    }
+                }
+                if bars.is_empty() {
+                    src.vm_error =
+                        Some(format!("{} series in window, longest {longest} bars < {need} needed", src.vm_series));
+                } else {
+                    src.source = "victoriametrics".into();
+                    let n_bars = bars.iter().map(BarSeries::len).sum();
+                    return LoadedBars { bars, source: src, longest, n_bars };
+                }
+            }
+            Err(e) => src.vm_error = Some(e.to_string()),
+        }
+    }
+    let mut bars = Vec::new();
+    for t in market.snapshot(instrument) {
+        let b = BarSeries::from_points(&fa_decoders::instrument_token(&t.instrument_id), &t.venue, &t.trades, step_ms);
+        longest = longest.max(b.len());
+        if b.len() >= need {
+            bars.push(b);
+        }
+    }
+    let reason = match (&src.vm_url, &src.vm_error) {
+        (None, _) => "no VictoriaMetrics configured".to_owned(),
+        (Some(_), Some(e)) => e.clone(),
+        (Some(_), None) => "VictoriaMetrics returned nothing".to_owned(),
+    };
+    src.source = format!("md.trade.> in-memory buffer (fallback: {reason})");
+    let n_bars = bars.iter().map(BarSeries::len).sum();
+    LoadedBars { bars, source: src, longest, n_bars }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +266,9 @@ mod tests {
         assert!(none.source.source.contains("no VictoriaMetrics configured"));
         let short = load(None, &market, &genome, &DataWindow::default(), 1.0, 500).await;
         assert!(short.series.is_empty() && short.longest == 50);
+        let bars = load_bars(None, &market, Timescale::Second, None, &DataWindow::default(), 1.0, 10).await;
+        assert_eq!(bars.bars.len(), 1);
+        assert_eq!((bars.bars[0].venue.as_str(), bars.bars[0].len(), bars.n_bars), ("sim", 50, 50));
+        assert!(bars.bars[0].ts_ms.windows(2).all(|w| w[1] > w[0]), "bars stamped at close, ascending");
     }
 }

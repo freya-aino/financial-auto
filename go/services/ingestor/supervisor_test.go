@@ -29,7 +29,7 @@ sources:
 		t.Fatal(err)
 	}
 	counters := bus.NewCounters()
-	run := func(ctx context.Context, _ *slog.Logger, _ connector.Connector) { <-ctx.Done() }
+	run := func(ctx context.Context, _ *slog.Logger, _ connector.Connector) error { <-ctx.Done(); return nil }
 	deps := func(catalog.Source) connector.Deps { return connector.Deps{Clock: connector.SystemClock{}} }
 	return NewSupervisor(cat, slog.Default(), counters, deps, run)
 }

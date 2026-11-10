@@ -7,10 +7,13 @@ publish.workspace = true
 
 [dependencies]
 fa-core.workspace = true
+fa-mcmc.workspace = true
 fa-proto.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

@@ -2,14 +2,21 @@
 //! Local only, no auth (ADR 0006).
 
 mod bus_tap;
+mod config_routes;
+mod evolution_routes;
 mod graph_routes;
+mod latent_routes;
 mod ledger_routes;
 mod live;
 mod live_routes;
 mod routes;
 mod sources;
+mod sources_routes;
 mod state;
 mod streams_routes;
+mod trading_routes;
+mod validation_routes;
+mod ws_routes;
 
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -56,14 +63,24 @@ async fn main() -> anyhow::Result<()> {
         .context("configuring NATS client")?;
 
     let state = state::AppState::new(cfg, args.sources, Some(nats));
+    state.live_mut().set_runtime(state.cfg.runtime.clone()); // [runtime] + config/runtime.toml overlay
+    config_routes::set_runtime_path(&args.config); // `PUT /api/config/runtime` persists next to it
     state.spawn_heartbeat_collector();
     state.spawn_live_collector();
     streams_routes::spawn_ensure_streams(&state);
+    sources::spawn_health_collector(&state); // ingest.health|gap|unresolved.* mirror (D-054)
 
     let app = routes::router(state.clone(), Some(args.frontend))
         .merge(graph_routes::router().with_state(state.clone()))
-        .merge(streams_routes::router().with_state(state.clone()));
-    let app = ledger_routes::install(state, app).await; // Postgres pool + paper-book seed + ledger routes (D-047)
+        .merge(streams_routes::router().with_state(state.clone()))
+        .merge(sources_routes::router().with_state(state.clone()))
+        .merge(latent_routes::router().with_state(state.clone()))
+        .merge(evolution_routes::router().with_state(state.clone()))
+        .merge(config_routes::router().with_state(state.clone()))
+        .merge(ws_routes::router().with_state(state.clone()))
+        .merge(validation_routes::router().with_state(state.clone())); // holdout, trial reports, populations (D-052)
+    let app = ledger_routes::install(state.clone(), app).await; // Postgres pool + paper-book seed + ledger routes (D-047)
+    let app = trading_routes::install(state, app); // strategy lifecycle + limits via ctl.risk.* (D-051)
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     tracing::info!(%bind, "control-api listening");
     axum::serve(listener, app).await?;

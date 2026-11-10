@@ -7,7 +7,7 @@ First-wave connector: Yahoo Finance chart endpoint (1m bars live, backfill by wi
 ## Behaviour
 - **Poll** (every minute): `GET /v8/finance/chart/<symbol>?interval=<tf>&range=1d` per `config.symbols` (default `SPY`), timeframe `config.timeframe` (default `1m`; `1m 5m 15m 1h 1d`).
 - **Normalize:** every completed bar → `Bar` on `md.bar.<tf>.yahoo.<inst>` **and** a synthetic `Trade` (price = close, size = volume, `venue_trade_id = bar:<unix>`) on `md.trade.yahoo.<inst>`, because the latent pipeline, strategy features and evo-worker eval (D-044) consume `md.trade.>`. `event_time` = bar close (open + tf); `publish_time = ingest_time` (spec 10 §6.2). Live polls skip bars already emitted (per-symbol watermark, persisted as an `ingest.backfill_cursor` row per instrument/timeframe) and the still-forming bar; null-padded minutes are dropped.
-- **Backfill:** `period1/period2` windows (≤ 7 d for 1m, ≤ 60 d for 5m/15m, ≤ 730 d for 1h), all bars emitted, `TransportMeta.backfill=1`.
+- **Backfill:** `period1/period2` windows (≤ 7 d for 1m, ≤ 60 d for 5m/15m, ≤ 730 d for 1h), all bars emitted, `TransportMeta.backfill=1`. Triggered by `jobs.ingest.backfill` jobs (`POST /api/sources/<id>/backfill`, D-054); the ingestor drives `Backfill` per instrument with a persisted range cursor.
 - **Resolution:** `Resolver.Resolve("yahoo", symbol)`; misses are reported as `Unresolved` (with Postgres the resolver provisions them, see `go/pkg/refdata`).
 - Rate limit from the catalog (`1/s, burst 3`).
 

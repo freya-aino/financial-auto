@@ -330,7 +330,8 @@ pub async fn paper_order(State(s): State<AppState>, Json(body): Json<PaperOrder>
     if s.live().is_halted("portfolio") {
         return err(StatusCode::CONFLICT, "portfolio is halted; resume before placing orders");
     }
-    if let Err(e) = publish(&s, subjects::order_approved(PAPER_ACCOUNT), &intent).await {
+    if let Err(e) = publish(&s, subjects::order_intent(PAPER_ACCOUNT), &intent).await {
+        // gated by risk-engine (D-051)
         return e.into_response();
     }
     let id = intent.intent_id.clone();

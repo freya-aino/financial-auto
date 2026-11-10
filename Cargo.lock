@@ -418,12 +418,16 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "fa-backtest",
+ "fa-blob",
  "fa-bus",
  "fa-core",
+ "fa-evolution",
  "fa-hub",
  "fa-ledger",
  "fa-mcmc",
  "fa-proto",
+ "fa-warehouse",
  "futures",
  "http-body-util",
  "serde",
@@ -431,6 +435,8 @@ dependencies = [
  "serde_yaml_ng",
  "sqlx",
  "tokio",
+ "tokio-tungstenite",
+ "toml",
  "tower",
  "tower-http 0.7.1",
  "tracing",
@@ -699,6 +705,7 @@ name = "evo-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "fa-backtest",
  "fa-blob",
@@ -708,10 +715,12 @@ dependencies = [
  "fa-evolution",
  "fa-hub",
  "fa-proto",
+ "fa-strategies",
  "fa-tsdb",
  "futures",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -734,8 +743,12 @@ version = "0.1.0"
 dependencies = [
  "fa-core",
  "fa-decoders",
+ "fa-strategies",
  "serde",
+ "serde_json",
+ "serde_yaml",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -892,10 +905,13 @@ name = "fa-strategies"
 version = "0.1.0"
 dependencies = [
  "fa-core",
+ "fa-mcmc",
  "fa-proto",
  "serde",
+ "serde_json",
  "thiserror",
  "toml",
+ "uuid",
 ]
 
 [[package]]
@@ -2346,6 +2362,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
  "toml",
@@ -2992,8 +3009,10 @@ name = "strategy-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "clap",
+ "fa-blob",
  "fa-bus",
  "fa-core",
  "fa-proto",

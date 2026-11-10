@@ -56,7 +56,9 @@ use crate::{
     gpu::{self, Lease, Notice},
     latent::LatentBuffer,
     market::{MarketBuffer, now_ms},
-    vary,
+    strategy,
+    trials::{self, TrialRow, TrialStore},
+    vary, vary_strategy,
 };
 
 pub const KIND: &str = "evo.eval.decoder";
@@ -91,6 +93,10 @@ pub struct Worker {
     pub hub: Option<HubClient>,
     /// Garage store for eval reports; `None` without credentials.
     pub blob: Option<S3BlobStore>,
+    /// Trial registry (`validation.trial`, `validation.generation_stats`, holdouts); `None` without Postgres.
+    pub trials: Option<TrialStore>,
+    /// Shared execution cost model (`go/services/broker-gateway/costs.yaml`).
+    pub cost: Arc<fa_backtest::cost::CostModel>,
 }
 
 /// What `handle` produces; the caller publishes the result and acks.
@@ -120,7 +126,7 @@ fn deadline_of(job: &Job, budget: Duration) -> Instant {
 }
 
 impl Worker {
-    fn failed(&self, job: &Job, error: String, used_ms: u64) -> Outcome {
+    pub(crate) fn failed(&self, job: &Job, error: String, used_ms: u64) -> Outcome {
         Outcome {
             result: JobResult {
                 job_id: job.job_id.clone(),
@@ -134,7 +140,7 @@ impl Worker {
         }
     }
 
-    async fn progress(&self, job_id: &str, fraction: f32, message: impl Into<String>) {
+    pub(crate) async fn progress(&self, job_id: &str, fraction: f32, message: impl Into<String>) {
         let p = JobProgress { job_id: job_id.into(), fraction, message: message.into() };
         if let Err(e) = self.bus.publish(subjects::job_progress(job_id), &p).await {
             tracing::debug!(error = %e, "progress publish failed");
@@ -146,9 +152,18 @@ impl Worker {
         match job.kind.as_str() {
             KIND => self.evaluate(job).await,
             vary::KIND => self.vary(job).await,
-            other => {
-                self.failed(job, format!("job kind `{other}` not implemented (only `{KIND}`, `{}`)", vary::KIND), 0)
-            }
+            strategy::KIND => self.evaluate_strategy(job).await,
+            vary_strategy::KIND => self.vary_strategy(job).await,
+            other => self.failed(
+                job,
+                format!(
+                    "job kind `{other}` not implemented (only `{KIND}`, `{}`, `{}`, `{}`)",
+                    vary::KIND,
+                    strategy::KIND,
+                    vary_strategy::KIND
+                ),
+                0,
+            ),
         }
     }
 
@@ -187,6 +202,57 @@ impl Worker {
             },
             outputs: Vec::new(),
         }
+    }
+
+    /// `evo.vary.strategy`: parents → children (see [`crate::vary_strategy`]). CPU only.
+    async fn vary_strategy(&self, job: &Job) -> Outcome {
+        let started = Instant::now();
+        let req: vary::VaryRequest = match serde_json::from_slice(&job.spec) {
+            Ok(r) => r,
+            Err(e) => return self.failed(job, format!("vary spec: {e}"), 0),
+        };
+        let out = match vary_strategy::produce(&req) {
+            Ok(o) => o,
+            Err(e) => return self.failed(job, format!("vary: {e}"), started.elapsed().as_millis() as u64),
+        };
+        self.progress(&job.job_id, 0.5, format!("{} children from {} parents", out.children.len(), out.parents.len()))
+            .await;
+        let helix =
+            match tokio::time::timeout(Duration::from_secs(20), vary_strategy::persist(self.hub.as_ref(), &req, &out))
+                .await
+            {
+                Ok(v) => v,
+                Err(_) => json!({"persisted": false, "reason": "helix timeout"}),
+            };
+        if helix["persisted"] != json!(true) {
+            tracing::warn!(job = %job.job_id, helix = %helix, "strategy lineage not (fully) persisted to Helix");
+        }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let payload = vary_strategy::payload(&req, &out, helix, &self.worker_id, elapsed_ms);
+        tracing::info!(job = %job.job_id, parents = out.parents.len(), children = out.children.len(), immigrants = out.immigrants, "strategy variation done");
+        Outcome {
+            result: JobResult {
+                job_id: job.job_id.clone(),
+                status: Status::Ok as i32,
+                result: serde_json::to_vec(&payload).unwrap_or_default(),
+                used_gpu_ms: elapsed_ms,
+                worker_id: self.worker_id.clone(),
+                ..Default::default()
+            },
+            outputs: Vec::new(),
+        }
+    }
+
+    /// `(generation loop index, rung)` from the eval envelope (0, 0 when absent).
+    pub fn parse_position(job: &Job) -> (i32, i32) {
+        let raw = std::str::from_utf8(&job.spec).unwrap_or("");
+        if let Ok(v) = serde_json::from_str::<Value>(raw) {
+            return (
+                v.get("generation").and_then(Value::as_i64).unwrap_or(0) as i32,
+                v.get("rung").and_then(Value::as_i64).unwrap_or(0) as i32,
+            );
+        }
+        (0, 0)
     }
 
     /// Splits an eval `Job.spec` into the genome string and the data window: an envelope
@@ -369,6 +435,26 @@ impl Worker {
         let report_key = fa_blob::eval_report(&job.parent_job_id, &job.job_id);
         let objectives: serde_json::Map<String, Value> =
             pooled.objectives().into_iter().map(|(k, v)| (k.to_owned(), json!(v))).collect();
+        // Trial registry (spec 41 §6.5): the naive sign policy's per-step P&L is the trial's return series.
+        let (gen_index, rung) = Self::parse_position(job);
+        let generation_stats = trials::register(
+            self.trials.as_ref(),
+            &TrialRow {
+                generation: if job.parent_job_id.is_empty() { "adhoc".into() } else { job.parent_job_id.clone() },
+                gen_index,
+                rung,
+                job_id: job.job_id.clone(),
+                candidate: genome.to_string(),
+                kind: KIND.into(),
+                window_start_ms: data_src.window_start_ms,
+                window_end_ms: data_src.window_end_ms,
+                sharpe: pooled.trade_sharpe,
+                n_obs: pooled.n_eval,
+                objectives: Value::Object(objectives.clone()),
+                returns: pooled.pnl.clone(),
+            },
+        )
+        .await;
         let instruments: Vec<Value> = reports
             .iter()
             .map(|r| {
@@ -390,6 +476,7 @@ impl Worker {
                      "vm_url": data_src.vm_url, "vm_series": data_src.vm_series, "vm_error": data_src.vm_error,
                      "latents": {"instruments": latent_inst, "points": latent_points},
                      "instruments": instruments},
+            "generation_stats": generation_stats,
             "budget": {"budget_ms": budget_ms, "elapsed_ms": elapsed_ms, "truncated": truncated},
             "stop": pooled.stop,
             // Written below when a Garage store is configured; the stored document says
@@ -424,7 +511,7 @@ impl Worker {
 
     /// Writes the report JSON to Garage. Returns whether it was persisted; failures only warn,
     /// the job result is published either way.
-    async fn persist_report(&self, key: &fa_blob::ObjectKey, payload: &Value) -> bool {
+    pub(crate) async fn persist_report(&self, key: &fa_blob::ObjectKey, payload: &Value) -> bool {
         let Some(blob) = &self.blob else { return false };
         let bytes = match serde_json::to_vec_pretty(payload) {
             Ok(b) => b,
@@ -496,5 +583,7 @@ mod tests {
         let (g, _) = Worker::parse_spec(&job("retrieval:k=4"));
         assert_eq!(g, "retrieval:k=4");
         assert_eq!(directions_json()["crps_skill"], "max");
+        assert_eq!(Worker::parse_position(&job(r#"{"genome":"g1","generation":2,"rung":1}"#)), (2, 1));
+        assert_eq!(Worker::parse_position(&job("retrieval:k=4")), (0, 0));
     }
 }

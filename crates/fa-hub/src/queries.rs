@@ -144,6 +144,50 @@ pub struct LatentHit {
     pub uncertainty: f64,
 }
 
+/// A stored `LatentVec` row read back with `value_map` (spec 50 `/api/latent/{snapshot}/projection`).
+/// The vector sits in the `vec<dim>` property; [`LatentRow::vector`] finds it whatever the dimension.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct LatentRow {
+    #[serde(rename = "$id")]
+    pub id: u64,
+    pub expert_space_id: String,
+    /// `centroid | observation | window`
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub ref_id: String,
+    #[serde(default)]
+    pub instrument_id: String,
+    #[serde(default)]
+    pub ts: Option<String>,
+    #[serde(default)]
+    pub uncertainty: f64,
+    /// Every other property, among them `vec<dim>`.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Json>,
+}
+
+impl LatentRow {
+    /// The stored vector (`vec<dim>` property as `f32`s), if the row carries one.
+    pub fn vector(&self) -> Option<Vec<f32>> {
+        self.extra.iter().find_map(|(k, v)| {
+            if !k.starts_with("vec") || !k[3..].chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let arr = v.as_array()?;
+            arr.iter().map(|x| x.as_f64().map(|f| f as f32)).collect()
+        })
+    }
+}
+
+/// A genome with its fitness records (spec 50 `/api/evolution/genomes/{id}`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct GenomeDetail {
+    pub genome: Genome,
+    pub fitness: Vec<FitnessRecord>,
+    pub parents: Vec<Genome>,
+}
+
 /// Any edge row as returned by `edge_properties`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct EdgeRow {
@@ -769,6 +813,38 @@ impl HubClient {
         resp.take("hits")
     }
 
+    /// Stored `LatentVec` rows of one expert space, newest first, at most `limit`
+    /// (spec 50 `/api/latent/{snapshot}/projection`). `kind` filters on `centroid | observation |
+    /// window`; `since_ms` keeps rows with `ts >= since` (unix milliseconds).
+    pub async fn space_latents(
+        &self,
+        expert_space_id: &str,
+        kind: Option<&str>,
+        since_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<LatentRow>> {
+        let mut preds = vec![Pred::eq(LATENT_TENANT, expert_space_id)];
+        if let Some(k) = kind.filter(|k| !k.is_empty()) {
+            preds.push(Pred::eq("kind", k));
+        }
+        if let Some(ms) = since_ms {
+            preds.push(Pred::gte("ts", Input::Lit(Val::DateTime(ms))));
+        }
+        let op = Op::nodes_with_label_where(node::LATENT_VEC, Pred::and(preds))
+            .order_by("ts", true)
+            .limit(limit.max(1))
+            .value_map(None);
+        let mut resp = self.batch(&Batch::read().named("space_latents").ret("rows", op)).await?;
+        resp.take("rows")
+    }
+
+    /// Number of `LatentVec` rows in one expert space.
+    pub async fn count_space_latents(&self, expert_space_id: &str) -> Result<u64> {
+        let op = Op::nodes_with_label_where(node::LATENT_VEC, Pred::eq(LATENT_TENANT, expert_space_id)).count();
+        let v = self.query(op).await?;
+        v.as_u64().ok_or_else(|| HubError::Shape { name: "count".into(), detail: v.to_string() })
+    }
+
     // ── evolution ───────────────────────────────────────────────────────────
 
     /// `addGenome`
@@ -848,6 +924,22 @@ impl HubClient {
     pub async fn genome_by_id(&self, genome_id: &str) -> Result<Option<Genome>> {
         let mut resp = self.batch(&Batch::read().ret("row", by_key(node::GENOME, "genome_id", genome_id))).await?;
         resp.take_opt("row")
+    }
+
+    /// Genome, its `FitnessRecord`s and direct parents by business id in one round trip
+    /// (spec 50 `/api/evolution/genomes/{id}`). `None` when the genome does not exist.
+    pub async fn genome_detail(&self, genome_id: &str) -> Result<Option<GenomeDetail>> {
+        let batch = Batch::read()
+            .named("genome_detail")
+            .var("g", by_key_nodes(node::GENOME, "genome_id", genome_id))
+            .ret("genome", Op::nodes(NodeRef::var("g")).value_map(None))
+            .ret("fitness", Op::nodes(NodeRef::var("g")).out(Some(edge::SCORED)).value_map(None))
+            .ret("parents", Op::nodes(NodeRef::var("g")).r#in(Some(edge::PARENT_OF)).value_map(None));
+        let mut resp = self.batch(&batch).await?;
+        let Some(genome) = resp.take_opt::<Genome>("genome")? else {
+            return Ok(None);
+        };
+        Ok(Some(GenomeDetail { genome, fitness: resp.take("fitness")?, parents: resp.take("parents")? }))
     }
 
     /// `addLineage`: `ParentOf{op}` parent → child; returns the edge id.
@@ -1077,6 +1169,20 @@ mod tests {
         });
         assert_eq!(props.len(), 6);
         assert!(matches!(props[5], ("updated_at", Input::Now)));
+    }
+
+    #[test]
+    fn latent_row_finds_its_vector_property() {
+        let r: LatentRow = serde_json::from_value(json!({
+            "$id": 7, "$label": "LatentVec", "expert_space_id": "sp", "kind": "observation", "ref_id": "r1",
+            "instrument_id": "i", "ts": "2026-11-10T00:00:00.000Z", "uncertainty": 0.5, "vec3": [1.0, 2.0, 3.0],
+            "vector_note": "ignored"
+        }))
+        .unwrap();
+        assert_eq!(r.vector(), Some(vec![1.0f32, 2.0, 3.0]));
+        let none: LatentRow =
+            serde_json::from_value(json!({ "$id": 8, "expert_space_id": "sp", "vecx": [1.0] })).unwrap();
+        assert_eq!(none.vector(), None);
     }
 
     #[test]

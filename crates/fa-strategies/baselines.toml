@@ -3,8 +3,9 @@
 # Every program here is HAND-WRITTEN, NOT EVOLVED (genome_id = "baseline"). They exist so the
 # signal → allocation → risk → paper-order pipeline runs before the evolution lab produces
 # promoted strategies (spec 35 §6.4). Programs use the GP DSL in S-expression form
-# (crates/fa-strategies/src/sexpr.rs); the primitives are evaluated on price-only fallback
-# features while graph/decoder feeds are missing (crates/fa-strategies/src/features.rs).
+# (crates/fa-strategies/src/sexpr.rs); the primitives are evaluated by `LiveContext`
+# (crates/fa-strategies/src/features.rs): real latent-graph / decoder data for the strategy's
+# timescale and instrument when the bus has it, price-only fallback statistics otherwise.
 #
 # `instruments = []` means "every instrument seen on md.trade.>".
 instruments = []
@@ -55,3 +56,28 @@ lookback_bars = 20
 step_secs = 10 # re-evaluates every 10 s although it reads 1m bars
 signal = "(if_gt stay_prob 0.55 (mul 400 analog_forecast) 0)"
 uncertainty = "(sub 1 stay_prob)"
+
+# ---- graph-primitive baselines (spec 35 §4.2 surface, D-053): real transition rows when
+# model-runtime publishes them for the timescale, fallbacks otherwise.
+
+[[strategy]]
+id = "baseline-graph-neighbors-1s"
+genome_id = "baseline"
+timescale = "1s"
+steps = 5
+lookback_bars = 32
+# mass flowing from the current region into its 3 most likely successors in one step, centred
+signal = "(mul 4 (sub (p_to_set (cur_region 0) (neighbors (cur_region 0) 3) 1) 0.5))"
+# uncertain when the chain is likely to stay put (little information in the move)
+uncertainty = "(p_trans (cur_region 0) (cur_region 0) 1)"
+
+[[strategy]]
+id = "baseline-graph-regime-1m"
+genome_id = "baseline"
+timescale = "1m"
+steps = 3
+lookback_bars = 20
+step_secs = 10
+# after two bars in a region, lean on that region's realised forward return; stand aside when the latent is novel
+signal = "(if_gt (novelty 0) 0.6 0 (if_gt (dwell (cur_region 0)) 2 (mul 400 (region_feature (cur_region 0) mean_fwd_return)) 0))"
+uncertainty = "(max (novelty 0) (sub 1 (path_value (sample_walk (cur_region 0) 3 64) up)))"

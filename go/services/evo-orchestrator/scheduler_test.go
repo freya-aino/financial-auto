@@ -6,6 +6,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	fav1 "github.com/fey/financial-auto/go/pkg/bus/pb/fa/v1"
 )
@@ -39,8 +40,17 @@ func TestGenerationRunsAllRungs(t *testing.T) {
 	done := false
 	for i := 0; i < len(s.jobs) && !done; i++ {
 		j := s.jobs[i]
-		if j.Kind != "evo.eval.decoder" || j.SnapshotId != "snap0" || j.ParentJobId != g.ID || len(j.Spec) != 0 {
+		if j.Kind != "evo.eval.decoder" || j.SnapshotId != "snap0" || j.ParentJobId != g.ID {
 			t.Fatalf("bad job %v", j)
+		}
+		var env struct {
+			Genome     string    `json:"genome"`
+			Generation int       `json:"generation"`
+			Rung       int       `json:"rung"`
+			DataWindow *struct{} `json:"data_window"`
+		}
+		if err := json.Unmarshal(j.Spec, &env); err != nil || env.Genome != j.GenomeId || env.Generation != 0 || env.DataWindow != nil {
+			t.Fatalf("eval envelope %s (%v)", j.Spec, err)
 		}
 		if done, err = g.OnResult(result(j), s.pub); err != nil {
 			t.Fatal(err)
@@ -214,5 +224,137 @@ func TestCancelledVaryJobEndsGeneration(t *testing.T) {
 	}
 	if f := g.Final(); len(f) != 1 || f[0].ID != "forecast:q=0.2" {
 		t.Fatalf("final %v", f)
+	}
+}
+
+// statsResult is an OK eval result carrying worker-side generation_stats.
+func statsResult(j *fav1.Job, n int, dsr, pbo float64) *fav1.JobResult {
+	r := evalResult(j)
+	r.Result = fmt.Appendf(nil, `{"score": 0.1, "generation_stats": {"n_trials": %d, "deflated_sharpe": %g, "pbo": %g, "pbo_trials": %d, "pbo_blocks": 16}}`, n, dsr, pbo, n)
+	return r
+}
+
+func TestValidationStatsRideAlongInSummaries(t *testing.T) {
+	var summaries []Summary
+	g, _ := NewGenerationWith(GenerationConfig{Kind: "evo.eval.decoder", Eta: 2, MinBudgetMs: 100, MaxBudgetMs: 100, MaxGenerations: 1,
+		Genomes: []string{"forecast:q=0.5", "forecast:q=0.2"}, OnSummary: func(s Summary) { summaries = append(summaries, s) }})
+	s := &sink{}
+	_ = g.Start(s.pub)
+	if done, _ := g.OnResult(statsResult(s.jobs[0], 1, 0.6, 0.5), s.pub); done {
+		t.Fatal("early")
+	}
+	// a result without stats keeps the last seen ones
+	done, _ := g.OnResult(evalResult(s.jobs[1]), s.pub)
+	if !done || len(summaries) != 1 || summaries[0].Validation == nil || summaries[0].Validation.NTrials != 1 || *summaries[0].Validation.PBO != 0.5 {
+		t.Fatalf("summaries %+v", summaries)
+	}
+	if summaries[0].State != "done" || summaries[0].ArtifactKey != "" {
+		t.Fatalf("state %q artifact %q", summaries[0].State, summaries[0].ArtifactKey)
+	}
+	if validationOf(&fav1.JobResult{Status: fav1.JobResult_STATUS_FAILED, Result: []byte(`{"generation_stats":{"n_trials":3}}`)}) != nil {
+		t.Fatal("failed results carry no stats")
+	}
+}
+
+func TestPauseDefersRungAndResumeSubmitsIt(t *testing.T) {
+	g, _ := NewGenerationWith(GenerationConfig{Kind: "evo.eval.decoder", Eta: 2, MinBudgetMs: 100, MaxBudgetMs: 1000, MaxGenerations: 1,
+		Genomes: []string{"forecast:q=0.5", "forecast:q=0.2", "forecast:q=0.9", "forecast:q=0.1"}})
+	s := &sink{}
+	_ = g.Start(s.pub)
+	if !g.Pause() || g.Pause() || !g.Paused() {
+		t.Fatal("pause should succeed once")
+	}
+	for _, j := range s.jobs[:4] {
+		if done, err := g.OnResult(evalResult(j), s.pub); done || err != nil {
+			t.Fatalf("done=%v err=%v", done, err)
+		}
+	}
+	if len(s.jobs) != 4 {
+		t.Fatalf("paused generation submitted rung 1: %d jobs", len(s.jobs))
+	}
+	_, gens, rung, _ := g.Index()
+	if rung != 1 || gens != 1 {
+		t.Fatalf("rung %d", rung)
+	}
+	ok, err := g.Resume(s.pub)
+	if !ok || err != nil || len(s.jobs) != 6 {
+		t.Fatalf("resume ok=%v err=%v jobs=%d", ok, err, len(s.jobs))
+	}
+	if ok, _ := g.Resume(s.pub); ok {
+		t.Fatal("double resume")
+	}
+	var env struct {
+		Rung int `json:"rung"`
+	}
+	_ = json.Unmarshal(s.jobs[5].Spec, &env)
+	if env.Rung != 1 {
+		t.Fatalf("deferred rung envelope %s", s.jobs[5].Spec)
+	}
+}
+
+func TestStopCancelsPendingAndPromotesNothing(t *testing.T) {
+	promoted := 0
+	g, _ := NewGenerationWith(GenerationConfig{Kind: StrategyEvalKind, Eta: 2, MinBudgetMs: 100, MaxBudgetMs: 1000, MaxGenerations: 2,
+		Genomes: []string{"s:q=0.5", "s:q=0.2", "s:q=0.9"},
+		Promote: func(*Generation, []FrontMember) (string, error) { promoted++; return "k", nil }})
+	s := &sink{}
+	_ = g.Start(s.pub)
+	_, _ = g.OnResult(evalResult(s.jobs[0]), s.pub)
+	cancelled := g.Stop()
+	if len(cancelled) != 2 || cancelled[s.jobs[1].JobId] != StrategyEvalKind {
+		t.Fatalf("cancelled %v", cancelled)
+	}
+	if len(g.Stop()) != 0 {
+		t.Fatal("stop twice")
+	}
+	if f := g.Final(); len(f) != 1 || f[0].ID != "s:q=0.5" {
+		t.Fatalf("final %v", f)
+	}
+	last := g.Summaries[len(g.Summaries)-1]
+	if last.State != "stopped" || !last.Final || !strings.Contains(last.Note, "2 pending") || promoted != 0 {
+		t.Fatalf("summary %+v promoted=%d", last, promoted)
+	}
+	// results arriving later for cancelled jobs are ignored
+	if done, _ := g.OnResult(evalResult(s.jobs[1]), s.pub); !done {
+		t.Fatal("stopped generation stays done")
+	}
+}
+
+func TestStrategyGenerationPromotesFinalFront(t *testing.T) {
+	var gotFront []FrontMember
+	var summaries []Summary
+	genomes := []string{
+		`{ id = "gp-a", timescale = "1s", signal = "(mul 2 analog_forecast)" }`,
+		`{ id = "gp-b", timescale = "1s", signal = "(neg analog_forecast)" }`,
+	}
+	g, _ := NewGenerationWith(GenerationConfig{Kind: StrategyEvalKind, Eta: 2, MinBudgetMs: 100, MaxBudgetMs: 100, MaxGenerations: 1,
+		Genomes: genomes, OnSummary: func(s Summary) { summaries = append(summaries, s) },
+		Promote: func(g *Generation, front []FrontMember) (string, error) {
+			gotFront = front
+			return ArtifactsBucket + "/" + StrategiesKey(g.ID), nil
+		}})
+	s := &sink{}
+	_ = g.Start(s.pub)
+	for i, j := range s.jobs {
+		r := &fav1.JobResult{JobId: j.JobId, Status: fav1.JobResult_STATUS_OK, Result: []byte(`{"score":0}`),
+			Objectives: map[string]float64{"sharpe": float64(i), "turnover": float64(i)},
+			Directions: map[string]string{"sharpe": "max", "turnover": "min"}}
+		_, _ = g.OnResult(r, s.pub)
+	}
+	last := summaries[len(summaries)-1]
+	if last.ArtifactKey != "fa-artifacts/strategies/"+g.ID+".toml" || len(gotFront) != 2 {
+		t.Fatalf("artifact %q front %d", last.ArtifactKey, len(gotFront))
+	}
+	body, n := StrategiesTOML(g.ID, g.Kind, append(gotFront, FrontMember{Genome: "forecast:h=3"}), time.Unix(0, 0))
+	if n != 2 || !strings.Contains(body, "instruments = []") || !strings.Contains(body, genomes[0]+",") || strings.Contains(body, "forecast:h=3") {
+		t.Fatalf("toml:\n%s", body)
+	}
+	if VaryKind(StrategyEvalKind) != "evo.vary.strategy" {
+		t.Fatal("vary kind")
+	}
+	// decoder generations are never archived by the strategy hook
+	hook := PromoteStrategies(nil, nil)
+	if key, err := hook(&Generation{Kind: "evo.eval.decoder"}, gotFront); key != "" || err != nil {
+		t.Fatalf("decoder promote %q %v", key, err)
 	}
 }

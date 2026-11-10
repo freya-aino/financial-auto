@@ -1,6 +1,9 @@
 package catalog
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestRepoCatalogIsValid(t *testing.T) {
 	c, err := Load("../../../config/sources.yaml")
@@ -51,5 +54,24 @@ sources:
 	}
 	if _, err := Parse([]byte("version: 1\nsources:\n  - {id: a, name: A, status: live, auth: none, config: {symbols: ['A B'], timeframe: 2m}}\n")); err == nil {
 		t.Fatal("expected invalid symbol/timeframe error")
+	}
+}
+
+func TestSetStatusAndDepth(t *testing.T) {
+	c, err := Parse([]byte("version: 1\nsources:\n  - {id: a, name: A, status: stub, auth: none}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.SetStatus("a", "disabled") || c.SetStatus("a", "bogus") || c.SetStatus("zz", "live") {
+		t.Fatal("SetStatus results")
+	}
+	if s, _ := c.ByID("a"); s.Status != "disabled" {
+		t.Fatalf("status %q", s.Status)
+	}
+	if got := c.ApplyStatuses(map[string]string{"a": "live", "zz": "live"}); len(got) != 1 || got[0] != "a" {
+		t.Fatalf("ApplyStatuses %v", got)
+	}
+	if BackfillDepth("1m") != 365*24*time.Hour || BackfillDepth("1h") != 5*365*24*time.Hour || BackfillDepth("1s") != 28*24*time.Hour {
+		t.Fatal("depths")
 	}
 }

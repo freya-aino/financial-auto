@@ -7,6 +7,8 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -76,10 +78,14 @@ func (s Source) Limit() RateLimit {
 	return DefaultRateLimit
 }
 
-// Catalog is the parsed file.
+// Catalog is the parsed file. Status edits at runtime (ctl.ingest.enable|disable,
+// D-054) go through SetStatus so readers and the ingestor's control handlers may
+// share one instance.
 type Catalog struct {
 	Version int      `yaml:"version"`
 	Sources []Source `yaml:"sources"`
+
+	mu sync.RWMutex
 }
 
 // Load reads and validates a catalog file.
@@ -156,10 +162,63 @@ func (c *Catalog) Validate() error {
 
 // ByID returns the entry with the given id.
 func (c *Catalog) ByID(id string) (Source, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	for _, s := range c.Sources {
 		if s.ID == id {
 			return s, true
 		}
 	}
 	return Source{}, false
+}
+
+// SetStatus changes an entry's status in memory (the Postgres row is the
+// caller's job). It reports false for an unknown id or an invalid status.
+func (c *Catalog) SetStatus(id, status string) bool {
+	if !slices.Contains(Statuses, status) {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.Sources {
+		if c.Sources[i].ID == id {
+			c.Sources[i].Status = status
+			return true
+		}
+	}
+	return false
+}
+
+// ApplyStatuses overwrites statuses from a map (Postgres wins over the YAML
+// seed after the first sync, spec 11 §8 / D-054). Unknown ids are ignored;
+// returns the ids whose status changed.
+func (c *Catalog) ApplyStatuses(statuses map[string]string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var changed []string
+	for i := range c.Sources {
+		if st, ok := statuses[c.Sources[i].ID]; ok && st != c.Sources[i].Status && slices.Contains(Statuses, st) {
+			c.Sources[i].Status = st
+			changed = append(changed, c.Sources[i].ID)
+		}
+	}
+	return changed
+}
+
+// BackfillDepth is the default history depth per timescale family (spec 10 §3:
+// seconds ≈ weeks, minutes ≈ 1 year, hours ≈ 5 years, days = maximum
+// available, capped here at 50 years). Unknown timescales get the minutes depth.
+func BackfillDepth(timescale string) time.Duration {
+	const day = 24 * time.Hour
+	switch {
+	case strings.HasSuffix(timescale, "s"):
+		return 4 * 7 * day
+	case strings.HasSuffix(timescale, "m"):
+		return 365 * day
+	case strings.HasSuffix(timescale, "h"):
+		return 5 * 365 * day
+	case strings.HasSuffix(timescale, "d"), strings.HasSuffix(timescale, "w"):
+		return 50 * 365 * day
+	}
+	return 365 * day
 }

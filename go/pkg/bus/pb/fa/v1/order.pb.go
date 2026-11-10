@@ -249,16 +249,21 @@ func (x *OrderIntent) GetCreatedAt() *timestamppb.Timestamp {
 }
 
 type OrderEvent struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	IntentId      string                 `protobuf:"bytes,1,opt,name=intent_id,json=intentId,proto3" json:"intent_id,omitempty"`
-	VenueOrderId  string                 `protobuf:"bytes,2,opt,name=venue_order_id,json=venueOrderId,proto3" json:"venue_order_id,omitempty"`
-	Kind          OrderEvent_Kind        `protobuf:"varint,3,opt,name=kind,proto3,enum=fa.v1.OrderEvent_Kind" json:"kind,omitempty"`
-	FillPrice     float64                `protobuf:"fixed64,4,opt,name=fill_price,json=fillPrice,proto3" json:"fill_price,omitempty"`
-	FillQuantity  float64                `protobuf:"fixed64,5,opt,name=fill_quantity,json=fillQuantity,proto3" json:"fill_quantity,omitempty"`
-	Fee           float64                `protobuf:"fixed64,6,opt,name=fee,proto3" json:"fee,omitempty"`
-	FeeCurrency   string                 `protobuf:"bytes,7,opt,name=fee_currency,json=feeCurrency,proto3" json:"fee_currency,omitempty"`
-	EventTime     *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=event_time,json=eventTime,proto3" json:"event_time,omitempty"`
-	Reason        string                 `protobuf:"bytes,9,opt,name=reason,proto3" json:"reason,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	IntentId     string                 `protobuf:"bytes,1,opt,name=intent_id,json=intentId,proto3" json:"intent_id,omitempty"`
+	VenueOrderId string                 `protobuf:"bytes,2,opt,name=venue_order_id,json=venueOrderId,proto3" json:"venue_order_id,omitempty"`
+	Kind         OrderEvent_Kind        `protobuf:"varint,3,opt,name=kind,proto3,enum=fa.v1.OrderEvent_Kind" json:"kind,omitempty"`
+	FillPrice    float64                `protobuf:"fixed64,4,opt,name=fill_price,json=fillPrice,proto3" json:"fill_price,omitempty"`
+	FillQuantity float64                `protobuf:"fixed64,5,opt,name=fill_quantity,json=fillQuantity,proto3" json:"fill_quantity,omitempty"`
+	Fee          float64                `protobuf:"fixed64,6,opt,name=fee,proto3" json:"fee,omitempty"`
+	FeeCurrency  string                 `protobuf:"bytes,7,opt,name=fee_currency,json=feeCurrency,proto3" json:"fee_currency,omitempty"`
+	EventTime    *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=event_time,json=eventTime,proto3" json:"event_time,omitempty"`
+	Reason       string                 `protobuf:"bytes,9,opt,name=reason,proto3" json:"reason,omitempty"`
+	// Execution quality (spec 40 §6.4, 41 §6.3): the arrival price is the last trade seen when
+	// the intent was accepted; slippage is the signed cost against the taker in basis points of
+	// the arrival price (fill vs arrival, positive = paid). Both are 0 for non-fill events.
+	ArrivalPrice  float64 `protobuf:"fixed64,10,opt,name=arrival_price,json=arrivalPrice,proto3" json:"arrival_price,omitempty"`
+	SlippageBps   float64 `protobuf:"fixed64,11,opt,name=slippage_bps,json=slippageBps,proto3" json:"slippage_bps,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -356,6 +361,20 @@ func (x *OrderEvent) GetReason() string {
 	return ""
 }
 
+func (x *OrderEvent) GetArrivalPrice() float64 {
+	if x != nil {
+		return x.ArrivalPrice
+	}
+	return 0
+}
+
+func (x *OrderEvent) GetSlippageBps() float64 {
+	if x != nil {
+		return x.SlippageBps
+	}
+	return 0
+}
+
 var File_fa_v1_order_proto protoreflect.FileDescriptor
 
 const file_fa_v1_order_proto_rawDesc = "" +
@@ -376,7 +395,7 @@ const file_fa_v1_order_proto_rawDesc = "" +
 	"\n" +
 	"created_at\x18\n" +
 	" \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAtB\x0e\n" +
-	"\f_limit_price\"\xbf\x03\n" +
+	"\f_limit_price\"\x87\x04\n" +
 	"\n" +
 	"OrderEvent\x12\x1b\n" +
 	"\tintent_id\x18\x01 \x01(\tR\bintentId\x12$\n" +
@@ -389,7 +408,10 @@ const file_fa_v1_order_proto_rawDesc = "" +
 	"\ffee_currency\x18\a \x01(\tR\vfeeCurrency\x129\n" +
 	"\n" +
 	"event_time\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\teventTime\x12\x16\n" +
-	"\x06reason\x18\t \x01(\tR\x06reason\"v\n" +
+	"\x06reason\x18\t \x01(\tR\x06reason\x12#\n" +
+	"\rarrival_price\x18\n" +
+	" \x01(\x01R\farrivalPrice\x12!\n" +
+	"\fslippage_bps\x18\v \x01(\x01R\vslippageBps\"v\n" +
 	"\x04Kind\x12\x14\n" +
 	"\x10KIND_UNSPECIFIED\x10\x00\x12\f\n" +
 	"\bKIND_ACK\x10\x01\x12\x15\n" +

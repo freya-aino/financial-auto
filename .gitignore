@@ -2,6 +2,7 @@
 .env
 .env.*
 config/secrets.toml
+config/runtime.toml
 
 # rust
 target/

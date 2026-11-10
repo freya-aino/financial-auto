@@ -2,10 +2,18 @@
 //! intents, approvals, rejections, halts and risk state out. Deterministic given the inputs
 //! (intent ids are the only non-deterministic field).
 //!
-//! Decision tick (spec 40 §6.1): latest signal per strategy → allocator weights → EUR targets
-//! per instrument (`fa_allocator::net_targets`) → hard caps (`fa_risk`) → halt gate (flatten /
-//! reduce-only) → diff against the paper book plus pending intents → `OrderIntent`s.
-use std::collections::{BTreeMap, HashMap, VecDeque};
+//! Decision tick (spec 40 §6.1): latest signal per **active** strategy → allocator weights →
+//! EUR targets per instrument (`fa_allocator::net_targets`) → hard caps (`fa_risk`) → halt gate
+//! (flatten / reduce-only) → diff against the paper book plus pending intents → `OrderIntent`s.
+//!
+//! Strategy lifecycle (D-051): every strategy seen on `signal.exposure.*` has a
+//! [`StrategyState`] (`active|paused|flattening|shadow`). Paused/flattening/shadow strategies
+//! contribute no exposure. Active strategies carry a virtual book built from fill attributions
+//! (even split across the intent's contributors, as persisted by D-047) whose mark-to-market
+//! drawdown against the allocated sleeve triggers the per-strategy kill switch (spec 40 §6.5).
+//! Shadow strategies carry a virtual book of their own signals on `shadow_sleeve_eur` and count
+//! completed horizons toward the promotion gate (spec 40 §6.6).
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use fa_allocator::{Allocator, PerformanceTracker};
 use fa_core::{Horizon, InstrumentId, Timescale};
@@ -17,8 +25,12 @@ use fa_proto::{
         order_event,
     },
 };
-use fa_risk::{HaltReason, HaltScope, MarketInfo, RiskEngine};
+use fa_risk::{
+    HaltReason, HaltScope, MarketInfo, RiskConfig, RiskEngine,
+    strategy::{Checklist, GateEvidence, StrategyAction, StrategyState, StrategyStatus},
+};
 use fa_strategies::ExposureDistribution;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::settings::Settings;
@@ -37,6 +49,9 @@ pub enum Out {
     Rejected { account: String, event: OrderEvent },
     /// `risk.halt.<scope>`
     Halt(Halt),
+    /// An automatic, consequential state change for `audit.log` (per-strategy drawdown pause,
+    /// flatten completion); the I/O layer persists it.
+    Audit { action: String, subject: String, payload: Value },
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +84,32 @@ struct ActiveHalt {
     manual: bool,
 }
 
+/// Attributed virtual sub-book of an active strategy (spec 40 §6.3): fills are split evenly
+/// across the intent's contributors (D-047 attribution), marked to market each tick.
+#[derive(Debug, Clone, Default)]
+struct VirtualBook {
+    cash_eur: f64,
+    qty: BTreeMap<InstrumentId, f64>,
+    /// Marked value at the previous tick, for the P&L increment.
+    last_value_eur: f64,
+}
+
+impl VirtualBook {
+    fn value(&self, marks: &BTreeMap<InstrumentId, f64>) -> f64 {
+        self.cash_eur + self.qty.iter().map(|(i, q)| q * marks.get(i).copied().unwrap_or(0.0)).sum::<f64>()
+    }
+
+    /// Closes every position at the marks (the strategy leaves the allocated set).
+    fn close(&mut self, marks: &BTreeMap<InstrumentId, f64>) {
+        self.cash_eur = self.value(marks);
+        self.qty.clear();
+        self.last_value_eur = self.cash_eur;
+    }
+}
+
+/// Bare `source` halts (no qualifier) are keyed by this in the per-source table.
+const ANY_SOURCE: &str = "*";
+
 pub struct Engine {
     settings: Settings,
     allocator: Box<dyn Allocator>,
@@ -86,9 +127,20 @@ pub struct Engine {
     intent_order: VecDeque<String>,
     pending: BTreeMap<String, Pending>,
     halts: BTreeMap<HaltScope, ActiveHalt>,
+    /// Health halts per source id (`source:<id>`); `HaltScope::Source` is active while non-empty.
+    source_halts: BTreeMap<String, ActiveHalt>,
     booked: Vec<BookedFill>,
     day: Option<i64>,
     day_start_equity: f64,
+    // strategy lifecycle (D-051)
+    strategies: BTreeMap<String, StrategyState>,
+    books: BTreeMap<String, VirtualBook>,
+    /// Shadow strategies: signed EUR exposure per instrument held virtually since the last tick.
+    shadow_exposure: BTreeMap<String, BTreeMap<InstrumentId, f64>>,
+    /// Signal `as_of` the horizon counter last advanced from, per shadow strategy.
+    horizon_anchor_ms: BTreeMap<String, i64>,
+    last_alloc: BTreeMap<String, f64>,
+    dirty: BTreeSet<String>,
     pub counters: BTreeMap<&'static str, f64>,
 }
 
@@ -133,11 +185,22 @@ impl Engine {
             intent_order: VecDeque::new(),
             pending: BTreeMap::new(),
             halts: BTreeMap::new(),
+            source_halts: BTreeMap::new(),
             booked: Vec::new(),
             day: None,
             day_start_equity: cash,
+            strategies: BTreeMap::new(),
+            books: BTreeMap::new(),
+            shadow_exposure: BTreeMap::new(),
+            horizon_anchor_ms: BTreeMap::new(),
+            last_alloc: BTreeMap::new(),
+            dirty: BTreeSet::new(),
             counters: BTreeMap::new(),
         }
+    }
+
+    pub fn limits(&self) -> &RiskConfig {
+        &self.risk.cfg
     }
 
     fn bump(&mut self, k: &'static str) {
@@ -166,6 +229,40 @@ impl Engine {
     /// Fills booked since the last call, oldest first.
     pub fn take_booked_fills(&mut self) -> Vec<BookedFill> {
         std::mem::take(&mut self.booked)
+    }
+
+    /// Strategy states changed since the last call (for `ledger.strategy_state`).
+    pub fn take_dirty_strategies(&mut self) -> Vec<StrategyState> {
+        let ids = std::mem::take(&mut self.dirty);
+        ids.iter().filter_map(|id| self.strategies.get(id).cloned()).collect()
+    }
+
+    /// Every strategy state (periodic full flush).
+    pub fn strategy_states(&self) -> Vec<StrategyState> {
+        self.strategies.values().cloned().collect()
+    }
+
+    pub fn strategy_ids(&self) -> Vec<String> {
+        self.strategies.keys().cloned().collect()
+    }
+
+    /// Ids a strategy's validation statistics may be filed under: its id and its genome id.
+    pub fn candidate_ids(&self, id: &str) -> Vec<String> {
+        let mut ids = vec![id.to_owned()];
+        if let Some((d, _)) = self.signals.get(id)
+            && !d.genome_id.is_empty()
+            && d.genome_id != id
+        {
+            ids.push(d.genome_id.clone());
+        }
+        ids
+    }
+
+    /// Restores persisted lifecycle rows at startup (rows win over the in-memory defaults).
+    pub fn seed_strategies(&mut self, rows: Vec<StrategyState>) {
+        for r in rows {
+            self.strategies.insert(r.strategy_id.clone(), r);
+        }
     }
 
     pub fn halted(&self) -> bool {
@@ -204,8 +301,28 @@ impl Engine {
             as_of_ms: ms_of(m.as_of.as_ref()).unwrap_or(now_ms),
             exposures,
         };
+        self.register_strategy(&m.strategy_id, now_ms);
+        if self.strategies[&m.strategy_id].status == StrategyStatus::Shadow {
+            let horizon_ms = d.horizon.duration().as_millis() as i64;
+            let anchor = *self.horizon_anchor_ms.entry(m.strategy_id.clone()).or_insert(d.as_of_ms);
+            if horizon_ms > 0 && d.as_of_ms - anchor >= horizon_ms {
+                let st = self.strategies.get_mut(&m.strategy_id).expect("registered");
+                st.horizons_completed += (d.as_of_ms - anchor) as u64 / horizon_ms as u64;
+                self.horizon_anchor_ms.insert(m.strategy_id.clone(), d.as_of_ms);
+                self.dirty.insert(m.strategy_id.clone());
+            }
+        }
         self.signals.insert(m.strategy_id.clone(), (d, now_ms));
         self.bump("signals");
+    }
+
+    fn register_strategy(&mut self, id: &str, now_ms: i64) {
+        if !self.strategies.contains_key(id) {
+            let status = StrategyStatus::parse(&self.settings.new_strategy_status).unwrap_or(StrategyStatus::Active);
+            self.strategies.insert(id.to_owned(), StrategyState::new(id, status, now_ms));
+            self.dirty.insert(id.to_owned());
+            self.bump("strategies.seen");
+        }
     }
 
     /// Mark + traded volume. Returns halts newly triggered by the equity move.
@@ -328,39 +445,266 @@ impl Engine {
         if applied {
             self.bump("fills");
             self.marks.entry(info.instrument).or_insert(m.fill_price);
+            self.attribute(&fill, &info.strategy_ids);
             self.booked.push(BookedFill { fill, strategy_ids: info.strategy_ids.clone(), at_ms });
         }
         self.check_equity(now_ms)
     }
 
-    /// A halt from the bus (operator kill switch or another service).
+    /// Splits a fill evenly across its contributing strategies' virtual books (spec 40 §6.3,
+    /// D-047). Flatten intents have no contributors and touch no book.
+    fn attribute(&mut self, fill: &Fill, strategy_ids: &[String]) {
+        let ids: Vec<&String> = strategy_ids.iter().filter(|id| self.strategies.contains_key(*id)).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let n = ids.len() as f64;
+        let (q, cost) = (fill.quantity / n, (fill.quantity * fill.price * fill.fx_to_eur + fill.fee_eur) / n);
+        for id in ids {
+            let b = self.books.entry(id.clone()).or_default();
+            *b.qty.entry(fill.instrument).or_insert(0.0) += q;
+            b.cash_eur -= cost;
+        }
+    }
+
+    /// A halt from the bus (operator kill switch, the ingestor's `risk.halt.source:<id>`, or
+    /// another service). Source halts are tracked per source id so one feed recovering does not
+    /// clear another's halt.
     pub fn on_halt(&mut self, h: &Halt, now_ms: i64) {
         let Some(scope) = HaltScope::parse(&h.scope) else {
             self.bump("halts.ignored_scope");
             return;
         };
         let reason = if h.manual { HaltReason::Manual(h.reason.clone()) } else { HaltReason::Health(h.reason.clone()) };
-        self.risk.halt(scope, reason);
-        self.halts.entry(scope).or_insert(ActiveHalt {
+        let active = ActiveHalt {
             reason: h.reason.clone(),
             since_ms: ms_of(h.since.as_ref()).unwrap_or(now_ms),
             manual: h.manual,
-        });
+        };
+        self.risk.halt(scope, reason);
+        if scope == HaltScope::Source {
+            let id = h.scope.split_once(':').map_or(ANY_SOURCE, |(_, id)| id).to_owned();
+            self.source_halts.entry(id).or_insert(active);
+        } else {
+            self.halts.entry(scope).or_insert(active);
+        }
         self.bump("halts.received");
     }
 
-    /// `risk.resume.<scope>` (D-030): manual re-arm.
+    /// `ingest.health.<source>` (spec 40 §6.5 health halts): `down` halts the source's scope and
+    /// flattens; `ok` clears a halt this path (or `risk.halt.source:<id>`) raised, never a manual
+    /// one. Returns true when the halt set changed.
+    pub fn on_source_health(&mut self, source: &str, status: &str, reason: &str, now_ms: i64) -> bool {
+        match status {
+            "down" => {
+                if self.source_halts.contains_key(source) {
+                    return false;
+                }
+                self.on_halt(
+                    &Halt {
+                        scope: format!("source:{source}"),
+                        reason: if reason.is_empty() { format!("ingest: {source} down") } else { reason.into() },
+                        since: Some(ts_of(now_ms)),
+                        manual: false,
+                    },
+                    now_ms,
+                );
+                true
+            }
+            "ok" => match self.source_halts.get(source) {
+                Some(h) if !h.manual => {
+                    self.clear_source(source);
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn clear_source(&mut self, id: &str) {
+        if id == ANY_SOURCE {
+            self.source_halts.clear();
+        } else {
+            self.source_halts.remove(id);
+        }
+        if self.source_halts.is_empty() {
+            self.risk.clear(HaltScope::Source);
+        }
+        self.bump("resumes");
+    }
+
+    /// `risk.resume.<scope>` (D-030): manual re-arm. `source:<id>` clears one source, bare
+    /// `source` clears them all.
     pub fn on_resume(&mut self, scope: &str) {
-        let Some(scope) = HaltScope::parse(scope) else {
+        let Some(parsed) = HaltScope::parse(scope) else {
             return;
         };
-        if scope == HaltScope::Portfolio {
+        if parsed == HaltScope::Source {
+            let id = scope.split_once(':').map_or(ANY_SOURCE, |(_, id)| id).to_owned();
+            self.clear_source(&id);
+            return;
+        }
+        if parsed == HaltScope::Portfolio {
             self.risk.rearm(self.equity());
         } else {
-            self.risk.clear(scope);
+            self.risk.clear(parsed);
         }
-        self.halts.remove(&scope);
+        self.halts.remove(&parsed);
         self.bump("resumes");
+    }
+
+    /// Any health halt (source / model / broker) is active (promotion gate item 5).
+    fn health_halted(&self) -> bool {
+        !self.source_halts.is_empty()
+            || self.halts.contains_key(&HaltScope::Model)
+            || self.halts.contains_key(&HaltScope::Broker)
+    }
+
+    // ------------------------------------------------------------ lifecycle (D-051)
+
+    #[cfg(test)]
+    pub fn strategy(&self, id: &str) -> Option<&StrategyState> {
+        self.strategies.get(id)
+    }
+
+    /// Gate checklist for a strategy; `deflated_sharpe` comes from `validation.trial` when the
+    /// I/O layer could read it (`None` = unknown → blocks promotion).
+    pub fn checklist(&self, id: &str, deflated_sharpe: Option<f64>, now_ms: i64) -> Option<Checklist> {
+        let st = self.strategies.get(id)?;
+        let ev = GateEvidence { deflated_sharpe, unresolved_health_halts: self.health_halted(), ..Default::default() };
+        Some(self.settings.promotion.check(st, &ev, now_ms))
+    }
+
+    /// Operator lifecycle action (`ctl.risk.strategy`). Errors follow the control-api prefix
+    /// convention (`not_found:` / `conflict:` / `invalid:`).
+    pub fn strategy_action(
+        &mut self,
+        id: &str,
+        action: StrategyAction,
+        deflated_sharpe: Option<f64>,
+        now_ms: i64,
+    ) -> Result<StrategyState, String> {
+        if !self.strategies.contains_key(id) {
+            return Err(format!("not_found: unknown strategy {id:?} (no signal seen, no persisted state)"));
+        }
+        let gate = if action == StrategyAction::Promote { self.checklist(id, deflated_sharpe, now_ms) } else { None };
+        let st = self.strategies.get_mut(id).expect("checked");
+        let was = st.status;
+        st.apply(action, now_ms, gate.as_ref())?;
+        let now_status = st.status;
+        self.after_transition(id, was, now_status);
+        self.bump("strategy.actions");
+        Ok(self.strategies[id].clone())
+    }
+
+    /// Book housekeeping when a strategy leaves or enters the allocated set.
+    fn after_transition(&mut self, id: &str, was: StrategyStatus, now: StrategyStatus) {
+        if was.allocates() && !now.allocates() {
+            if let Some(b) = self.books.get_mut(id) {
+                b.close(&self.marks);
+            }
+            self.last_alloc.remove(id);
+        }
+        if now != StrategyStatus::Shadow {
+            self.shadow_exposure.remove(id);
+            self.horizon_anchor_ms.remove(id);
+        }
+        if was != now {
+            self.dirty.insert(id.to_owned());
+        }
+    }
+
+    /// Portfolio flatten without a halt (`ctl.risk.flatten`): every active strategy goes to
+    /// `flattening` (→ `paused` after this tick's closing intents); returns the affected ids.
+    /// Resume them one by one; nothing re-enters on its own.
+    pub fn flatten_all(&mut self, now_ms: i64) -> Vec<String> {
+        let ids: Vec<String> = self
+            .strategies
+            .iter()
+            .filter(|(_, s)| s.status == StrategyStatus::Active)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            let _ = self.strategy_action(id, StrategyAction::Flatten, None, now_ms);
+        }
+        self.bump("flatten.portfolio");
+        ids
+    }
+
+    /// Runtime limit change (`ctl.risk.limits` `set`): `patch` is a partial JSON object merged
+    /// over the current limits (`leverage_cap` keys merge too). Only tightening is accepted
+    /// (spec 40 §6.5); otherwise `loosen: <fields>` names every offending field.
+    pub fn set_limits(&mut self, patch: &Value) -> Result<RiskConfig, String> {
+        let Some(obj) = patch.as_object() else {
+            return Err("invalid: `set` must be a JSON object of limit fields".into());
+        };
+        let mut merged = serde_json::to_value(&self.risk.cfg).map_err(|e| format!("invalid: {e}"))?;
+        let cur = merged.as_object_mut().expect("struct serialises to an object");
+        for (k, v) in obj {
+            if !cur.contains_key(k) {
+                return Err(format!("invalid: unknown limit field {k:?}"));
+            }
+            if k == "leverage_cap" {
+                let Some(caps) = v.as_object() else {
+                    return Err("invalid: leverage_cap must be an object of asset class → cap".into());
+                };
+                let target = cur.get_mut(k).and_then(Value::as_object_mut).expect("leverage_cap is an object");
+                for (class, cap) in caps {
+                    target.insert(class.clone(), cap.clone());
+                }
+            } else {
+                cur.insert(k.clone(), v.clone());
+            }
+        }
+        let new: RiskConfig = serde_json::from_value(merged).map_err(|e| format!("invalid: {e}"))?;
+        let bad = self.risk.cfg.check_tightens(&new);
+        if !bad.is_empty() {
+            return Err(format!("loosen: {}", bad.join("; ")));
+        }
+        self.risk.cfg = new.clone();
+        self.settings.limits = new.clone();
+        self.bump("limits.tightened");
+        Ok(new)
+    }
+
+    /// Strategy list for `ctl.risk.strategy list` / `GET /api/trading/strategies`.
+    pub fn strategies_view(&self, deflated_sharpe: &BTreeMap<String, Option<f64>>, now_ms: i64) -> Value {
+        let rows: Vec<Value> = self
+            .strategies
+            .values()
+            .map(|s| {
+                let dsr = deflated_sharpe.get(&s.strategy_id).copied().flatten();
+                let gate = self.checklist(&s.strategy_id, dsr, now_ms);
+                self.strategy_json(s, gate.as_ref(), now_ms)
+            })
+            .collect();
+        json!({ "as_of": ts_rfc3339(now_ms), "strategies": rows })
+    }
+
+    pub fn strategy_json(&self, s: &StrategyState, gate: Option<&Checklist>, now_ms: i64) -> Value {
+        let weight = self.last_alloc.get(&s.strategy_id).copied().unwrap_or(0.0);
+        let shadow_days = s.shadow_since_ms.map(|t| (now_ms - t) as f64 / MS_PER_DAY as f64);
+        json!({
+            "strategy_id": s.strategy_id,
+            "status": s.status.as_str(),
+            "prev_status": s.prev_status.map(StrategyStatus::as_str),
+            "since": ts_rfc3339(s.since_ms),
+            "first_seen": ts_rfc3339(s.first_seen_ms),
+            "sleeve_eur": s.sleeve_eur,
+            "weight": weight,
+            "pnl_eur": s.pnl_eur,
+            "peak_pnl_eur": s.peak_pnl_eur,
+            "drawdown": s.drawdown(),
+            "max_drawdown": s.max_drawdown,
+            "last_reason": s.last_reason,
+            "shadow": {
+                "since": s.shadow_since_ms.map(ts_rfc3339),
+                "days": shadow_days,
+                "horizons_completed": s.horizons_completed,
+            },
+            "gate": gate,
+        })
     }
 
     // ---------------------------------------------------------------- internals
@@ -452,16 +796,29 @@ impl Engine {
     pub fn tick(&mut self, now_ms: i64) -> Vec<Out> {
         self.roll_day(now_ms);
         let mut out = self.check_equity(now_ms);
+        let equity = self.equity();
+        let deployable = self.risk.deployable(equity);
+        // strategy books first: they need the previous tick's marks, which update_performance replaces
+        out.extend(self.track_strategy_books(deployable, now_ms));
         self.update_performance();
         let ttl = self.settings.signal_ttl_secs as i64 * 1000;
         self.signals.retain(|_, (_, seen)| now_ms - *seen <= ttl);
         self.pending.retain(|_, p| now_ms - p.created_ms <= self.settings.pending_ttl_secs as i64 * 1000);
-
-        let equity = self.equity();
-        let deployable = self.risk.deployable(equity);
-        let dists: Vec<ExposureDistribution> = self.signals.values().map(|(d, _)| d.clone()).collect();
+        // only active strategies are allocated; paused / flattening / shadow contribute nothing
+        let dists: Vec<ExposureDistribution> = self
+            .signals
+            .values()
+            .filter(|(d, _)| self.strategies.get(&d.strategy_id).is_some_and(|s| s.status.allocates()))
+            .map(|(d, _)| d.clone())
+            .collect();
         let stats = self.perf.stats_for(dists.iter().map(|d| d.strategy_id.as_str()));
         let alloc = self.allocator.allocate(&stats);
+        for (id, w) in &alloc {
+            if let Some(s) = self.strategies.get_mut(id) {
+                s.sleeve_eur = w * deployable;
+            }
+        }
+        self.last_alloc = alloc.clone();
         let raw = fa_allocator::net_targets(&dists, &alloc, deployable);
 
         let market: BTreeMap<InstrumentId, MarketInfo> = raw
@@ -472,6 +829,7 @@ impl Engine {
                     *i,
                     MarketInfo {
                         asset_class: self.settings.default_asset_class,
+                        venue: String::new(), // one bucket until reference data reaches the engine
                         horizon_volume_eur: self.horizon_volume_eur(*i, now_ms),
                     },
                 )
@@ -531,6 +889,92 @@ impl Engine {
             out.push(Out::Intent(intent.clone()));
             out.push(Out::Approved(intent));
         }
+        // flattening strategies have had their closing intents issued: they are paused now
+        let flattening: Vec<String> = self
+            .strategies
+            .iter()
+            .filter(|(_, s)| s.status == StrategyStatus::Flattening)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in flattening {
+            if let Some(s) = self.strategies.get_mut(&id) {
+                s.flattened(now_ms);
+            }
+            self.dirty.insert(id.clone());
+            out.push(Out::Audit {
+                action: "strategy.flattened".into(),
+                subject: id,
+                payload: json!({"status": "paused"}),
+            });
+        }
+        out
+    }
+
+    /// Marks every strategy's virtual book to market, feeds the drawdown tracker and applies
+    /// the per-strategy kill switch (spec 40 §6.5: flatten + pause). Shadow books hold the
+    /// strategy's own signal on `shadow_sleeve_eur`; active books hold attributed fills.
+    fn track_strategy_books(&mut self, deployable: f64, now_ms: i64) -> Vec<Out> {
+        let limit = self.risk.cfg.strategy_max_drawdown;
+        let shadow_sleeve = self.settings.shadow_sleeve_eur;
+        let mut breached = Vec::new();
+        let ids: Vec<String> = self.strategies.keys().cloned().collect();
+        for id in ids {
+            let status = self.strategies[&id].status;
+            let (delta, sleeve) = match status {
+                StrategyStatus::Active => {
+                    let Some(b) = self.books.get_mut(&id) else { continue };
+                    let v = b.value(&self.marks);
+                    let delta = v - b.last_value_eur;
+                    b.last_value_eur = v;
+                    (delta, self.last_alloc.get(&id).copied().unwrap_or(0.0) * deployable)
+                }
+                StrategyStatus::Shadow => {
+                    // P&L of the exposure held since the previous tick
+                    let held = self.shadow_exposure.remove(&id).unwrap_or_default();
+                    let delta: f64 = held
+                        .iter()
+                        .filter_map(|(i, eur)| {
+                            let (prev, now) = (self.tick_marks.get(i)?, self.marks.get(i)?);
+                            (*prev > 0.0).then(|| eur * (now / prev - 1.0))
+                        })
+                        .sum();
+                    // and the exposure the latest signal asks for, carried into the next tick
+                    if let Some((d, _)) = self.signals.get(&id)
+                        && !d.exposures.is_empty()
+                    {
+                        let per_asset = shadow_sleeve / d.exposures.len() as f64;
+                        let next: BTreeMap<InstrumentId, f64> = d
+                            .exposures
+                            .iter()
+                            .filter(|e| self.marks.contains_key(&e.instrument))
+                            .map(|e| (e.instrument, per_asset * e.mean / (1.0 + e.stddev.max(0.0))))
+                            .collect();
+                        self.shadow_exposure.insert(id.clone(), next);
+                    }
+                    (delta, shadow_sleeve)
+                }
+                _ => continue,
+            };
+            let st = self.strategies.get_mut(&id).expect("iterating own keys");
+            if delta == 0.0 && sleeve <= 0.0 {
+                continue;
+            }
+            let dd = st.observe_pnl(delta, sleeve);
+            if dd >= limit && limit > 0.0 && sleeve > 0.0 {
+                st.breach(dd, limit, now_ms);
+                breached.push((id, status, dd));
+            }
+        }
+        let mut out = Vec::new();
+        for (id, was, dd) in breached {
+            self.after_transition(&id, was, StrategyStatus::Paused);
+            self.bump("strategy.drawdown_pauses");
+            out.push(Out::Audit {
+                action: "strategy.paused".into(),
+                subject: id.clone(),
+                payload: json!({"reason": self.strategies[&id].last_reason, "drawdown": dd, "limit": limit, "was": was.as_str(), "automatic": true}),
+            });
+        }
         out
     }
 
@@ -548,8 +992,14 @@ impl Engine {
             active_halts: self
                 .halts
                 .iter()
-                .map(|(s, h)| Halt {
-                    scope: s.as_str().into(),
+                .map(|(s, h)| (s.as_str().to_owned(), h))
+                .chain(
+                    self.source_halts.iter().map(|(id, h)| {
+                        (if id == ANY_SOURCE { "source".to_owned() } else { format!("source:{id}") }, h)
+                    }),
+                )
+                .map(|(scope, h)| Halt {
+                    scope,
                     reason: h.reason.clone(),
                     since: Some(ts_of(h.since_ms)),
                     manual: h.manual,
@@ -557,6 +1007,10 @@ impl Engine {
                 .collect(),
         }
     }
+}
+
+fn ts_rfc3339(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(|t| t.to_rfc3339()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -599,7 +1053,7 @@ mod tests {
             fee: 0.0,
             fee_currency: "EUR".into(),
             event_time: Some(ts_of(now)),
-            reason: String::new(),
+            ..Default::default()
         };
         e.on_order_event(&ev, now);
     }
@@ -688,12 +1142,24 @@ mod tests {
         assert!(!h.manual);
         assert!(e.halted());
         e.on_signal(&signal("a", inst, 1.0), T0 + 2500);
-        assert!(e.tick(T0 + 3000).is_empty(), "reduce-only: cannot add to the long");
+        let out = e.tick(T0 + 3000);
+        let ints = approved(&out);
+        assert!(ints.iter().all(|i| i.side == Side::Sell as i32), "reduce-only: cannot add to the long");
+        // the strategy lost 2 500 EUR of its 50 000 EUR sleeve = 5 % → per-strategy kill switch,
+        // and its position is closed (a reducing order, allowed under the daily-loss halt)
+        assert!(
+            out.iter().any(
+                |o| matches!(o, Out::Audit { action, subject, .. } if action == "strategy.paused" && subject == "a")
+            ),
+            "{out:?}"
+        );
+        assert_eq!(e.strategy("a").unwrap().status, StrategyStatus::Paused);
+        assert!(e.strategy("a").unwrap().last_reason.contains("≥ limit 5.00%"));
+        assert_eq!(ints.len(), 1);
+        assert!((ints[0].quantity - 50.0).abs() < 1e-6, "may only close, not flip");
+        fill(&mut e, &ints[0], 50.0, T0 + 3100);
         e.on_signal(&signal("a", inst, -1.0), T0 + 3500);
-        let sell = approved(&e.tick(T0 + 4000));
-        assert_eq!(sell.len(), 1);
-        assert!((sell[0].quantity - 50.0).abs() < 1e-6, "may only close, not flip");
-        fill(&mut e, &sell[0], 50.0, T0 + 4100);
+        assert!(approved(&e.tick(T0 + 4000)).is_empty(), "paused strategy places no new orders");
         assert!((e.state(T0 + 4100).daily_pnl_eur + 2_500.0).abs() < 1e-6);
         // next UTC day clears the daily-loss halt
         let out = e.tick(T0 + MS_PER_DAY + 1000);
@@ -824,5 +1290,201 @@ mod tests {
         assert!((e.equity() - 50_000.0).abs() < 1e-9);
         let st = e.state(T0 + 2000);
         assert!(st.drawdown.abs() < 1e-9, "peak re-armed at the seeded equity");
+    }
+
+    fn audits<'a>(out: &'a [Out], action: &str) -> Vec<&'a str> {
+        out.iter()
+            .filter_map(|o| match o {
+                Out::Audit { action: a, subject, .. } if a == action => Some(subject.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn paused_strategy_contributes_no_exposure_until_resumed() {
+        let inst = InstrumentId::new();
+        let mut e = warm(inst);
+        e.on_signal(&signal("a", inst, 1.0), T0);
+        e.on_signal(&signal("b", inst, 1.0), T0);
+        let buy = approved(&e.tick(T0 + 1000));
+        assert_eq!(buy.len(), 1);
+        assert!((buy[0].quantity * PX - 5_000.0).abs() < 1e-6, "a + b → 100k, capped to 5k");
+        fill(&mut e, &buy[0], PX, T0 + 1100);
+        assert_eq!(e.strategy("a").unwrap().status, StrategyStatus::Active);
+        assert!((e.strategy("a").unwrap().sleeve_eur - 50_000.0).abs() < 1e-6);
+        // lifecycle errors follow the control-api prefix convention
+        assert!(e.strategy_action("nope", StrategyAction::Pause, None, T0).unwrap_err().starts_with("not_found:"));
+        assert!(e.strategy_action("a", StrategyAction::Resume, None, T0).unwrap_err().starts_with("conflict:"));
+        // pause a: only b remains (50k target, still capped at 5k) → nothing to trade
+        let st = e.strategy_action("a", StrategyAction::Pause, None, T0 + 2000).unwrap();
+        assert_eq!(st.status, StrategyStatus::Paused);
+        assert!(e.take_dirty_strategies().iter().any(|s| s.strategy_id == "a"));
+        e.on_signal(&signal("a", inst, 1.0), T0 + 2500);
+        e.on_signal(&signal("b", inst, 1.0), T0 + 2500);
+        assert!(approved(&e.tick(T0 + 3000)).is_empty());
+        // pause b too: no active strategy → position flattened
+        e.strategy_action("b", StrategyAction::Pause, None, T0 + 3500).unwrap();
+        e.on_signal(&signal("b", inst, 1.0), T0 + 3600);
+        let flat = approved(&e.tick(T0 + 4000));
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].side, Side::Sell as i32);
+        assert!((flat[0].quantity - 50.0).abs() < 1e-6, "paused strategies hold no exposure");
+        assert!(flat[0].strategy_ids.is_empty());
+        fill(&mut e, &flat[0], PX, T0 + 4100);
+        assert!(e.strategy_action("a", StrategyAction::Pause, None, T0 + 4200).unwrap_err().contains("already paused"));
+        // resume a: its signal is allocated again
+        assert_eq!(
+            e.strategy_action("a", StrategyAction::Resume, None, T0 + 4500).unwrap().status,
+            StrategyStatus::Active
+        );
+        e.on_signal(&signal("a", inst, 1.0), T0 + 4600);
+        let again = approved(&e.tick(T0 + 5000));
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].side, Side::Buy as i32);
+        assert_eq!(again[0].strategy_ids, vec!["a"]);
+        // flatten a single active strategy: flattening → paused after the tick, audited
+        fill(&mut e, &again[0], PX, T0 + 5100);
+        assert_eq!(
+            e.strategy_action("a", StrategyAction::Flatten, None, T0 + 5500).unwrap().status,
+            StrategyStatus::Flattening
+        );
+        let out = e.tick(T0 + 6000);
+        assert_eq!(approved(&out)[0].side, Side::Sell as i32);
+        assert_eq!(audits(&out, "strategy.flattened"), vec!["a"]);
+        assert_eq!(e.strategy("a").unwrap().status, StrategyStatus::Paused);
+        let view = e.strategies_view(&BTreeMap::new(), T0 + 6000);
+        assert_eq!(view["strategies"].as_array().unwrap().len(), 2);
+        assert_eq!(view["strategies"][0]["status"], "paused");
+        assert_eq!(view["strategies"][0]["gate"]["green"], false);
+    }
+
+    #[test]
+    fn shadow_strategies_track_a_virtual_book_and_need_a_green_gate() {
+        let inst = InstrumentId::new();
+        let mut st = settings();
+        st.new_strategy_status = "shadow".into();
+        st.promotion.min_shadow_days = 1.0 / 24.0; // one hour
+        st.promotion.min_horizons = 2;
+        let mut e = Engine::new(st);
+        for s in 0..3_600 {
+            e.on_trade(inst, T0 - 3_600_000 + s * 1000, PX, 10.0);
+        }
+        e.on_signal(&signal("s", inst, 1.0), T0);
+        assert!(e.tick(T0 + 1000).is_empty(), "shadow strategies place no orders");
+        assert_eq!(e.strategy("s").unwrap().status, StrategyStatus::Shadow);
+        // the virtual book is long 10 000 EUR (one asset, full sleeve): a 1 % move is +100 EUR
+        e.on_trade(inst, T0 + 1500, PX * 1.01, 1.0);
+        e.tick(T0 + 2000);
+        assert!((e.strategy("s").unwrap().pnl_eur - 100.0).abs() < 1e-6, "{}", e.strategy("s").unwrap().pnl_eur);
+        assert_eq!(e.strategy("s").unwrap().sleeve_eur, 10_000.0);
+        // horizons: 5x1s signals every 5 s advance the counter
+        let mut sig = signal("s", inst, 1.0);
+        sig.as_of = Some(ts_of(T0 + 5_000));
+        e.on_signal(&sig, T0 + 5_000);
+        sig.as_of = Some(ts_of(T0 + 10_000));
+        e.on_signal(&sig, T0 + 10_000);
+        assert_eq!(e.strategy("s").unwrap().horizons_completed, 2);
+        // gate: shadow time short and no deflated Sharpe → refused with the missing list
+        let err = e.strategy_action("s", StrategyAction::Promote, None, T0 + 10_000).unwrap_err();
+        assert!(err.starts_with("conflict: promotion gate not green"), "{err}");
+        assert!(err.contains("min_shadow_days") && err.contains("deflated_sharpe"), "{err}");
+        assert_eq!(e.strategy("s").unwrap().status, StrategyStatus::Shadow);
+        // an hour later, with a DSR row: still refused without the statistic …
+        let later = T0 + 3_600_000 + 1;
+        let cl = e.checklist("s", None, later).unwrap();
+        assert_eq!(cl.missing, vec!["deflated_sharpe"]);
+        // … and promoted with it; the strategy is allocated from the next tick
+        let st = e.strategy_action("s", StrategyAction::Promote, Some(0.4), later).unwrap();
+        assert_eq!(st.status, StrategyStatus::Active);
+        assert_eq!(st.last_reason, "promoted: gate green");
+        e.on_trade(inst, later, PX, 10_000.0); // refill the (now empty) hourly volume window
+        e.on_signal(&signal("s", inst, 1.0), later);
+        assert_eq!(approved(&e.tick(later + 1000)).len(), 1, "promoted strategy trades");
+        // health halts block the gate for other shadow strategies
+        e.strategy_action("s", StrategyAction::Shadow, None, later + 2000).unwrap();
+        e.on_source_health("yahoo", "down", "stale", later + 2000);
+        assert_eq!(
+            e.checklist("s", Some(1.0), later + 2000).unwrap().missing,
+            vec!["min_shadow_days", "min_horizons", "no_health_halts"]
+        );
+    }
+
+    #[test]
+    fn source_health_halts_are_tracked_per_source() {
+        let inst = InstrumentId::new();
+        let mut e = warm(inst);
+        e.on_signal(&signal("a", inst, 1.0), T0);
+        let buy = approved(&e.tick(T0 + 1000));
+        fill(&mut e, &buy[0], PX, T0 + 1100);
+        assert!(e.on_source_health("yahoo", "down", "no data for 90 s", T0 + 2000));
+        assert!(!e.on_source_health("yahoo", "down", "", T0 + 2001), "already halted");
+        assert!(e.halted());
+        let flat = approved(&e.tick(T0 + 3000));
+        assert_eq!(flat.len(), 1, "health halt flattens");
+        assert_eq!(flat[0].side, Side::Sell as i32);
+        // the ingestor's own risk.halt.source:<id> lands in the same table
+        e.on_halt(
+            &Halt { scope: "source:hn".into(), reason: "down".into(), manual: false, ..Default::default() },
+            T0 + 3500,
+        );
+        let scopes: Vec<String> = e.state(T0 + 3500).active_halts.iter().map(|h| h.scope.clone()).collect();
+        assert_eq!(scopes, vec!["source:hn", "source:yahoo"]);
+        assert!(e.on_source_health("yahoo", "ok", "", T0 + 4000));
+        assert!(e.halted(), "hn is still down");
+        e.on_resume("source:hn");
+        assert!(!e.halted());
+        assert!(e.state(T0 + 4000).active_halts.is_empty());
+        // a manual source halt is never cleared by a health frame, only by resume
+        e.on_halt(
+            &Halt { scope: "source:yahoo".into(), reason: "operator".into(), manual: true, ..Default::default() },
+            T0 + 5000,
+        );
+        assert!(!e.on_source_health("yahoo", "ok", "", T0 + 5001));
+        assert!(e.halted());
+        e.on_resume("source");
+        assert!(!e.halted());
+        assert_eq!(e.counters["halts.received"], 3.0);
+    }
+
+    #[test]
+    fn portfolio_flatten_pauses_all_and_limits_only_tighten() {
+        let inst = InstrumentId::new();
+        let mut e = warm(inst);
+        e.on_signal(&signal("a", inst, 1.0), T0);
+        e.on_signal(&signal("b", inst, 0.5), T0);
+        let buy = approved(&e.tick(T0 + 1000));
+        fill(&mut e, &buy[0], PX, T0 + 1100);
+        let mut ids = e.flatten_all(T0 + 2000);
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b"]);
+        let out = e.tick(T0 + 3000);
+        let flat = approved(&out);
+        assert_eq!(flat.len(), 1);
+        assert!((flat[0].quantity - 50.0).abs() < 1e-6);
+        assert_eq!(audits(&out, "strategy.flattened").len(), 2);
+        assert!(e.strategy_ids().iter().all(|id| e.strategy(id).unwrap().status == StrategyStatus::Paused));
+        assert!(e.flatten_all(T0 + 4000).is_empty(), "nothing active any more");
+        fill(&mut e, &flat[0], PX, T0 + 3100);
+
+        // limits: loosening is refused field by field, tightening applies immediately
+        let err = e.set_limits(&json!({"max_drawdown": 0.5, "leverage_cap": {"fx": 9.0}})).unwrap_err();
+        assert!(
+            err.starts_with("loosen: max_drawdown: 0.1 → 0.5 would loosen; leverage_cap.fx: 3 → 9 would loosen"),
+            "{err}"
+        );
+        assert_eq!(e.limits().max_drawdown, 0.1, "refused change leaves limits untouched");
+        assert!(e.set_limits(&json!({"nope": 1})).unwrap_err().starts_with("invalid: unknown limit field"));
+        assert!(e.set_limits(&json!(3)).unwrap_err().starts_with("invalid:"));
+        assert!(e.set_limits(&json!({"leverage_cap": 2})).unwrap_err().starts_with("invalid:"));
+        let new = e.set_limits(&json!({"max_position_frac": 0.01, "leverage_cap": {"fx": 1.0}})).unwrap();
+        assert_eq!(new.max_position_frac, 0.01);
+        assert_eq!(new.leverage_cap[&fa_core::AssetClass::Fx], 1.0);
+        assert_eq!(new.leverage_cap[&fa_core::AssetClass::Equity], 1.5, "other classes keep their caps");
+        assert_eq!(e.limits(), &new);
+        e.strategy_action("a", StrategyAction::Resume, None, T0 + 5000).unwrap();
+        e.on_signal(&signal("a", inst, 1.0), T0 + 5000);
+        let buy = approved(&e.tick(T0 + 6000));
+        assert!((buy[0].quantity * PX - 1_000.0).abs() < 1e-6, "new 1 % position cap binds: {}", buy[0].quantity * PX);
     }
 }

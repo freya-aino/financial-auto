@@ -161,6 +161,8 @@ Also available but unused: `GET /healthz`, `GET /readyz` (503 while indexes catc
 ```sh
 cargo test -p fa-hub                                   # unit tests (JSON shapes, parsing, catalog validation)
 FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test live   # against `just up`'s helix
+
+Known flake: when the live suite runs concurrently with other Helix writers (a workspace-wide `cargo test` plus the compose `model-runtime`), `ensure_upsert_and_lifecycle_queries_are_idempotent` has once seen a transition count off by one; it passes reliably on its own and with `--test-threads=1`.
 ```
 The live tests create `test-<nanos>-…` rows and drop them afterwards; the indexes created by
 `ensure_schema` and the `vec4` latent index remain. `live.rs` covers the typed queries, the

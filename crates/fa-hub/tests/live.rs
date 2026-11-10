@@ -419,3 +419,42 @@ async fn genome_business_id_writes_for_evo_worker() {
     assert!(matches!(bad, Err(HubError::NotFound { .. })), "{bad:?}");
     cleanup(&c, &p).await;
 }
+
+#[tokio::test]
+async fn space_latents_read_back_vectors_newest_first() {
+    let Some(c) = client() else { return };
+    c.ensure_schema_ready(WAIT).await.expect("schema");
+    c.ensure_latent_index_ready(4, WAIT).await.expect("latent index");
+    let p = prefix();
+    let space = format!("{p}space-l");
+    let mk = |ref_id: &str, ts_ms: i64, v: [f32; 4]| NewLatent {
+        vector: v.to_vec(),
+        expert_space_id: space.clone(),
+        kind: "observation".into(),
+        ref_id: format!("{p}{ref_id}"),
+        instrument_id: "BTC".into(),
+        ts_ms,
+        uncertainty: 0.1,
+    };
+    c.add_latents(&[
+        mk("a", 1_762_620_000_000, [1.0, 0.0, 0.0, 0.0]),
+        mk("b", 1_762_620_060_000, [0.0, 1.0, 0.0, 0.0]),
+        mk("c", 1_762_620_120_000, [0.0, 0.0, 1.0, 0.0]),
+    ])
+    .await
+    .expect("add_latents");
+    assert_eq!(c.count_space_latents(&space).await.expect("count"), 3);
+
+    let rows = c.space_latents(&space, Some("observation"), None, 10).await.expect("space_latents");
+    let refs: Vec<&str> = rows.iter().map(|r| r.ref_id.as_str()).collect();
+    assert_eq!(refs, vec![format!("{p}c"), format!("{p}b"), format!("{p}a")], "{rows:?}");
+    assert_eq!(rows[0].vector(), Some(vec![0.0, 0.0, 1.0, 0.0]), "{:?}", rows[0]);
+    assert!(rows.iter().all(|r| r.ts.is_some()));
+
+    let recent = c.space_latents(&space, None, Some(1_762_620_060_000), 10).await.expect("since");
+    assert_eq!(recent.len(), 2, "{recent:?}");
+    let limited = c.space_latents(&space, None, None, 1).await.expect("limit");
+    assert_eq!(limited.len(), 1);
+
+    cleanup(&c, &p).await;
+}

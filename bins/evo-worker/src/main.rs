@@ -17,7 +17,10 @@ mod gpu;
 mod job;
 mod latent;
 mod market;
+mod strategy;
+mod trials;
 mod vary;
+mod vary_strategy;
 
 use std::time::Duration;
 
@@ -54,6 +57,12 @@ struct Args {
     /// Disable VictoriaMetrics reads (buffer only).
     #[arg(long, env = "FA_EVO_NO_TSDB", default_value_t = false)]
     no_tsdb: bool,
+    /// Execution cost model shared with the paper venue (YAML); missing file → built-in defaults.
+    #[arg(long, env = "FA_COSTS", default_value = fa_backtest::cost::COSTS_YAML_PATH)]
+    costs: String,
+    /// Disable the Postgres trial registry.
+    #[arg(long, env = "FA_EVO_NO_REGISTRY", default_value_t = false)]
+    no_registry: bool,
 }
 
 #[tokio::main]
@@ -129,6 +138,41 @@ async fn main() -> anyhow::Result<()> {
         Some(t)
     };
     let hub = Some(fa_hub::HubClient::new(fa_hub::HubClient::url_from_env_or(&cfg.helix.url)));
+    // Trial registry (spec 41 §6.5): validation.trial / generation_stats / holdout.
+    let trials = if args.no_registry {
+        None
+    } else {
+        match trials::TrialStore::connect(&cfg.postgres.url).await {
+            Some(t) if t.ready().await => {
+                tracing::info!("trial registry: postgres validation.* ready");
+                Some(t)
+            }
+            Some(_) => {
+                tracing::warn!(
+                    "postgres reachable but validation.* tables missing (start control-api to migrate); registry disabled"
+                );
+                None
+            }
+            None => None,
+        }
+    };
+    // Cost model (spec 41 §6.3): same file as the paper venue.
+    let cost = std::sync::Arc::new(match std::fs::read_to_string(&args.costs) {
+        Ok(src) => match fa_backtest::cost::CostModel::from_yaml(&src) {
+            Ok(m) => {
+                tracing::info!(path = %args.costs, "cost model loaded");
+                m
+            }
+            Err(e) => {
+                tracing::warn!(path = %args.costs, error = %e, "cost model unreadable; using built-in defaults");
+                fa_backtest::cost::CostModel::default()
+            }
+        },
+        Err(e) => {
+            tracing::warn!(path = %args.costs, error = %e, "no cost model file; using built-in defaults");
+            fa_backtest::cost::CostModel::default()
+        }
+    });
     let (notices, _) = broadcast::channel(256);
     tokio::spawn(gpu::run_notices(bus.clone(), notices.clone()));
 
@@ -178,6 +222,8 @@ async fn main() -> anyhow::Result<()> {
         latents,
         hub,
         blob,
+        trials,
+        cost,
     };
     tracing::info!(%worker_id, gpu_lease_mb = args.gpu_lease_mb, "pulling jobs from {STREAM}");
     // One message at a time so idle workers do not hoard jobs other replicas could take.

@@ -11,6 +11,17 @@
 //	ctl.evo.cancel   args: job_id — drops the job from its generation (scored as failed), releases
 //	                 the GPU lease named after the job id and publishes JobResult{CANCELLED, error
 //	                 "cancelled by operator"} on jobs.result.<kind> so views update.
+//	ctl.evo.pause    args: generation_id — stop dispatching new rungs (running jobs finish)
+//	ctl.evo.resume   args: generation_id — continue; a rung deferred while paused is submitted
+//	ctl.evo.stop     args: generation_id — cancel every pending job (STATUS_CANCELLED results,
+//	                 leases released) and end the generation with a final summary
+//
+// The eval kind names the family (`evo.eval.<family>`); the variation kind is derived
+// (`evo.vary.<family>`), so decoder and strategy generations run through the same loop. Eval
+// results may carry `generation_stats` (trial registry, spec 41 §6.5); the latest one is
+// published in every summary as `validation`. When a strategy generation ends, its Pareto front
+// is written to Garage as `fa-artifacts/strategies/<generation>.toml` (`-garage`, secrets from
+// `-secrets`/FA_SECRETS) and announced as `artifact_key`.
 //
 // Error replies carry a prefix control-api maps to HTTP: `not_found:` (404), `conflict:` (409).
 //
@@ -45,8 +56,10 @@ import (
 	"github.com/oklog/ulid/v2"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/fey/financial-auto/go/pkg/archive"
 	"github.com/fey/financial-auto/go/pkg/bus"
 	fav1 "github.com/fey/financial-auto/go/pkg/bus/pb/fa/v1"
+	"github.com/fey/financial-auto/go/pkg/connector"
 )
 
 const service = "evo-orchestrator"
@@ -58,6 +71,8 @@ func main() {
 	natsURL := flag.String("nats", envOr("FA_NATS_URL", "nats://127.0.0.1:4222"), "NATS URL")
 	gpuMem := flag.Int("gpu-mem-mb", envInt("FA_GPU_MEM_MB", 24_000), "GPU memory managed by the arbiter (MB), reported as gpu.capacity_mb")
 	maxGens := flag.Int("max-generations", envInt("FA_EVO_MAX_GENERATIONS", 1), "default max_generations for ctl.evo.start (halving + variation loops)")
+	garageURL := flag.String("garage", envOr("FA_GARAGE_URL", "http://127.0.0.1:3900"), "Garage S3 endpoint for promoted strategy populations (empty disables)")
+	secretsPath := flag.String("secrets", envOr("FA_SECRETS", "config/secrets.toml"), "secrets file with [garage] access_key_id / secret_access_key (D-020)")
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("svc", service)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -98,6 +113,20 @@ func main() {
 	var gensMu sync.Mutex
 	gens := map[string]*Generation{}
 
+	// Promotion hand-off (spec 35 §6.4): final strategy fronts → Garage population files.
+	var promote Promote
+	if *garageURL != "" {
+		secrets, err := connector.LoadSecrets(*secretsPath)
+		if err != nil {
+			log.Warn("secrets", "path", *secretsPath, "err", err)
+		} else if st, err := archive.NewS3(archive.Options{Endpoint: *garageURL, AccessKey: secrets.Get("garage", "access_key_id"), SecretKey: secrets.Get("garage", "secret_access_key")}); err != nil {
+			log.Warn("garage client unavailable; strategy fronts are not archived", "err", err)
+		} else {
+			promote = PromoteStrategies(st, func(err error) { log.Warn("promote", "err", err) })
+			log.Info("promoted strategy populations go to Garage", "endpoint", *garageURL, "bucket", ArtifactsBucket)
+		}
+	}
+
 	// Per-rung Pareto summaries: heartbeat gauges + generation.summary on jobs.result.evo.generation.
 	onSummary := func(s Summary) {
 		counters.Set("pareto.front_size", float64(len(s.ParetoFront)))
@@ -118,8 +147,20 @@ func main() {
 		if err := pub.Publish(bus.JobResult(GenerationSummaryKind), res); err != nil {
 			log.Warn("summary publish", "err", err)
 		}
-		log.Info("generation.summary", "id", s.GenerationID, "gen", s.Generation, "rung", s.Rung, "final", s.Final,
-			"candidates", s.Candidates, "front", len(s.ParetoFront), "fronts", s.FrontSizes, "survivors", s.Survivors)
+		if s.Validation != nil {
+			counters.Set("validation.n_trials", float64(s.Validation.NTrials))
+			if s.Validation.DeflatedSharpe != nil {
+				counters.Set("validation.deflated_sharpe", *s.Validation.DeflatedSharpe)
+			}
+			if s.Validation.PBO != nil {
+				counters.Set("validation.pbo", *s.Validation.PBO)
+			}
+		}
+		if s.ArtifactKey != "" {
+			counters.Add("promotions.artifacts", 1)
+		}
+		log.Info("generation.summary", "id", s.GenerationID, "gen", s.Generation, "rung", s.Rung, "final", s.Final, "state", s.State,
+			"candidates", s.Candidates, "front", len(s.ParetoFront), "fronts", s.FrontSizes, "survivors", s.Survivors, "artifact", s.ArtifactKey)
 	}
 	finish := func(id string, g *Generation) {
 		log.Info("generation done", "id", id, "final", g.Final())
@@ -202,6 +243,7 @@ func main() {
 		g, err := NewGenerationWith(GenerationConfig{
 			Kind: r.Args["kind"], SnapshotID: r.Args["snapshot_id"], Genomes: genomes, Eta: eta, MinBudgetMs: minB, MaxBudgetMs: maxB,
 			Seed: uint64(time.Now().UnixNano()), MaxGenerations: mg, TotalBudgetMs: totalB, DataWindowHours: window, OnSummary: onSummary,
+			Promote: promote,
 		})
 		if err != nil {
 			return "", err
@@ -254,6 +296,73 @@ func main() {
 			return "cancelled " + jobID, nil
 		}
 		return "", fmt.Errorf("not_found: job %q is not pending in any generation", jobID)
+	})
+
+	// Operator control of a running generation (spec 50 §4.6 `POST /api/evolution/runs/{id}/{action}`).
+	byGeneration := func(r *fav1.CtlRequest) (*Generation, error) {
+		id := r.Args["generation_id"]
+		if id == "" {
+			return nil, fmt.Errorf("invalid: generation_id is required")
+		}
+		g, ok := gens[id]
+		if !ok {
+			return nil, fmt.Errorf("not_found: generation %q is not active", id)
+		}
+		return g, nil
+	}
+	handle(bus.Ctl("evo", "pause"), func(r *fav1.CtlRequest) (string, error) {
+		gensMu.Lock()
+		defer gensMu.Unlock()
+		g, err := byGeneration(r)
+		if err != nil {
+			return "", err
+		}
+		if !g.Pause() {
+			return "", fmt.Errorf("conflict: generation %s is already paused or done", g.ID)
+		}
+		counters.Add("generations.paused", 1)
+		log.Info("generation paused", "id", g.ID)
+		return "paused " + g.ID, nil
+	})
+	handle(bus.Ctl("evo", "resume"), func(r *fav1.CtlRequest) (string, error) {
+		gensMu.Lock()
+		defer gensMu.Unlock()
+		g, err := byGeneration(r)
+		if err != nil {
+			return "", err
+		}
+		ok, err := g.Resume(publishJob)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", fmt.Errorf("conflict: generation %s is not paused", g.ID)
+		}
+		log.Info("generation resumed", "id", g.ID)
+		return "resumed " + g.ID, nil
+	})
+	handle(bus.Ctl("evo", "stop"), func(r *fav1.CtlRequest) (string, error) {
+		gensMu.Lock()
+		defer gensMu.Unlock()
+		g, err := byGeneration(r)
+		if err != nil {
+			return "", err
+		}
+		cancelled := g.Stop()
+		for jobID, kind := range cancelled {
+			res := &fav1.JobResult{JobId: jobID, Status: fav1.JobResult_STATUS_CANCELLED, Error: "cancelled by operator (generation stopped)", WorkerId: service}
+			if err := pub.Publish(bus.JobResult(kind), res); err != nil {
+				log.Warn("cancel publish", "job", jobID, "err", err)
+			}
+			for _, id := range arb.Release(jobID) {
+				notify("granted", id)
+			}
+			counters.Add("jobs.cancelled", 1)
+		}
+		counters.Add("generations.stopped", 1)
+		finish(g.ID, g)
+		log.Info("generation stopped", "id", g.ID, "cancelled", len(cancelled))
+		return fmt.Sprintf("stopped %s (%d job(s) cancelled)", g.ID, len(cancelled)), nil
 	})
 
 	if _, err := pub.NC.Subscribe(bus.AllJobResults, func(m *nats.Msg) {

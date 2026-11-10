@@ -17,6 +17,7 @@ url = "postgres://fa:fa@postgres:5432/fa"
 
 [garage]
 endpoint = "http://garage:3900"
+public_endpoint = "http://127.0.0.1:3900" # presigned URLs handed to the browser (spec 50 §4.6)
 region = "garage"
 bucket_raw = "fa-raw"
 bucket_media = "fa-media"

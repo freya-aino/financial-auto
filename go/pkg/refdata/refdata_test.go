@@ -119,3 +119,105 @@ func TestLiveResolverCursorsRunLog(t *testing.T) {
 	}
 	t.Cleanup(func() { s.Pool.Exec(ctx, `delete from ingest.connector_run where id = $1`, runID) })
 }
+
+func TestLiveStatusesBackfillCursorsProvisionHook(t *testing.T) {
+	s := liveStore(t)
+	ctx := context.Background()
+	cat, err := catalog.Load("../../../config/sources.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncCatalog(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	// Statuses round trip: DB status wins over the YAML seed.
+	st, err := s.Statuses(ctx)
+	if err != nil || st["yahoo"] == "" {
+		t.Fatalf("statuses %v %v", st, err)
+	}
+	orig := st["frankfurter"]
+	if err := s.SetStatus(ctx, "frankfurter", "disabled"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.SetStatus(ctx, "frankfurter", orig) })
+	st, _ = s.Statuses(ctx)
+	if st["frankfurter"] != "disabled" {
+		t.Fatalf("status not persisted: %q", st["frankfurter"])
+	}
+	if err := s.SyncCatalog(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	st, _ = s.Statuses(ctx)
+	if st["frankfurter"] != "disabled" {
+		t.Fatalf("sync overwrote the DB status: %q", st["frankfurter"])
+	}
+	if err := s.SetStatus(ctx, "no_such_source_xyz", "live"); err == nil {
+		t.Fatal("expected error for unknown id")
+	}
+
+	// Provision hook fires once per new pair and the quarantine row carries the instrument id.
+	sym := "TESTHOOK_" + time.Now().UTC().Format("20060102150405.000")
+	var hooked []string
+	r := NewResolver(s, nil, nil)
+	r.OnProvision = func(src, symbol, id string) { hooked = append(hooked, src+"/"+symbol+"/"+id) }
+	id, ok := r.Resolve("yahoo", sym)
+	if !ok || len(hooked) != 1 || hooked[0] != "yahoo/"+sym+"/"+id {
+		t.Fatalf("hook %v (%s %v)", hooked, id, ok)
+	}
+	r.Resolve("yahoo", sym)
+	if len(hooked) != 1 {
+		t.Fatal("hook fired for a cached pair")
+	}
+	var qinst string
+	if err := s.Pool.QueryRow(ctx, `select instrument_id::text from ingest.quarantine where source_id = 'yahoo' and venue_symbol = $1`, sym).Scan(&qinst); err != nil || qinst != id {
+		t.Fatalf("quarantine instrument_id %q %v", qinst, err)
+	}
+	t.Cleanup(func() {
+		s.Pool.Exec(ctx, `delete from ingest.quarantine where venue_symbol = $1`, sym)
+		s.Pool.Exec(ctx, `delete from ingest.backfill_cursor where instrument_id = $1`, id)
+		s.Pool.Exec(ctx, `delete from ref.identifier where instrument_id = $1`, id)
+		s.Pool.Exec(ctx, `delete from ref.listing where instrument_id = $1`, id)
+		s.Pool.Exec(ctx, `delete from ref.instrument where id = $1`, id)
+	})
+
+	// Bounded backfill ranges are independent of the live watermark row.
+	bc := NewBackfillCursors(s)
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(24 * time.Hour)
+	if _, _, ok, err := bc.GetBackfill(ctx, "yahoo", id, "1m", start); ok || err != nil {
+		t.Fatalf("empty range %v %v", ok, err)
+	}
+	if err := bc.SetBackfill(ctx, "yahoo", id, "1m", start, end, time.Time{}, "pending"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bc.SetBackfill(ctx, "yahoo", id, "1m", start, end, start.Add(time.Hour), "running"); err != nil {
+		t.Fatal(err)
+	}
+	cur, status, ok, err := bc.GetBackfill(ctx, "yahoo", id, "1m", start)
+	if err != nil || !ok || status != "running" || !cur.Equal(start.Add(time.Hour)) {
+		t.Fatalf("range %v %q %v %v", cur, status, ok, err)
+	}
+	if err := bc.SetBackfill(ctx, "yahoo", id, "1m", start, end, time.Time{}, "done"); err != nil {
+		t.Fatal(err)
+	}
+	cur, status, _, _ = bc.GetBackfill(ctx, "yahoo", id, "1m", start)
+	if status != "done" || !cur.Equal(start.Add(time.Hour)) {
+		t.Fatalf("done keeps cursor: %v %q", cur, status)
+	}
+	if _, ok, _ := NewCursors(s).GetCursor(ctx, "yahoo", id, "1m"); ok {
+		t.Fatal("bounded range must not show up as the live watermark")
+	}
+	rows, err := s.ListCursors(ctx, "yahoo", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range rows {
+		if r.InstrumentID == id && !r.Live && r.Status == "done" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ListCursors missing the range: %+v", rows)
+	}
+}

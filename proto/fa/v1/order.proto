@@ -43,4 +43,9 @@ message OrderEvent {
   string fee_currency = 7;
   google.protobuf.Timestamp event_time = 8;
   string reason = 9;
+  // Execution quality (spec 40 §6.4, 41 §6.3): the arrival price is the last trade seen when
+  // the intent was accepted; slippage is the signed cost against the taker in basis points of
+  // the arrival price (fill vs arrival, positive = paid). Both are 0 for non-fill events.
+  double arrival_price = 10;
+  double slippage_bps = 11;
 }

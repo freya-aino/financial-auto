@@ -1,9 +1,14 @@
 //! Backtest & validation (spec 41): deflated Sharpe ratio, PBO via CSCV, the replay driver
-//! interface (replay runs through the live code path), and [`eval`], the sequential
-//! point-in-time scorer for series decoders used by `evo-worker`.
+//! interface (replay runs through the live code path), [`eval`], the sequential
+//! point-in-time scorer for series decoders, [`replay`], the pipeline replay of
+//! `fa_strategies` programs with execution simulation through the [`cost`] model, and
+//! [`validation`], the per-generation statistics over a trial set (deflated Sharpe, PBO).
 
+pub mod cost;
 pub mod eval;
+pub mod replay;
 pub mod stats;
+pub mod validation;
 
 /// A replay source drives the same pipeline as live, in event-time order with
 /// point-in-time (publish_time ≤ decision time) semantics.
@@ -38,6 +43,13 @@ pub fn run_replay<S: ReplaySource>(src: &mut S, sink: &mut impl ReplaySink<S::Ev
 pub enum ReplayError {
     #[error("replay source out of order: {got} after {prev}")]
     OutOfOrder { prev: i64, got: i64 },
+    /// A `Selection` replay touched the locked holdout (spec 41 §6.4): rejected, not penalised.
+    #[error("selection window intersects the locked {timescale} holdout [{holdout_start_ms}, {holdout_end_ms}]")]
+    HoldoutIntersect { timescale: String, holdout_start_ms: i64, holdout_end_ms: i64 },
+    #[error("no bars in the replay window")]
+    NoData,
+    #[error("candidate: {0}")]
+    Candidate(String),
 }
 
 #[cfg(test)]

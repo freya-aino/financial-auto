@@ -5,7 +5,7 @@ use std::{path::PathBuf, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::State,
     http::{StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -17,7 +17,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{bus_tap, live_routes as lr, sources, state::AppState};
+use crate::{bus_tap, live_routes as lr, state::AppState};
 
 pub fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
     let mut app = Router::new()
@@ -26,15 +26,11 @@ pub fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         .route("/api/services", get(services))
         .route("/api/config/timescales", get(timescales))
         .route("/api/services/{name}/{action}", post(not_implemented))
-        .route("/api/config/{section}", any(not_implemented))
         .route("/api/jobs", get(lr::jobs))
         .route("/api/jobs/{id}/cancel", post(lr::cancel_job))
         .route("/api/gpu", get(lr::gpu))
         // 4.2 Sources & ingestion
-        .route("/api/sources", get(list_sources))
-        .route("/api/sources/{id}", get(get_source))
-        .route("/api/sources/{id}/{action}", post(not_implemented))
-        .route("/api/instruments", get(not_implemented))
+        // (sources, instruments and quarantine live in `sources_routes`, merged in main)
         .route("/api/ingest/{source}/{action}", post(lr::ingest_control))
         // 4.3 Bus tap
         .route("/ws/bus", get(bus_tap::ws_bus))
@@ -44,20 +40,10 @@ pub fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         .route("/api/latent/timescales", get(lr::latent_timescales))
         .route("/api/latent/timescales/{ts}/{view}", get(lr::latent_view))
         .route("/api/decoders/outputs", get(lr::decoder_outputs))
-        .route("/api/latent/snapshots/{id}/{action}", post(not_implemented))
-        .route("/api/latent/{snapshot}/{view}", get(not_implemented))
-        .route("/ws/latent", get(not_implemented))
         // 4.6 Evolution
         .route("/api/evolution/jobs", get(lr::jobs))
         .route("/api/evolution/gpu", get(lr::gpu))
-        .route("/api/evolution/generations", post(lr::start_generation))
-        .route("/api/evolution/populations", get(not_implemented))
-        .route("/api/evolution/populations/{id}/pareto", get(not_implemented))
-        .route("/api/evolution/genomes/{id}", get(not_implemented))
-        .route("/api/evolution/genomes/{id}/outputs", get(not_implemented))
-        .route("/api/evolution/runs", post(not_implemented))
-        .route("/api/evolution/runs/{id}/{action}", post(not_implemented))
-        .route("/ws/evolution", get(not_implemented))
+        .route("/api/evolution/generations", get(crate::evolution_routes::generations).post(lr::start_generation))
         // 4.7 Trading
         .route("/api/trading/positions", get(lr::positions))
         .route("/api/trading/orders", get(lr::orders).post(lr::paper_order))
@@ -76,7 +62,6 @@ pub fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         .route("/api/trading/limits", any(not_implemented))
         .route("/api/trading/reconciliation", get(not_implemented))
         .route("/api/audit", get(not_implemented))
-        .route("/ws/trading", get(not_implemented))
         .route("/api/{*rest}", any(api_not_found));
 
     if let Some(dir) = frontend.filter(|d| d.join("index.html").is_file()) {
@@ -188,23 +173,6 @@ async fn timescales(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({ "timescales": ladder }))
 }
 
-async fn list_sources(State(state): State<AppState>) -> Response {
-    match sources::load(&state.sources_path) {
-        Ok(cat) => Json(cat).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
-    }
-}
-
-async fn get_source(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    match sources::load(&state.sources_path) {
-        Ok(cat) => match cat.sources.into_iter().find(|s| s.id == id) {
-            Some(s) => Json(s).into_response(),
-            None => (StatusCode::NOT_FOUND, Json(json!({"error": "unknown source", "id": id}))).into_response(),
-        },
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use axum::{body::Body, http::Request};
@@ -236,18 +204,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sources_lists_catalog() {
-        let (s, v) = get_json("/api/sources").await;
-        assert_eq!(s, StatusCode::OK);
-        assert!(v["sources"].as_array().unwrap().len() >= 70);
-        let (s, v) = get_json("/api/sources/oanda").await;
-        assert_eq!(s, StatusCode::OK);
-        assert_eq!(v["id"], "oanda");
-        let (s, _) = get_json("/api/sources/nope").await;
-        assert_eq!(s, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
     async fn timescales_follow_config() {
         let (_, v) = get_json("/api/config/timescales").await;
         assert_eq!(v["timescales"][0]["id"], "1s");
@@ -256,9 +212,9 @@ mod tests {
 
     #[tokio::test]
     async fn unimplemented_routes_return_501_with_spec_pointer() {
-        let (s, v) = get_json("/api/evolution/populations").await;
+        let (s, v) = get_json("/api/audit").await;
         assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(v["spec"], "specs/50-control-api.md §4.6");
+        assert_eq!(v["spec"], "specs/50-control-api.md §4.7");
         let (s, v) = get_json("/api/trading/pnl").await;
         assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(v["spec"], "specs/50-control-api.md §4.7");

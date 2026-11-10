@@ -2,7 +2,10 @@
 
 Runtime configuration: source catalog, platform config, timescale ladder. Secrets live in git-ignored `secrets.toml`.
 
-**Status:** in use — `platform.toml` (host) and `platform.docker.toml` (compose hostnames) are read by every Rust service via `fa-core` (`FA_CONFIG`); `sources.yaml` is loaded by `go/pkg/catalog` and served by control-api `/api/sources`; `secrets.example.toml` documents the git-ignored `secrets.toml` (no code reads it yet).
+**Status:** in use — `platform.toml` (host) and `platform.docker.toml` (compose hostnames) are read by every Rust service via `fa-core` (`FA_CONFIG`); `sources.yaml` is loaded by `go/pkg/catalog`, synced into Postgres `catalog.source` by the ingestor and served (with the Postgres status and live health overlaid) by control-api `/api/sources`; `secrets.toml` (git-ignored, documented by `secrets.example.toml`) is read by the ingestor (`[garage]`, `[sources.<id>]`, D-020).
+
+## Source status precedence (spec 11 §8, D-054)
+`status:` in `sources.yaml` is only the **seed**. The ingestor's catalog sync inserts new ids with the YAML status but never overwrites the status of an existing `catalog.source` row, and then applies the Postgres statuses to its in-memory catalog. `POST /api/sources/{id}/enable|disable` (→ `ctl.ingest.enable|disable`) write `live` / `disabled` to Postgres, so a disabled source stays disabled across restarts even if the YAML still says `live`; the response of `GET /api/sources` shows both (`status` = effective, `yaml_status` = seed). To change a status from the YAML again, update the row (`update catalog.source set status = ... where id = ...`) or disable/enable through the API.
 
 ## Owns
 `sources.yaml`, `platform.toml`, `platform.docker.toml`, `secrets.example.toml`.

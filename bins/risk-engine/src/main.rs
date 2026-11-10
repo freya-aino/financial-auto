@@ -1,15 +1,20 @@
 //! risk-engine: meta-allocation + non-evolvable risk limits + paper book (specs 40, 42).
 //!
-//! Subscribes to `signal.exposure.>`, `order.>`, `risk.halt.>`, `risk.resume.>` and
-//! `md.trade.>`; publishes `order.intent.paper` → `order.approved.paper` (or a rejection on
-//! `order.event.paper`), `risk.state`, `risk.halt.<scope>` and `svc.heartbeat.risk-engine`.
+//! Subscribes to `signal.exposure.>`, `order.>`, `risk.halt.>`, `risk.resume.>`,
+//! `ingest.health.>` and `md.trade.>`; publishes `order.intent.paper` → `order.approved.paper`
+//! (or a rejection on `order.event.paper`), `risk.state`, `risk.halt.<scope>` and
+//! `svc.heartbeat.risk-engine`. Answers request/reply on `ctl.risk.strategy`
+//! (`{strategy_id, action: pause|resume|flatten|promote|shadow}` or `{action: list}`),
+//! `ctl.risk.limits` (`{}` → current limits; `{set: <json>}` → tighten-only change) and
+//! `ctl.risk.flatten` with a `CtlReply` whose message is JSON (D-051).
 //! Only paper trading exists: settings with any other mode are refused and non-paper intents
 //! are rejected (D-029). Starting cash 100 000 EUR (D-028). The halt/resume contract follows
 //! D-030. All decision logic is in [`engine`] (pure, tested); this file is I/O.
 //!
-//! When `[postgres]` is reachable the paper book is loaded from the ledger tables at startup and
-//! every intent, fill, halt/resume (audit) and periodic position snapshot is persisted
-//! ([`persist`]); without Postgres the engine stays in memory and says so once.
+//! When `[postgres]` is reachable the paper book and the strategy lifecycle rows are loaded at
+//! startup and every intent, fill, halt/resume, lifecycle action, limit change (audit) and
+//! periodic position / strategy snapshot is persisted ([`persist`]); a reconciliation diff halts
+//! scope `broker`. Without Postgres the engine stays in memory and says so once.
 mod engine;
 mod persist;
 mod settings;
@@ -20,7 +25,14 @@ use anyhow::Context;
 use clap::Parser;
 use fa_bus::{Bus, subjects};
 use fa_core::{InstrumentId, config::PlatformConfig};
-use fa_proto::v1::{Envelope, ExposureDistribution, Halt, Heartbeat, OrderEvent, OrderIntent, envelope::Payload};
+use fa_proto::{
+    Message,
+    v1::{
+        CtlReply, CtlRequest, Envelope, ExposureDistribution, Halt, Heartbeat, OrderEvent, OrderIntent,
+        envelope::Payload,
+    },
+};
+use fa_risk::strategy::StrategyAction;
 use futures::StreamExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -78,10 +90,17 @@ async fn publish_outs(bus: &Bus, store: &Store, engine: &Shared, outs: Vec<Out>)
                     let ledger = engine.lock().await.ledger().clone();
                     p.snapshot(&ledger, "halt").await;
                 }
+                Out::Audit { action, subject, payload } => {
+                    p.audit(action, Some(subject), payload.clone()).await;
+                }
                 _ => {}
             }
         }
         let r = match &o {
+            Out::Audit { action, subject, payload } => {
+                tracing::warn!(action, subject, %payload, "automatic lifecycle change");
+                Ok(())
+            }
             Out::Intent(i) => bus.publish(subjects::order_intent(&i.account_id), i).await,
             Out::Approved(i) => bus.publish(subjects::order_approved(&i.account_id), i).await,
             Out::Rejected { account, event } => bus.publish(subjects::order_event(account), event).await,
@@ -93,6 +112,107 @@ async fn publish_outs(bus: &Bus, store: &Store, engine: &Shared, outs: Vec<Out>)
         if let Err(e) = r {
             tracing::warn!(error = %e, "publish failed");
         }
+    }
+}
+
+/// Actor recorded in `audit.log` for a control request (`ui` from control-api, else this service).
+fn actor_of(req: &CtlRequest) -> String {
+    match req.args.get("actor").map(String::as_str) {
+        Some("ui") => "ui".into(),
+        Some(a) if a.starts_with("system:") && a.len() < 64 => a.into(),
+        _ => persist::ACTOR.into(),
+    }
+}
+
+/// One control request. Ok → JSON for the reply message; Err → prefixed message
+/// (`not_found:` / `conflict:` / `invalid:` / `loosen:`).
+async fn handle_ctl(verb: &str, req: &CtlRequest, engine: &Shared, store: &Store) -> Result<serde_json::Value, String> {
+    let now = now_ms();
+    let actor = actor_of(req);
+    match verb {
+        "strategy" => {
+            let action = req.args.get("action").map(String::as_str).unwrap_or("");
+            if action == "list" {
+                let candidates: Vec<(String, Vec<String>)> = {
+                    let e = engine.lock().await;
+                    e.strategy_ids().into_iter().map(|id| (id.clone(), e.candidate_ids(&id))).collect()
+                };
+                let mut dsr = std::collections::BTreeMap::new();
+                if let Some(p) = store {
+                    for (id, cands) in &candidates {
+                        let refs: Vec<&str> = cands.iter().map(String::as_str).collect();
+                        dsr.insert(id.clone(), p.deflated_sharpe(&refs).await);
+                    }
+                }
+                return Ok(engine.lock().await.strategies_view(&dsr, now));
+            }
+            let Some(action) = StrategyAction::parse(action) else {
+                return Err(format!("invalid: action {action:?}; use pause|resume|flatten|promote|shadow|list"));
+            };
+            let id = req.args.get("strategy_id").cloned().unwrap_or_default();
+            if id.is_empty() {
+                return Err("invalid: strategy_id is required".into());
+            }
+            let dsr = match (action, store) {
+                (StrategyAction::Promote, Some(p)) => {
+                    let cands = engine.lock().await.candidate_ids(&id);
+                    let refs: Vec<&str> = cands.iter().map(String::as_str).collect();
+                    p.deflated_sharpe(&refs).await
+                }
+                _ => None,
+            };
+            let (state, gate) = {
+                let mut e = engine.lock().await;
+                let state = e.strategy_action(&id, action, dsr, now)?;
+                let gate = e.checklist(&id, dsr, now);
+                (state, gate)
+            };
+            if let Some(p) = store {
+                p.strategy_state(&state, gate.as_ref()).await;
+                p.audit_as(
+                    &actor,
+                    &format!("strategy.{}", action.as_str()),
+                    Some(&id),
+                    serde_json::json!({"status": state.status.as_str(), "prev_status": state.prev_status.map(|s| s.as_str()), "gate": gate}),
+                )
+                .await;
+            }
+            let view = engine.lock().await.strategy_json(&state, gate.as_ref(), now);
+            Ok(view)
+        }
+        "limits" => {
+            let Some(set) = req.args.get("set") else {
+                return Ok(serde_json::to_value(engine.lock().await.limits()).unwrap_or_default());
+            };
+            let patch: serde_json::Value =
+                serde_json::from_str(set).map_err(|e| format!("invalid: set is not JSON: {e}"))?;
+            let (before, after) = {
+                let mut e = engine.lock().await;
+                let before = e.limits().clone();
+                let after = e.set_limits(&patch)?;
+                (before, after)
+            };
+            if let Some(p) = store {
+                p.audit_as(
+                    &actor,
+                    "limits.tightened",
+                    Some("paper"),
+                    serde_json::json!({"set": patch, "before": before, "after": after}),
+                )
+                .await;
+            }
+            tracing::warn!(%actor, %patch, "limits tightened at runtime");
+            Ok(serde_json::to_value(&after).unwrap_or_default())
+        }
+        "flatten" => {
+            let ids = engine.lock().await.flatten_all(now);
+            if let Some(p) = store {
+                p.audit_as(&actor, "flatten.portfolio", Some("paper"), serde_json::json!({"strategies": ids})).await;
+            }
+            tracing::warn!(%actor, ?ids, "portfolio flatten requested");
+            Ok(serde_json::json!({"ok": true, "flattening": ids}))
+        }
+        _ => Err(format!("invalid: unknown verb {verb}")),
     }
 }
 
@@ -138,7 +258,12 @@ async fn main() -> anyhow::Result<()> {
                     positions = ledger.positions.values().filter(|x| x.quantity != 0.0).count(),
                     "paper book loaded from postgres"
                 );
-                engine.lock().await.seed_ledger(ledger);
+                let states = p.load_strategy_states().await;
+                tracing::info!(strategies = states.len(), "strategy lifecycle rows loaded");
+                let mut e = engine.lock().await;
+                e.seed_ledger(ledger);
+                e.seed_strategies(states);
+                drop(e);
                 p.audit("limits.loaded", Some(&settings.account), limits).await;
                 Some(Arc::new(p))
             }
@@ -320,7 +445,54 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // persistence timers: position snapshots + reconciliation (spec 42)
+    // ingest.health.<source> (JSON frames from the ingestor): `down` halts the source, `ok` clears it
+    {
+        let (engine, store) = (engine.clone(), store.clone());
+        let mut sub = bus.subscribe_raw("ingest.health.>".into()).await?;
+        tokio::spawn(async move {
+            while let Some(m) = sub.next().await {
+                let Some(source) = m.subject.strip_prefix("ingest.health.") else { continue };
+                let Ok(frame) = serde_json::from_slice::<serde_json::Value>(&m.payload) else { continue };
+                let status = frame["status"].as_str().unwrap_or("");
+                let reason = frame["reason"].as_str().unwrap_or("");
+                let changed = engine.lock().await.on_source_health(source, status, reason, now_ms());
+                if changed {
+                    tracing::warn!(source, status, reason, "source health changed the halt set");
+                    if let Some(p) = &store {
+                        let action = if status == "down" { "halt" } else { "resume" };
+                        p.audit(
+                            action,
+                            Some(&format!("source:{source}")),
+                            serde_json::json!({"reason": reason, "manual": false, "raised_by": "ingest.health"}),
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+    }
+
+    // control plane: ctl.risk.strategy | ctl.risk.limits | ctl.risk.flatten (request/reply, CtlReply)
+    for verb in ["strategy", "limits", "flatten"] {
+        let (bus, engine, store) = (bus.clone(), engine.clone(), store.clone());
+        let mut sub = bus.subscribe_raw(subjects::ctl("risk", verb)).await?;
+        tokio::spawn(async move {
+            while let Some(m) = sub.next().await {
+                let Some(reply_to) = m.reply.clone() else { continue };
+                let req = CtlRequest::decode(m.payload.as_ref()).unwrap_or_default();
+                let (ok, message) = match handle_ctl(verb, &req, &engine, &store).await {
+                    Ok(v) => (true, v.to_string()),
+                    Err(e) => (false, e),
+                };
+                let reply = CtlReply { ok, message };
+                if let Err(e) = bus.client().publish(reply_to, reply.encode_to_vec().into()).await {
+                    tracing::warn!(error = %e, "ctl reply failed");
+                }
+            }
+        });
+    }
+
+    // persistence timers: position + strategy snapshots, dirty strategy rows, reconciliation (spec 42)
     if let Some(p) = store.clone() {
         let engine_s = engine.clone();
         let p_s = p.clone();
@@ -329,11 +501,28 @@ async fn main() -> anyhow::Result<()> {
             tick.tick().await; // skip the immediate first tick
             loop {
                 tick.tick().await;
-                let ledger = engine_s.lock().await.ledger().clone();
+                let (ledger, states) = {
+                    let e = engine_s.lock().await;
+                    (e.ledger().clone(), e.strategy_states())
+                };
                 p_s.snapshot(&ledger, "timer").await;
+                for s in &states {
+                    p_s.strategy_state(s, None).await;
+                }
             }
         });
-        let engine_r = engine.clone();
+        let (engine_d, p_d) = (engine.clone(), p.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let dirty = engine_d.lock().await.take_dirty_strategies();
+                for s in &dirty {
+                    p_d.strategy_state(s, None).await;
+                }
+            }
+        });
+        let (engine_r, bus_r) = (engine.clone(), bus.clone());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(reconcile_secs.max(1)));
             tick.tick().await;
@@ -342,6 +531,20 @@ async fn main() -> anyhow::Result<()> {
                 let ledger = engine_r.lock().await.ledger().clone();
                 if let Some(d) = p.reconcile(&ledger).await {
                     p.audit("reconciliation.diff", Some(p.book()), serde_json::to_value(&d).unwrap_or_default()).await;
+                    // spec 42 §6: a diff halts the venue until resolved (risk.resume.broker re-arms)
+                    let h = Halt {
+                        scope: "broker".into(),
+                        reason: format!(
+                            "reconciliation diff: cash memory {:.2} vs postgres {:.2}, {} position diffs",
+                            d.cash_ours,
+                            d.cash_theirs,
+                            d.positions.len()
+                        ),
+                        since: Some(fa_proto::now()),
+                        manual: false,
+                    };
+                    engine_r.lock().await.on_halt(&h, now_ms());
+                    publish_outs(&bus_r, &Some(p.clone()), &engine_r, vec![Out::Halt(h)]).await;
                 }
             }
         });

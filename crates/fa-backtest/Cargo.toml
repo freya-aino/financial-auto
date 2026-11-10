@@ -8,7 +8,11 @@ publish.workspace = true
 [dependencies]
 fa-core.workspace = true
 fa-decoders.workspace = true
+fa-strategies.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+uuid.workspace = true
 thiserror.workspace = true
 
 [lints]

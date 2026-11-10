@@ -1,0 +1,38 @@
+# Paper venue cost + slippage model (spec 41 §6.3, spec 40 §6.7; D-051). Loaded with
+# `-costs` / `FA_COSTS`; `testdata/cost_fixture.json` is exported from this file so the Rust
+# backtester (crates/fa-backtest) prices fills identically. All placeholders until calibrated
+# against realised live slippage (spec 41 §6.3).
+#
+# Fill = last ± (half_spread + impact); impact = last · k · σ_day · sqrt(notional / ADV);
+# fee = max(commission_min_eur, notional · commission_bps / 1e4). Spread comes from the latest
+# `md.quote.>` for the instrument when one has been seen, else from `spread_bps`.
+# σ_day is an EWMA of trade-to-trade log returns per second scaled to 24 h; ADV is the last hour
+# of traded notional extrapolated to 24 h; both fall back to the defaults below.
+
+default_k: 0.1          # square-root impact coefficient
+default_sigma: 0.02     # 2 %/day when no volatility estimate exists yet
+default_adv_eur: 10000000
+default_class: equity   # the gateway has no reference data; map known instruments below
+
+# instrument UUID -> asset class (equity | etf | fx | crypto | commodity | rates | index | derivative | prediction_market)
+instruments:
+  01900000-0000-7000-8000-000000000001: equity   # synthetic heartbeat instrument
+
+# Lookup: venues.<venue>.classes.<class>, venues.<venue>.default, default.classes.<class>, default.default.
+default:
+  default: { commission_bps: 5, commission_min_eur: 1, spread_bps: 5 }
+  classes:
+    equity:  { commission_bps: 5,  commission_min_eur: 1,    spread_bps: 5,  borrow_bps_day: 0.3 }
+    etf:     { commission_bps: 5,  commission_min_eur: 1,    spread_bps: 3 }
+    fx:      { commission_bps: 0,  commission_min_eur: 0,    spread_bps: 1,  funding_bps_day: 0.5 }
+    crypto:  { commission_bps: 10, commission_min_eur: 0,    spread_bps: 4,  funding_bps_day: 1.0, impact_k: 0.2 }
+    commodity: { commission_bps: 5, commission_min_eur: 1,   spread_bps: 10 }
+    index:   { commission_bps: 5,  commission_min_eur: 1,    spread_bps: 2 }
+
+venues:
+  sim:      # synthetic heartbeat feed: costless venue so the baseline paper P&L is readable
+    default: { commission_bps: 0, commission_min_eur: 0, spread_bps: 0, impact_k: 0 }
+  yahoo:    # delayed bars/quotes; treat as a retail broker
+    classes:
+      equity: { commission_bps: 5, commission_min_eur: 1, spread_bps: 5 }
+      crypto: { commission_bps: 10, commission_min_eur: 0, spread_bps: 10, impact_k: 0.2 }

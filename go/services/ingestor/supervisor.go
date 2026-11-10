@@ -26,8 +26,14 @@ var (
 // Statuses from the catalog that may never be started at runtime.
 var blockedStatuses = []string{"disabled", "planned"}
 
-// Runner drives one initialized connector until ctx is done.
-type Runner func(ctx context.Context, log *slog.Logger, c connector.Connector)
+// Runner drives one initialized connector until ctx is done. A non-nil error
+// means the connector ended on its own (health: `down`, halt raised).
+type Runner func(ctx context.Context, log *slog.Logger, c connector.Connector) error
+
+// StatusStore persists catalog statuses (refdata.Store); nil keeps them in memory.
+type StatusStore interface {
+	SetStatus(ctx context.Context, id, status string) error
+}
 
 // RunLogger records connector lifecycles (Postgres ingest.connector_run).
 type RunLogger interface {
@@ -48,6 +54,10 @@ type Supervisor struct {
 	Secrets func(id string) map[string]string
 	// RunLog, when set, gets a row per start/stop of catalog sources.
 	RunLog RunLogger
+	// Health, when set, is told about starts/stops (ingest.health.* frames).
+	Health *Tracker
+	// Statuses, when set, persists enable/disable (catalog.source.status).
+	Statuses StatusStore
 
 	mu      sync.Mutex
 	running map[string]*instance
@@ -108,7 +118,8 @@ func (s *Supervisor) Start(parent context.Context, id string) error {
 	if s.Secrets != nil {
 		cfg.Secrets = s.Secrets(id)
 	}
-	if err := c.Init(ctx, cfg, s.deps(src)); err != nil {
+	deps := s.deps(src)
+	if err := c.Init(ctx, cfg, deps); err != nil {
 		cancel()
 		return fmt.Errorf("init %s: %w", id, err)
 	}
@@ -116,6 +127,10 @@ func (s *Supervisor) Start(parent context.Context, id string) error {
 	s.running[id] = inst
 	s.updateCountersLocked()
 	_, inCatalog := s.cat.ByID(id)
+	if s.Health != nil {
+		ml, _ := deps.Limiter.(*connector.MeteredLimiter)
+		s.Health.Register(c, ml)
+	}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -130,15 +145,22 @@ func (s *Supervisor) Start(parent context.Context, id string) error {
 				runID = rid
 			}
 		}
-		s.run(ctx, s.log.With("source", id), c)
+		runErr := s.run(ctx, s.log.With("source", id), c)
+		operator := ctx.Err() != nil
+		if s.Health != nil {
+			s.Health.Unregister(id, operator, runErr)
+		}
 		if runID != "" {
 			after := s.snapshot()
-			status := "stopped"
-			if ctx.Err() == nil {
+			status, lastErr := "stopped", ""
+			if !operator {
 				status = "failed" // ended on its own
+				if runErr != nil {
+					lastErr = runErr.Error()
+				}
 			}
 			ectx, ecancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := s.RunLog.End(ectx, runID, status, int64(after["events."+id]-before["events."+id]), int64(after["errors."+id]-before["errors."+id]), ""); err != nil {
+			if err := s.RunLog.End(ectx, runID, status, int64(after["events."+id]-before["events."+id]), int64(after["errors."+id]-before["errors."+id]), lastErr); err != nil {
 				s.log.Warn("run log end", "source", id, "err", err)
 			}
 			ecancel()
@@ -172,6 +194,67 @@ func (s *Supervisor) Stop(id string) error {
 	<-inst.done
 	s.log.Info("connector stopped", "source", id)
 	return nil
+}
+
+// IsRunning reports whether id has a live connector.
+func (s *Supervisor) IsRunning(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.running[id]
+	return ok
+}
+
+// SetStatus changes a catalog source's status in memory and, with Statuses
+// set, in Postgres (which then wins over the YAML seed on every later start).
+func (s *Supervisor) SetStatus(ctx context.Context, id, status string) error {
+	if _, ok := s.cat.ByID(id); !ok {
+		return fmt.Errorf("%w: source %q is not in the catalog", ErrNotFound, id)
+	}
+	if !slices.Contains(catalog.Statuses, status) {
+		return fmt.Errorf("%w: status %q", ErrInvalid, status)
+	}
+	if s.Statuses != nil {
+		if err := s.Statuses.SetStatus(ctx, id, status); err != nil {
+			return fmt.Errorf("persist status: %w", err)
+		}
+	}
+	s.cat.SetStatus(id, status)
+	return nil
+}
+
+// Disable sets status `disabled` and stops the connector if it runs.
+// Returns whether a connector was stopped.
+func (s *Supervisor) Disable(ctx context.Context, id string) (bool, error) {
+	if err := s.SetStatus(ctx, id, "disabled"); err != nil {
+		return false, err
+	}
+	if !s.IsRunning(id) {
+		return false, nil
+	}
+	err := s.Stop(id)
+	return err == nil, err
+}
+
+// Enable sets status `live` (the source is operable again; a connector must
+// be registered) and starts the connector unless it already runs.
+// Returns whether a connector was started.
+func (s *Supervisor) Enable(ctx context.Context, id string) (bool, error) {
+	if !slices.Contains(connector.Registered(), id) {
+		if _, ok := s.cat.ByID(id); !ok {
+			return false, fmt.Errorf("%w: source %q is not in the catalog", ErrNotFound, id)
+		}
+		return false, fmt.Errorf("%w: source %q has no connector; enable it once one exists", ErrConflict, id)
+	}
+	if err := s.SetStatus(ctx, id, "live"); err != nil {
+		return false, err
+	}
+	if s.IsRunning(id) {
+		return false, nil
+	}
+	if err := s.Start(ctx, id); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Running lists running ids in sorted order.

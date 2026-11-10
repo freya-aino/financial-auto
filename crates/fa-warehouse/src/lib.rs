@@ -1,6 +1,8 @@
 //! PostgreSQL warehouse access (specs 12, 20; D-013): reference data, catalog, macro vintages,
-//! plus the append-only [`audit`] log (spec 42).
+//! the append-only [`audit`] log (spec 42) and the instrument search / quarantine review
+//! functions in [`refdata`] (D-054).
 pub mod audit;
+pub mod refdata;
 
 use std::path::Path;
 
