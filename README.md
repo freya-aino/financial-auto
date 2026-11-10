@@ -20,15 +20,16 @@ just dev                     # prints the host run order; `just app-up` runs eve
 | Path | What |
 |---|---|
 | `specs/` | Specifications, ADRs, maturity overview |
-| `crates/` | Rust libraries (core, storage clients, ML, evolution, risk, ledger, backtest) |
+| `crates/` | Rust libraries (core, storage clients, metrics, ML baselines, evolution, strategies, risk, ledger, backtest) |
 | `bins/` | Rust services: `model-runtime`, `strategy-runtime`, `risk-engine`, `evo-worker`, `control-api`, `trainer` (CLI) |
 | `go/` | Go: connector framework, connectors, `ingestor`, `broker-gateway`, `evo-orchestrator` |
 | `proto/` | Protobuf contracts shared by Rust and Go |
 | `helix/` | HelixDB schema and queries |
-| `migrations/` | PostgreSQL warehouse + ledger schema |
 | `frontend/` | SvelteKit operator UI |
 | `compose.yaml` | Everything runs through it: infra (NATS, HelixDB, VictoriaMetrics, PostgreSQL, Garage) + all platform services and the `ui` service under profile `app` |
 | `docker/` | Dockerfiles for the Rust, Go and UI images, nginx and Garage config, Garage init script |
-| `config/` | Source catalog, platform config (secrets in git-ignored `config/secrets.toml`) |
+| `config/` | Source catalog, platform config (secrets in git-ignored `config/secrets.toml`, runtime overrides in `config/runtime.toml`) |
+| `scripts/` | Backup, restore and health-wait scripts (`just backup`, `just restore DIR`) |
+| `migrations/` | PostgreSQL schemas: reference, catalog, ingest, ledger, audit, validation |
 
 Every component directory has a `README.md` linking to the specs that govern it.

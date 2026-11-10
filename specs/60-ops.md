@@ -86,16 +86,22 @@ Workers are stateless: pull from JetStream work queues with explicit ack and ack
 7. control-api, frontend.
 Trading stays halted until steps 3–5 report healthy.
 
+**Implemented today (D-056):** `just app-up` ends in `scripts/healthwait.sh`, which waits for infra health, then control-api `/api/health` (migrations applied, every store reachable), then the risk-engine heartbeat (ledger loaded from Postgres, D-047) before reporting the other services. Trading stays halted until risk-engine is up because it is the only publisher of approved orders.
+
 ### 6.5 Observability
 - Metrics: ingestion rates/lag per source, bus consumer lag, inference latency per timescale, GPU utilisation/memory per class, job throughput, P&L/exposure, limit headroom, slippage.
 - Tracing: `tracing` (Rust) and `slog`/OTel (Go) with trace ids propagated in NATS headers.
 - Alerts (proposal): VM alerting rules → `ops.alert` subject → UI banner.
+
+**Implemented today (D-056):** every service serves Prometheus text on `GET /metrics` (`crates/fa-metrics`, re-exported as `fa_bus::metrics`; Go `go/pkg/bus/metrics.go`): heartbeat counters mirrored as `fa_heartbeat_counter{service,key}`, process gauges, JetStream consumer lag, and control-api HTTP counts/latency. VictoriaMetrics scrapes all targets itself (`docker/vm-scrape.yaml`, `-promscrape.config`); host ports 9101..9107 and 9110. Alert rules exist only as a proposal file (`docker/vm-alerts.proposal.yaml`); no vmalert, no `ops.alert` yet.
 
 ### 6.6 Backups
 - Postgres: nightly `pg_dump` + WAL archiving **(proposal)**.
 - Helix: nightly snapshot of data directory (service paused or via native snapshot if available).
 - Garage: bucket replication/rsync of critical buckets (models, raw archive) to a second disk.
 - `just restore` tested quarterly **(proposal)**.
+
+**Implemented today (D-056):** `scripts/backup.sh` (`just backup`) writes `backups/<ts>/` with `pg_dump -Fc` + globals, a tar of the `helix-data` volume (helix stopped for seconds), rclone copies of the critical Garage buckets, optional `nats stream backup`, and a sha256 manifest; `scripts/restore.sh DIR` (`just restore`) verifies, confirms, stops the app services and restores in the §6.4 order (`--postgres-db` for scratch drills, verified). WAL archiving and the off-machine copy are still open.
 
 ### 6.7 Secrets
 - API keys in `config/secrets.toml` (git-ignored) or env vars `FA_<SOURCE>_<KEY>`.

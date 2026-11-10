@@ -71,6 +71,8 @@ pub trait Evaluator {
 
 **Implemented today (D-052):** `fa_backtest::replay` replays GP strategy genomes step by step over VictoriaMetrics bars (visible at close, ordered by `(close, instrument)` through the look-ahead guard) with a virtual book per sleeve and the cost model of §6.3; identical spec + seed + data give a byte-identical report. Encoders, MCMC and decoders are not re-run inside the replay yet: the strategy sees the price-only fallback context (feeding recorded latents is the next step).
 
+**Since D-059** replays feed the recorded `latent.*` / `decoder.output.*` messages (read from the `LATENT` JetStream stream by time range) into the same `LatentGraph` / `DecoderOutputs` the live runtime uses, point-in-time, and report `sources{graph, decoder, fallback}`; a replay declares its snapshot and refuses latents of another one unless Diagnostic.
+
 ### 6.2 Point-in-time rules
 - An event is visible at time t iff `knowledge_time ≤ t`, where knowledge_time = `publish_time` if known else `ingest_time` (live) or a conservative per-source delay (backfilled data, catalog field).
 - Bars become visible at bar close + source latency.
@@ -85,6 +87,8 @@ Per venue & instrument class: commission schedule, spread (from quotes, or model
 
 ### 6.4 Data windows
 Per timescale: `[selection window] [embargo gap] [locked holdout] [live]`. The holdout is the most recent completed segment at lock time, then fixed; it rolls forward only by an explicit re-lock action recorded in the audit log (re-lock invalidates gate results computed on the old holdout). Selection evaluations requesting any timestamp in the holdout are rejected.
+
+**Implemented today (D-059):** `POST /api/validation/holdout` locks a completed segment per timescale (immutable by trigger, 409 on overlap); Promotion-purpose replays run only as `evo.eval.strategy.holdout` jobs inside a locked holdout and their trial rows never enter selection statistics.
 
 ### 6.5 Multiple-testing corrections
 - **Trial registry**: every evaluated candidate is recorded with its selection-window statistics.
