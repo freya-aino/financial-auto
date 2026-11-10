@@ -67,6 +67,8 @@ Initial samplers (proposal): `ConjugateExact` (Dirichlet closed form, baseline),
 - `stationary(region_set) -> Dist<Vec<f64>>`
 - `asset_prior(a, b) -> CrossAssetPrior` (covariance, lead-lag, predictive gain)
 
+**Implemented today (D-053):** `fa_strategies::graph::GraphAt` is the point-in-time query surface over `fa_mcmc::MarkovGraph` rows rebuilt from the published posterior summaries (`set_row_from_summary` recovers the Dirichlet concentration from the 90 % interval): k-step probabilities by matrix power (`TransitionMatrix::k_step`), neighbours by mass, posterior-predictive walks seeded per step, hitting times from sampled paths, dwell in event-time bars, `novelty = max(posterior std, unknown mass)`.
+
 ### 4.3 Bus
 - `latent.mcmc.<timescale>.<expert>`: posterior summary updates (`fa.v1.KernelUpdate`).
 - `jobs.mcmc.refit`: batch sampler jobs (work queue, spec 21/60).

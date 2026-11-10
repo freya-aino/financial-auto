@@ -84,6 +84,8 @@ Conventions: `/api/v1/...` **(proposal: version prefix)**; JSON; time as RFC3339
 ### 4.8 WebSocket protocol
 Envelope: `{ "stream": "...", "seq": n, "ts": "...", "data": {...} }`. Client may send `{ "op": "subscribe" | "unsubscribe", "topics": [...] }`. Server applies backpressure by dropping to latest-value for high-rate topics and signals `{ "op": "lagged", "dropped": n }`.
 
+**Implemented today (D-055):** every route of §4 is implemented except `POST /api/services/{name}/start|stop|restart` (no process supervisor). The four sockets share one loop: `{stream, seq, ts, topic, data}` frames, `{op: subscribe|unsubscribe, topics}` filtering, latest-value coalescing for state streams (10 Hz latent/evolution, 5 Hz trading) and a bounded queue for the bus tap, `{op:"lagged",dropped}` after any drop. `PUT /api/config/runtime` is the only writable config section (bounded, persisted to git-ignored `config/runtime.toml`, audited). Routes are listed with their state in `bins/control-api/README.md`.
+
 ## 5. Data model
 Stateless except a small cache. Reads: Postgres (catalog, ledger, audit, jobs), Helix (graph, latent, lineage), VictoriaMetrics (series via PromQL/MetricsQL passthrough `/api/metrics/query` **(proposal)**), Garage (presigned URLs for blobs).
 

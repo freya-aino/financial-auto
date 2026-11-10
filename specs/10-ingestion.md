@@ -71,6 +71,8 @@ type Deps struct {
 - `ctl.ingest.{start|stop|status}` request/reply with arg `source` (D-036; `reload` pending).
 - `DiscoveryHook` interface: `Discover(ctx, query) ([]SourceTarget, error)` — no implementation in v1.
 
+**Implemented today (D-054):** `ctl.ingest.{start,stop,status,enable,disable,backfill}` with arg `source` (`status` replies JSON with health, cursors and limiter usage); `enable|disable` persist `catalog.source.status` (Postgres wins over the YAML seed after the first sync). Health: JSON frames on `ingest.health.<source>` every 5 s (`ok|degraded|down`, ages, error rate, limiter saturation); an unexpected `down` raises `risk.halt.source:<id>` and recovery publishes `risk.resume.source:<id>`; `ingest.gap.<source>` and `ingest.unresolved.<source>` as in §4.2. Backfill runs from the `JOBS_INGEST` work queue (`jobs.ingest.backfill`, cursor rows per range so redeliveries resume).
+
 ## 5. Data model
 
 ### 5.1 Envelope (all canonical events)

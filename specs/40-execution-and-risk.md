@@ -124,6 +124,8 @@ Exposures are converted to signed EUR notionals and summed per instrument. Attri
 | VWAP | as TWAP but volume-profile weighted (needs intraday volume curve) |
 Selection inputs: strategy horizon, order notional / horizon volume, spread, venue capabilities (from catalog 11). Every child fill records arrival price for slippage measurement.
 
+**Implemented today (D-051):** the paper venue (`go/services/broker-gateway`) prices every fill with `costs.yaml` (commission bps + minimum, half spread from `md.quote.>` or a modelled `spread_bps`, square-root impact `k·σ_day·sqrt(notional/ADV)` estimated from the tape); `OrderEvent` carries `arrival_price` and signed `slippage_bps`. Limit orders rest as `ACK` until crossed and fill passively at the limit; cancellation uses a provisional `order.cancel.<account>` payload. Only market and limit; TWAP/VWAP/POV remain proposals.
+
 ### 6.5 Hard limits — details
 - **Drawdown kill switch**: portfolio equity vs running peak (EUR); breach → flatten all live positions with market/smart-limit-aggressive, halt all live strategies, require manual re-arm. Per-strategy drawdown → flatten + pause that strategy.
 - **Daily loss limit**: realised + unrealised P&L since session start (UTC day for 24/7 venues, exchange day otherwise) ≤ −X% equity → no new risk-increasing orders until next day; reducing orders allowed.
@@ -133,6 +135,8 @@ Selection inputs: strategy horizon, order notional / horizon volume, spread, ven
 - **Liquidity cap net of payouts**: `|position_i| ≤ k × volume_i(horizon)`, and `Σ capital deployed ≤ equity − payout_quota_reserved_today` (payout quota from ledger 42).
 Limits are loaded from `config/risk.toml` at startup and can only be tightened at runtime from the UI; loosening requires config change + restart **(proposal)**.
 
+**Implemented today (D-041, D-051):** position, liquidity and leverage caps, concentration caps per asset class and venue, a portfolio gross cap, per-strategy drawdown (attributed sub-books, auto-pause at `strategy_max_drawdown` of the sleeve), payout-quota netting, and the halt state machine with scopes `portfolio`, `daily_loss`, `source:<id>`, `model`, `broker` (raised on a reconciliation diff). Runtime limit changes go through `ctl.risk.limits` and may only tighten (`RiskConfig::check_tightens`).
+
 ### 6.6 Promotion gate (paper → live)
 A strategy is promotable when **all** hold:
 1. Minimum shadow calendar time in live paper (placeholder 30 days) **and** a minimum number of completed horizons (placeholder 20).
@@ -141,6 +145,8 @@ A strategy is promotable when **all** hold:
 4. Shadow performance statistically consistent with backtest (e.g. shadow Sharpe within the backtest's confidence band; slippage within modelled band).
 5. No unresolved health halts in the shadow window.
 Promotion is executed manually from the UI (gate must be green); initial live sleeve is small (placeholder 1% of equity) and grows only via the allocator. Demotion is automatic on per-strategy drawdown breach or gate-statistics decay.
+
+**Implemented today (D-051):** lifecycle `active|paused|flattening|shadow` per strategy in `ledger.strategy_state`, controlled by `ctl.risk.strategy` (`pause|resume|flatten|promote|shadow`) and `POST /api/trading/strategies/{id}/{action}`. The gate blocks on min shadow days, min horizons, deflated Sharpe (read from `validation.generation_stats`; unknown blocks) and no health halts; PBO and shadow-vs-backtest consistency are advisory. Promotion is shadow → active, since no live sleeve exists (D-029). `new_strategy_status` defaults to `active` so the baseline keeps trading.
 
 ### 6.7 Modes
 - **Paper**: broker-gateway `Venue` implementation simulates fills against live quotes using the same cost/slippage model as backtest (41). Shares code paths with live except the final `Submit`.

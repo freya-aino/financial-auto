@@ -123,6 +123,8 @@ Constraints: max depth, max nodes, evaluation-time budget per step (cost objecti
 
 **Fallback observation:** until regions, transitions and decoder outputs are consumed, `features::FallbackContext` maps the primitive surface onto empirical price statistics of the strategy's own bar window: `analog_forecast` = mean log return per bar; `(quantile q)` = normal-approximation quantile of lookback returns; `(path_up k)` = share of positive k-bar windows; `stay_prob` = sign persistence (or latent region dwell when `latent.state.>` is present); `region_entropy` = latent posterior std if known, else `std / (|mean| + std)`; transition and decoder-score primitives return 0. This is a placeholder, not the semantics above. Portfolio primitives read the strategy's virtual book (last emitted exposure).
 
+**Since D-053** the primitives read real inputs: `fa_strategies::graph::LatentGraph` (from `latent.state|region|transition.>`, point-in-time, rebuilt per expert space on `fa_mcmc::MarkovGraph`) and `fa_strategies::decoders::DecoderOutputs` (from `decoder.output.<family>`), behind `features::LiveContext`, which falls back to the D-040 price statistics only where data is missing and counts the source per call (`primitives.graph|decoder|fallback` in the runtime heartbeat). The typed spec primitives (`cur_region`, `neighbors`, `p_trans`, `p_to_set`, `hitting_time`, `dwell`, `novelty`, `region_feature`, `path_value`, `fc_quantile`, `fc_dist`, `analog_outcome`, `analog_age`, `text_score`, `visual_score`) are parsed and type-checked by `sexpr`; `text_score`/`visual_score` answer 0 until a producer exists. **Since D-052** a strategy genome (`fa_strategies::genome`, one-line TOML inline table, id = phenotype hash) can be generated at random (`random`), varied (`ops`: typed subtree crossover, point/subtree/hoist mutation, constant jitter) and evaluated by `evo.eval.strategy`.
+
 ### 4.3 Neural policy (proposal)
 - **Input:** concatenation of expert latents (masked by genome), region membership embeddings, a graph summary vector (k-step predictive region distribution embedded via region embeddings), cached elite decoder outputs (quantiles, analog stats), portfolio state.
 - **Architecture genes:** MLP / small transformer over asset tokens (set-equivariant across the asset set), width, depth.
@@ -169,6 +171,8 @@ Both representations share these objectives, so they compete directly. **PBO** i
 1. Elite candidates are evaluated **once** on the **locked holdout** (spec 41); failures are retired and the holdout-use counter increments.
 2. Passing strategies run in **live paper shadow** for the minimum calendar time (spec 40 gate).
 3. Promotion to paper/live is decided by the gate (spec 40). Retirement on gate failure, decay of live performance, or snapshot incompatibility.
+
+**Implemented today (D-052, D-053):** the final Pareto front of a strategy generation is written to Garage as `fa-artifacts/strategies/<generation>.toml` and announced as `artifact_key`; `strategy-runtime` loads it on `ctl.strategy.reload` (validated, swapped atomically, surviving ids keep their virtual books) and honours `ctl.strategy.pause|resume`. Lifecycle status and the promotion gate live in risk-engine (spec 40 §6.6, D-051).
 
 ### 6.5 Snapshot dependency
 Strategies are tied to the encoder snapshot they were evolved on. On a snapshot change:

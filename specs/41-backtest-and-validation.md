@@ -69,6 +69,8 @@ pub trait Evaluator {
 - Runs encoders (frozen snapshot), MCMC, decoders, strategies, allocator and **paper venue** exactly as live; online adapters are either frozen or replayed online per spec flag **(proposal)**.
 - Speed: fast-forward mode skips wall-clock waits; heavy encoder inference is cached per (snapshot, window) in Garage to make many strategy evaluations cheap **(proposal)**.
 
+**Implemented today (D-052):** `fa_backtest::replay` replays GP strategy genomes step by step over VictoriaMetrics bars (visible at close, ordered by `(close, instrument)` through the look-ahead guard) with a virtual book per sleeve and the cost model of §6.3; identical spec + seed + data give a byte-identical report. Encoders, MCMC and decoders are not re-run inside the replay yet: the strategy sees the price-only fallback context (feeding recorded latents is the next step).
+
 ### 6.2 Point-in-time rules
 - An event is visible at time t iff `knowledge_time ≤ t`, where knowledge_time = `publish_time` if known else `ingest_time` (live) or a conservative per-source delay (backfilled data, catalog field).
 - Bars become visible at bar close + source latency.
@@ -79,6 +81,8 @@ pub trait Evaluator {
 ### 6.3 Cost model
 Per venue & instrument class: commission schedule, spread (from quotes, or modelled from bar range when quotes unavailable), slippage as function of order notional / volume and volatility (square-root impact **(proposal)**), funding (perps/FX swaps), borrow (shorts). Paper venue (40) uses the same model; realised live slippage recalibrates it periodically.
 
+**Implemented today (D-051, D-052):** one model shared by the paper venue (`go/services/broker-gateway/costs.yaml`) and the backtest (`fa_backtest::cost`, pinned to the venue's `testdata/cost_fixture.json`): lookup `venues.<v>.classes.<c>` → `venues.<v>.default` → `default.classes.<c>` → `default.default`; fill = price ± (half spread + `k·σ_day·sqrt(N/ADV)`), commission with floor, funding/borrow carry per day as placeholders. Live slippage recalibration is pending.
+
 ### 6.4 Data windows
 Per timescale: `[selection window] [embargo gap] [locked holdout] [live]`. The holdout is the most recent completed segment at lock time, then fixed; it rolls forward only by an explicit re-lock action recorded in the audit log (re-lock invalidates gate results computed on the old holdout). Selection evaluations requesting any timestamp in the holdout are rejected.
 
@@ -87,6 +91,8 @@ Per timescale: `[selection window] [embargo gap] [locked holdout] [live]`. The h
 - **Deflated Sharpe Ratio** (Bailey & López de Prado): adjusts observed Sharpe for the number of trials, variance of trial Sharpes, skew and kurtosis; fitness uses DSR (or its probability) instead of raw Sharpe.
 - **PBO** via combinatorially symmetric cross-validation over the selection window's sub-blocks, computed per generation for the elite set; reported and used in the promotion gate. (CSCV is not walk-forward training; it reuses existing evaluations.)
 - Effective number of trials estimated from clustered correlation of trial returns **(proposal)**.
+
+**Implemented today (D-052):** every decoder or strategy evaluation writes a `validation.trial` row (generation, loop, rung, candidate, Sharpe, n_obs, objectives, 64 return block sums). After each trial the worker recomputes `validation.generation_stats` (deflated Sharpe of the best trial against the expected maximum of n trials, CSCV PBO with 16 blocks), which the orchestrator publishes in every `generation.summary`. Selection replays intersecting a locked `validation.holdout` row are rejected; the holdout lock workflow itself is pending.
 
 ### 6.6 Live paper shadow
 Strategies entering shadow run on live data with the paper venue. Tracked: calendar days, completed horizons, Sharpe / drawdown / hit rate, slippage vs model, consistency vs backtest distribution. Feeds the promotion gate in 40.
