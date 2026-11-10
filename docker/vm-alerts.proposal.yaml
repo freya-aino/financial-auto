@@ -1,0 +1,63 @@
+# PROPOSAL (spec 60 §6.5 "Alerts"): vmalert rule groups over the metrics every service now exports.
+# Not wired into compose yet — there is no vmalert container and no `ops.alert` publisher. To try it:
+#   docker run --rm --network financial-auto_default -v $PWD/docker/vm-alerts.proposal.yaml:/rules.yaml:ro \
+#     victoriametrics/vmalert:v1.155.0 -rule=/rules.yaml -datasource.url=http://victoriametrics:8428 \
+#     -notifier.url=http://alertmanager:9093   # or -remoteWrite.url to store ALERTS series only
+# Thresholds are starting points for a single-workstation paper stack.
+groups:
+  - name: fa-services
+    interval: 30s
+    rules:
+      - alert: ServiceScrapeDown
+        expr: up{job=~"fa.*"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "{{ $labels.service }} /metrics not scraped for 1m" }
+      - alert: HeartbeatStale
+        expr: time() - fa_heartbeat_last_unix_seconds > 15   # ops.heartbeat_timeout (spec 60 §7)
+        for: 30s
+        labels: { severity: critical }
+        annotations: { summary: "{{ $labels.service }} heartbeat older than 15 s" }
+      - alert: ProcessRssHigh
+        expr: fa_process_resident_memory_bytes > 2 * 1024 * 1024 * 1024
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.service }} RSS above 2 GiB" }
+
+  - name: fa-bus
+    rules:
+      - alert: WorkQueueBacklog
+        expr: fa_bus_consumer_num_pending > 100
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.stream }}/{{ $labels.consumer }} has {{ $value }} undelivered jobs" }
+      - alert: WorkQueueRedeliveries
+        expr: increase(fa_bus_consumer_redelivered[15m]) > 10
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.stream }} redelivering jobs (worker crashes or ack_wait too short)" }
+
+  - name: fa-control-api
+    rules:
+      - alert: ApiErrorRate
+        expr: sum(rate(fa_http_requests_total{status=~"5.."}[5m])) / sum(rate(fa_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "control-api 5xx ratio above 5 %" }
+      - alert: ApiLatencyP99
+        expr: histogram_quantile(0.99, sum by (le) (rate(fa_http_request_duration_seconds_bucket[5m]))) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "control-api p99 latency above 1 s" }
+
+  - name: fa-trading
+    rules:
+      - alert: RiskHalted
+        expr: fa_heartbeat_counter{service="risk-engine",key="halted"} > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "risk-engine reports an active halt" }
+      - alert: IngestionStalled
+        expr: increase(fa_heartbeat_counter{service="ingestor",key=~"events.*"}[10m]) == 0
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "ingestor {{ $labels.key }} did not advance for 10 min" }

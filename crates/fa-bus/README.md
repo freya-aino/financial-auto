@@ -16,8 +16,21 @@ The spec 21 §5 table lives in [`streams.json`](streams.json) (`MD` 24 h, `TEXT`
 
 Live test against the compose NATS: `FA_NATS_TEST=1 cargo test -p fa-bus -- --nocapture live` (also exercises drift repair and the work-queue helper on a throwaway `JOBS_FABUSTEST` stream it deletes afterwards).
 
+## Metrics (D-056)
+`fa_bus::metrics` re-exports [`fa-metrics`](../fa-metrics/README.md) so a service's whole observability hook is one line, `fa_bus::metrics::serve_from_env("<service>", env!("CARGO_PKG_VERSION"))`. `Bus::publish` mirrors every `svc.heartbeat.*` message's counters into `fa_heartbeat_counter{service,key}` before sending it, so heartbeat counters are scrapeable without a second instrumentation. `streams::spawn_consumer_lag(consumer)` (called by `ensure_work_queue`, and by evo-worker for its hand-rolled `JOBS_EVO` consumer) polls `consumer.info()` every 10 s into `fa_bus_consumer_num_pending|ack_pending|redelivered|waiting{stream,consumer}`.
+
+## Replay reader (`replay` module, D-059)
+Reads a JetStream stream **by time range** so a backtest can rebuild the latent graph and decoder outputs the live strategies saw (spec 41 §3/§6.1):
+
+- `read_range(&js, stream, filter_subject, start_ms, end_ms, &ReadOptions)` — ordered ephemeral pull consumer with `deliver_policy = by_start_time(start)` and one filter subject, drained until the first message published after `end`, until the server reports nothing pending, or after `idle` (default 2 s) without a message; returns `RecordedMessage { subject, stream_seq, published_ms, payload }` oldest first. `published_ms` is the server receive time — the message's **knowledge time**, which point-in-time replays filter on. A range after the stream's last message returns at once (stream info is checked first); `max_messages` (default 500 000) caps a read.
+- `read_latents(&js, start_ms, end_ms, &opts)` — the four `LATENT_FILTERS` (`latent.state.>`, `latent.region.>`, `latent.transition.>`, `decoder.output.>`) of the `LATENT` stream merged in `(published_ms, stream_seq)` order (`sort_records`).
+- `LatentMessage::decode(subject, payload)` → `State | Region | Transition | DecoderOutput` with `snapshot_id()`, `timescale()`, `as_of_ms()`; `Recorded::decode` / `decode_all` for whole slices.
+- `to_jsonl` / `from_jsonl` — one JSON object per line with a hex payload, the fixture format `crates/fa-backtest/testdata/latent_fixture.jsonl` uses.
+
+Live test: `FA_NATS_TEST=1 cargo test -p fa-bus -- --nocapture live_read` publishes three batches into a scratch `FABUSREPLAY` stream with gaps between them, reads the middle batch back by time, checks filter subjects, caps and the empty-range fast path, then deletes the stream. Inspect a stream from the shell with the example: `cargo run -p fa-bus --example read_range -- LATENT 'latent.state.1s.>' -10m now --limit 20` (times: RFC 3339, epoch ms, `now`, `-<n>h|m|s`; `--json` decodes `jobs.result.>` payloads).
+
 ## Owns
-Subject constants, typed pub/sub, job pull loop, stream table + provisioning.
+Subject constants, typed pub/sub, job pull loop, stream table + provisioning, time-range stream reader (`replay`), metrics re-export + heartbeat/consumer-lag bridges.
 
 ## Governing specs
 - [21-bus-and-contracts](../../specs/21-bus-and-contracts.md)

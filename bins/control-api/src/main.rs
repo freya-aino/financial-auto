@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    fa_bus::metrics::serve_from_env("control-api", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config).context("loading platform config")?;
     let bind: SocketAddr = cfg.control_api.bind.parse().context("parsing control_api.bind")?;
 
@@ -81,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(validation_routes::router().with_state(state.clone())); // holdout, trial reports, populations (D-052)
     let app = ledger_routes::install(state.clone(), app).await; // Postgres pool + paper-book seed + ledger routes (D-047)
     let app = trading_routes::install(state, app); // strategy lifecycle + limits via ctl.risk.* (D-051)
+    let app = app.layer(fa_bus::metrics::http::layer()); // fa_http_requests_total / fa_http_request_duration_seconds (D-056)
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     tracing::info!(%bind, "control-api listening");
     axum::serve(listener, app).await?;

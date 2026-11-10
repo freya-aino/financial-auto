@@ -200,7 +200,64 @@ pub async fn ensure_work_queue(
             .await
             .map_err(|source| StreamsError::Consumer { name: name.clone(), source })?,
     };
+    spawn_consumer_lag(consumer.clone());
     Ok((stream, consumer))
+}
+
+/// How often [`spawn_consumer_lag`] refreshes the consumer gauges.
+pub const CONSUMER_LAG_POLL: Duration = Duration::from_secs(10);
+
+/// Polls `consumer.info()` every [`CONSUMER_LAG_POLL`] and exports the lag gauges spec 60 §6.5
+/// asks for: `fa_bus_consumer_num_pending{stream,consumer}` (messages not yet delivered),
+/// `fa_bus_consumer_ack_pending`, `fa_bus_consumer_redelivered` and `fa_bus_consumer_waiting`.
+/// Idempotent per `(stream, consumer)`; the task ends when the consumer cannot be described
+/// ten times in a row (deleted) and removes its series.
+pub fn spawn_consumer_lag(mut consumer: consumer::Consumer<pull::Config>) -> Option<tokio::task::JoinHandle<()>> {
+    static ACTIVE: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+    let info = consumer.cached_info();
+    let key = (info.stream_name.clone(), info.name.clone());
+    {
+        let mut active = ACTIVE.lock().unwrap_or_else(|p| p.into_inner());
+        if active.contains(&key) {
+            return None;
+        }
+        active.push(key.clone());
+    }
+    Some(tokio::spawn(async move {
+        let (stream, name) = key;
+        let labels = [("stream", stream.as_str()), ("consumer", name.as_str())];
+        let pending =
+            fa_metrics::gauge("fa_bus_consumer_num_pending", "JetStream messages not yet delivered to the consumer");
+        let acks = fa_metrics::gauge("fa_bus_consumer_ack_pending", "JetStream messages delivered and awaiting ack");
+        let redelivered =
+            fa_metrics::gauge("fa_bus_consumer_redelivered", "JetStream messages redelivered to the consumer");
+        let waiting = fa_metrics::gauge("fa_bus_consumer_waiting", "Pull requests waiting on the consumer");
+        let mut failures = 0u32;
+        let mut tick = tokio::time::interval(CONSUMER_LAG_POLL);
+        loop {
+            tick.tick().await;
+            match consumer.info().await {
+                Ok(i) => {
+                    failures = 0;
+                    pending.set_with(&labels, i.num_pending as f64);
+                    acks.set_with(&labels, i.num_ack_pending as f64);
+                    redelivered.set_with(&labels, i.num_redelivered as f64);
+                    waiting.set_with(&labels, i.num_waiting as f64);
+                }
+                Err(e) => {
+                    failures += 1;
+                    tracing::debug!(%stream, consumer = %name, error = %e, "consumer info failed");
+                    if failures >= 10 {
+                        for g in [&pending, &acks, &redelivered, &waiting] {
+                            g.remove_with(&labels);
+                        }
+                        ACTIVE.lock().unwrap_or_else(|p| p.into_inner()).retain(|k| k.0 != stream || k.1 != name);
+                        return;
+                    }
+                }
+            }
+        }
+    }))
 }
 
 /// Status of one stream for `GET /api/bus/streams` (spec 50 §4.3).

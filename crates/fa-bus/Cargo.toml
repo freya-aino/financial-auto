@@ -9,15 +9,17 @@ publish.workspace = true
 async-nats.workspace = true
 bytes.workspace = true
 fa-core.workspace = true
+fa-metrics.workspace = true
 fa-proto.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+time = "0.3"
 
 [lints]
 workspace = true

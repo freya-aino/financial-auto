@@ -9,8 +9,12 @@
 //!    out-of-order source (look-ahead guard);
 //! 2. at every step of the strategy's timescale the open positions are marked to the new
 //!    closes (equity point, per-step return net of carry), then the program decides on the
-//!    instruments that have `lookback_bars + 1` closes using only closes `≤ t`
-//!    (`features::FallbackContext`, spec 35 §4.2.1) and its own virtual book;
+//!    instruments that have `lookback_bars + 1` closes through the same
+//!    `features::LiveContext` the live runtime uses (spec 35 §4.2.1): a `graph::LatentGraph` and
+//!    `decoders::DecoderOutputs` rebuilt point-in-time from recorded `LATENT` messages
+//!    ([`crate::latents`]: only records published `≤ t` are ingested, views filter `as_of ≤ t`),
+//!    the price-only fallback where the recording has nothing, counted per source in
+//!    `sources.graph|decoder|fallback`; plus its own virtual book;
 //! 3. the target exposure `mean ∈ [-1, 1]` of each sleeve (`capital / n_instruments`) is
 //!    filled at the close through [`CostModel::price`] (half spread + square-root impact on the
 //!    fill price, commission with a floor; σ_day from the lookback's per-bar return std), and
@@ -31,15 +35,19 @@
 //! | `n_trades`, `n_obs` | counts (informational) | — |
 //!
 //! Deterministic: the programs and the cost model are pure, events are totally ordered by
-//! `(close time, instrument index)`, so identical spec + seed + data give an identical report
-//! (CI test). The seed is recorded and reserved for stochastic components (none today).
+//! `(close time, instrument index)`, recorded latents by `(publish time, sequence)` and the
+//! graph's sampled walks are seeded per step, so identical spec + seed + data + recording give
+//! an identical report (CI test). The seed is recorded and reserved for stochastic components
+//! (none today). A replay declares its encoder snapshot (`ReplaySpec::snapshot`); latents of
+//! another snapshot are refused unless the purpose is `Diagnostic` ([`crate::latents::check_snapshot`]).
 
 use std::{collections::BTreeMap, time::Instant};
 
 use fa_core::{InstrumentId, Timescale};
 use fa_strategies::{
     GpStrategy, Strategy, StrategyContext,
-    features::{FallbackContext, VirtualBook},
+    decoders::PriceLookup,
+    features::{FallbackContext, LiveContext, VirtualBook},
     population::StrategyDef,
 };
 use serde::{Deserialize, Serialize};
@@ -48,6 +56,7 @@ use crate::{
     ReplayError, ReplaySink, ReplaySource,
     cost::{ClassCosts, CostInputs, CostModel},
     eval::Stop,
+    latents::{FeedCounters, LatentFeed, RecordedLatents, SnapshotCheck, SourceCounts, check_snapshot},
     run_replay, stats,
 };
 
@@ -70,7 +79,8 @@ pub struct ReplaySpec {
     /// Instrument tokens to trade; empty = every series in the data set.
     pub instruments: Vec<String>,
     pub timescale: Timescale,
-    /// Encoder snapshot the candidate was evolved on (recorded; fallback features ignore it).
+    /// Encoder snapshot the candidate was evolved on. Recorded latents of another snapshot are
+    /// refused unless `purpose == Diagnostic`; empty adopts the recording's snapshot.
     pub snapshot: String,
     pub cost_model: String,
     pub seed: u64,
@@ -243,6 +253,28 @@ pub struct EvalReport {
     pub returns: Vec<f64>,
     /// Per-trade log (capped at [`MAX_TRADE_LOG`] entries; `n_trades` counts all).
     pub trades: Vec<Trade>,
+    /// Primitive calls answered by the graph, the decoder cache or the price fallback (D-053).
+    #[serde(default)]
+    pub sources: SourceCounts,
+    /// What the recorded latents contributed.
+    #[serde(default)]
+    pub latents: ReplayLatents,
+}
+
+/// Recorded-latent bookkeeping of a report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayLatents {
+    /// A recording was supplied (even if it covered none of the window).
+    pub available: bool,
+    /// Records in the recording.
+    pub recorded: usize,
+    /// Records ingested by the last step (published at or before it).
+    pub fed: FeedCounters,
+    pub snapshot: SnapshotCheck,
+    /// Transition rows of the graph at the end of the replay.
+    pub graph_rows: usize,
+    /// Decoder outputs cached at the end of the replay.
+    pub decoder_outputs: usize,
 }
 
 /// Trade-log cap per report.
@@ -264,6 +296,9 @@ impl EvalReport {
             ("psr", f(self.psr)),
             ("n_trades", self.n_trades as f64),
             ("n_obs", self.n_obs as f64),
+            ("sources.graph", self.sources.graph as f64),
+            ("sources.decoder", self.sources.decoder as f64),
+            ("sources.fallback", self.sources.fallback as f64),
         ]
     }
 
@@ -293,13 +328,15 @@ pub struct PipelineReplay<'a> {
     pub cost: &'a CostModel,
     pub holdouts: &'a [Holdout],
     pub controls: ReplayControls,
+    /// Recorded `LATENT` traffic covering the window; `None` = price-only fallback throughout.
+    pub latents: Option<&'a RecordedLatents>,
 }
 
 impl Evaluator for PipelineReplay<'_> {
     fn evaluate(&self, spec: &ReplaySpec, candidate: &StrategyDef) -> Result<EvalReport, ReplayError> {
         check_holdout(spec, self.holdouts)?;
         let strategy = candidate.build().map_err(|e| ReplayError::Candidate(e.to_string()))?;
-        replay(&strategy, candidate.lookback_bars, self.data, spec, self.cost, &self.controls)
+        replay(&strategy, candidate.lookback_bars, self.data, spec, self.cost, &self.controls, self.latents)
     }
 }
 
@@ -330,6 +367,8 @@ struct Sleeve {
     schedule: ClassCosts,
     schedule_2x: ClassCosts,
     closes: Vec<f64>,
+    /// Close times of `closes` (for the analog price lookup).
+    close_ts: Vec<i64>,
     units: f64,
     /// Volume-weighted entry price of the open position (for `unrealised_pnl`).
     entry_price: f64,
@@ -341,9 +380,27 @@ struct Sleeve {
 /// Cash + mark-to-market accounting: `equity = cash + Σ units · last_price`; every cost is
 /// taken from cash when paid, so `Δequity` per step is the net return and `Δequity + costs`
 /// the gross one.
+/// Last close at or before a time (the `PriceLookup` behind `analog_outcome`).
+struct SleevePrices<'a> {
+    ts: &'a [i64],
+    px: &'a [f64],
+}
+
+impl PriceLookup for SleevePrices<'_> {
+    fn price_at(&self, at_ms: i64) -> Option<f64> {
+        let n = self.ts.partition_point(|t| *t <= at_ms);
+        (n > 0).then(|| self.px[n - 1])
+    }
+}
+
 struct Engine<'a> {
     strategy: GpStrategy,
     lookback: usize,
+    /// Strategy horizon in bars (the `k` of `analog_forecast`).
+    steps: u32,
+    /// Recorded latents replayed point-in-time; `None` = fallback only.
+    feed: Option<LatentFeed<'a>>,
+    sources: SourceCounts,
     spec: &'a ReplaySpec,
     controls: &'a ReplayControls,
     cost: &'a CostModel,
@@ -382,6 +439,7 @@ struct Engine<'a> {
 }
 
 impl<'a> Engine<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         strategy: GpStrategy,
         lookback: usize,
@@ -390,11 +448,15 @@ impl<'a> Engine<'a> {
         cost: &'a CostModel,
         sleeves: Vec<Sleeve>,
         total_steps_hint: usize,
+        feed: Option<LatentFeed<'a>>,
     ) -> Self {
         let n = sleeves.len().max(1) as f64;
         Self {
+            steps: strategy.horizon.steps.max(1),
             strategy,
             lookback: lookback.max(2),
+            feed,
+            sources: SourceCounts::default(),
             spec,
             controls,
             cost,
@@ -492,17 +554,46 @@ impl<'a> Engine<'a> {
             self.halted = true;
             return;
         }
-        let ctxs: Vec<FallbackContext> = ready
-            .iter()
-            .map(|&i| {
-                let s = &self.sleeves[i];
-                let from = s.closes.len() - (self.lookback + 1);
-                FallbackContext::new(&s.closes[from..], None, s.book)
-            })
-            .collect();
-        let assets: Vec<(InstrumentId, &dyn StrategyContext)> =
-            ready.iter().zip(&ctxs).map(|(&i, c)| (self.sleeves[i].id, c as &dyn StrategyContext)).collect();
-        let dist = self.strategy.step(ts, &assets);
+        // Knowledge time: only recordings published at or before this step are visible.
+        if let Some(f) = &mut self.feed {
+            f.advance(ts);
+        }
+        let (lookback, steps, timescale) = (self.lookback, self.steps, self.spec.timescale);
+        let (dist, stds, sources) = {
+            let view = self.feed.as_ref().map(|f| f.graph.at(timescale, ts));
+            let prices: Vec<SleevePrices<'_>> = ready
+                .iter()
+                .map(|&i| SleevePrices { ts: &self.sleeves[i].close_ts, px: &self.sleeves[i].closes })
+                .collect();
+            let ctxs: Vec<LiveContext<'_>> = ready
+                .iter()
+                .zip(&prices)
+                .map(|(&i, p)| {
+                    let s = &self.sleeves[i];
+                    let from = s.closes.len() - (lookback + 1);
+                    let mut c = LiveContext::new(FallbackContext::new(&s.closes[from..], None, s.book), s.id, steps);
+                    if let Some(v) = &view {
+                        c = c.with_graph(v);
+                    }
+                    if let Some(f) = &self.feed {
+                        c = c.with_decoders(f.decoders.at(s.id, ts, f.decoder_max_age_ms));
+                    }
+                    c.with_prices(p)
+                })
+                .collect();
+            let assets: Vec<(InstrumentId, &dyn StrategyContext)> =
+                ready.iter().zip(&ctxs).map(|(&i, c)| (self.sleeves[i].id, c as &dyn StrategyContext)).collect();
+            let dist = self.strategy.step(ts, &assets);
+            let stds: Vec<f64> = ctxs.iter().map(|c| c.fallback().std_return()).collect();
+            let mut sources = SourceCounts::default();
+            for c in &ctxs {
+                sources.add(c.sources());
+            }
+            (dist, stds, sources)
+        };
+        self.sources.graph += sources.graph;
+        self.sources.decoder += sources.decoder;
+        self.sources.fallback += sources.fallback;
         self.n_steps += 1;
         let mut std_sum = 0.0;
         for (k, &i) in ready.iter().enumerate() {
@@ -510,7 +601,7 @@ impl<'a> Engine<'a> {
             let mean = if e.mean.is_finite() { e.mean.clamp(-1.0, 1.0) } else { 0.0 };
             let sd = if e.stddev.is_finite() { e.stddev.clamp(0.0, 1.0) } else { 1.0 };
             std_sum += sd;
-            self.fill(i, ts, mean, ctxs[k].std_return());
+            self.fill(i, ts, mean, stds[k]);
         }
         self.pending_std = Some(std_sum / ready.len() as f64);
         if self.n_steps.is_multiple_of(self.controls.progress_every.max(1))
@@ -603,15 +694,24 @@ impl ReplaySink<Event> for Engine<'_> {
         if self.halted {
             return;
         }
+        let timescale = self.spec.timescale;
         let s = &mut self.sleeves[event.inst];
         s.closes.push(event.close);
+        s.close_ts.push(publish_time_ms);
         s.last_price = event.close;
         s.pending_decision = true;
+        if let Some(f) = &mut self.feed {
+            // realised one-bar returns per region (`region_feature`), as the live runtime does
+            f.graph.record_close(timescale, s.id, publish_time_ms, event.close);
+        }
     }
 }
 
 /// Replays `strategy` over `data` (one series per instrument) under `spec`. Instruments listed
 /// in `spec.instruments` select a subset of the data; an empty list uses every series.
+/// `latents` is the recorded `LATENT` traffic the programs see point-in-time (`None` = the
+/// price-only fallback throughout).
+#[allow(clippy::too_many_arguments)]
 pub fn replay(
     strategy: &GpStrategy,
     lookback_bars: usize,
@@ -619,11 +719,16 @@ pub fn replay(
     spec: &ReplaySpec,
     cost: &CostModel,
     controls: &ReplayControls,
+    latents: Option<&RecordedLatents>,
 ) -> Result<EvalReport, ReplayError> {
     let started = Instant::now();
     if spec.capital.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || !spec.capital.is_finite() {
         return Err(ReplayError::Candidate("capital must be positive".into()));
     }
+    let snapshot = match latents {
+        Some(rec) => check_snapshot(spec, rec)?,
+        None => SnapshotCheck { declared: spec.snapshot.clone(), ..Default::default() },
+    };
     let selected: Vec<&BarSeries> = data
         .iter()
         .filter(|s| !s.is_empty())
@@ -645,6 +750,7 @@ pub fn replay(
             schedule: cost.schedule(&s.venue, &cost.class_of(&s.instrument_id)),
             schedule_2x: cost.scaled(2.0).schedule(&s.venue, &cost.class_of(&s.instrument_id)),
             closes: Vec::with_capacity(s.len()),
+            close_ts: Vec::with_capacity(s.len()),
             units: 0.0,
             entry_price: 0.0,
             last_price: 0.0,
@@ -667,10 +773,19 @@ pub fn replay(
         return Err(ReplayError::NoData);
     }
     let distinct_steps = events.windows(2).filter(|w| w[0].0 != w[1].0).count() + 1;
-    let mut engine = Engine::new(strategy.clone(), lookback_bars, spec, controls, cost, sleeves, distinct_steps);
+    let feed = latents.map(LatentFeed::new);
+    let mut engine = Engine::new(strategy.clone(), lookback_bars, spec, controls, cost, sleeves, distinct_steps, feed);
     let mut src = VecSource { events: events.into_iter() };
     run_replay(&mut src, &mut engine)?;
     engine.flush_step();
+    let latents_report = ReplayLatents {
+        available: latents.is_some(),
+        recorded: latents.map_or(0, RecordedLatents::len),
+        fed: engine.feed.as_ref().map(|f| f.fed).unwrap_or_default(),
+        snapshot,
+        graph_rows: engine.feed.as_ref().map_or(0, |f| f.graph.row_count()),
+        decoder_outputs: engine.feed.as_ref().map_or(0, |f| f.decoders.len()),
+    };
 
     let n_obs = engine.returns.len();
     let (sharpe, psr, dsr, sharpe_2x) = if n_obs > 2 {
@@ -726,6 +841,8 @@ pub fn replay(
         equity: engine.equity_curve,
         returns: engine.returns,
         trades: engine.trades,
+        sources: engine.sources,
+        latents: latents_report,
     })
 }
 
@@ -815,7 +932,8 @@ mod tests {
         let d = data(3);
         let cost = CostModel::default();
         let spec = ReplaySpec { capital: 10_000.0, ..ReplaySpec::selection(Timescale::Second, 0, i64::MAX) };
-        let ev = PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ReplayControls::default() };
+        let ev =
+            PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ReplayControls::default(), latents: None };
         let a = ev.evaluate(&spec, &def("(mul 400 analog_forecast)")).unwrap();
         let b = ev.evaluate(&spec, &def("(mul 400 analog_forecast)")).unwrap();
         let strip = |mut r: EvalReport| {
@@ -841,7 +959,13 @@ mod tests {
         assert!(flat.returns.iter().all(|r| *r == 0.0));
         // costs matter: a 2× cost model gives lower net P&L for the same decisions
         let twice = cost.scaled(2.0);
-        let ev2 = PipelineReplay { data: &d, cost: &twice, holdouts: &[], controls: ReplayControls::default() };
+        let ev2 = PipelineReplay {
+            data: &d,
+            cost: &twice,
+            holdouts: &[],
+            controls: ReplayControls::default(),
+            latents: None,
+        };
         let c = ev2.evaluate(&spec, &def("(mul 400 analog_forecast)")).unwrap();
         assert!(c.total_cost > a.total_cost && c.net_pnl < a.net_pnl);
         assert!((a.cost_sensitivity - (a.sharpe - c.sharpe)).abs() < 1e-9, "2× sensitivity matches a 2× replay");
@@ -852,13 +976,15 @@ mod tests {
         let d = vec![BarSeries::from_points("up", "paper", &walk(600, 11, 0.001, 1000), 1000)];
         let cost = CostModel::default();
         let spec = ReplaySpec { capital: 100_000.0, ..ReplaySpec::selection(Timescale::Second, 0, i64::MAX) };
-        let ev = PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ReplayControls::default() };
+        let ev =
+            PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ReplayControls::default(), latents: None };
         let r = ev.evaluate(&spec, &def("1000")).unwrap();
         assert!(r.gross_pnl > 0.0, "{r:?}");
         assert!(r.n_trades < 60, "a constant target rebalances only past the threshold: {}", r.n_trades);
-        let churn = PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ReplayControls::default() }
-            .evaluate(&ReplaySpec { min_trade_fraction: 0.0, ..spec.clone() }, &def("1000"))
-            .unwrap();
+        let churn =
+            PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ReplayControls::default(), latents: None }
+                .evaluate(&ReplaySpec { min_trade_fraction: 0.0, ..spec.clone() }, &def("1000"))
+                .unwrap();
         assert!(churn.n_trades > r.n_trades && churn.total_cost > r.total_cost);
         assert!(r.sharpe > 0.0 && r.psr > 0.5);
     }
@@ -870,37 +996,39 @@ mod tests {
         let h = [Holdout { timescale: Timescale::Second, start_ms: 300_000, end_ms: 400_000, locked_at_ms: 1 }];
         let spec = ReplaySpec::selection(Timescale::Second, 0, 350_000);
         assert!(matches!(check_holdout(&spec, &h), Err(ReplayError::HoldoutIntersect { .. })));
-        let ev = PipelineReplay { data: &d, cost: &cost, holdouts: &h, controls: ReplayControls::default() };
+        let ev =
+            PipelineReplay { data: &d, cost: &cost, holdouts: &h, controls: ReplayControls::default(), latents: None };
         assert!(ev.evaluate(&spec, &def("1")).is_err());
         let promo = ReplaySpec { purpose: ReplayPurpose::Promotion, ..spec.clone() };
         assert!(check_holdout(&promo, &h).is_ok());
         let other_ts = ReplaySpec { timescale: Timescale::Minute, ..spec.clone() };
         assert!(check_holdout(&other_ts, &h).is_ok());
         let before = ReplaySpec::selection(Timescale::Second, 0, 299_999);
-        let r = PipelineReplay { data: &d, cost: &cost, holdouts: &h, controls: ReplayControls::default() }
-            .evaluate(&before, &def("1"))
-            .unwrap();
+        let r =
+            PipelineReplay { data: &d, cost: &cost, holdouts: &h, controls: ReplayControls::default(), latents: None }
+                .evaluate(&before, &def("1"))
+                .unwrap();
         assert!(r.last_ts_ms <= 299_999);
         // stop hooks
         let ctl = ReplayControls { max_steps: Some(5), ..Default::default() };
-        let r = PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ctl }
+        let r = PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ctl, latents: None }
             .evaluate(&ReplaySpec::selection(Timescale::Second, 0, i64::MAX), &def("1"))
             .unwrap();
         assert_eq!((r.n_steps, r.stop), (5, Stop::MaxSteps));
         let ctl = ReplayControls { should_stop: Some(Box::new(|n| n >= 2)), ..Default::default() };
-        let r = PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ctl }
+        let r = PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ctl, latents: None }
             .evaluate(&ReplaySpec::selection(Timescale::Second, 0, i64::MAX), &def("1"))
             .unwrap();
         assert_eq!((r.n_steps, r.stop), (2, Stop::Interrupted));
         // no data in window
         assert!(matches!(
-            PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ReplayControls::default() }
+            PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ReplayControls::default(), latents: None }
                 .evaluate(&ReplaySpec::selection(Timescale::Second, 10_000_000, 20_000_000), &def("1")),
             Err(ReplayError::NoData)
         ));
         let bad = StrategyDef { signal: "(rsi 14)".into(), ..def("1") };
         assert!(matches!(
-            PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ReplayControls::default() }
+            PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ReplayControls::default(), latents: None }
                 .evaluate(&ReplaySpec::selection(Timescale::Second, 0, i64::MAX), &bad),
             Err(ReplayError::Candidate(_))
         ));
@@ -933,5 +1061,137 @@ mod tests {
             "01900000000070008000000000000001"
         );
         assert_eq!(instrument_id("a"), instrument_id("a"));
+    }
+
+    /// The real recording (`testdata/latent_fixture.jsonl`, trimmed from the live `LATENT`
+    /// stream) over SYNTHETIC bars placed in its time range.
+    fn fixture_setup() -> (crate::latents::RecordedLatents, Vec<BarSeries>, ReplaySpec) {
+        let rec = crate::latents::RecordedLatents::from_jsonl(crate::latents::tests::FIXTURE).unwrap();
+        let insts = rec.instruments_of(Timescale::Second);
+        assert!(!insts.is_empty(), "fixture has 1s states");
+        let states: Vec<i64> = rec
+            .records()
+            .iter()
+            .filter(|r| matches!(&r.message, fa_bus::replay::LatentMessage::State(s) if s.timescale == "1s"))
+            .map(|r| r.published_ms)
+            .collect();
+        let (t0, t1) = (*states.iter().min().unwrap(), *states.iter().max().unwrap());
+        let start = (t0 / 1000) * 1000 - 60_000;
+        let n = ((t1 - start) / 1000) as usize + 2;
+        let data: Vec<BarSeries> = insts
+            .iter()
+            .enumerate()
+            .map(|(k, i)| {
+                let pts: Vec<(i64, f64)> =
+                    walk(n, 40 + k as u64, 0.0, 1000).into_iter().map(|(t, p)| (start + t, p)).collect();
+                BarSeries::from_points(&i.subject_token(), "sim", &pts, 1000)
+            })
+            .collect();
+        let spec = ReplaySpec { capital: 10_000.0, ..ReplaySpec::selection(Timescale::Second, start, t1 + 1000) };
+        (rec, data, spec)
+    }
+
+    #[test]
+    fn recorded_latents_feed_the_graph_deterministically() {
+        let (rec, data, spec) = fixture_setup();
+        let cost = CostModel::default();
+        let graph_program = def("(add (mul 4 (sub stay_prob 0.5)) (mul 50 (fc_dist 5)))");
+        let ev = PipelineReplay {
+            data: &data,
+            cost: &cost,
+            holdouts: &[],
+            controls: ReplayControls::default(),
+            latents: Some(&rec),
+        };
+        let a = ev.evaluate(&spec, &graph_program).unwrap();
+        let b = ev.evaluate(&spec, &graph_program).unwrap();
+        let strip = |mut r: EvalReport| {
+            r.elapsed_ms = 0.0;
+            r
+        };
+        assert_eq!(strip(a.clone()), strip(b), "identical spec + data + recording → identical report");
+        eprintln!("sources {:?} latents {:?}", a.sources, a.latents);
+        assert!(a.latents.available && a.latents.recorded == rec.len());
+        assert!(
+            a.latents.fed.states > 0 && a.latents.fed.transitions > 0 && a.latents.graph_rows > 0,
+            "{:?}",
+            a.latents
+        );
+        assert!(a.sources.graph > 0, "graph primitives answered from the recording: {:?}", a.sources);
+        assert!(a.sources.fallback > 0, "steps before the first state fall back");
+        assert_eq!(a.latents.snapshot.declared, "stat-v1-1s");
+        assert!(!a.latents.snapshot.mixed);
+        let obj = a.objectives();
+        assert!(obj.iter().any(|(k, v)| *k == "sources.graph" && *v > 0.0));
+        // the same program without the recording is fallback-only and differs
+        let plain = PipelineReplay {
+            data: &data,
+            cost: &cost,
+            holdouts: &[],
+            controls: ReplayControls::default(),
+            latents: None,
+        }
+        .evaluate(&spec, &graph_program)
+        .unwrap();
+        assert_eq!((plain.sources.graph, plain.sources.decoder), (0, 0));
+        assert!(!plain.latents.available);
+        assert_ne!(plain.returns, a.returns, "graph-fed decisions differ from the price fallback");
+        // snapshot consistency (spec 41 §4): a replay declared on another snapshot is refused…
+        let other = ReplaySpec { snapshot: "stat-v2-1s".into(), ..spec.clone() };
+        assert!(matches!(ev.evaluate(&other, &graph_program), Err(ReplayError::SnapshotMismatch { .. })));
+        // …unless it is diagnostic
+        let diag = ReplaySpec { purpose: ReplayPurpose::Diagnostic, ..other };
+        let d = ev.evaluate(&diag, &graph_program).unwrap();
+        assert!(d.latents.snapshot.mixed && d.latents.snapshot.declared == "stat-v2-1s");
+    }
+
+    #[test]
+    fn a_latent_after_the_step_is_never_visible() {
+        // SYNTHETIC recording: the instrument sits in region `a`, then switches to `b` at 10 s.
+        // Up to and including the step at 10 s nothing of `b` is visible (published at 10.05 s).
+        use crate::latents::tests::{raw, region_msg, row_msg, state_msg};
+        let inst = instrument_id("01900000-0000-7000-8000-000000000001");
+        let mut msgs = vec![
+            raw("latent.region.1s", 1, 0, region_msg("s", "a")),
+            raw("latent.region.1s", 2, 0, region_msg("s", "b")),
+            raw("latent.transition.1s", 3, 0, row_msg("s", "a", 0, &[("a", 0.9), ("unknown", 0.1)])),
+            raw("latent.transition.1s", 4, 0, row_msg("s", "b", 0, &[("b", 0.1), ("a", 0.8), ("unknown", 0.1)])),
+        ];
+        for t in 1..=20i64 {
+            let region = if t < 10 { "a" } else { "b" };
+            msgs.push(raw("latent.state.1s.x", 10 + t as u64, t * 1000 + 50, state_msg("s", inst, t * 1000, region)));
+        }
+        let rec = crate::latents::RecordedLatents::new(msgs);
+        let bars = vec![BarSeries::from_points(&inst.subject_token(), "sim", &walk(40, 1, 0.0, 1000), 1000)];
+        let cost = CostModel::default();
+        // stay_prob is 0.9 in `a` and 0.1 in `b`: the exposure flips sign at the switch
+        let prog = StrategyDef { lookback_bars: 2, ..def("(mul 100 (sub stay_prob 0.5))") };
+        let step = |end_ms: i64| {
+            PipelineReplay {
+                data: &bars,
+                cost: &cost,
+                holdouts: &[],
+                controls: ReplayControls::default(),
+                latents: Some(&rec),
+            }
+            .evaluate(&ReplaySpec::selection(Timescale::Second, 0, end_ms), &prog)
+            .unwrap()
+        };
+        let upto_10 = step(10_000);
+        assert!(!upto_10.trades.is_empty());
+        assert!(
+            upto_10.trades.iter().all(|t| t.target_exposure > 0.9),
+            "through 10 s the switch (published 10.05 s) is invisible: {:?}",
+            upto_10.trades
+        );
+        let upto_11 = step(11_000);
+        let last = upto_11.trades.last().unwrap();
+        assert_eq!(last.ts_ms, 11_000);
+        assert!(last.target_exposure < -0.9, "at 11 s the state dated 10 s is visible: {last:?}");
+        assert_eq!(upto_11.latents.fed.states, 10, "states published ≤ 11 s");
+        assert!(upto_11.sources.graph > 0 && upto_11.sources.graph >= upto_10.sources.graph);
+        // before any state exists everything falls back
+        let early = step(2_000);
+        assert_eq!(early.sources.graph, 0);
     }
 }

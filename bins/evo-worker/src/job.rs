@@ -97,6 +97,8 @@ pub struct Worker {
     pub trials: Option<TrialStore>,
     /// Shared execution cost model (`go/services/broker-gateway/costs.yaml`).
     pub cost: Arc<fa_backtest::cost::CostModel>,
+    /// Recorded `LATENT` traffic for strategy replays (bounded per-window cache, D-059).
+    pub recorded: crate::recorded::RecordedStore,
 }
 
 /// What `handle` produces; the caller publishes the result and acks.
@@ -154,13 +156,15 @@ impl Worker {
             vary::KIND => self.vary(job).await,
             strategy::KIND => self.evaluate_strategy(job).await,
             vary_strategy::KIND => self.vary_strategy(job).await,
+            crate::holdout::KIND => self.evaluate_holdout(job).await,
             other => self.failed(
                 job,
                 format!(
-                    "job kind `{other}` not implemented (only `{KIND}`, `{}`, `{}`, `{}`)",
+                    "job kind `{other}` not implemented (only `{KIND}`, `{}`, `{}`, `{}`, `{}`)",
                     vary::KIND,
                     strategy::KIND,
-                    vary_strategy::KIND
+                    vary_strategy::KIND,
+                    crate::holdout::KIND
                 ),
                 0,
             ),
@@ -452,6 +456,7 @@ impl Worker {
                 n_obs: pooled.n_eval,
                 objectives: Value::Object(objectives.clone()),
                 returns: pooled.pnl.clone(),
+                holdout_id: None,
             },
         )
         .await;

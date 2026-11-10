@@ -12,7 +12,7 @@ use fa_core::{Timescale, rng::Rng};
 use fa_encoders::{EncoderFamily, EncoderInput, MarketBar, StatisticalEncoder};
 use fa_expert_space::{EvidenceSoftmaxRouter, Router};
 use fa_mcmc::MarkovGraph;
-use fa_patterns::{OnlineRegionCfg, OnlineRegionDiscovery, OnlineRegionSet, RegionLifecycle};
+use fa_patterns::{OnlineRegionCfg, OnlineRegionDiscovery, OnlineRegionSet, RegionLifecycle, RegionMap};
 use fa_proto::{
     Timestamp,
     v1::{ExpertLatent, ExpertSpaceRef, LatentState, RegionEvent, TransitionProb, TransitionUpdate, region_event},
@@ -124,6 +124,9 @@ pub struct StepOutput {
     pub transitions: Vec<TransitionUpdate>,
 }
 
+/// Region sets and transition models, one of each per expert.
+type Stages = (Vec<Box<dyn OnlineRegionDiscovery>>, Vec<Box<dyn TransitionModel>>);
+
 pub struct TimescalePipeline {
     ts: Timescale,
     encoder: Box<dyn EncoderFamily>,
@@ -136,35 +139,104 @@ pub struct TimescalePipeline {
 
 impl TimescalePipeline {
     /// Baseline wiring: statistical encoder, energy-softmax router, leader clustering, Dirichlet rows.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn baseline(ts: Timescale, cfg: &PipelineConfig) -> Self {
-        let encoder = StatisticalEncoder::new(ts);
+        Self::with_encoder(ts, cfg, Box::new(StatisticalEncoder::new(ts)), None)
+    }
+
+    /// Any encoder (a loaded snapshot, spec 36) with the baseline router / regions / transitions.
+    /// With a `region_map` (the snapshot's `region_map.json`) the region sets start seeded with
+    /// its regions, so matched lineages continue (D-007); otherwise they start empty.
+    pub fn with_encoder(
+        ts: Timescale,
+        cfg: &PipelineConfig,
+        encoder: Box<dyn EncoderFamily>,
+        region_map: Option<&RegionMap>,
+    ) -> Self {
         let n_experts = encoder.sizing().max_experts as usize;
-        let snapshot = encoder.snapshot_id().to_owned();
-        let regions = (0..n_experts)
-            .map(|k| {
-                Box::new(OnlineRegionSet::new(cfg.regions, snapshot.clone(), k as u32, format!("{ts}-e{k}")))
-                    as Box<dyn OnlineRegionDiscovery>
-            })
-            .collect();
-        let transitions = (0..n_experts)
-            .map(|k| {
-                Box::new(DirichletTransitions::new(
-                    cfg.alpha_0,
-                    gamma_forget(ts),
-                    cfg.ci_level,
-                    cfg.mc_draws,
-                    cfg.seed ^ ((k as u64 + 1) * 0x9E37_79B9),
-                )) as Box<dyn TransitionModel>
-            })
-            .collect();
+        let (regions, transitions) = Self::stages(ts, cfg, encoder.snapshot_id(), n_experts, region_map);
         Self {
             ts,
-            encoder: Box::new(encoder),
+            encoder,
             router: Box::new(EvidenceSoftmaxRouter::default()),
             regions,
             transitions,
             last_closed: HashMap::new(),
         }
+    }
+
+    fn stages(
+        ts: Timescale,
+        cfg: &PipelineConfig,
+        snapshot: &str,
+        n_experts: usize,
+        region_map: Option<&RegionMap>,
+    ) -> Stages {
+        let regions = (0..n_experts)
+            .map(|k| {
+                // Region ids: `<ts>-e<k>-r<nnn>` for the in-process baseline, `<snapshot>-e<k>-r<nnn>` for a
+                // trained snapshot (its `regions.json` uses that prefix, so new births continue the series).
+                let prefix = if region_map.is_some() { format!("{snapshot}-e{k}") } else { format!("{ts}-e{k}") };
+                let set = match region_map.and_then(|m| m.expert(k as u32)) {
+                    Some(e) => OnlineRegionSet::seeded(cfg.regions, snapshot, k as u32, prefix, &e.regions),
+                    None => OnlineRegionSet::new(cfg.regions, snapshot, k as u32, prefix),
+                };
+                Box::new(set) as Box<dyn OnlineRegionDiscovery>
+            })
+            .collect();
+        let transitions = (0..n_experts)
+            .map(|k| {
+                let mut t = DirichletTransitions::new(
+                    cfg.alpha_0,
+                    gamma_forget(ts),
+                    cfg.ci_level,
+                    cfg.mc_draws,
+                    cfg.seed ^ ((k as u64 + 1) * 0x9E37_79B9),
+                );
+                if let Some(e) = region_map.and_then(|m| m.expert(k as u32)) {
+                    for r in &e.regions {
+                        t.register_region(&r.region_id);
+                    }
+                }
+                Box::new(t) as Box<dyn TransitionModel>
+            })
+            .collect();
+        (regions, transitions)
+    }
+
+    /// `Created` events for every region currently live (used once at start to announce the
+    /// regions a loaded snapshot was seeded with).
+    pub fn seeded_region_events(&self) -> Vec<RegionEvent> {
+        self.regions
+            .iter()
+            .enumerate()
+            .flat_map(|(k, set)| {
+                set.regions()
+                    .into_iter()
+                    .map(|r| self.region_event(k as u32, RegionLifecycle::Created { region: r.clone() }))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Hot-swaps the encoder (spec 36 §6.4 promotion / rollback) without restarting: the region
+    /// sets are rebuilt from the new snapshot's `region_map` (seeded) or start empty, the
+    /// transition posteriors restart (kernel transfer, spec 33 §6.6, is not implemented) and the
+    /// per-instrument chain positions are cleared. Returns `Created` events for every seeded
+    /// region so the bus and Helix learn the new snapshot's regions.
+    pub fn swap_encoder(
+        &mut self,
+        cfg: &PipelineConfig,
+        encoder: Box<dyn EncoderFamily>,
+        region_map: Option<&RegionMap>,
+    ) -> Vec<RegionEvent> {
+        let n_experts = encoder.sizing().max_experts as usize;
+        self.encoder = encoder;
+        let (regions, transitions) = Self::stages(self.ts, cfg, self.encoder.snapshot_id(), n_experts, region_map);
+        self.regions = regions;
+        self.transitions = transitions;
+        self.last_closed.clear();
+        self.seeded_region_events()
     }
 
     pub fn timescale(&self) -> Timescale {
@@ -177,14 +249,6 @@ impl TimescalePipeline {
 
     pub fn context_steps(&self) -> usize {
         self.encoder.sizing().context_steps as usize
-    }
-
-    pub fn n_experts(&self) -> u32 {
-        self.regions.len() as u32
-    }
-
-    pub fn latent_dim(&self) -> u32 {
-        self.encoder.sizing().latent_dim
     }
 
     pub fn live_regions(&self) -> usize {
@@ -341,6 +405,64 @@ mod tests {
         assert!(n_created >= 3, "at least one region per expert");
         assert_eq!(n_trans, 38 * 3, "one transition row per expert per closed step after the first");
         assert!(pl.live_regions() >= 3 && pl.transition_rows() >= 3);
+    }
+
+    #[test]
+    fn swapping_the_encoder_seeds_regions_from_the_map_and_restarts_the_chain() {
+        let cfg = PipelineConfig::default();
+        let mut pl = TimescalePipeline::baseline(Timescale::Minute, &cfg);
+        let all = bars(30, 4);
+        for end in 2..=all.len() {
+            pl.step(&StepInput {
+                instrument_id: "i",
+                as_of_ms: end as i64 * 60_000,
+                bars: &all[..end],
+                bar_closed: true,
+            })
+            .unwrap();
+        }
+        assert!(pl.transition_rows() > 0);
+        let stats = StatisticalEncoder::fit(Timescale::Minute, &all, &fa_encoders::FitConfig::default()).unwrap();
+        let enc = StatisticalEncoder::with_stats(Timescale::Minute, "snap-x", stats);
+        let seed = fa_patterns::FittedRegion {
+            region_id: "snap-x-e0-r000".into(),
+            lineage_id: "1m-e0-r000".into(),
+            expert_index: 0,
+            centroid: vec![0.0; 8],
+            radius: 1.0,
+            mass: 1.0,
+            parent_region_id: Some("1m-e0-r000".into()),
+            score: 0.9,
+        };
+        let map = RegionMap {
+            snapshot_id: "snap-x".into(),
+            parent_snapshot_id: Some("stat-v1-1m".into()),
+            probe_set_version: "p".into(),
+            n_probes: 1,
+            carry_threshold: 0.5,
+            experts: vec![fa_patterns::ExpertRegionMap {
+                expert_index: 0,
+                regions: vec![seed],
+                parent_regions: 1,
+                matched: 1,
+                carried_mass: 1.0,
+            }],
+            note: None,
+        };
+        let events = pl.swap_encoder(&cfg, Box::new(enc), Some(&map));
+        assert_eq!(pl.snapshot_id(), "snap-x");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].region_id, "snap-x-e0-r000");
+        assert_eq!(events[0].lineage_id, "1m-e0-r000");
+        assert_eq!(events[0].space.as_ref().unwrap().snapshot_id, "snap-x");
+        assert_eq!(pl.live_regions(), 1);
+        assert_eq!(pl.transition_rows(), 0, "old posteriors dropped; nothing observed yet");
+        let out =
+            pl.step(&StepInput { instrument_id: "i", as_of_ms: 31 * 60_000, bars: &all, bar_closed: true }).unwrap();
+        assert!(out.transitions.is_empty(), "chain position cleared: first closed bar observes nothing");
+        let st = out.state.unwrap();
+        assert_eq!(st.snapshot_id, "snap-x");
+        assert!(st.experts.iter().all(|e| e.region_id.starts_with("snap-x-e")), "{:?}", st.experts);
     }
 
     #[test]

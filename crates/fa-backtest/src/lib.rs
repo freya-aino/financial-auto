@@ -6,6 +6,7 @@
 
 pub mod cost;
 pub mod eval;
+pub mod latents;
 pub mod replay;
 pub mod stats;
 pub mod validation;
@@ -48,6 +49,10 @@ pub enum ReplayError {
     HoldoutIntersect { timescale: String, holdout_start_ms: i64, holdout_end_ms: i64 },
     #[error("no bars in the replay window")]
     NoData,
+    /// Recorded latents of another encoder snapshot than the one the replay declares (spec 41 §4
+    /// `ReplaySpec.snapshot`); only `Diagnostic` replays may mix snapshots.
+    #[error("latents of snapshot(s) `{found}` mixed into a replay declared on `{declared}`")]
+    SnapshotMismatch { declared: String, found: String },
     #[error("candidate: {0}")]
     Candidate(String),
 }

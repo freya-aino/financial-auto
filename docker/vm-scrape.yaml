@@ -1,0 +1,47 @@
+# VictoriaMetrics scrape config (spec 60 §4/§6.5, D-056): every compose service exposes
+# GET /metrics on :9100 inside the compose network (FA_METRICS_BIND=0.0.0.0:9100).
+# Mounted read-only into the victoriametrics service: -promscrape.config=/etc/vm-scrape.yaml
+# Check: curl -s 'http://127.0.0.1:8428/api/v1/query?query=up' (every target should be 1).
+global:
+  scrape_interval: 15s
+  scrape_timeout: 5s
+
+scrape_configs:
+  # Platform services, one static target each (compose DNS names; `service` label = heartbeat name).
+  - job_name: fa
+    static_configs:
+      - targets: ["control-api:9100"]
+        labels: { service: control-api }
+      - targets: ["model-runtime:9100"]
+        labels: { service: model-runtime }
+      - targets: ["strategy-runtime:9100"]
+        labels: { service: strategy-runtime }
+      - targets: ["risk-engine:9100"]
+        labels: { service: risk-engine }
+      - targets: ["ingestor:9100"]
+        labels: { service: ingestor }
+      - targets: ["broker-gateway:9100"]
+        labels: { service: broker-gateway }
+      - targets: ["evo-orchestrator:9100"]
+        labels: { service: evo-orchestrator }
+
+  # evo-worker can run as N replicas (--scale); the compose DNS A record lists every replica.
+  - job_name: fa-evo-worker
+    dns_sd_configs:
+      - names: ["evo-worker"]
+        type: A
+        port: 9100
+    relabel_configs:
+      - target_label: service
+        replacement: evo-worker
+
+  # Infrastructure with native Prometheus endpoints.
+  - job_name: victoriametrics
+    static_configs:
+      - targets: ["127.0.0.1:8428"]
+  - job_name: garage
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["garage:3903"]
+  # NATS (:8222 is JSON only), Postgres and HelixDB need exporters; their health is covered by
+  # control-api `/api/health` dependency probes and the compose healthchecks.

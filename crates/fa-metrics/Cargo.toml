@@ -1,0 +1,18 @@
+[package]
+name = "fa-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+tower = { version = "0.5.3", default-features = false }
+tracing.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
+
+[lints]
+workspace = true

@@ -28,6 +28,7 @@ fa-allocator = { path = "crates/fa-allocator" }
 fa-risk = { path = "crates/fa-risk" }
 fa-ledger = { path = "crates/fa-ledger" }
 fa-backtest = { path = "crates/fa-backtest" }
+fa-metrics = { path = "crates/fa-metrics" }
 
 # external
 anyhow = "1.0.104"

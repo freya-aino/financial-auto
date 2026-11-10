@@ -2,7 +2,11 @@
 
 Live service: bus → encoders → expert spaces → regions/MCMC → decoders/strategies → signals.
 
-**Status:** baseline latent pipeline running — consumes `md.trade.>`, builds rolling bars per timescale and instrument, and publishes `LatentState`, `RegionEvent` and `TransitionUpdate` derived from the live trade stream. Encoders are the deterministic **statistical baseline** (no neural models, D-004); decoders and strategies are not wired yet.
+**Status:** baseline latent pipeline running — consumes `md.trade.>`, builds rolling bars per timescale and instrument, and publishes `LatentState`, `RegionEvent` and `TransitionUpdate` derived from the live trade stream. Encoders are the deterministic **statistical** family (no neural models, D-004): the in-process baseline, or a **trained snapshot** loaded from Garage and hot-swapped on promotion (spec 36, `src/snapshot.rs`, D-058); decoders and strategies are not wired yet.
+
+## Snapshot lifecycle (`src/snapshot.rs`, spec 36 §6.4)
+- **Start:** per timescale, the `active` Helix `Snapshot` with `encoder_family = statistical` is resolved. A row with a `garage_key` is loaded from Garage (`manifest.json` + `weights.bin` → `StatisticalEncoder::from_manifest`, `region_map.json` → region sets seeded with the snapshot's regions and lineages); no active row, a row without an artifact (the baseline `stat-v1-<ts>`), Helix down or no Garage credentials (`config/secrets.toml`) → the in-process baseline, registered as `active` (gen 0 when first created; `ensure_snapshot` keeps an existing row). Seeded regions are announced as `Created` events (bus + Helix). Log line: `encoder resolved ts=… snapshot=… source=garage|baseline note=…`.
+- **`ctl.model.reload`** (request/reply `CtlRequest{verb: reload, args: timescale, snapshot_id?}`): resolves the named snapshot (default: the active one), `TimescalePipeline::swap_encoder` replaces the encoder, rebuilds the region sets from the new `region_map` (matched lineages continue; unmatched regions are new lineages, new births continue the series), **restarts the transition posteriors** (kernel transfer of spec 33 §6.6 is not implemented) and clears the per-instrument chain positions; the new snapshot and its seeded regions are re-announced. Reply: `1m: <from> -> <to> (gen N, garage|baseline, K seeded regions, carried mass x)`, `unchanged <id>`, or an error (unknown snapshot, wrong timescale, no artifact) in which case the current encoder keeps serving. control-api's `POST /api/latent/snapshots/{id}/promote|rollback` sends it after changing the Helix status. Heartbeat counters `reloads`, `reloads.<ts>`.
 
 ## What runs (per timescale in `config/platform.toml`, D-011)
 | Stage | Trait (swap point) | Baseline implementation |
@@ -26,7 +30,7 @@ The pipeline output is also persisted into HelixDB through [`fa-hub`](../../crat
 
 | Event | Helix rows | When |
 |---|---|---|
-| start | `Snapshot stat-v1-<ts>` (status `active`) + `ExpertSpace <snapshot>-e<k>` (dim 8) | once per process (`ensure_*`, get-or-create) |
+| start / reload | `Snapshot` (the served snapshot: `stat-v1-<ts>` baseline with status `active`, or the loaded trained snapshot with its generation and `garage_key`) + `ExpertSpace <snapshot>-e<k>` (dim 8) | once per process and on every `ctl.model.reload` (`ensure_*`, get-or-create) |
 | region created | `LatentRegion` (`region_id`, `lineage_id`, `method=leader`, `radius`, `status=live`) + `InSpace` | on the event (upsert: the baseline's ids `<ts>-e<k>-r<nnn>` are process-local, D-039, so a restart revives rows of the same id) |
 | region merged / retired | `LatentRegion.status = merged \| retired`, `related_region_id` | on the event |
 | transition row published | `Transition` edge `from → to` with `count` (observations seen by this process), `mean`, `lower`, `upper`, `kernel_params`, `updated_at` | **coalesced**: at most one write per edge per `--hub-flush-secs` (default 10); only successors observed at least once get an edge (prior-only mass stays in the in-memory view) |

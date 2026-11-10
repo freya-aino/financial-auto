@@ -7,12 +7,15 @@
 //! and `TransitionUpdate` on `latent.transition.<ts>`, plus a heartbeat with counters.
 //!
 //! Neural encoders are off (D-004): the "snapshot" is the versioned statistical baseline
-//! (`stat-v1-<ts>`), not a trained model. Every stage sits behind a trait so trained
+//! (`stat-v1-<ts>`) or a **trained statistical snapshot** from Garage (spec 36, [`snapshot`]):
+//! the active Helix `Snapshot` of each timescale is loaded at start and hot-swapped on
+//! `ctl.model.reload` (promote / rollback). Every stage sits behind a trait so trained
 //! models can replace the baselines without touching the bus contract.
 
 mod bars;
 mod hub_sink;
 mod pipeline;
+mod snapshot;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -28,7 +31,7 @@ use fa_patterns::OnlineRegionCfg;
 use fa_proto::v1::{Envelope, Heartbeat, envelope::Payload};
 use futures::StreamExt;
 use pipeline::{PipelineConfig, StepInput, TimescalePipeline};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 #[derive(Parser)]
 struct Args {
@@ -94,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
     let args = Args::parse();
+    fa_bus::metrics::serve_from_env("model-runtime", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config)?;
     let bus = Bus::connect(&cfg.nats.url).await?;
 
@@ -106,20 +110,29 @@ async fn main() -> anyhow::Result<()> {
         },
         ..PipelineConfig::default()
     };
-    let mut states: Vec<TimescaleState> = cfg
-        .timescales
-        .iter()
-        .map(|&ts| TimescaleState {
-            pipeline: TimescalePipeline::baseline(ts, &pcfg),
+    // Active snapshot per timescale from Helix + Garage, else the in-process baseline (spec 36).
+    let hub_url = args.hub_url.clone().unwrap_or_else(|| fa_hub::HubClient::url_from_env_or(&cfg.helix.url));
+    let loader = snapshot::SnapshotLoader::new(&cfg, (!args.no_hub).then(|| hub_url.clone()));
+    let mut states: Vec<TimescaleState> = Vec::with_capacity(cfg.timescales.len());
+    let mut descs = Vec::with_capacity(cfg.timescales.len());
+    for &ts in &cfg.timescales {
+        let loaded = match loader.resolve(ts, None).await {
+            Ok(l) => l,
+            Err(e) => snapshot::SnapshotLoader::baseline(ts, Some(format!("active snapshot unusable: {e}"))),
+        };
+        tracing::info!(%ts, snapshot = %loaded.desc.snapshot_id, generation = loaded.desc.generation, source = loaded.source, note = ?loaded.note, seeded_regions = loaded.region_map.as_ref().map_or(0, fa_patterns::RegionMap::n_regions), "encoder resolved");
+        states.push(TimescaleState {
+            pipeline: TimescalePipeline::with_encoder(ts, &pcfg, loaded.encoder, loaded.region_map.as_ref()),
             series: HashMap::new(),
             last_preview: HashMap::new(),
-        })
-        .collect();
+        });
+        descs.push(loaded.desc);
+    }
     tracing::info!(
         timescales = ?cfg.timescales,
         snapshots = ?states.iter().map(|s| s.pipeline.snapshot_id().to_owned()).collect::<Vec<_>>(),
         region_radius = args.region_radius,
-        "model-runtime starting (baseline pipeline: statistical encoder, no neural models)"
+        "model-runtime starting (statistical encoders, no neural models)"
     );
 
     let counters: Counters = Arc::default();
@@ -128,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
     let sink = (!args.no_hub).then(|| {
         let sink = hub_sink::HubSink::spawn(
             hub_sink::SinkConfig {
-                url: args.hub_url.clone().unwrap_or_else(|| fa_hub::HubClient::url_from_env_or(&cfg.helix.url)),
+                url: hub_url.clone(),
                 flush: Duration::from_secs(args.hub_flush_secs.max(1)),
                 latent_timescales: args.hub_latent_timescales.iter().filter_map(|t| t.trim().parse().ok()).collect(),
                 queue: args.hub_queue,
@@ -136,21 +149,40 @@ async fn main() -> anyhow::Result<()> {
             },
             counters.clone(),
         );
-        for st in &states {
-            sink.announce_snapshot(hub_sink::SnapshotDesc {
-                snapshot_id: st.pipeline.snapshot_id().to_owned(),
-                timescale: st.pipeline.timescale(),
-                n_experts: st.pipeline.n_experts(),
-                dim: st.pipeline.latent_dim(),
-            });
+        for d in &descs {
+            sink.announce_snapshot(d.clone());
         }
         sink
     });
     let region_radius = f64::from(args.region_radius);
+    // Seeded regions of loaded snapshots are announced like births so the bus and Helix know them.
+    for st in &states {
+        let events = st.pipeline.seeded_region_events();
+        if !events.is_empty() {
+            let out = pipeline::StepOutput { region_events: events, ..Default::default() };
+            if let Some(sink) = &sink {
+                sink.observe(st.pipeline.timescale(), false, &out, region_radius);
+            }
+            publish_step(&bus, &counters, st.pipeline.timescale(), "", false, out, &st.pipeline).await;
+        }
+    }
+
+    let (reload_tx, mut reload_rx) = mpsc::channel::<snapshot::ReloadRequest>(8);
+    tokio::spawn(snapshot::run_reload_listener(bus.clone(), reload_tx));
 
     let preview = Duration::from_secs(args.preview_secs);
     let mut trades = bus.subscribe::<Envelope>(subjects::ALL_MD_TRADES.into()).await?;
-    while let Some((subject, env)) = trades.next().await {
+    loop {
+        let (subject, env) = tokio::select! {
+            msg = trades.next() => match msg {
+                Some(m) => m,
+                None => break,
+            },
+            Some(req) = reload_rx.recv() => {
+                reload(req, &mut states, &loader, &pcfg, sink.as_ref(), &bus, &counters, region_radius).await;
+                continue;
+            }
+        };
         {
             let mut c = counters.lock().await;
             *c.entry("trades_total".into()).or_default() += 1.0;
@@ -192,6 +224,63 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `ctl.model.reload`: resolve the snapshot, swap the encoder, re-announce the snapshot and its
+/// seeded regions (bus + Helix), answer with what is now serving.
+#[allow(clippy::too_many_arguments)]
+async fn reload(
+    req: snapshot::ReloadRequest,
+    states: &mut [TimescaleState],
+    loader: &snapshot::SnapshotLoader,
+    pcfg: &PipelineConfig,
+    sink: Option<&hub_sink::HubSink>,
+    bus: &Bus,
+    counters: &Counters,
+    region_radius: f64,
+) {
+    let ts = req.timescale;
+    let Some(st) = states.iter_mut().find(|s| s.pipeline.timescale() == ts) else {
+        let _ = req.reply.send(fa_proto::v1::CtlReply { ok: false, message: format!("timescale {ts} not served") });
+        return;
+    };
+    let loaded = match loader.resolve(ts, req.snapshot_id.as_deref()).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(%ts, snapshot = ?req.snapshot_id, error = %e, "reload refused");
+            let _ = req.reply.send(fa_proto::v1::CtlReply { ok: false, message: e.to_string() });
+            return;
+        }
+    };
+    let previous = st.pipeline.snapshot_id().to_owned();
+    if previous == loaded.desc.snapshot_id {
+        let _ = req.reply.send(fa_proto::v1::CtlReply { ok: true, message: format!("unchanged {previous}") });
+        return;
+    }
+    let seeded = loaded.region_map.as_ref().map_or(0, fa_patterns::RegionMap::n_regions);
+    let carried = loaded.region_map.as_ref().map_or(0.0, fa_patterns::RegionMap::carried_mass);
+    let events = st.pipeline.swap_encoder(pcfg, loaded.encoder, loaded.region_map.as_ref());
+    tracing::info!(%ts, from = %previous, to = %loaded.desc.snapshot_id, generation = loaded.desc.generation, source = loaded.source, seeded_regions = seeded, carried_mass = carried, "encoder swapped");
+    if let Some(sink) = sink {
+        sink.announce_snapshot(loaded.desc.clone());
+    }
+    let out = pipeline::StepOutput { region_events: events, ..Default::default() };
+    if let Some(sink) = sink {
+        sink.observe(ts, false, &out, region_radius);
+    }
+    publish_step(bus, counters, ts, "", false, out, &st.pipeline).await;
+    {
+        let mut c = counters.lock().await;
+        *c.entry("reloads".into()).or_default() += 1.0;
+        *c.entry(format!("reloads.{ts}")).or_default() += 1.0;
+    }
+    let _ = req.reply.send(fa_proto::v1::CtlReply {
+        ok: true,
+        message: format!(
+            "{ts}: {previous} -> {} (gen {}, {}, {seeded} seeded regions, carried mass {carried:.3})",
+            loaded.desc.snapshot_id, loaded.desc.generation, loaded.source
+        ),
+    });
 }
 
 async fn publish_step(

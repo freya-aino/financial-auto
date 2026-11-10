@@ -36,10 +36,16 @@ migrate:
 app-build:
     {{compose}} --profile app build
 
-# Start infrastructure + all platform services; UI at http://127.0.0.1:8080, API at :7700
+# Start infrastructure + all platform services; UI at http://127.0.0.1:8080, API at :7700.
+# Then waits in the spec 60 §6.4 order (infra → control-api /api/health → risk-engine heartbeat).
 app-up:
     {{compose}} --profile app up -d
     {{compose}} --profile app ps
+    {{root}}/scripts/healthwait.sh
+
+# Wait for the running stack to be healthy, printing the §6.4 recovery steps: just healthwait [timeout]
+healthwait timeout="180":
+    {{root}}/scripts/healthwait.sh {{timeout}}
 
 # Stop everything (keeps volumes)
 app-down:
@@ -59,6 +65,36 @@ app-scale-workers n:
 # Run the trainer CLI in a container: just trainer pretrain --help
 trainer *args:
     {{compose}} --profile tools run --rm trainer {{args}}
+
+# ── observability (spec 60 §6.5, D-056) ────────────────────────────────
+
+# Every service's /metrics is scraped by VictoriaMetrics (docker/vm-scrape.yaml); shows the `up` series
+metrics-up:
+    curl -fsS 'http://127.0.0.1:8428/api/v1/query?query=up' | sed 's/},{/},\n{/g'
+
+# Dump one service's /metrics from the host: just metrics risk-engine  (ports: docker/README.md)
+metrics service="control-api":
+    #!/usr/bin/env sh
+    set -eu
+    case "{{service}}" in
+        control-api) p=9101 ;; model-runtime) p=9102 ;; strategy-runtime) p=9103 ;; risk-engine) p=9104 ;;
+        ingestor) p=9105 ;; broker-gateway) p=9106 ;; evo-orchestrator) p=9107 ;; evo-worker) p=9110 ;;
+        *) echo "unknown service {{service}}" >&2; exit 2 ;;
+    esac
+    curl -fsS "http://127.0.0.1:$p/metrics"
+
+# ── backups (spec 60 §6.6, spec 20 §6.6, D-056) ─────────────────────────
+
+# Postgres dump + HelixDB volume tar (helix paused for seconds) + Garage critical buckets → backups/<timestamp>/
+# backup.schedule: `0 3 * * * cd <repo> && scripts/backup.sh >> backups/backup.log 2>&1` in crontab (no cron container)
+backup *args:
+    {{root}}/scripts/backup.sh {{args}}
+
+# Restore a backup directory in the §6.4 order (asks for confirmation; `--yes` skips it):
+#   just restore backups/<ts>                       # overwrite live Postgres/Helix/Garage
+#   just restore backups/<ts> --postgres-db fa_restore_test   # drill: Postgres only, into a scratch database
+restore dir *args:
+    {{root}}/scripts/restore.sh {{dir}} {{args}}
 
 # ── contracts ───────────────────────────────────────────────────────────
 

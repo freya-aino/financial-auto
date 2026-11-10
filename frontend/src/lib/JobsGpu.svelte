@@ -4,6 +4,8 @@
 	import { onMount } from 'svelte';
 	import Empty from './Empty.svelte';
 	import { ago, api, live, poll, short, type GpuStatus, type JobView } from './api';
+	import { runtime } from './runtime.svelte';
+	import { evolutionWs, onBus } from './ws.svelte';
 
 	let jobs = $state<JobView[]>([]);
 	let gpu = $state<GpuStatus | null>(null);
@@ -15,6 +17,9 @@
 	const active = $derived(jobs.filter((j) => j.status === 'queued' || j.status === 'running'));
 	const running = $derived(active.filter((j) => j.status === 'running'));
 	const preempted = $derived(jobs.filter((j) => j.status === 'preempted').length);
+	const queued = $derived(active.filter((j) => j.status === 'queued'));
+	/** Recent non-evolution jobs (e.g. `ingest.backfill` from the Sources backfill dialog, D-054). */
+	const recentOps = $derived(jobs.filter((j) => !j.kind.startsWith('evo.') && j.status !== 'running').slice(0, 8));
 	const byClass = $derived.by(() => {
 		const rows = classes.map((c) => ({ name: c, queued: 0, running: 0 }));
 		const other = { name: 'other', queued: 0, running: 0 };
@@ -48,7 +53,21 @@
 		}
 	}
 
-	onMount(() => poll(refresh, 2000));
+	// Live job frames arrive on /ws/evolution (`job.<id>`); REST stays the fallback.
+	const jobTopic = evolutionWs.topic('job.>');
+	$effect(() => {
+		if (jobTopic.count) void refresh();
+	});
+
+	onMount(() => {
+		const stopPoll = poll(refresh, () => (evolutionWs.live ? runtime.pollMs * 10 : runtime.pollMs));
+		const stopBus = onBus('jobs.>', refresh, 300);
+		return () => {
+			stopPoll();
+			stopBus();
+			jobTopic.close();
+		};
+	});
 </script>
 
 <section class="panel">
@@ -107,6 +126,41 @@
 	{:else}
 		<Empty producer="jobs.* (evo-orchestrator / trainer)" />
 	{/if}
+	{#if queued.length}
+		<h3 class="sub">Queued ({queued.length})</h3>
+		<table>
+			<thead><tr><th>job</th><th>kind</th><th>priority</th><th>submitted</th><th></th></tr></thead>
+			<tbody>
+				{#each queued.slice(0, 8) as j (j.job_id)}
+					<tr title={j.message}>
+						<td class="mono">{short(j.job_id, 10)}</td>
+						<td class="mono dim">{j.kind}</td>
+						<td class="mono dim">{classes[j.priority] ?? j.priority}</td>
+						<td class="mono dim">{ago(j.submitted_at, now)} ago</td>
+						<td><button onclick={() => cancel(j)}>cancel</button></td>
+					</tr>
+				{/each}
+			</tbody>
+		</table>
+	{/if}
+	{#if recentOps.length}
+		<h3 class="sub">Recent ops jobs <span class="dim">(ingest.backfill …)</span></h3>
+		<table>
+			<thead><tr><th>job</th><th>kind</th><th>status</th><th>progress</th><th>message</th><th>updated</th></tr></thead>
+			<tbody>
+				{#each recentOps as j (j.job_id)}
+					<tr title={j.error || j.message}>
+						<td class="mono">{short(j.job_id, 10)}</td>
+						<td class="mono dim">{j.kind}</td>
+						<td><span class="badge" class:ok={j.status === 'ok'} class:danger={j.status === 'failed' || j.status === 'budget_exceeded'} class:warn={j.status === 'queued' || j.status === 'preempted'}>{j.status}</span></td>
+						<td><div class="progress"><div style="width: {100 * j.progress}%"></div></div></td>
+						<td class="dim msg">{j.error || j.message}</td>
+						<td class="mono dim">{ago(j.updated_at, now)}</td>
+					</tr>
+				{/each}
+			</tbody>
+		</table>
+	{/if}
 	{#if cancelMsg}<p class="badge warn">{cancelMsg}</p>{/if}
 	<p class="dim small">Full job history and Pareto views: <a href="/evolution/">Evolution Lab</a>.</p>
 </section>
@@ -149,5 +203,11 @@
 	.small {
 		font-size: 11px;
 		margin: 10px 0 0;
+	}
+	.msg {
+		max-width: 220px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 </style>

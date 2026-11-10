@@ -1,20 +1,26 @@
 //! `evo.eval.strategy` (spec 35 §6.1–6.2, spec 41 §4): replay one GP strategy genome through
 //! `fa_backtest::replay` over VictoriaMetrics bars at the strategy's timescale, net of the
-//! shared cost model, and report the objective set. **Evaluation only**: nothing is published
-//! on `signal.*`; the live `strategy-runtime` keeps its own population.
+//! shared cost model, with the **recorded latent graph and decoder outputs** of the window
+//! ([`crate::recorded`], D-053 feeds replayed point-in-time), and report the objective set.
+//! **Evaluation only**: nothing is published on `signal.*`; the live `strategy-runtime` keeps
+//! its own population.
 //!
 //! `Job.spec` is the genome text (`fa_strategies::genome::StrategyGenome` inline TOML) or the
 //! envelope `{"genome": "<text>", "data_window": {...}, "generation": n, "rung": r,
-//! "purpose": "selection" | "promotion" | "diagnostic"}`; without a spec, `Job.genome_id`.
+//! "purpose": "selection" | "diagnostic"}`; without a spec, `Job.genome_id`. A `promotion`
+//! purpose is **refused** here: promotion replays run only as `evo.eval.strategy.holdout`
+//! ([`crate::holdout`]) inside a locked holdout.
 //!
 //! Result payload (protocol `evo.eval.strategy/v0`):
 //! ```json
 //! {"protocol":"evo.eval.strategy/v0","score":<deflated_sharpe>,
-//!  "objectives":{"deflated_sharpe","sharpe","max_drawdown","turnover","cost_sensitivity","compute_cost","calibration","cost_share","psr","n_trades","n_obs"},
+//!  "objectives":{"deflated_sharpe","sharpe","max_drawdown","turnover","cost_sensitivity","compute_cost","calibration","cost_share","psr","n_trades","n_obs","sources.graph","sources.decoder","sources.fallback"},
 //!  "directions":{"deflated_sharpe":"max","sharpe":"max","max_drawdown":"min","turnover":"min","cost_sensitivity":"min","compute_cost":"min"},
 //!  "genome":{"text":"{ id = … }","id":"gp-…","timescale":"1s","steps":5,"lookback_bars":32,"signal":"…","uncertainty":"…"},
 //!  "replay":{"purpose":"selection","window_start_ms":…,"window_end_ms":…,"cost_model":"costs.yaml","capital":…,"n_trials":…,"trial_sharpe_var":…,
-//!            "instruments":[…],"n_steps":…,"n_obs":…,"n_trades":…,"gross_pnl":…,"total_cost":…,"net_pnl":…,"stop":"complete"},
+//!            "instruments":[…],"n_steps":…,"n_obs":…,"n_trades":…,"gross_pnl":…,"total_cost":…,"net_pnl":…,"stop":"complete",
+//!            "snapshot":"stat-v1-1s","sources":{"graph":…,"decoder":…,"fallback":…},"latents":{"available":true,"fed":{…},"snapshot":{…}}},
+//!  "latents":{"source":"jetstream LATENT …","cached":false,"summary":{…},"cache":{…}},
 //!  "data":{"source":"victoriametrics",…},"generation_stats":{…}|null,"helix":{…},
 //!  "budget":{…},"report_ref":{"planned":"fa-artifacts/evals/<generation>/<job>.json","persisted":true}}
 //! ```
@@ -32,7 +38,9 @@ use fa_backtest::{
     ReplayError,
     cost::CostModel,
     eval::Stop,
-    replay::{self, DIRECTIONS, EvalReport, Evaluator, PipelineReplay, ReplayControls, ReplayPurpose, ReplaySpec},
+    replay::{
+        self, DIRECTIONS, EvalReport, Evaluator, Holdout, PipelineReplay, ReplayControls, ReplayPurpose, ReplaySpec,
+    },
 };
 use fa_hub::queries::{NewFitness, NewGenome};
 use fa_proto::v1::{Job, JobResult, job_result::Status};
@@ -41,14 +49,15 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use crate::{
-    data::{self, DataWindow},
+    data::{self, DataWindow, LoadedBars},
     job::{Outcome, Worker},
+    recorded::LoadedLatents,
     trials::{self, TrialRow},
 };
 
 pub const KIND: &str = "evo.eval.strategy";
 pub const PROTOCOL: &str = "evo.eval.strategy/v0";
-const DEFAULT_BUDGET_MS: u64 = 60_000;
+pub(crate) const DEFAULT_BUDGET_MS: u64 = 60_000;
 /// Strategy capital per replay (EUR): large enough that the commission floor does not dominate.
 pub const CAPITAL: f64 = 100_000.0;
 
@@ -92,19 +101,176 @@ pub fn parse_spec(job: &Job) -> StrategyJobSpec {
     out
 }
 
+/// Why an `evo.eval.strategy` job may not run with `purpose = promotion` (spec 41 §6.4, D-059).
+pub const PROMOTION_REFUSED: &str =
+    "promotion replays run only as `evo.eval.strategy.holdout` jobs inside a locked holdout (spec 41 §6.4)";
+
+/// Admission of an `evo.eval.strategy` job: only `selection` and `diagnostic` purposes.
+pub fn admit(spec: &StrategyJobSpec) -> Result<(), &'static str> {
+    if spec.purpose == ReplayPurpose::Promotion { Err(PROMOTION_REFUSED) } else { Ok(()) }
+}
+
 pub fn directions_json() -> Value {
     Value::Object(DIRECTIONS.iter().map(|(k, d)| ((*k).to_owned(), json!(d))).collect())
 }
 
+/// Objective map of a report as JSON.
+pub fn objectives_json(report: &EvalReport) -> serde_json::Map<String, Value> {
+    report.objectives().into_iter().map(|(k, v)| (k.to_owned(), json!(v))).collect()
+}
+
+/// `JobResult` carrying the typed objectives of a report.
+pub fn ok_result(worker_id: &str, job: &Job, payload: &Value, report: &EvalReport, elapsed_ms: u64) -> JobResult {
+    JobResult {
+        job_id: job.job_id.clone(),
+        status: Status::Ok as i32,
+        result: serde_json::to_vec(payload).unwrap_or_default(),
+        used_gpu_ms: elapsed_ms,
+        worker_id: worker_id.to_owned(),
+        objectives: report.objectives().into_iter().map(|(k, v)| (k.to_owned(), v)).collect(),
+        directions: DIRECTIONS.iter().map(|(k, d)| ((*k).to_owned(), (*d).to_owned())).collect(),
+        ..Default::default()
+    }
+}
+
+/// The `replay` block of a result payload.
+pub fn replay_json(rspec: &ReplaySpec, report: &EvalReport, n_holdouts: usize, registry: bool) -> Value {
+    json!({
+        "purpose": rspec.purpose, "window_start_ms": rspec.window_ms.0, "window_end_ms": rspec.window_ms.1,
+        "cost_model": report.cost_model, "capital": report.capital, "n_trials": rspec.n_trials,
+        "trial_sharpe_var": rspec.trial_sharpe_var, "instruments": report.instruments,
+        "n_steps": report.n_steps, "n_obs": report.n_obs, "n_trades": report.n_trades,
+        "gross_pnl": report.gross_pnl, "total_cost": report.total_cost, "net_pnl": report.net_pnl,
+        "final_equity": report.final_equity, "first_ts_ms": report.first_ts_ms, "last_ts_ms": report.last_ts_ms,
+        "stop": report.stop, "holdouts": n_holdouts, "registry": registry,
+        "snapshot": report.latents.snapshot.declared, "sources": report.sources, "latents": report.latents,
+    })
+}
+
+/// The `data` block of a result payload.
+pub fn data_json(loaded: &LoadedBars) -> Value {
+    json!({
+        "source": loaded.source.source, "timescale": loaded.source.timescale, "step_ms": loaded.source.step_ms,
+        "window_start_ms": loaded.source.window_start_ms, "window_end_ms": loaded.source.window_end_ms,
+        "vm_url": loaded.source.vm_url, "vm_series": loaded.source.vm_series, "vm_error": loaded.source.vm_error,
+        "bars": loaded.n_bars,
+    })
+}
+
+/// A finished replay.
+pub struct Replayed {
+    pub report: EvalReport,
+    pub latents: LoadedLatents,
+    pub elapsed_ms: u64,
+    pub budget_ms: u64,
+    pub truncated: bool,
+}
+
 impl Worker {
+    /// Loads the recorded latents for `rspec` and runs the replay within the job budget
+    /// (blocking task, cancellable, progress every 500 ms). `Err` is the failure `Outcome` (boxed).
+    pub(crate) async fn replay_within_budget(
+        &self,
+        job: &Job,
+        def: &fa_strategies::population::StrategyDef,
+        rspec: &ReplaySpec,
+        bars: Vec<replay::BarSeries>,
+        holdouts: Vec<Holdout>,
+        started: Instant,
+    ) -> Result<Replayed, Box<Outcome>> {
+        let budget_ms = if job.budget_gpu_ms == 0 { DEFAULT_BUDGET_MS } else { job.budget_gpu_ms };
+        let budget = Duration::from_millis(budget_ms);
+        let latents = self.recorded.load(&self.bus.jetstream(), rspec).await;
+        self.progress(
+            &job.job_id,
+            0.0,
+            match &latents.latents {
+                Some(r) => format!(
+                    "recorded latents: {} messages ({})",
+                    r.len(),
+                    if latents.cached { "cached" } else { "read" }
+                ),
+                None => format!("no recorded latents ({})", latents.error.as_deref().unwrap_or("none")),
+            },
+        )
+        .await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (ptx, mut prx) = watch::channel((0usize, 0usize));
+        let eval_started = Instant::now();
+        let cost: Arc<CostModel> = self.cost.clone();
+        let rec = latents.latents.clone();
+        let task = {
+            let cancel = cancel.clone();
+            let def = def.clone();
+            let rspec = rspec.clone();
+            tokio::task::spawn_blocking(move || {
+                let controls = ReplayControls {
+                    max_steps: None,
+                    should_stop: Some(Box::new(move |_| {
+                        cancel.load(Ordering::Relaxed) || eval_started.elapsed() > budget
+                    })),
+                    on_progress: Some(Box::new(move |done, total| {
+                        let _ = ptx.send((done, total));
+                    })),
+                    progress_every: 32,
+                };
+                PipelineReplay { data: &bars, cost: &cost, holdouts: &holdouts, controls, latents: rec.as_deref() }
+                    .evaluate(&rspec, &def)
+            })
+        };
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        tick.tick().await;
+        let mut task = task;
+        let result = loop {
+            tokio::select! {
+                r = &mut task => break r,
+                _ = tick.tick() => {
+                    let (done, total) = *prx.borrow_and_update();
+                    let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                    self.progress(&job.job_id, frac.min(0.99), format!("step {done}/{total}")).await;
+                }
+            }
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let report: EvalReport = match result {
+            Ok(Ok(r)) => r,
+            Ok(Err(ReplayError::NoData)) => {
+                return Err(Box::new(self.failed(job, "no bars in the replay window".into(), elapsed_ms)));
+            }
+            Ok(Err(e @ (ReplayError::HoldoutIntersect { .. } | ReplayError::SnapshotMismatch { .. }))) => {
+                tracing::warn!(job = %job.job_id, error = %e, "replay rejected");
+                return Err(Box::new(self.failed(job, format!("rejected: {e}"), elapsed_ms)));
+            }
+            Ok(Err(e)) => return Err(Box::new(self.failed(job, format!("replay: {e}"), elapsed_ms))),
+            Err(e) => return Err(Box::new(self.failed(job, format!("replay task failed: {e}"), elapsed_ms))),
+        };
+        if report.n_steps == 0 {
+            let status = if eval_started.elapsed() > budget { Status::BudgetExceeded } else { Status::Failed };
+            return Err(Box::new(Outcome {
+                result: JobResult {
+                    job_id: job.job_id.clone(),
+                    status: status as i32,
+                    error: format!("no decision step completed within the {budget_ms} ms budget"),
+                    used_gpu_ms: elapsed_ms,
+                    worker_id: self.worker_id.clone(),
+                    ..Default::default()
+                },
+                outputs: Vec::new(),
+            }));
+        }
+        let truncated = report.stop == Stop::Interrupted;
+        Ok(Replayed { report, latents, elapsed_ms, budget_ms, truncated })
+    }
+
     /// `evo.eval.strategy`.
     pub async fn evaluate_strategy(&self, job: &Job) -> Outcome {
         let started = Instant::now();
-        let budget_ms = if job.budget_gpu_ms == 0 { DEFAULT_BUDGET_MS } else { job.budget_gpu_ms };
-        let budget = Duration::from_millis(budget_ms);
 
         // 1. genome + envelope
         let spec = parse_spec(job);
+        if let Err(e) = admit(&spec) {
+            return self.failed(job, format!("rejected: {e}"), 0);
+        }
         let genome = match StrategyGenome::parse(&spec.genome_text) {
             Ok(g) => g,
             Err(e) => return self.failed(job, format!("strategy genome: {e}"), 0),
@@ -170,71 +336,17 @@ impl Worker {
             return self.failed(job, format!("rejected: {e}"), started.elapsed().as_millis() as u64);
         }
 
-        // 4. replay within budget (blocking, cancellable)
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (ptx, mut prx) = watch::channel((0usize, 0usize));
-        let eval_started = Instant::now();
-        let bars = loaded.bars;
-        let cost: Arc<CostModel> = self.cost.clone();
+        // 4. recorded latents + replay within budget
         let n_holdouts = holdouts.len();
-        let task = {
-            let cancel = cancel.clone();
-            let def = def.clone();
-            let rspec = rspec.clone();
-            tokio::task::spawn_blocking(move || {
-                let controls = ReplayControls {
-                    max_steps: None,
-                    should_stop: Some(Box::new(move |_| {
-                        cancel.load(Ordering::Relaxed) || eval_started.elapsed() > budget
-                    })),
-                    on_progress: Some(Box::new(move |done, total| {
-                        let _ = ptx.send((done, total));
-                    })),
-                    progress_every: 32,
-                };
-                PipelineReplay { data: &bars, cost: &cost, holdouts: &holdouts, controls }.evaluate(&rspec, &def)
-            })
+        let data_block = data_json(&loaded);
+        let run = match self.replay_within_budget(job, &def, &rspec, loaded.bars, holdouts, started).await {
+            Ok(r) => r,
+            Err(outcome) => return *outcome,
         };
-        let mut tick = tokio::time::interval(Duration::from_millis(500));
-        tick.tick().await;
-        let mut task = task;
-        let result = loop {
-            tokio::select! {
-                r = &mut task => break r,
-                _ = tick.tick() => {
-                    let (done, total) = *prx.borrow_and_update();
-                    let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                    self.progress(&job.job_id, frac.min(0.99), format!("step {done}/{total}")).await;
-                }
-            }
-        };
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let report: EvalReport = match result {
-            Ok(Ok(r)) => r,
-            Ok(Err(ReplayError::HoldoutIntersect { .. })) | Ok(Err(ReplayError::NoData)) => {
-                return self.failed(job, "no bars in the replay window".into(), elapsed_ms);
-            }
-            Ok(Err(e)) => return self.failed(job, format!("replay: {e}"), elapsed_ms),
-            Err(e) => return self.failed(job, format!("replay task failed: {e}"), elapsed_ms),
-        };
-        if report.n_steps == 0 {
-            let status = if eval_started.elapsed() > budget { Status::BudgetExceeded } else { Status::Failed };
-            return Outcome {
-                result: JobResult {
-                    job_id: job.job_id.clone(),
-                    status: status as i32,
-                    error: format!("no decision step completed within the {budget_ms} ms budget"),
-                    used_gpu_ms: elapsed_ms,
-                    worker_id: self.worker_id.clone(),
-                    ..Default::default()
-                },
-                outputs: Vec::new(),
-            };
-        }
+        let report = &run.report;
 
         // 5. registry + stats, Helix, Garage, result
-        let objectives: serde_json::Map<String, Value> =
-            report.objectives().into_iter().map(|(k, v)| (k.to_owned(), json!(v))).collect();
+        let objectives = objectives_json(report);
         let generation_stats = trials::register(
             self.trials.as_ref(),
             &TrialRow {
@@ -250,6 +362,7 @@ impl Worker {
                 n_obs: report.n_obs,
                 objectives: Value::Object(objectives.clone()),
                 returns: report.returns.clone(),
+                holdout_id: None,
             },
         )
         .await;
@@ -263,7 +376,6 @@ impl Worker {
             Err(_) => json!({"persisted": false, "reason": "helix timeout"}),
         };
         let report_key = fa_blob::eval_report(&job.parent_job_id, &job.job_id);
-        let truncated = report.stop == Stop::Interrupted;
         let mut payload = json!({
             "protocol": PROTOCOL,
             "score": report.score(),
@@ -272,20 +384,12 @@ impl Worker {
             "genome": {"text": genome.to_string(), "id": def.id, "timescale": def.timescale, "steps": def.steps,
                        "lookback_bars": def.lookback_bars, "signal": def.signal, "uncertainty": def.uncertainty,
                        "nodes": genome.size()},
-            "replay": {"purpose": rspec.purpose, "window_start_ms": rspec.window_ms.0, "window_end_ms": rspec.window_ms.1,
-                       "cost_model": report.cost_model, "capital": report.capital, "n_trials": rspec.n_trials,
-                       "trial_sharpe_var": rspec.trial_sharpe_var, "instruments": report.instruments,
-                       "n_steps": report.n_steps, "n_obs": report.n_obs, "n_trades": report.n_trades,
-                       "gross_pnl": report.gross_pnl, "total_cost": report.total_cost, "net_pnl": report.net_pnl,
-                       "final_equity": report.final_equity, "first_ts_ms": report.first_ts_ms, "last_ts_ms": report.last_ts_ms,
-                       "stop": report.stop, "holdouts": n_holdouts, "registry": self.trials.is_some()},
-            "data": {"source": loaded.source.source, "timescale": loaded.source.timescale, "step_ms": loaded.source.step_ms,
-                     "window_start_ms": loaded.source.window_start_ms, "window_end_ms": loaded.source.window_end_ms,
-                     "vm_url": loaded.source.vm_url, "vm_series": loaded.source.vm_series, "vm_error": loaded.source.vm_error,
-                     "bars": loaded.n_bars},
+            "replay": replay_json(&rspec, report, n_holdouts, self.trials.is_some()),
+            "latents": self.recorded.json(&run.latents),
+            "data": data_block,
             "generation_stats": generation_stats,
             "helix": helix,
-            "budget": {"budget_ms": budget_ms, "elapsed_ms": elapsed_ms, "truncated": truncated},
+            "budget": {"budget_ms": run.budget_ms, "elapsed_ms": run.elapsed_ms, "truncated": run.truncated},
             "stop": report.stop,
             "report_ref": {"planned": format!("{}/{}", report_key.bucket, report_key.key), "persisted": self.blob.is_some()},
             "worker_id": self.worker_id,
@@ -299,20 +403,8 @@ impl Worker {
             payload["report_ref"]["persisted"] = json!(false);
         }
         tracing::info!(job = %job.job_id, strategy = %def.id, sharpe = report.sharpe, dsr = report.deflated_sharpe,
-            trades = report.n_trades, steps = report.n_steps, "strategy evaluated");
-        Outcome {
-            result: JobResult {
-                job_id: job.job_id.clone(),
-                status: Status::Ok as i32,
-                result: serde_json::to_vec(&payload).unwrap_or_default(),
-                used_gpu_ms: elapsed_ms,
-                worker_id: self.worker_id.clone(),
-                objectives: report.objectives().into_iter().map(|(k, v)| (k.to_owned(), v)).collect(),
-                directions: DIRECTIONS.iter().map(|(k, d)| ((*k).to_owned(), (*d).to_owned())).collect(),
-                ..Default::default()
-            },
-            outputs: Vec::new(),
-        }
+            trades = report.n_trades, steps = report.n_steps, sources = ?report.sources, "strategy evaluated");
+        Outcome { result: ok_result(&self.worker_id, job, &payload, report, run.elapsed_ms), outputs: Vec::new() }
     }
 }
 
@@ -366,5 +458,33 @@ mod tests {
         assert_eq!(parse_spec(&job("")).genome_text, "fallback");
         assert_eq!(directions_json()["deflated_sharpe"], "max");
         assert_eq!(parse_spec(&job(r#"{"data_window": {"hours": 1}}"#)).genome_text, "fallback");
+    }
+
+    #[test]
+    fn promotion_purpose_is_refused_outside_the_holdout_job() {
+        let text = r#"{ id = "gp-1", timescale = "1s", signal = "1" }"#;
+        let job = |spec: String| Job { spec: spec.into_bytes(), ..Default::default() };
+        let env = format!(r#"{{"genome": {}, "purpose": "promotion"}}"#, serde_json::to_string(text).unwrap());
+        let refused = admit(&parse_spec(&job(env))).unwrap_err();
+        assert!(refused.contains("evo.eval.strategy.holdout"), "{refused}");
+        assert!(admit(&parse_spec(&job(text.to_owned()))).is_ok());
+        let diag = format!(r#"{{"genome": {}, "purpose": "diagnostic"}}"#, serde_json::to_string(text).unwrap());
+        assert!(admit(&parse_spec(&job(diag))).is_ok());
+    }
+
+    /// `FA_NATS_TEST=1`: the worker refuses the job before touching any data.
+    #[tokio::test]
+    async fn worker_refuses_promotion_purpose() {
+        if std::env::var("FA_NATS_TEST").is_err() {
+            return;
+        }
+        let worker = crate::holdout::tests::offline_worker().await;
+        let text = r#"{ id = "gp-1", timescale = "1s", signal = "1" }"#;
+        let env = format!(r#"{{"genome": {}, "purpose": "promotion"}}"#, serde_json::to_string(text).unwrap());
+        let job = Job { job_id: "j1".into(), kind: KIND.into(), spec: env.into_bytes(), ..Default::default() };
+        let out = worker.evaluate_strategy(&job).await;
+        assert_eq!(out.result.status, Status::Failed as i32);
+        assert!(out.result.error.contains("evo.eval.strategy.holdout"), "{}", out.result.error);
+        eprintln!("promotion purpose → {}", out.result.error);
     }
 }

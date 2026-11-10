@@ -59,6 +59,10 @@ pub struct SnapshotDesc {
     pub timescale: Timescale,
     pub n_experts: u32,
     pub dim: u32,
+    /// Spec 36 lineage fields (`ensure_snapshot` is get-or-create, so an existing row keeps its own).
+    pub generation: u32,
+    pub garage_key: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -335,9 +339,9 @@ impl Drain {
             snapshot_id: d.snapshot_id.clone(),
             timescale: d.timescale.to_string(),
             encoder_family: "statistical".into(),
-            generation: 1,
-            garage_key: String::new(),
-            status: "active".into(),
+            generation: d.generation,
+            garage_key: d.garage_key.clone(),
+            status: d.status.clone(),
         };
         let snap = match self.hub.ensure_snapshot(&snap).await {
             Ok(s) => s,

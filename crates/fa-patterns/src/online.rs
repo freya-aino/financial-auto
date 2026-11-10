@@ -117,6 +117,38 @@ impl OnlineRegionSet {
         }
     }
 
+    /// A set pre-populated with the regions of a trained snapshot (`region_map.json`,
+    /// [`crate::FittedRegion`]): ids, lineages and centroids are taken as given, so live
+    /// memberships continue the snapshot's lineages (D-007). `mass` seeds the centroid's inertia
+    /// (at least one point). New regions born later continue the ordinal sequence.
+    pub fn seeded(
+        cfg: OnlineRegionCfg,
+        snapshot_id: impl Into<String>,
+        expert_index: u32,
+        id_prefix: impl Into<String>,
+        seeds: &[crate::FittedRegion],
+    ) -> Self {
+        let mut set = Self::new(cfg, snapshot_id, expert_index, id_prefix);
+        for s in seeds {
+            let region = Region {
+                id: s.region_id.clone(),
+                lineage_id: s.lineage_id.clone(),
+                snapshot_id: set.snapshot_id.clone(),
+                expert_index,
+                centroid: s.centroid.clone(),
+                radius: cfg.radius,
+                method: DiscoveryMethod::Leader,
+            };
+            set.slots.push(Slot { region, mass: s.mass.max(1.0), alive: true });
+            // ids are `<prefix>-r<nnn>`: keep the next ordinal above every seeded one
+            if let Some(n) = s.region_id.rsplit("-r").next().and_then(|n| n.parse::<u32>().ok()) {
+                set.next_ordinal = set.next_ordinal.max(n + 1);
+            }
+        }
+        set.next_ordinal = set.next_ordinal.max(seeds.len() as u32);
+        set
+    }
+
     pub fn cfg(&self) -> &OnlineRegionCfg {
         &self.cfg
     }
@@ -324,6 +356,42 @@ mod tests {
         assert_eq!(set.live_count(), 1);
         assert_eq!(set.regions()[0].expert_index, 2);
         assert_eq!(set.regions()[0].snapshot_id, "snap");
+    }
+
+    #[test]
+    fn seeded_set_keeps_ids_and_lineages_and_continues_ordinals() {
+        let seeds = vec![
+            crate::FittedRegion {
+                region_id: "snap-e0-r000".into(),
+                lineage_id: "1m-e0-r004".into(),
+                expert_index: 0,
+                centroid: vec![0.0, 0.0],
+                radius: 1.0,
+                mass: 0.6,
+                parent_region_id: Some("1m-e0-r004".into()),
+                score: 0.8,
+            },
+            crate::FittedRegion {
+                region_id: "snap-e0-r001".into(),
+                lineage_id: "snap-e0-r001".into(),
+                expert_index: 0,
+                centroid: vec![5.0, 0.0],
+                radius: 1.0,
+                mass: 0.4,
+                parent_region_id: None,
+                score: 0.0,
+            },
+        ];
+        let cfg = OnlineRegionCfg { radius: 1.0, merge_radius: 0.3, max_regions: 8, ..Default::default() };
+        let mut set = OnlineRegionSet::seeded(cfg, "snap", 0, "snap-e0", &seeds);
+        assert_eq!(set.live_count(), 2);
+        let a = set.observe(&[0.2, 0.0]);
+        assert_eq!(a.region_id, "snap-e0-r000");
+        assert_eq!(a.lineage_id, "1m-e0-r004", "inherited lineage");
+        assert!(a.events.is_empty());
+        let b = set.observe(&[10.0, 0.0]);
+        assert_eq!(b.region_id, "snap-e0-r002", "new regions continue after the seeds");
+        assert_eq!(b.lineage_id, "snap-e0-r002");
     }
 
     #[test]

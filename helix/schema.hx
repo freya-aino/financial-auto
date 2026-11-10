@@ -76,6 +76,14 @@ E::HasSpace {
     Properties: {}
 }
 
+E::SnapshotParent {
+    From: Snapshot, // parent
+    To: Snapshot,   // child (spec 36 lineage; written by the trainer)
+    Properties: {
+        op: String, // pretrain | generation | adapter
+    }
+}
+
 // ── Latent regions and the Markov state graph (specs 30, 33) ────────────
 N::LatentRegion {
     UNIQUE INDEX region_id: String,

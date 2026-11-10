@@ -55,10 +55,13 @@ services:
       - "-storageDataPath=/storage"
       - "-retentionPeriod=100y" # per-timescale retention is enforced by our writers (spec 20)
       - "-httpListenAddr=:8428"
+      - "-promscrape.config=/etc/vm-scrape.yaml" # scrapes every service's /metrics (spec 60 §4, D-056)
+      - "-promscrape.config.strictParse=false"
     ports:
       - "127.0.0.1:8428:8428"
     volumes:
       - vm-data:/storage
+      - ./docker/vm-scrape.yaml:/etc/vm-scrape.yaml:ro
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8428/health"]
       interval: 5s
@@ -92,11 +95,13 @@ services:
       FA_CONFIG: /app/config/platform.docker.toml
       FA_SOURCES: /app/config/sources.yaml
       FA_SECRETS: /app/config/secrets.toml
+      FA_METRICS_BIND: 0.0.0.0:9100 # GET /metrics, scraped by victoriametrics; host ports 91xx below (D-056)
       RUST_LOG: info
     volumes: &secrets-volume
       - ./config/secrets.toml:/app/config/secrets.toml:ro # git-ignored; create with docker/garage-init.sh (D-045)
     ports:
       - "127.0.0.1:7700:7700"
+      - "127.0.0.1:9101:9100" # metrics
     depends_on: &core-deps
       nats:
         condition: service_healthy
@@ -136,6 +141,8 @@ services:
     command: ["model-runtime"]
     environment: *rust-env
     volumes: *secrets-volume
+    ports:
+      - "127.0.0.1:9102:9100" # metrics
     depends_on: *core-deps
     restart: unless-stopped
     # deploy:
@@ -152,6 +159,8 @@ services:
     command: ["strategy-runtime"]
     environment: *rust-env # FA_STRATEGIES=<file> for a non-baseline population
     volumes: *secrets-volume
+    ports:
+      - "127.0.0.1:9103:9100" # metrics
     depends_on: *core-deps
     restart: unless-stopped
 
@@ -165,6 +174,8 @@ services:
     volumes:
       - ./bins/risk-engine/risk.toml:/app/risk.toml:ro # limits editable without a rebuild (D-041)
       - ./config/secrets.toml:/app/config/secrets.toml:ro
+    ports:
+      - "127.0.0.1:9104:9100" # metrics
     depends_on: *core-deps
     restart: unless-stopped
 
@@ -174,6 +185,8 @@ services:
     command: ["evo-worker"]
     environment: *rust-env
     volumes: *secrets-volume
+    ports:
+      - "127.0.0.1:9110-9119:9100" # metrics; a range so up to 10 replicas can publish (scrape uses DNS inside compose)
     depends_on: *core-deps
     restart: unless-stopped
     # Scale with: docker compose --profile app up -d --scale evo-worker=N
@@ -198,6 +211,9 @@ services:
     volumes: *secrets-volume
     environment:
       FA_SECRETS: /app/config/secrets.toml
+      FA_METRICS_BIND: 0.0.0.0:9100
+    ports:
+      - "127.0.0.1:9105:9100" # metrics
     depends_on:
       victoriametrics:
         condition: service_healthy
@@ -215,6 +231,9 @@ services:
     volumes: *secrets-volume
     environment:
       FA_SECRETS: /app/config/secrets.toml
+      FA_METRICS_BIND: 0.0.0.0:9100
+    ports:
+      - "127.0.0.1:9106:9100" # metrics
     depends_on:
       nats:
         condition: service_healthy
@@ -229,7 +248,10 @@ services:
       FA_GPU_MEM_MB: "24000" # reported as gpu.capacity_mb (D-031); set to the real card
       FA_SECRETS: /app/config/secrets.toml
       FA_GARAGE_URL: http://garage:3900 # strategy promotion artifacts (D-052)
+      FA_METRICS_BIND: 0.0.0.0:9100
     volumes: *secrets-volume
+    ports:
+      - "127.0.0.1:9107:9100" # metrics
     depends_on:
       nats:
         condition: service_healthy
@@ -242,7 +264,9 @@ services:
     image: financial-auto/rust:dev
     build: *rust-build
     entrypoint: ["trainer"]
-    environment: *rust-env
+    environment:
+      <<: *rust-env
+      FA_METRICS_BIND: "off" # one-off CLI, nothing to scrape
     volumes: *secrets-volume
     depends_on: *core-deps
     # deploy:

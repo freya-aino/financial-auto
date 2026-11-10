@@ -31,6 +31,9 @@ pub mod edge {
     pub const LISTED_ON: &str = "ListedOn";
     pub const SAME_EXPOSURE: &str = "SameExposure";
     pub const HAS_SPACE: &str = "HasSpace";
+    /// Snapshot lineage (spec 36 §5): parent snapshot → child snapshot, `op` = the job kind that
+    /// produced the child (`pretrain | generation | adapter`).
+    pub const SNAPSHOT_PARENT: &str = "SnapshotParent";
     pub const IN_SPACE: &str = "InSpace";
     pub const TRANSITION: &str = "Transition";
     pub const HIER: &str = "Hier";

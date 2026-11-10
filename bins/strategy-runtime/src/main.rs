@@ -135,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    fa_bus::metrics::serve_from_env("strategy-runtime", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config).context("loading platform config")?;
     let file = match &args.strategies {
         Some(p) => {

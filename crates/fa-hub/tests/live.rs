@@ -458,3 +458,35 @@ async fn space_latents_read_back_vectors_newest_first() {
 
     cleanup(&c, &p).await;
 }
+
+#[tokio::test]
+async fn snapshot_lineage_and_status_lookup() {
+    let Some(c) = client() else { return };
+    c.ensure_schema_ready(WAIT).await.expect("schema");
+    let p = prefix();
+    let mk = |g: u32, status: &str| NewSnapshot {
+        snapshot_id: format!("{p}snap-g{g}"),
+        timescale: format!("{p}ts"),
+        encoder_family: "statistical".into(),
+        generation: g,
+        garage_key: format!("snapshots/{p}snap-g{g}/manifest.json"),
+        status: status.into(),
+    };
+    let parent = c.ensure_snapshot(&mk(0, "active")).await.expect("parent");
+    let child = c.ensure_snapshot(&mk(1, "candidate")).await.expect("child");
+    assert!(c.snapshot_parent(child.id).await.expect("no parent yet").is_none());
+    c.link_snapshot_parent(parent.id, child.id, "pretrain").await.expect("link");
+    let got = c.snapshot_parent(child.id).await.expect("parent lookup").expect("linked");
+    assert_eq!(got.id, parent.id);
+    let kids = c.snapshot_children(parent.id).await.expect("children");
+    assert_eq!(kids.len(), 1);
+    assert_eq!(kids[0].snapshot_id, child.snapshot_id);
+
+    let ts = format!("{p}ts");
+    let active = c.active_snapshot(&ts, "statistical").await.expect("active").expect("one active");
+    assert_eq!(active.id, parent.id);
+    let cands = c.snapshots_by_status(&ts, "statistical", "candidate").await.expect("candidates");
+    assert_eq!(cands.len(), 1);
+    assert!(c.active_snapshot(&ts, "fsq_hybrid").await.expect("other family").is_none());
+    cleanup(&c, &p).await;
+}

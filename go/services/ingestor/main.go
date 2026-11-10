@@ -75,6 +75,7 @@ func main() {
 	garageURL := flag.String("garage", env("FA_GARAGE_URL", ""), "Garage S3 endpoint for the raw archive, e.g. http://127.0.0.1:3900 (empty disables)")
 	secretsPath := flag.String("secrets", env("FA_SECRETS", "config/secrets.toml"), "secrets file (D-020); FA_<SOURCE>_<KEY> env vars override")
 	hbEvery := flag.Duration("heartbeat", 5*time.Second, "service heartbeat interval")
+	metricsBind := flag.String("metrics", bus.MetricsBindDefault(service), "Prometheus GET /metrics bind (FA_METRICS_BIND; off disables)")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("svc", service)
@@ -99,6 +100,7 @@ func main() {
 	counters := bus.NewCounters()
 	instance := ulid.Make().String()
 	go bus.RunHeartbeat(ctx, pub, service, instance, "0.1.0", *hbEvery, counters, func(err error) { log.Warn("heartbeat", "err", err) })
+	go bus.ServeMetrics(ctx, *metricsBind, service, "0.1.0", counters, log) // spec 60 §4 metrics endpoint (D-056)
 
 	var writer *tsdb.Writer
 	if *tsdbURL != "" {

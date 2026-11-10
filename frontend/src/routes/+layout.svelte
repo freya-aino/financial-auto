@@ -5,7 +5,8 @@
 	import { onMount } from 'svelte';
 	import KillSwitch from '../lib/KillSwitch.svelte';
 	import { api, eur, live, poll, type Health, type RiskView } from '../lib/api';
-	import { bus, onBus } from '../lib/ws.svelte';
+	import { runtime } from '../lib/runtime.svelte';
+	import { bus, onBus, sockets, tradingWs } from '../lib/ws.svelte';
 
 	let { children } = $props();
 
@@ -23,8 +24,31 @@
 
 	let now = $state(Date.now());
 	const figures = $derived(risk?.reported ?? risk?.paper ?? null);
-	const retryIn = $derived(bus.nextRetryAt === null ? null : Math.max(0, Math.ceil((bus.nextRetryAt - now) / 1000)));
 	const pnl = $derived(risk?.reported?.daily_pnl_eur ?? risk?.paper.pnl_eur ?? null);
+	/** Sockets that are wanted but not open (spec 51 §8 banner), with their reconnect countdown. */
+	const staleSockets = $derived(
+		Object.entries(sockets)
+			.filter(([, s]) => s.stale)
+			.map(([name, s]) => ({
+				name,
+				status: s.status,
+				attempt: s.attempt,
+				error: s.error,
+				retryIn: s.nextRetryAt === null ? null : Math.max(0, Math.ceil((s.nextRetryAt - now) / 1000)),
+				reconnect: () => s.reconnectNow()
+			}))
+	);
+	const anyStale = $derived(staleSockets.length > 0);
+	const lagged = $derived(bus.dropped + tradingWs.lagged + sockets.latent.lagged + sockets.evolution.lagged);
+
+	// The top-bar risk figures come from /ws/trading (`risk` topic) while it is open; REST is the fallback.
+	const riskTopic = tradingWs.topic<RiskView>('risk');
+	$effect(() => {
+		if (riskTopic.data) {
+			risk = riskTopic.data;
+			riskError = false;
+		}
+	});
 
 	async function pollHealth() {
 		try {
@@ -45,8 +69,9 @@
 	}
 
 	onMount(() => {
+		void runtime.load();
 		const stopHealth = poll(pollHealth, 5000);
-		const stopRisk = poll(pollRisk, 2000);
+		const stopRisk = poll(pollRisk, () => (tradingWs.live ? runtime.pollMs * 10 : runtime.pollMs));
 		const tick = setInterval(() => (now = Date.now()), 500);
 		const stopBus = onBus('risk.>', pollRisk);
 		return () => {
@@ -54,6 +79,7 @@
 			stopRisk();
 			stopBus();
 			clearInterval(tick);
+			riskTopic.close();
 		};
 	});
 </script>
@@ -91,27 +117,28 @@
 					<span class="dot" class:ok={up} class:warn={!up} title="{name}: {up ? 'reachable' : 'unreachable'}">{name}</span>
 				{/each}
 			{/if}
+			<span class="dot sock" class:ok={tradingWs.live} class:warn={!tradingWs.live} title="/ws/trading {tradingWs.status}{tradingWs.flushMs ? ` · flush ${tradingWs.flushMs} ms` : ''}{lagged ? ` · ${lagged} frames superseded/dropped across sockets` : ''}">ws</span>
 			<KillSwitch {risk} compact onchanged={pollRisk} />
 		</div>
 	</header>
-	{#if bus.stale || healthError || riskError}
+	{#if anyStale || healthError || riskError}
 		<div class="stale-banner" role="status">
 			{#if healthError || riskError}
 				<span class="badge danger">control-api unreachable</span>
-				<span>Figures are stale; polling continues every 2 s.</span>
+				<span>Figures are stale; polling continues every {(runtime.pollMs / 1000).toFixed(1)} s.</span>
 			{/if}
-			{#if bus.stale}
-				<span class="badge warn">bus {bus.status}</span>
+			{#each staleSockets as s (s.name)}
+				<span class="badge warn">/ws/{s.name} {s.status}</span>
 				<span>
-					Live updates paused, data may be stale.
-					{#if bus.status === 'connecting'}Connecting…{:else if retryIn !== null}Reconnecting in {retryIn}s (attempt {bus.attempt}).{/if}
-					{#if bus.error}<span class="dim">{bus.error}</span>{/if}
+					{#if s.status === 'connecting'}Connecting…{:else if s.retryIn !== null}Reconnecting in {s.retryIn}s (attempt {s.attempt}).{/if}
+					{#if s.error}<span class="dim">{s.error}</span>{/if}
 				</span>
-				<button type="button" onclick={() => bus.reconnectNow()}>Retry now</button>
-			{/if}
+				<button type="button" onclick={s.reconnect}>Retry now</button>
+			{/each}
+			{#if anyStale}<span class="dim">Live updates paused on those streams; REST polling every {(runtime.pollMs / 1000).toFixed(1)} s is the fallback.</span>{/if}
 		</div>
 	{/if}
-	<main class:stale={bus.stale}>
+	<main class:stale={anyStale}>
 		{@render children()}
 	</main>
 </div>

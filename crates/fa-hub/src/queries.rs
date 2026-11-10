@@ -487,6 +487,49 @@ impl HubClient {
         resp.take("rows")
     }
 
+    /// Snapshots of one timescale and encoder family with `status` (`candidate | active | retired`),
+    /// newest `created_at` first. The trainer and model-runtime resolve the active snapshot with it.
+    pub async fn snapshots_by_status(&self, timescale: &str, family: &str, status: &str) -> Result<Vec<Snapshot>> {
+        let pred = Pred::and([
+            Pred::eq("timescale", timescale),
+            Pred::eq("encoder_family", family),
+            Pred::eq("status", status),
+        ]);
+        let op = Op::nodes_with_label_where(node::SNAPSHOT, pred).value_map(None);
+        let mut resp = self.batch(&Batch::read().named("snapshots_by_status").ret("rows", op)).await?;
+        let mut rows: Vec<Snapshot> = resp.take("rows")?;
+        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.snapshot_id.cmp(&a.snapshot_id)));
+        Ok(rows)
+    }
+
+    /// The active snapshot of a timescale for one encoder family, if any (newest when several).
+    pub async fn active_snapshot(&self, timescale: &str, family: &str) -> Result<Option<Snapshot>> {
+        Ok(self.snapshots_by_status(timescale, family, "active").await?.into_iter().next())
+    }
+
+    /// `SnapshotParent{op}` edge parent → child (spec 36 lineage). Returns the edge id.
+    pub async fn link_snapshot_parent(&self, parent: u64, child: u64, op: &str) -> Result<u64> {
+        let edge_op = Op::nodes(parent).add_e(edge::SNAPSHOT_PARENT, child, vec![("op", s(op))]);
+        let mut resp = self.batch(&Batch::write().named("link_snapshot_parent").ret("e", edge_op)).await?;
+        Ok(resp.take_one::<IdRow>("e")?.id)
+    }
+
+    /// Parent snapshot of `child` (`In<SnapshotParent>`), if linked.
+    pub async fn snapshot_parent(&self, child: u64) -> Result<Option<Snapshot>> {
+        let op = Op::nodes(child).r#in(Some(edge::SNAPSHOT_PARENT)).value_map(None);
+        let mut resp = self.batch(&Batch::read().named("snapshot_parent").ret("rows", op)).await?;
+        let mut rows: Vec<Snapshot> = resp.take("rows")?;
+        rows.truncate(1);
+        Ok(rows.pop())
+    }
+
+    /// Snapshots derived from `parent` (`Out<SnapshotParent>`).
+    pub async fn snapshot_children(&self, parent: u64) -> Result<Vec<Snapshot>> {
+        let op = Op::nodes(parent).out(Some(edge::SNAPSHOT_PARENT)).value_map(None);
+        let mut resp = self.batch(&Batch::read().named("snapshot_children").ret("rows", op)).await?;
+        resp.take("rows")
+    }
+
     /// Set `status` on a snapshot (`promote`/`rollback` routes). Returns the updated row.
     pub async fn set_snapshot_status(&self, snapshot: u64, status: &str) -> Result<Snapshot> {
         let op = Op::nodes(snapshot).set_property("status", status).value_map(None);

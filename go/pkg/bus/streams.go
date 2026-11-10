@@ -167,6 +167,7 @@ func EnsureWorkQueue(ctx context.Context, js jetstream.JetStream, kind, durable 
 	if err != nil {
 		return s, nil, err
 	}
+	go WatchConsumerLag(ctx, c) // fa_bus_consumer_num_pending{stream,consumer} for the owner's /metrics (D-056)
 	return s, c, nil
 }
 

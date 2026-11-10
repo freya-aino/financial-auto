@@ -66,6 +66,28 @@ pub fn snapshot(ts: Timescale, family: &str, generation: u32, name: &str) -> Obj
     ObjectKey { bucket: buckets::MODELS, key: format!("snapshots/{ts}/{family}/{generation}/{name}") }
 }
 
+/// A file of a trained snapshot addressed by id: `fa-models/snapshots/<snapshot_id>/<name>`
+/// (spec 36 §5; `manifest.json`, `weights.bin`, `regions.json`, `region_map.json`).
+pub fn snapshot_file(snapshot_id: &str, name: &str) -> ObjectKey {
+    ObjectKey { bucket: buckets::MODELS, key: format!("snapshots/{snapshot_id}/{name}") }
+}
+
+/// Prefix of every file of one snapshot (for listings).
+pub fn snapshot_prefix(snapshot_id: &str) -> String {
+    format!("snapshots/{snapshot_id}/")
+}
+
+/// Versioned online-adapter artifact: `fa-models/adapters/<snapshot_id>/<unix_ms>.json` (spec 36 §6.5).
+pub fn adapter_state(snapshot_id: &str, ts_ms: i64) -> ObjectKey {
+    ObjectKey { bucket: buckets::MODELS, key: format!("adapters/{snapshot_id}/{ts_ms}.json") }
+}
+
+/// Resumable job state: `fa-ckpt/<job_id>/state.json` (spec 36 §6.7; the trainer's
+/// checkpoint, overwritten on every save so `checkpoint_ref` stays one key).
+pub fn job_state(job_id: &str) -> ObjectKey {
+    ObjectKey { bucket: buckets::CKPT, key: format!("{job_id}/state.json") }
+}
+
 /// Online adapter state: `fa-models/adapters/<snapshot_id>/<version>`.
 pub fn adapter(snapshot_id: &str, version: u64) -> ObjectKey {
     ObjectKey { bucket: buckets::MODELS, key: format!("adapters/{snapshot_id}/{version}") }
@@ -219,6 +241,12 @@ mod tests {
             "snapshots/1h/fsq_hybrid/3/weights.mpk"
         );
         assert_eq!(checkpoint("job1", 7).key, "job1/000007");
+        assert_eq!(snapshot_file("stat-v2-1m-01J", "manifest.json").key, "snapshots/stat-v2-1m-01J/manifest.json");
+        assert_eq!(snapshot_file("s", "weights.bin").bucket, "fa-models");
+        assert_eq!(snapshot_prefix("s"), "snapshots/s/");
+        assert_eq!(adapter_state("stat-v1-1m", 1_700_000_000_000).key, "adapters/stat-v1-1m/1700000000000.json");
+        assert_eq!(job_state("j1").key, "j1/state.json");
+        assert_eq!(job_state("j1").bucket, "fa-ckpt");
         assert_eq!(eval_report("", "j1").key, "evals/adhoc/j1.json");
         assert_eq!(eval_report("gen1", "j1").bucket, "fa-artifacts");
         assert_eq!(media("youtube", "m1", MediaPart::Frames, "0001.jpg").key, "youtube/m1/frames/0001.jpg");

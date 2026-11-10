@@ -84,8 +84,11 @@ pub fn job_progress(job_id: &str) -> String {
     format!("jobs.progress.{job_id}")
 }
 
+/// Prefix of every heartbeat subject (`fa_bus::Bus::publish` mirrors these into metrics).
+pub const HEARTBEAT_PREFIX: &str = "svc.heartbeat.";
+
 pub fn heartbeat(service: &str) -> String {
-    format!("svc.heartbeat.{service}")
+    format!("{HEARTBEAT_PREFIX}{service}")
 }
 
 /// GPU arbiter protocol (spec 60, D-006): request/reply `acquire` (args `lease_id`, `class`, `mem_mb` → reply

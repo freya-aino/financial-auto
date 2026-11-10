@@ -37,6 +37,7 @@ const (
 func main() {
 	natsURL := flag.String("nats", envOr("FA_NATS_URL", "nats://127.0.0.1:4222"), "NATS URL")
 	costsPath := flag.String("costs", envOr("FA_COSTS", ""), "cost + slippage model YAML (spec 41 §6.3); built-in defaults when empty")
+	metricsBind := flag.String("metrics", bus.MetricsBindDefault(service), "Prometheus GET /metrics bind (FA_METRICS_BIND; off disables)")
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("svc", service)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -61,6 +62,7 @@ func main() {
 
 	counters := bus.NewCounters()
 	go bus.RunHeartbeat(ctx, pub, service, ulid.Make().String(), "0.2.0", 5*time.Second, counters, nil)
+	go bus.ServeMetrics(ctx, *metricsBind, service, "0.2.0", counters, log) // spec 60 §4 metrics endpoint (D-056)
 
 	engine := NewPaperEngine(costs)
 	publish := func(items []Published) {

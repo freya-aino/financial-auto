@@ -14,9 +14,11 @@
 
 mod data;
 mod gpu;
+mod holdout;
 mod job;
 mod latent;
 mod market;
+mod recorded;
 mod strategy;
 mod trials;
 mod vary;
@@ -71,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
     let args = Args::parse();
+    fa_bus::metrics::serve_from_env("evo-worker", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config)?;
     // Secrets: `$FA_SECRETS` / config/secrets.toml + FA_GARAGE_* env (D-020). Missing = none.
     let secrets = Secrets::load()?;
@@ -113,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
             stream.get_or_create_consumer(CONSUMER, consumer_cfg).await?
         }
     };
+    fa_bus::streams::spawn_consumer_lag(consumer.clone()); // fa_bus_consumer_num_pending{stream,consumer} (spec 60 §6.5)
 
     let market = market::MarketBuffer::default();
     tokio::spawn(market.clone().run(bus.clone()));
@@ -224,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
         blob,
         trials,
         cost,
+        recorded: recorded::RecordedStore::from_env(),
     };
     tracing::info!(%worker_id, gpu_lease_mb = args.gpu_lease_mb, "pulling jobs from {STREAM}");
     // One message at a time so idle workers do not hoard jobs other replicas could take.

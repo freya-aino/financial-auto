@@ -741,13 +741,16 @@ dependencies = [
 name = "fa-backtest"
 version = "0.1.0"
 dependencies = [
+ "fa-bus",
  "fa-core",
  "fa-decoders",
+ "fa-proto",
  "fa-strategies",
  "serde",
  "serde_json",
  "serde_yaml",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 
@@ -776,11 +779,13 @@ dependencies = [
  "async-nats",
  "bytes",
  "fa-core",
+ "fa-metrics",
  "fa-proto",
  "futures",
  "serde",
  "serde_json",
  "thiserror",
+ "time",
  "tokio",
  "tracing",
 ]
@@ -815,6 +820,7 @@ dependencies = [
  "fa-core",
  "fa-expert-space",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -873,11 +879,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fa-metrics"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "fa-patterns"
 version = "0.1.0"
 dependencies = [
  "fa-core",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1758,6 +1775,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "fa-blob",
  "fa-bus",
  "fa-core",
  "fa-encoders",
@@ -3453,11 +3471,24 @@ name = "trainer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "fa-blob",
+ "fa-bus",
  "fa-core",
  "fa-encoders",
+ "fa-hub",
+ "fa-patterns",
+ "fa-proto",
+ "fa-tsdb",
+ "futures",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "ulid",
 ]
 
 [[package]]

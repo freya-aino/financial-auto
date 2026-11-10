@@ -5,7 +5,7 @@
 //! |---|---|
 //! | `GET /api/latent/{snapshot}/experts` | Helix `ExpertSpace` rows (+ region counts) joined with the bus-fed routing stats and norm covariance of `live::SnapshotStats` |
 //! | `GET /api/latent/{snapshot}/projection?expert=&range=&n=&dims=&kind=` | Helix `LatentVec` rows of the expert space, PCA (power iteration) server-side, cached 30 s |
-//! | `POST /api/latent/snapshots/{id}/promote\|rollback` | `HubClient::set_snapshot_status` |
+//! | `POST /api/latent/snapshots/{id}/promote\|rollback` | `HubClient::set_snapshot_status`, then `ctl.model.reload` (`timescale`, `snapshot_id` = the new active) so model-runtime hot-swaps the encoder (spec 36 §6.4) |
 //! | `WS /ws/latent?snapshot=&instruments=` | `LatentState` changes from `live`, latest value per instrument, ≤ `runtime.ws.latent_hz` |
 use std::{
     collections::HashMap,
@@ -22,6 +22,10 @@ use axum::{
 };
 use chrono::Utc;
 use fa_hub::HubError;
+use fa_proto::{
+    Message,
+    v1::{CtlReply, CtlRequest},
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -398,9 +402,36 @@ async fn snapshot_action(State(s): State<AppState>, Path((id, action)): Path<(St
             Err(e) => return hub_error(e),
         }
     }
-    let audited = audit(&s, &format!("latent.snapshot.{action}"), &id, json!({ "changes": applied })).await;
-    Json(json!({ "ok": true, "snapshot_id": id, "action": action, "changes": applied, "audited": audited }))
+    // The runtime follows the status change: reload the timescale onto the new active snapshot
+    // (promote: the target; rollback: the previous active when one exists, else the baseline).
+    let new_active = changes.iter().find(|(_, _, st)| *st == "active").map(|(_, sid, _)| sid.clone());
+    let reload = reload_runtime(&s, &target.timescale, new_active.as_deref()).await;
+    let audited =
+        audit(&s, &format!("latent.snapshot.{action}"), &id, json!({ "changes": applied, "reload": reload })).await;
+    Json(json!({ "ok": true, "snapshot_id": id, "action": action, "changes": applied, "reload": reload, "audited": audited }))
         .into_response()
+}
+
+/// `ctl.model.reload` request/reply; never fails the route (the Helix status is already set).
+async fn reload_runtime(s: &AppState, timescale: &str, snapshot_id: Option<&str>) -> Value {
+    let Some(client) = s.nats.as_ref().filter(|_| s.nats_connected()) else {
+        return json!({ "ok": false, "detail": "NATS not connected; model-runtime keeps its current encoder" });
+    };
+    let mut args = HashMap::from([("timescale".to_owned(), timescale.to_owned())]);
+    if let Some(id) = snapshot_id {
+        args.insert("snapshot_id".into(), id.to_owned());
+    }
+    let req = CtlRequest { verb: "reload".into(), args };
+    let subject = fa_bus::subjects::ctl("model", "reload");
+    let fut = client.request(subject.clone(), req.encode_to_vec().into());
+    match tokio::time::timeout(Duration::from_secs(30), fut).await {
+        Ok(Ok(msg)) => match CtlReply::decode(msg.payload.as_ref()) {
+            Ok(r) => json!({ "ok": r.ok, "detail": r.message, "subject": subject, "snapshot_id": snapshot_id }),
+            Err(e) => json!({ "ok": false, "detail": format!("bad reply: {e}"), "subject": subject }),
+        },
+        Ok(Err(e)) => json!({ "ok": false, "detail": format!("{e} (is model-runtime running?)"), "subject": subject }),
+        Err(_) => json!({ "ok": false, "detail": "no reply within 30s", "subject": subject }),
+    }
 }
 
 // ------------------------------------------------------------ ws/latent

@@ -9,7 +9,9 @@
 //! upserts `validation.generation_stats` and returns the stats so they ride along in the
 //! `JobResult` JSON (`generation_stats`), where the orchestrator folds them into
 //! `generation.summary`. Locked holdouts (`validation.holdout`) are read per timescale before a
-//! Selection replay.
+//! Selection replay. Holdout evaluations (`evo.eval.strategy.holdout`, D-059) are rows with
+//! `kind = holdout` and a `holdout_id`; they are **excluded** from every generation statistic
+//! ([`TrialStore::trials`] filters them), so promotion evidence never feeds selection.
 //!
 //! Everything here is best effort: a failed write only warns (the evaluation result is still
 //! published) and a missing pool means no registry.
@@ -41,6 +43,16 @@ pub struct TrialRow {
     pub objectives: Value,
     /// Per-step net returns (compressed on write).
     pub returns: Vec<f64>,
+    /// Locked holdout this row was evaluated on (`kind = holdout` only).
+    pub holdout_id: Option<String>,
+}
+
+/// A locked holdout row with its id (`validation.holdout.id`, migration `20261110000050`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldoutRow {
+    pub id: String,
+    pub holdout: Holdout,
+    pub note: Option<String>,
 }
 
 #[derive(Clone)]
@@ -82,10 +94,10 @@ impl TrialStore {
         let returns: Vec<f64> = if t.returns.is_empty() { Vec::new() } else { block_sums(&t.returns, N_BLOCKS) };
         sqlx::query(
             "insert into validation.trial \
-             (generation, gen_index, rung, job_id, candidate, kind, window_start, window_end, sharpe, n_obs, objectives, returns) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+             (generation, gen_index, rung, job_id, candidate, kind, window_start, window_end, sharpe, n_obs, objectives, returns, holdout_id) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::uuid) \
              on conflict (job_id) do update set sharpe = excluded.sharpe, n_obs = excluded.n_obs, \
-             objectives = excluded.objectives, returns = excluded.returns",
+             objectives = excluded.objectives, returns = excluded.returns, holdout_id = excluded.holdout_id",
         )
         .bind(&t.generation)
         .bind(t.gen_index)
@@ -99,15 +111,18 @@ impl TrialStore {
         .bind(i32::try_from(t.n_obs).unwrap_or(i32::MAX))
         .bind(&t.objectives)
         .bind(&returns)
+        .bind(&t.holdout_id)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// All trials of a generation (every loop and rung), oldest first.
+    /// All selection trials of a generation (every loop and rung), oldest first. Holdout rows
+    /// (`kind = holdout`) never take part in selection statistics.
     pub async fn trials(&self, generation: &str) -> Result<Vec<Trial>, sqlx::Error> {
         let rows = sqlx::query(
-            "select candidate, sharpe, n_obs, returns from validation.trial where generation = $1 order by created_at",
+            "select candidate, sharpe, n_obs, returns from validation.trial \
+             where generation = $1 and kind <> 'holdout' order by created_at",
         )
         .bind(generation)
         .fetch_all(&self.pool)
@@ -177,6 +192,48 @@ impl TrialStore {
         Ok(s)
     }
 
+    /// One locked holdout by id; `None` when unknown (or not a UUID).
+    pub async fn holdout_by_id(&self, id: &str) -> Result<Option<HoldoutRow>, sqlx::Error> {
+        if uuid_like(id).is_none() {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "select id::text as id, timescale, start_at, end_at, locked_at, note from validation.holdout where id = $1::uuid",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| {
+            let timescale: Timescale = r.get::<String, _>("timescale").parse().ok()?;
+            Some(HoldoutRow {
+                id: r.get::<String, _>("id"),
+                holdout: Holdout {
+                    timescale,
+                    start_ms: r.get::<DateTime<Utc>, _>("start_at").timestamp_millis(),
+                    end_ms: r.get::<DateTime<Utc>, _>("end_at").timestamp_millis(),
+                    locked_at_ms: r.get::<DateTime<Utc>, _>("locked_at").timestamp_millis(),
+                },
+                note: r.get::<Option<String>, _>("note"),
+            })
+        }))
+    }
+
+    /// Latest genome text evaluated under a strategy id (`gp-…`, matched against the inline
+    /// table prefix `{ id = "<id>"`), or the text itself when it already is one.
+    pub async fn candidate_text(&self, candidate: &str) -> Result<Option<String>, sqlx::Error> {
+        if candidate.trim_start().starts_with('{') {
+            return Ok(Some(candidate.to_owned()));
+        }
+        let row = sqlx::query(
+            "select candidate from validation.trial where candidate like ('{ id = \"' || $1 || '\"%') \
+             order by created_at desc limit 1",
+        )
+        .bind(candidate)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get::<String, _>("candidate")))
+    }
+
     /// Locked holdouts of a timescale.
     pub async fn holdouts(&self, timescale: Timescale) -> Result<Vec<Holdout>, sqlx::Error> {
         let rows = sqlx::query(
@@ -194,6 +251,34 @@ impl TrialStore {
                 locked_at_ms: r.get::<DateTime<Utc>, _>("locked_at").timestamp_millis(),
             })
             .collect())
+    }
+}
+
+/// Loose UUID check (36 chars, dashes in place) so a bad id is a clean "not found".
+pub fn uuid_like(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    (b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        }))
+    .then_some(s)
+}
+
+/// Records a holdout trial **without** touching the generation statistics (promotion evidence
+/// never feeds selection). Returns whether the row was written.
+pub async fn register_holdout(store: Option<&TrialStore>, row: &TrialRow) -> bool {
+    let Some(store) = store else { return false };
+    match tokio::time::timeout(Duration::from_secs(15), store.record(row)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, job = %row.job_id, "holdout trial write failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(job = %row.job_id, "holdout trial write timed out");
+            false
+        }
     }
 }
 
@@ -249,12 +334,39 @@ mod tests {
                 n_obs: 200,
                 objectives: serde_json::json!({"sharpe": 0.01 * f64::from(i)}),
                 returns,
+                holdout_id: None,
             };
             let v = register(Some(&store), &row).await;
             assert_eq!(v["n_trials"], serde_json::json!(i + 1), "{v}");
         }
+        // a holdout row of the same generation is written but never counted
+        let hold_row = TrialRow {
+            job_id: format!("{generation}-holdout"),
+            kind: "holdout".into(),
+            holdout_id: None,
+            rung: 0,
+            ..TrialRow {
+                generation: generation.clone(),
+                gen_index: 0,
+                rung: 0,
+                job_id: String::new(),
+                candidate: "c0".into(),
+                kind: String::new(),
+                window_start_ms: 0,
+                window_end_ms: 1,
+                sharpe: 9.0,
+                n_obs: 10,
+                objectives: serde_json::json!({}),
+                returns: vec![0.0; 10],
+                holdout_id: None,
+            }
+        };
+        assert!(register_holdout(Some(&store), &hold_row).await);
+        assert!(store.holdout_by_id("not-a-uuid").await.unwrap().is_none());
+        assert_eq!(store.candidate_text("{ id = \"x\" }").await.unwrap().as_deref(), Some("{ id = \"x\" }"));
+        assert!(store.candidate_text("gp-does-not-exist").await.unwrap().is_none());
         let (n, var) = store.deflation_inputs(&generation).await;
-        assert_eq!(n, 3);
+        assert_eq!(n, 3, "holdout rows do not feed selection statistics");
         assert!(var > 0.0);
         let trials = store.trials(&generation).await.unwrap();
         assert_eq!(trials.len(), 3);

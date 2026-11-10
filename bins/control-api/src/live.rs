@@ -342,6 +342,10 @@ pub struct GenerationView {
     pub vary_job_id: String,
     pub elapsed_ms: u64,
     pub at: Option<String>,
+    /// Latest `validation.generation_stats` the orchestrator rode along (D-052): deflated Sharpe, PBO, counts.
+    pub validation: Option<Value>,
+    /// Garage key of the promoted `strategies.<generation>.toml` once the loop finished (D-052).
+    pub artifact_key: Option<String>,
     /// running | done | paused | stopped (the last two set by `POST /api/evolution/runs/{id}/…`).
     pub status: String,
     /// Survivors per rung as seen so far: `rungs_seen[r]` = survivors after rung `r`.
@@ -382,6 +386,9 @@ pub struct OrderEventView {
     pub fee_currency: String,
     pub event_time: Option<DateTime<Utc>>,
     pub reason: String,
+    /// Paper venue arrival price and signed slippage in bp (D-051); 0 for venues without a cost model.
+    pub arrival_price: f64,
+    pub slippage_bps: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -927,12 +934,25 @@ impl Live {
             vary_job_id: String::new(),
             elapsed_ms: 0,
             at: None,
+            validation: None,
+            artifact_key: None,
             status: "running".into(),
             survivors_by_rung: BTreeMap::new(),
             updated_at: now,
         });
         g.kind = str_of("kind");
         g.generation = u32_of("generation");
+        if let Some(val) = v.get("validation").filter(|x| !x.is_null()) {
+            g.validation = Some(val.clone());
+        }
+        if let Some(key) = v.get("artifact_key").and_then(Value::as_str).filter(|k| !k.is_empty()) {
+            g.artifact_key = Some(key.to_owned());
+        }
+        if let Some(state) = v.get("state").and_then(Value::as_str)
+            && matches!(state, "stopped" | "paused" | "done")
+        {
+            g.status = state.to_owned();
+        }
         g.max_generations = u32_of("max_generations");
         g.rung = u32_of("rung");
         g.rungs = u32_of("rungs");
@@ -985,6 +1005,8 @@ impl Live {
             vary_job_id: String::new(),
             elapsed_ms: 0,
             at: None,
+            validation: None,
+            artifact_key: None,
             status: status.to_owned(),
             survivors_by_rung: BTreeMap::new(),
             updated_at: now,
@@ -1180,6 +1202,8 @@ impl Live {
             fee_currency: m.fee_currency.clone(),
             event_time: ts(m.event_time.as_ref()),
             reason: m.reason.clone(),
+            arrival_price: m.arrival_price,
+            slippage_bps: m.slippage_bps,
         });
         o.status = kind_s.into();
         o.reason = m.reason;

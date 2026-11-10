@@ -1,6 +1,12 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	// Latent & Graph (spec 51 §6.3). Live state per instrument arrives on /ws/latent
+	// (`state.<snapshot>.<instrument>`, `region.<snapshot>.<id>`); REST polling is the fallback.
+	// The persisted side (snapshots, experts, projection, MCMC graph, explorer) comes from HelixDB.
+	import { onMount, untrack } from 'svelte';
 	import Empty from '../../lib/Empty.svelte';
+	import Experts from '../../lib/Experts.svelte';
+	import GraphExplorer from '../../lib/GraphExplorer.svelte';
+	import Projection from '../../lib/Projection.svelte';
 	import QuantileStrip from '../../lib/QuantileStrip.svelte';
 	import RegionGraph from '../../lib/RegionGraph.svelte';
 	import ViewHeader from '../../lib/ViewHeader.svelte';
@@ -10,13 +16,17 @@
 		poll,
 		short,
 		type DecoderOutputView,
+		type ExpertsView,
 		type GraphEdge,
 		type GraphNode,
 		type LatentStateView,
-		type Region
+		type McmcGraph,
+		type Region,
+		type Snapshot
 	} from '../../lib/api';
 	import { loadPref, savePref } from '../../lib/prefs';
-	import { onBus } from '../../lib/ws.svelte';
+	import { runtime } from '../../lib/runtime.svelte';
+	import { latentWs, onBus } from '../../lib/ws.svelte';
 
 	let configured = $state<string[]>([]);
 	let seen = $state<string[]>([]);
@@ -32,13 +42,67 @@
 	let error = $state('');
 	let now = $state(Date.now());
 
+	// persisted (HelixDB)
+	let snapshots = $state<Snapshot[]>([]);
+	let snapshotsError = $state('');
+	let snapshot = $state(loadPref('latent.snapshot', ''));
+	let experts = $state<ExpertsView | null>(null);
+	let expertsError = $state('');
+	let mcmc = $state<McmcGraph | null>(null);
+	let mcmcError = $state('');
+	let graphSource = $state(loadPref<'live' | 'persisted'>('latent.graphSource', 'live'));
+	let actionMsg = $state('');
+	let actionOk = $state(true);
+	let actionBusy = $state(false);
+
 	$effect(() => savePref('latent.ts', ts));
 	$effect(() => savePref('latent.family', family));
+	$effect(() => savePref('latent.snapshot', snapshot));
+	$effect(() => savePref('latent.graphSource', graphSource));
 
 	const timescales = $derived([...new Set([...configured, ...seen])]);
-	const selectedRows = $derived(edges.filter((e) => e.from === selected).sort((a, b) => b.mean - a.mean));
+	const forTimescale = $derived(snapshots.filter((s) => s.timescale === ts));
+	const snapshotRow = $derived(snapshots.find((s) => s.snapshot_id === snapshot) ?? null);
+	const expertIndices = $derived(experts?.experts.map((e) => e.expert_index) ?? [0, 1, 2]);
 
-	async function refresh() {
+	/** Persisted MCMC graph in the RegionGraph's node/edge shape. */
+	const persistedNodes = $derived<GraphNode[]>(
+		(mcmc?.nodes ?? []).map((r) => ({
+			id: r.region_id,
+			lineage_id: r.lineage_id,
+			expert_index: mcmc?.spaces.find((s) => s.expert_space_id === r.expert_space_id)?.index ?? null,
+			status: r.status === 'live' ? 'created' : r.status,
+			occupancy: 0
+		}))
+	);
+	const persistedEdges = $derived<GraphEdge[]>(
+		(mcmc?.edges ?? []).map((e) => ({ from: e.from_region_id, to: e.to_region_id, mean: e.mean, lower: e.lower, upper: e.upper, sampler_id: e.sampler_id }))
+	);
+	const graphNodes = $derived(graphSource === 'persisted' ? persistedNodes : nodes);
+	const graphEdges = $derived(graphSource === 'persisted' ? persistedEdges : edges);
+	const selectedRows = $derived(graphEdges.filter((e) => e.from === selected).sort((a, b) => b.mean - a.mean));
+
+	// /ws/latent: latest state per instrument for the selected snapshot, region lifecycle events.
+	const stateTopics = latentWs.topics<LatentStateView>('state.>');
+	const regionTopic = latentWs.topic('region.>');
+	$effect(() => {
+		if (!stateTopics.count) return;
+		const [snap, scale] = untrack(() => [snapshot, ts]);
+		const fresh = new Map(untrack(() => states).map((s) => [s.instrument_id, s]));
+		for (const f of stateTopics.entries.values()) {
+			if (f.data.snapshot_id === snap || f.data.timescale === scale) fresh.set(f.data.instrument_id, f.data);
+		}
+		states = [...fresh.values()].sort((a, b) => a.instrument_id.localeCompare(b.instrument_id));
+		now = Date.now();
+	});
+	$effect(() => {
+		if (regionTopic.count) void refreshLive();
+	});
+	$effect(() => {
+		if (snapshot) latentWs.setQuery({ snapshot });
+	});
+
+	async function refreshLive() {
 		now = Date.now();
 		try {
 			const t = await live.timescales();
@@ -63,17 +127,88 @@
 		}
 	}
 
+	async function refreshSnapshots() {
+		try {
+			snapshots = (await live.snapshots()).snapshots.sort((a, b) => a.timescale.localeCompare(b.timescale) || b.created_at.localeCompare(a.created_at));
+			snapshotsError = '';
+		} catch (e) {
+			snapshotsError = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	async function refreshPersisted() {
+		if (!snapshot) return;
+		const [e, g] = await Promise.allSettled([live.experts(snapshot), live.mcmcGraph(snapshot, ts)]);
+		if (e.status === 'fulfilled') {
+			experts = e.value;
+			expertsError = '';
+		} else expertsError = e.reason instanceof Error ? e.reason.message : String(e.reason);
+		if (g.status === 'fulfilled') {
+			mcmc = g.value;
+			mcmcError = '';
+		} else {
+			mcmc = null;
+			mcmcError = g.reason instanceof Error ? g.reason.message : String(g.reason);
+		}
+	}
+
+	// pick the active snapshot of the timescale whenever the timescale changes or the pick is stale
+	$effect(() => {
+		if (!forTimescale.length) return;
+		if (!forTimescale.some((s) => s.snapshot_id === snapshot)) {
+			snapshot = (forTimescale.find((s) => s.status === 'active') ?? forTimescale[0]).snapshot_id;
+		}
+	});
+	$effect(() => {
+		void snapshot;
+		void ts;
+		void refreshPersisted();
+	});
+
+	async function snapshotAction(action: 'promote' | 'rollback') {
+		if (!snapshotRow) return;
+		const what =
+			action === 'promote'
+				? `Promote ${snapshotRow.snapshot_id} to the active ${ts} snapshot? Other active snapshots of ${ts} are retired.`
+				: `Roll back ${snapshotRow.snapshot_id}? It is retired and the newest other retired ${ts} snapshot becomes active again.`;
+		if (!confirm(`${what} This is audited (latent.snapshot.${action}).`)) return;
+		actionBusy = true;
+		try {
+			await live.snapshotAction(snapshotRow.snapshot_id, action);
+			actionMsg = `${action} ok`;
+			actionOk = true;
+			await refreshSnapshots();
+		} catch (e) {
+			actionMsg = e instanceof Error ? e.message : String(e);
+			actionOk = false;
+		} finally {
+			actionBusy = false;
+		}
+	}
+
+	function refresh() {
+		void refreshLive();
+		void refreshPersisted();
+	}
+
 	onMount(() => {
-		const stopPoll = poll(refresh, 2000);
-		const stopBus = onBus(['latent.>', 'decoder.output.>'], refresh);
+		void refreshSnapshots();
+		const stopPoll = poll(refreshLive, () => (latentWs.live ? runtime.pollMs * 10 : runtime.pollMs));
+		const stopPersisted = poll(refreshPersisted, () => runtime.pollMs * 15);
+		const stopSnapshots = poll(refreshSnapshots, () => runtime.pollMs * 30);
+		const stopBus = onBus(['decoder.output.>'], refreshLive);
 		return () => {
 			stopPoll();
+			stopPersisted();
+			stopSnapshots();
 			stopBus();
+			stateTopics.close();
+			regionTopic.close();
 		};
 	});
 </script>
 
-<ViewHeader title="Latent & Graph" spec="51 §6.3" note="live from latent.* and decoder.output.*; refetches on bus frames" />
+<ViewHeader title="Latent & Graph" spec="51 §6.3" note="live states on /ws/latent (state.<snapshot>.*), persisted graph from HelixDB; REST polling as fallback" />
 
 <div class="toolbar">
 	<label>
@@ -84,18 +219,43 @@
 			{/each}
 		</select>
 	</label>
-	<span class="dim">{nodes.length} regions · {edges.length} transitions · {states.length} instruments</span>
+	<label>
+		snapshot
+		<select bind:value={snapshot} disabled={!forTimescale.length} title="GET /api/latent/snapshots (HelixDB)">
+			{#each forTimescale as s (s.snapshot_id)}
+				<option value={s.snapshot_id}>{s.snapshot_id} · {s.status} · gen {s.generation}</option>
+			{:else}
+				<option value="">no persisted snapshot for {ts}</option>
+			{/each}
+		</select>
+	</label>
+	{#if snapshotRow}
+		<span class="badge" class:ok={snapshotRow.status === 'active'} class:warn={snapshotRow.status === 'candidate'}>{snapshotRow.status}</span>
+		<button onclick={() => snapshotAction('promote')} disabled={actionBusy || snapshotRow.status === 'active'} title="POST /api/latent/snapshots/{snapshotRow.snapshot_id}/promote">promote</button>
+		<button onclick={() => snapshotAction('rollback')} disabled={actionBusy || snapshotRow.status === 'retired'} title="POST /api/latent/snapshots/{snapshotRow.snapshot_id}/rollback">rollback</button>
+		{#if actionMsg}<span class="badge" class:ok={actionOk} class:danger={!actionOk}>{actionMsg}</span>{/if}
+	{/if}
+	<span class="dim">{graphNodes.length} regions · {graphEdges.length} transitions · {states.length} instruments</span>
+	<span class="badge" class:ok={latentWs.live} class:warn={!latentWs.live} title="/ws/latent?snapshot={snapshot} · {latentWs.frames} frames · {latentWs.lagged} superseded">ws {latentWs.status}</span>
 	{#if error}<span class="badge danger">{error}</span>{/if}
+	{#if snapshotsError}<span class="badge warn" title="GET /api/latent/snapshots">{snapshotsError}</span>{/if}
 </div>
 
 <div class="grid two">
 	<section class="panel">
 		<div class="panel-head">
 			<h2>Region transition graph</h2>
-			<span class="dim">width = posterior mean · hover for 90% interval · click to pin</span>
+			<div class="src">
+				<select bind:value={graphSource} aria-label="graph source">
+					<option value="live">live (latent.transition.{ts}, in-memory)</option>
+					<option value="persisted">persisted (HelixDB /api/mcmc/{snapshot || '…'}/graph)</option>
+				</select>
+				<span class="dim">width = mean · hover for 90% interval · click to pin</span>
+			</div>
 		</div>
-		{#if nodes.length}
-			<RegionGraph {nodes} {edges} {selected} onselect={(id) => (selected = id)} />
+		{#if graphSource === 'persisted' && mcmcError}<p class="badge warn">{mcmcError}</p>{/if}
+		{#if graphNodes.length}
+			<RegionGraph nodes={graphNodes} edges={graphEdges} {selected} onselect={(id) => (selected = id)} />
 			{#if selected}
 				<h3 class="sub">Outgoing from <code>{selected}</code></h3>
 				<table>
@@ -115,10 +275,16 @@
 					</tbody>
 				</table>
 			{/if}
+		{:else if graphSource === 'persisted'}
+			<Empty producer="HelixDB Transition edges for {snapshot} (model-runtime hub sink, D-048)" />
 		{:else}
 			<Empty producer="latent.region.{ts} / latent.transition.{ts} (model-runtime MCMC stage)" />
 		{/if}
 	</section>
+
+	<Experts view={experts} error={expertsError} {now} />
+	<Projection {snapshot} experts={expertIndices} {selected} onselect={(id) => (selected = id)} />
+	<GraphExplorer node={selected ?? snapshot} />
 
 	<section class="panel">
 		<div class="panel-head">
@@ -243,6 +409,23 @@
 		align-items: center;
 		gap: 12px;
 		margin-bottom: 12px;
+		flex-wrap: wrap;
+	}
+	.toolbar label {
+		display: flex;
+		gap: 6px;
+		align-items: center;
+		color: var(--text-dim);
+	}
+	.toolbar button {
+		font-size: 11px;
+		padding: 1px 8px;
+	}
+	.src {
+		display: flex;
+		gap: 8px;
+		align-items: center;
+		flex-wrap: wrap;
 	}
 	.two {
 		grid-template-columns: repeat(auto-fill, minmax(520px, 1fr));

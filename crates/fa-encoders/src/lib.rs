@@ -6,10 +6,15 @@
 //! until then; it implements the same [`EncoderFamily`] contract.
 
 pub mod baseline;
+pub mod snapshot;
 
-pub use baseline::{EXPERT_DIM, EXPERT_NAMES, MARKET_ROW_LEN, MarketBar, StatisticalEncoder};
+pub use baseline::{EXPERT_DIM, EXPERT_NAMES, FitConfig, MARKET_ROW_LEN, MarketBar, StatisticalEncoder};
 use fa_core::Timescale;
 use serde::{Deserialize, Serialize};
+pub use snapshot::{
+    DataRef, MANIFEST_FILE, NormAccumulator, NormStats, ProbeSetRef, REGION_MAP_FILE, REGIONS_FILE, STATISTICAL_FAMILY,
+    SnapshotManifest, WEIGHTS_FILE,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -163,6 +168,8 @@ pub enum EncoderError {
     BackendDisabled,
     #[error("input shape mismatch: {0}")]
     Shape(String),
+    #[error("snapshot manifest: {0}")]
+    Manifest(String),
 }
 
 /// A trained encoder of one family at one timescale.

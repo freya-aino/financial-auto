@@ -225,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    fa_bus::metrics::serve_from_env("risk-engine", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config).context("loading platform config")?;
     let settings = match std::fs::read_to_string(&args.risk) {
         Ok(src) => Settings::parse(&src).with_context(|| format!("parsing {}", args.risk.display()))?,

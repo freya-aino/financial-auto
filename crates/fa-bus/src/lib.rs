@@ -1,6 +1,7 @@
 //! NATS JetStream access: subject taxonomy, typed protobuf pub/sub and the JetStream
 //! stream table (spec 21).
 
+pub mod replay;
 pub mod streams;
 pub mod subjects;
 
@@ -9,6 +10,8 @@ use fa_proto::Message;
 use futures::{Stream, StreamExt};
 
 pub use async_nats;
+/// Prometheus exporter shared by every service (D-056); re-exported so binaries need no extra dependency.
+pub use fa_metrics as metrics;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BusError {
@@ -42,9 +45,14 @@ impl Bus {
         async_nats::jetstream::new(self.client.clone())
     }
 
-    /// Publishes a protobuf message on a core NATS subject.
+    /// Publishes a protobuf message on a core NATS subject. Heartbeats (`svc.heartbeat.*`) are
+    /// additionally mirrored into `fa_heartbeat_counter{service,key}` gauges (D-056).
     pub async fn publish<M: Message>(&self, subject: String, msg: &M) -> Result<(), BusError> {
-        self.client.publish(subject, Bytes::from(msg.encode_to_vec())).await?;
+        let bytes = msg.encode_to_vec();
+        if subject.starts_with(subjects::HEARTBEAT_PREFIX) {
+            mirror_heartbeat(&bytes);
+        }
+        self.client.publish(subject, Bytes::from(bytes)).await?;
         Ok(())
     }
 
@@ -70,5 +78,30 @@ impl Bus {
     /// Raw subscription (used by the control-api bus tap).
     pub async fn subscribe_raw(&self, subject: String) -> Result<async_nats::Subscriber, BusError> {
         Ok(self.client.subscribe(subject).await?)
+    }
+}
+
+/// Decodes an encoded `Heartbeat` and records its counters as metrics gauges.
+fn mirror_heartbeat(bytes: &[u8]) {
+    if let Ok(hb) = fa_proto::v1::Heartbeat::decode(bytes) {
+        fa_metrics::heartbeat::record(&hb.service, hb.counters.iter().map(|(k, v)| (k.as_str(), *v)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fa_proto::Message;
+
+    #[test]
+    fn heartbeat_publish_mirrors_counters_into_metrics() {
+        let hb = fa_proto::v1::Heartbeat {
+            service: "unit-svc".into(),
+            counters: [("x.count".to_owned(), 7.0)].into_iter().collect(),
+            ..Default::default()
+        };
+        super::mirror_heartbeat(&hb.encode_to_vec());
+        let out = fa_metrics::render();
+        assert!(out.contains("fa_heartbeat_counter{service=\"unit-svc\",key=\"x.count\"} 7\n"), "{out}");
+        assert!(super::subjects::heartbeat("unit-svc").starts_with(super::subjects::HEARTBEAT_PREFIX));
     }
 }

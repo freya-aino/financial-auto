@@ -5,12 +5,14 @@
 //! density/Mapper methods exist.
 
 pub mod online;
+pub mod region_map;
 
 use std::collections::HashMap;
 
 pub use online::{
     Assignment, LeaderClustering, OnlineRegionCfg, OnlineRegionDiscovery, OnlineRegionSet, RegionLifecycle,
 };
+pub use region_map::{AlignInput, ExpertRegionMap, FittedRegion, ParentIds, RegionMap, align_expert};
 use serde::{Deserialize, Serialize};
 
 pub type RegionId = String;

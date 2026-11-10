@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     EncoderError, EncoderFamily, EncoderInput, FamilyDescriptor, FamilyId, LatentKind, PriorKind, ScaleSizing,
     default_sizing,
+    snapshot::{NormAccumulator, NormStats, STATISTICAL_FAMILY, SnapshotManifest},
 };
 
 /// One bar at the encoder's timescale.
@@ -88,11 +89,32 @@ impl EncoderInput {
 }
 
 /// Deterministic statistical encoder for one timescale.
+///
+/// Without fitted statistics (`StatisticalEncoder::new`) it is the parameter-free gen-0
+/// baseline `stat-v1-<ts>`. A trained snapshot ([`StatisticalEncoder::fit`] →
+/// [`StatisticalEncoder::from_manifest`]) carries [`NormStats`]: every raw feature is
+/// z-scored against the training distribution before the bounded squash, so the latent is
+/// centred on the fitted history instead of on the fixed in-window scale.
 #[derive(Debug, Clone)]
 pub struct StatisticalEncoder {
     descriptor: FamilyDescriptor,
     sizing: ScaleSizing,
     snapshot_id: String,
+    norm: Option<NormStats>,
+}
+
+/// How [`StatisticalEncoder::fit`] walks the history: one window per `stride` bars, each
+/// ending at a bar close, at least `min_window` bars long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FitConfig {
+    pub stride: usize,
+    pub min_window: usize,
+}
+
+impl Default for FitConfig {
+    fn default() -> Self {
+        Self { stride: 1, min_window: 8 }
+    }
 }
 
 impl StatisticalEncoder {
@@ -110,11 +132,110 @@ impl StatisticalEncoder {
         };
         let sizing =
             ScaleSizing { max_experts: EXPERT_NAMES.len() as u32, latent_dim: EXPERT_DIM as u32, ..default_sizing(ts) };
-        Self { descriptor, sizing, snapshot_id: format!("{}-{ts}", Self::VERSION) }
+        Self { descriptor, sizing, snapshot_id: format!("{}-{ts}", Self::VERSION), norm: None }
+    }
+
+    /// The gen-0 baseline id of a timescale (`stat-v1-<ts>`).
+    pub fn baseline_id(ts: Timescale) -> String {
+        format!("{}-{ts}", Self::VERSION)
+    }
+
+    /// A fitted encoder under its own snapshot id.
+    pub fn with_stats(ts: Timescale, snapshot_id: impl Into<String>, norm: NormStats) -> Self {
+        Self { snapshot_id: snapshot_id.into(), norm: Some(norm), ..Self::new(ts) }
+    }
+
+    /// Rebuilds the encoder of a snapshot from its manifest and `weights.bin`
+    /// ([`NormStats::to_bytes`]). `params.context_steps` overrides the default sizing.
+    pub fn from_manifest(manifest: &SnapshotManifest, weights: &[u8]) -> Result<Self, EncoderError> {
+        if manifest.encoder_family != STATISTICAL_FAMILY {
+            return Err(EncoderError::Manifest(format!(
+                "family `{}` is not the statistical encoder",
+                manifest.encoder_family
+            )));
+        }
+        let norm = NormStats::from_bytes(weights)?;
+        if norm.n_experts() != EXPERT_NAMES.len() || norm.dim() != EXPERT_DIM {
+            return Err(EncoderError::Manifest(format!(
+                "weights are {}x{}, encoder is {}x{EXPERT_DIM}",
+                norm.n_experts(),
+                norm.dim(),
+                EXPERT_NAMES.len()
+            )));
+        }
+        let mut enc = Self::with_stats(manifest.timescale, manifest.snapshot_id.clone(), norm);
+        if let Some(ctx) = manifest.params.get("context_steps").and_then(serde_json::Value::as_u64) {
+            enc.sizing.context_steps = ctx.clamp(2, u64::from(u32::MAX)) as u32;
+        }
+        Ok(enc)
     }
 
     pub fn timescale(&self) -> Timescale {
         self.sizing.timescale
+    }
+
+    pub fn norm(&self) -> Option<&NormStats> {
+        self.norm.as_ref()
+    }
+
+    /// Family hyperparameters recorded in a manifest (`params`).
+    pub fn params(&self, fit: &FitConfig) -> serde_json::Value {
+        serde_json::json!({
+            "version": Self::VERSION,
+            "context_steps": self.sizing.context_steps,
+            "experts": EXPERT_NAMES,
+            "expert_dim": EXPERT_DIM,
+            "normalised": self.norm.is_some(),
+            "fit": fit,
+        })
+    }
+
+    /// Raw (un-normalised) features of one window: `[expert][dim]`, each in (−1, 1).
+    pub fn raw_features(&self, bars: &[MarketBar]) -> Result<Vec<Vec<f32>>, EncoderError> {
+        if bars.is_empty() {
+            return Err(EncoderError::Shape("empty bar window".into()));
+        }
+        let f = Features::new(self.window(bars));
+        Ok(vec![f.returns_expert(), f.volatility_expert(), f.activity_expert()])
+    }
+
+    /// Window ends visited by [`Self::fit`] over `n` bars: `min_window, min_window + stride, …, n`.
+    pub fn fit_window_ends(n: usize, cfg: &FitConfig) -> Vec<usize> {
+        let stride = cfg.stride.max(1);
+        let first = cfg.min_window.max(2);
+        if n < first {
+            return Vec::new();
+        }
+        let mut ends: Vec<usize> = (first..=n).step_by(stride).collect();
+        if ends.last() != Some(&n) {
+            ends.push(n);
+        }
+        ends
+    }
+
+    /// Accumulates the raw features of the windows ending at `ends` (indices into `bars`,
+    /// exclusive) into `acc`. Split across calls to checkpoint a long fit.
+    pub fn fit_into(&self, bars: &[MarketBar], ends: &[usize], acc: &mut NormAccumulator) -> Result<(), EncoderError> {
+        for &end in ends {
+            let end = end.min(bars.len());
+            acc.push(&self.raw_features(&bars[..end])?);
+        }
+        Ok(())
+    }
+
+    /// Fits the normalisation statistics over every window of `bars` (oldest first).
+    pub fn fit(ts: Timescale, bars: &[MarketBar], cfg: &FitConfig) -> Result<NormStats, EncoderError> {
+        let enc = Self::new(ts);
+        let mut acc = NormAccumulator::default();
+        enc.fit_into(bars, &Self::fit_window_ends(bars.len(), cfg), &mut acc)?;
+        if acc.n == 0 {
+            return Err(EncoderError::Shape(format!(
+                "{} bars are fewer than min_window {}",
+                bars.len(),
+                cfg.min_window
+            )));
+        }
+        Ok(acc.finish())
     }
 
     /// Context actually used: the last `context_steps` bars.
@@ -143,8 +264,14 @@ impl EncoderFamily for StatisticalEncoder {
         }
         let bars: Vec<MarketBar> = input.market.iter().map(|r| MarketBar::from_row(r)).collect::<Result<_, _>>()?;
         let w = self.window(&bars);
-        let f = Features::new(w);
-        let latents = [f.returns_expert(), f.volatility_expert(), f.activity_expert()];
+        let mut latents = self.raw_features(w)?;
+        if let Some(norm) = &self.norm {
+            for (e, row) in latents.iter_mut().enumerate() {
+                for (d, x) in row.iter_mut().enumerate() {
+                    *x = squash(norm.apply(e, d, f64::from(*x))) as f32;
+                }
+            }
+        }
         // Estimation uncertainty of in-window z-scores shrinks like 1/n (variance), so the
         // posterior log-variance is −ln(n); one bar → unit variance.
         let log_var = -(w.len() as f32).ln();
@@ -411,6 +538,56 @@ mod tests {
         let spiky = enc.encode(&EncoderInput::from_bars(0, &bars)).unwrap();
         // feature 2 of the volatility expert is the range z-score
         assert!(spiky.experts[1].mean[2] > 0.9 && spiky.experts[1].mean[2] > calm.experts[1].mean[2]);
+    }
+
+    #[test]
+    fn fitted_snapshot_is_reproducible_from_its_artifact() {
+        let bars = walk(300, 11, 0.001);
+        let cfg = FitConfig { stride: 3, min_window: 16 };
+        let stats = StatisticalEncoder::fit(Timescale::Minute, &bars, &cfg).unwrap();
+        let ends = StatisticalEncoder::fit_window_ends(300, &cfg);
+        assert_eq!(ends.first(), Some(&16));
+        assert_eq!(ends.last(), Some(&300));
+        assert_eq!(stats.n_windows, ends.len() as u64);
+        assert_eq!(stats.n_experts(), 3);
+        assert!(stats.std.iter().flatten().all(|s| s.is_finite() && *s >= 0.0));
+        // chunked accumulation equals one pass
+        let enc = StatisticalEncoder::new(Timescale::Minute);
+        let mut acc = NormAccumulator::default();
+        enc.fit_into(&bars, &ends[..40], &mut acc).unwrap();
+        enc.fit_into(&bars, &ends[40..], &mut acc).unwrap();
+        assert_eq!(acc.finish(), stats);
+
+        let manifest = SnapshotManifest {
+            snapshot_id: "stat-v1-1m-g0-test".into(),
+            encoder_family: STATISTICAL_FAMILY.into(),
+            timescale: Timescale::Minute,
+            generation: 0,
+            parent_snapshot_id: None,
+            created_at: String::new(),
+            params: serde_json::json!({"context_steps": 64}),
+            probe_set: Default::default(),
+            data: Default::default(),
+            metrics: Default::default(),
+            feedback: None,
+            seed: 0,
+        };
+        let fitted = StatisticalEncoder::from_manifest(&manifest, &stats.to_bytes()).unwrap();
+        assert_eq!(fitted.snapshot_id(), "stat-v1-1m-g0-test");
+        assert_eq!(fitted.sizing().context_steps, 64);
+        let input = EncoderInput::from_bars(0, &bars);
+        let a = fitted.encode(&input).unwrap();
+        let mut same = StatisticalEncoder::with_stats(Timescale::Minute, "x", stats.clone());
+        same.sizing.context_steps = 64;
+        let b = same.encode(&input).unwrap();
+        assert_eq!(a.experts[0].mean, b.experts[0].mean, "same stats + context → same latent");
+        assert!(a.experts.iter().all(|e| e.mean.iter().all(|v| v.is_finite() && v.abs() < 1.0)));
+        let raw = StatisticalEncoder::new(Timescale::Minute).encode(&input).unwrap();
+        assert_ne!(a.experts[1].mean, raw.experts[1].mean, "normalisation changes the latent");
+        let mut other = manifest.clone();
+        other.encoder_family = "fsq_hybrid".into();
+        assert!(matches!(StatisticalEncoder::from_manifest(&other, &stats.to_bytes()), Err(EncoderError::Manifest(_))));
+        assert!(StatisticalEncoder::fit(Timescale::Minute, &bars[..4], &cfg).is_err());
     }
 
     #[test]

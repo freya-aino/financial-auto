@@ -73,6 +73,7 @@ func main() {
 	maxGens := flag.Int("max-generations", envInt("FA_EVO_MAX_GENERATIONS", 1), "default max_generations for ctl.evo.start (halving + variation loops)")
 	garageURL := flag.String("garage", envOr("FA_GARAGE_URL", "http://127.0.0.1:3900"), "Garage S3 endpoint for promoted strategy populations (empty disables)")
 	secretsPath := flag.String("secrets", envOr("FA_SECRETS", "config/secrets.toml"), "secrets file with [garage] access_key_id / secret_access_key (D-020)")
+	metricsBind := flag.String("metrics", bus.MetricsBindDefault(service), "Prometheus GET /metrics bind (FA_METRICS_BIND; off disables)")
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("svc", service)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -89,6 +90,7 @@ func main() {
 	counters := bus.NewCounters()
 	counters.Set("gpu.capacity_mb", float64(*gpuMem))
 	go bus.RunHeartbeat(ctx, pub, service, ulid.Make().String(), "0.1.0", 5*time.Second, counters, nil)
+	go bus.ServeMetrics(ctx, *metricsBind, service, "0.1.0", counters, log)
 	go func() { // keep arbiter gauges fresh for heartbeats
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
