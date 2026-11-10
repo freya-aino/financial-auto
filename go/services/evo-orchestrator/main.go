@@ -5,21 +5,31 @@
 //
 //	ctl.gpu.acquire  args: lease_id, class, mem_mb
 //	ctl.gpu.release  args: lease_id
-//	ctl.evo.start    args: kind, snapshot_id, genomes (comma list), eta, min_budget_ms, max_budget_ms
+//	ctl.evo.start    args: kind, snapshot_id, genomes (newline list, D-044), eta, min_budget_ms,
+//	                 max_budget_ms, max_generations (default -max-generations / 1),
+//	                 total_budget_ms (0 = fixed population), data_window_hours (0 = worker default)
 //	ctl.evo.cancel   args: job_id — drops the job from its generation (scored as failed), releases
-//	                 the GPU lease named after the job id and publishes JobResult{FAILED, error
+//	                 the GPU lease named after the job id and publishes JobResult{CANCELLED, error
 //	                 "cancelled by operator"} on jobs.result.<kind> so views update.
 //
 // Error replies carry a prefix control-api maps to HTTP: `not_found:` (404), `conflict:` (409).
 //
+// Ranking: NSGA-II (non-dominated sort + crowding distance) over JobResult.objectives /
+// directions (proto maps, else the result JSON), falling back to the scalar `score`. After
+// every rung a `generation.summary` JSON (Pareto front, front sizes, survivors) is published as
+// JobResult{job_id: <generation id>, result: <json>} on jobs.result.evo.generation.
+//
 // Heartbeat counters: gpu.used_mb, gpu.active, gpu.queued, gpu.capacity_mb (from -gpu-mem-mb /
-// FA_GPU_MEM_MB, default 24000; D-031), generations.started|done, jobs.cancelled.
+// FA_GPU_MEM_MB, default 24000; D-031), generations.started|done|active, generations.loops,
+// jobs.cancelled, vary.jobs, vary.failed, pareto.front_size, pareto.fronts, pareto.candidates,
+// pareto.unranked, pareto.generation, pareto.rung.
 //
 // Notifications (CtlRequest, no reply): ctl.gpu.preempt / ctl.gpu.granted with arg lease_id.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -41,9 +51,13 @@ import (
 
 const service = "evo-orchestrator"
 
+// GenerationSummaryKind is the `jobs.result.<kind>` suffix carrying generation.summary JSON.
+const GenerationSummaryKind = "evo.generation"
+
 func main() {
 	natsURL := flag.String("nats", envOr("FA_NATS_URL", "nats://127.0.0.1:4222"), "NATS URL")
 	gpuMem := flag.Int("gpu-mem-mb", envInt("FA_GPU_MEM_MB", 24_000), "GPU memory managed by the arbiter (MB), reported as gpu.capacity_mb")
+	maxGens := flag.Int("max-generations", envInt("FA_EVO_MAX_GENERATIONS", 1), "default max_generations for ctl.evo.start (halving + variation loops)")
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("svc", service)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -83,6 +97,36 @@ func main() {
 
 	var gensMu sync.Mutex
 	gens := map[string]*Generation{}
+
+	// Per-rung Pareto summaries: heartbeat gauges + generation.summary on jobs.result.evo.generation.
+	onSummary := func(s Summary) {
+		counters.Set("pareto.front_size", float64(len(s.ParetoFront)))
+		counters.Set("pareto.fronts", float64(len(s.FrontSizes)))
+		counters.Set("pareto.candidates", float64(s.Candidates))
+		counters.Set("pareto.unranked", float64(s.Unranked))
+		counters.Set("pareto.generation", float64(s.Generation))
+		counters.Set("pareto.rung", float64(s.Rung))
+		if s.VaryJobID != "" {
+			counters.Add("vary.jobs", 1)
+			counters.Add("generations.loops", 1)
+		}
+		b, err := json.Marshal(s)
+		if err != nil {
+			return
+		}
+		res := &fav1.JobResult{JobId: s.GenerationID, Status: fav1.JobResult_STATUS_OK, Result: b, WorkerId: service}
+		if err := pub.Publish(bus.JobResult(GenerationSummaryKind), res); err != nil {
+			log.Warn("summary publish", "err", err)
+		}
+		log.Info("generation.summary", "id", s.GenerationID, "gen", s.Generation, "rung", s.Rung, "final", s.Final,
+			"candidates", s.Candidates, "front", len(s.ParetoFront), "fronts", s.FrontSizes, "survivors", s.Survivors)
+	}
+	finish := func(id string, g *Generation) {
+		log.Info("generation done", "id", id, "final", g.Final())
+		counters.Add("generations.done", 1)
+		delete(gens, id)
+		counters.Set("generations.active", float64(len(gens)))
+	}
 
 	handle := func(subject string, fn func(*fav1.CtlRequest) (string, error)) {
 		_, err := pub.NC.Subscribe(subject, func(m *nats.Msg) {
@@ -149,14 +193,25 @@ func main() {
 		if maxB == 0 {
 			maxB = 16 * minB
 		}
-		g, err := NewGeneration(r.Args["kind"], r.Args["snapshot_id"], genomes, eta, minB, maxB, uint64(time.Now().UnixNano()))
+		mg := *maxGens
+		if v, err := strconv.Atoi(r.Args["max_generations"]); err == nil && v > 0 {
+			mg = v
+		}
+		totalB, _ := strconv.ParseUint(r.Args["total_budget_ms"], 10, 64)
+		window, _ := strconv.Atoi(r.Args["data_window_hours"])
+		g, err := NewGenerationWith(GenerationConfig{
+			Kind: r.Args["kind"], SnapshotID: r.Args["snapshot_id"], Genomes: genomes, Eta: eta, MinBudgetMs: minB, MaxBudgetMs: maxB,
+			Seed: uint64(time.Now().UnixNano()), MaxGenerations: mg, TotalBudgetMs: totalB, DataWindowHours: window, OnSummary: onSummary,
+		})
 		if err != nil {
 			return "", err
 		}
 		gensMu.Lock()
 		gens[g.ID] = g
+		counters.Set("generations.active", float64(len(gens)))
 		gensMu.Unlock()
 		counters.Add("generations.started", 1)
+		log.Info("generation start", "id", g.ID, "kind", g.Kind, "genomes", len(genomes), "eta", g.eta, "max_generations", mg, "min_budget_ms", minB)
 		return g.ID, g.Start(publishJob)
 	})
 
@@ -172,22 +227,27 @@ func main() {
 				continue
 			}
 			res := &fav1.JobResult{
-				JobId: jobID, Status: fav1.JobResult_STATUS_FAILED, Error: "cancelled by operator", WorkerId: service,
+				JobId: jobID, Status: fav1.JobResult_STATUS_CANCELLED, Error: "cancelled by operator", WorkerId: service,
+			}
+			kind := g.Kind
+			if g.GenomeOf(jobID) == "" {
+				kind = VaryKind(g.Kind) // the pending variation job
 			}
 			done, err := g.OnResult(res, publishJob)
 			if err != nil {
 				log.Warn("generation after cancel", "id", g.ID, "err", err)
+				if kind != g.Kind {
+					counters.Add("vary.failed", 1)
+				}
 			}
 			if done {
-				log.Info("generation done", "id", g.ID, "final", g.Final())
-				counters.Add("generations.done", 1)
-				delete(gens, g.ID)
+				finish(g.ID, g)
 			}
 			// Lease ids follow job ids (convention until workers report their lease ids).
 			for _, id := range arb.Release(jobID) {
 				notify("granted", id)
 			}
-			if err := pub.Publish(bus.JobResult(g.Kind), res); err != nil {
+			if err := pub.Publish(bus.JobResult(kind), res); err != nil {
 				return "", err
 			}
 			counters.Add("jobs.cancelled", 1)
@@ -208,14 +268,16 @@ func main() {
 			if !g.Owns(res.JobId) {
 				continue
 			}
+			isVary := g.GenomeOf(res.JobId) == ""
 			done, err := g.OnResult(&res, publishJob)
 			if err != nil {
 				log.Warn("generation", "id", id, "err", err)
+				if isVary {
+					counters.Add("vary.failed", 1)
+				}
 			}
 			if done {
-				log.Info("generation done", "id", id, "final", g.Final())
-				counters.Add("generations.done", 1)
-				delete(gens, id)
+				finish(id, g)
 			}
 			return
 		}
@@ -224,7 +286,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Info("started", "gpu_mem_mb", *gpuMem)
+	log.Info("started", "gpu_mem_mb", *gpuMem, "max_generations", *maxGens)
 	<-ctx.Done()
 	log.Info("stopped")
 }

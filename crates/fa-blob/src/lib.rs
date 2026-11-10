@@ -1,6 +1,12 @@
-//! Garage S3 layout (spec 20 §5.5, spec 10 §4.2) and a storage trait.
+//! Garage S3 layout (spec 20 §5.5, spec 10 §4.2), a storage trait, an in-memory store and
+//! the SigV4 S3 client (`S3BlobStore`) for Garage.
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use fa_core::Timescale;
+
+pub mod s3;
+pub mod sigv4;
+
+pub use s3::S3BlobStore;
 
 pub mod buckets {
     pub const RAW: &str = "fa-raw";
@@ -97,31 +103,98 @@ pub enum BlobError {
     Backend(String),
 }
 
-/// Object storage abstraction. The Garage S3 implementation is added when the
-/// first producer needs it; `MemoryStore` serves tests and local dry runs.
-pub trait BlobStore: Send + Sync {
-    fn put(&self, key: &ObjectKey, bytes: Vec<u8>) -> Result<(), BlobError>;
-    fn get(&self, key: &ObjectKey) -> Result<Vec<u8>, BlobError>;
+/// One entry of a prefix listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMeta {
+    pub key: String,
+    pub size: u64,
+    /// RFC 3339 as reported by the server.
+    pub last_modified: Option<String>,
+    pub etag: Option<String>,
 }
+
+pub const OCTET_STREAM: &str = "application/octet-stream";
+pub const JSON: &str = "application/json";
+
+/// Object storage abstraction. [`S3BlobStore`] talks to Garage; `MemoryStore` serves tests
+/// and local dry runs. Methods return `Send` futures so stores can be shared across tasks.
+pub trait BlobStore: Send + Sync {
+    fn put(
+        &self,
+        key: &ObjectKey,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+    fn get(&self, key: &ObjectKey) -> impl Future<Output = Result<Vec<u8>, BlobError>> + Send;
+    /// HEAD: `Ok(false)` when the object does not exist.
+    fn exists(&self, key: &ObjectKey) -> impl Future<Output = Result<bool, BlobError>> + Send;
+    /// Deleting a missing object is not an error.
+    fn delete(&self, key: &ObjectKey) -> impl Future<Output = Result<(), BlobError>> + Send;
+    /// All objects under `prefix` in `bucket` (follows pagination).
+    fn list(
+        &self,
+        bucket: &'static str,
+        prefix: &str,
+    ) -> impl Future<Output = Result<Vec<ObjectMeta>, BlobError>> + Send;
+}
+
+/// `(content_type, bytes)` per key.
+type MemoryMap = std::collections::BTreeMap<ObjectKey, (String, Vec<u8>)>;
 
 #[derive(Default)]
 pub struct MemoryStore {
-    inner: std::sync::Mutex<std::collections::HashMap<ObjectKey, Vec<u8>>>,
+    inner: std::sync::Mutex<MemoryMap>,
+}
+
+impl MemoryStore {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, MemoryMap>, BlobError> {
+        self.inner.lock().map_err(|e| BlobError::Backend(e.to_string()))
+    }
+
+    /// Content type recorded with `put`.
+    pub fn content_type(&self, key: &ObjectKey) -> Option<String> {
+        self.inner.lock().ok()?.get(key).map(|(ct, _)| ct.clone())
+    }
+}
+
+impl std::cmp::PartialOrd for ObjectKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::cmp::Ord for ObjectKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.bucket, &self.key).cmp(&(other.bucket, &other.key))
+    }
 }
 
 impl BlobStore for MemoryStore {
-    fn put(&self, key: &ObjectKey, bytes: Vec<u8>) -> Result<(), BlobError> {
-        self.inner.lock().map_err(|e| BlobError::Backend(e.to_string()))?.insert(key.clone(), bytes);
+    async fn put(&self, key: &ObjectKey, bytes: Vec<u8>, content_type: &str) -> Result<(), BlobError> {
+        self.lock()?.insert(key.clone(), (content_type.to_owned(), bytes));
         Ok(())
     }
 
-    fn get(&self, key: &ObjectKey) -> Result<Vec<u8>, BlobError> {
-        self.inner
-            .lock()
-            .map_err(|e| BlobError::Backend(e.to_string()))?
-            .get(key)
-            .cloned()
-            .ok_or_else(|| BlobError::NotFound(key.bucket, key.key.clone()))
+    async fn get(&self, key: &ObjectKey) -> Result<Vec<u8>, BlobError> {
+        self.lock()?.get(key).map(|(_, b)| b.clone()).ok_or_else(|| BlobError::NotFound(key.bucket, key.key.clone()))
+    }
+
+    async fn exists(&self, key: &ObjectKey) -> Result<bool, BlobError> {
+        Ok(self.lock()?.contains_key(key))
+    }
+
+    async fn delete(&self, key: &ObjectKey) -> Result<(), BlobError> {
+        self.lock()?.remove(key);
+        Ok(())
+    }
+
+    async fn list(&self, bucket: &'static str, prefix: &str) -> Result<Vec<ObjectMeta>, BlobError> {
+        Ok(self
+            .lock()?
+            .iter()
+            .filter(|(k, _)| k.bucket == bucket && k.key.starts_with(prefix))
+            .map(|(k, (_, b))| ObjectMeta { key: k.key.clone(), size: b.len() as u64, last_modified: None, etag: None })
+            .collect())
     }
 }
 
@@ -155,8 +228,25 @@ mod tests {
     fn memory_store_roundtrip() {
         let s = MemoryStore::default();
         let k = genome_weights("g1");
-        s.put(&k, vec![1, 2]).unwrap();
-        assert_eq!(s.get(&k).unwrap(), vec![1, 2]);
-        assert!(s.get(&genome_weights("g2")).is_err());
+        futures_lite_block_on(async {
+            s.put(&k, vec![1, 2], OCTET_STREAM).await.unwrap();
+            assert_eq!(s.get(&k).await.unwrap(), vec![1, 2]);
+            assert!(s.exists(&k).await.unwrap());
+            assert!(!s.exists(&genome_weights("g2")).await.unwrap());
+            assert!(matches!(s.get(&genome_weights("g2")).await, Err(BlobError::NotFound(..))));
+            s.put(&eval_report("g", "j"), b"{}".to_vec(), JSON).await.unwrap();
+            assert_eq!(s.content_type(&eval_report("g", "j")).as_deref(), Some(JSON));
+            let l = s.list(buckets::MODELS, "genomes/").await.unwrap();
+            assert_eq!(l.len(), 1);
+            assert_eq!(l[0].key, "genomes/g1/weights");
+            assert!(s.list(buckets::ARTIFACTS, "nothing/").await.unwrap().is_empty());
+            s.delete(&k).await.unwrap();
+            s.delete(&k).await.unwrap();
+            assert!(!s.exists(&k).await.unwrap());
+        });
+    }
+
+    fn futures_lite_block_on<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
     }
 }

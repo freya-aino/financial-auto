@@ -113,6 +113,10 @@ pub struct StartGeneration {
     pub eta: Option<u32>,
     pub min_budget_ms: Option<u64>,
     pub max_budget_ms: Option<u64>,
+    /// Generation loops (elites + `evo.vary.decoder` children); orchestrator default 1 (D-049).
+    pub max_generations: Option<u32>,
+    pub total_budget_ms: Option<u64>,
+    pub data_window_hours: Option<u32>,
 }
 
 /// Starts a successive-halving generation via the orchestrator's `ctl.evo.start`.
@@ -132,6 +136,15 @@ pub async fn start_generation(State(s): State<AppState>, Json(body): Json<StartG
     }
     if let Some(v) = body.max_budget_ms {
         args.push(("max_budget_ms", v.to_string()));
+    }
+    if let Some(v) = body.max_generations {
+        args.push(("max_generations", v.to_string()));
+    }
+    if let Some(v) = body.total_budget_ms {
+        args.push(("total_budget_ms", v.to_string()));
+    }
+    if let Some(v) = body.data_window_hours {
+        args.push(("data_window_hours", v.to_string()));
     }
     let req = CtlRequest { verb: "start".into(), args: args.into_iter().map(|(k, v)| (k.to_owned(), v)).collect() };
     match ctl_request(&s, subjects::ctl("evo", "start"), &req).await {

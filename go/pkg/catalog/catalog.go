@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -16,6 +17,8 @@ var (
 	Capabilities = []string{"data", "execution"}
 	Transports   = []string{"rest", "websocket", "fix", "grpc", "graphql", "sse", "socket", "file", "sdk", "stream"}
 	Auths        = []string{"none", "api_key", "oauth2", "hmac", "session", "wallet", "gateway"}
+	// Timeframes a catalog entry may ask a connector to poll (bar subjects, spec 21).
+	Timeframes = []string{"1m", "5m", "15m", "1h", "1d"}
 )
 
 // RateLimit is an optional per-source token bucket. Not yet present in
@@ -27,6 +30,19 @@ type RateLimit struct {
 
 // DefaultRateLimit applies when a source declares none (placeholder, spec 10 tunables).
 var DefaultRateLimit = RateLimit{PerSecond: 5, Burst: 10}
+
+// Params is the optional free-form connector configuration of a catalog
+// entry (`config:`). Secrets never live here (spec 11 §4, D-020).
+type Params struct {
+	// Symbols are venue symbols the connector polls/streams (tickers, ISINs, FX pairs).
+	Symbols []string `yaml:"symbols,omitempty" json:"symbols,omitempty"`
+	// Queries are search terms for text sources (Google News).
+	Queries []string `yaml:"queries,omitempty" json:"queries,omitempty"`
+	// Timeframe is the bar timeframe polled live (default per connector, e.g. "1m").
+	Timeframe string `yaml:"timeframe,omitempty" json:"timeframe,omitempty"`
+	// Extra holds connector-specific string settings (e.g. lemon `mic`, oanda `env`).
+	Extra map[string]string `yaml:"extra,omitempty" json:"extra,omitempty"`
+}
 
 // Source is one catalog entry.
 type Source struct {
@@ -41,6 +57,15 @@ type Source struct {
 	TosNotes     string     `yaml:"tos_notes" json:"tos_notes"`
 	Notes        string     `yaml:"notes" json:"notes"`
 	RateLimit    *RateLimit `yaml:"rate_limit,omitempty" json:"rate_limit,omitempty"`
+	Config       *Params    `yaml:"config,omitempty" json:"config,omitempty"`
+}
+
+// Params returns the entry's connector configuration or an empty one.
+func (s Source) Params() Params {
+	if s.Config != nil {
+		return *s.Config
+	}
+	return Params{}
 }
 
 // Limit returns the source's rate limit or the default.
@@ -105,6 +130,24 @@ func (c *Catalog) Validate() error {
 		for _, v := range s.Transport {
 			if !slices.Contains(Transports, v) {
 				errs = append(errs, fmt.Errorf("%s: invalid transport %q", where, v))
+			}
+		}
+		if s.RateLimit != nil && (s.RateLimit.PerSecond <= 0 || s.RateLimit.Burst <= 0) {
+			errs = append(errs, fmt.Errorf("%s: rate_limit needs per_second > 0 and burst > 0", where))
+		}
+		if s.Config != nil {
+			for _, sym := range s.Config.Symbols {
+				if sym == "" || strings.ContainsAny(sym, " \t,") {
+					errs = append(errs, fmt.Errorf("%s: invalid symbol %q", where, sym))
+				}
+			}
+			for _, q := range s.Config.Queries {
+				if strings.TrimSpace(q) == "" {
+					errs = append(errs, fmt.Errorf("%s: empty query", where))
+				}
+			}
+			if tf := s.Config.Timeframe; tf != "" && !slices.Contains(Timeframes, tf) {
+				errs = append(errs, fmt.Errorf("%s: invalid timeframe %q", where, tf))
 			}
 		}
 	}

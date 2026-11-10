@@ -93,3 +93,66 @@ func TestWriterFlushesAndCounts(t *testing.T) {
 	cancel()
 	<-done
 }
+
+func TestQuoteBarBookPoints(t *testing.T) {
+	at := time.Date(2026, 1, 2, 3, 4, 0, 0, time.UTC)
+	inst := "01900000-0000-7000-8000-000000000002"
+	vwap := 10.5
+	cases := []struct {
+		name    string
+		env     *fav1.Envelope
+		metrics []string
+		labels  map[string]string
+	}{
+		{"quote", &fav1.Envelope{SourceId: "lemon", InstrumentId: inst, EventTime: timestamppb.New(at),
+			Payload: &fav1.Envelope_Quote{Quote: &fav1.Quote{BidPrice: 9, BidSize: 1, AskPrice: 11, AskSize: 2}}},
+			[]string{MetricQuoteBidPx, MetricQuoteBidSz, MetricQuoteAskPx, MetricQuoteAskSz}, map[string]string{"venue": "lemon"}},
+		{"bar", &fav1.Envelope{SourceId: "yahoo", InstrumentId: inst, EventTime: timestamppb.New(at),
+			Payload: &fav1.Envelope_Bar{Bar: &fav1.Bar{Timeframe: "1m", Open: 1, High: 2, Low: 0.5, Close: 1.5, Volume: 100, Vwap: &vwap}}},
+			[]string{MetricBarOpen, MetricBarHigh, MetricBarLow, MetricBarClose, MetricBarVolume, MetricBarVwap}, map[string]string{"tf": "1m"}},
+		{"book", &fav1.Envelope{SourceId: "x", InstrumentId: inst, EventTime: timestamppb.New(at),
+			Payload: &fav1.Envelope_Book{Book: &fav1.BookSnapshot{
+				Bids: []*fav1.BookLevel{{Price: 9, Size: 1}, {Price: 8, Size: 2}},
+				Asks: []*fav1.BookLevel{{Price: 11, Size: 3}}}}},
+			[]string{MetricBookBidPx, MetricBookBidSz, MetricBookBidPx, MetricBookBidSz, MetricBookAskPx, MetricBookAskSz}, map[string]string{"lvl": "0"}},
+	}
+	for _, c := range cases {
+		pts := Points(c.env, "venue-token")
+		if len(pts) != len(c.metrics) {
+			t.Fatalf("%s: got %d points, want %d: %+v", c.name, len(pts), len(c.metrics), pts)
+		}
+		for i, p := range pts {
+			if p.Metric != c.metrics[i] {
+				t.Errorf("%s[%d]: metric %s, want %s", c.name, i, p.Metric, c.metrics[i])
+			}
+			if p.TsMs != at.UnixMilli() || p.Labels["inst"] != "01900000000070008000000000000002" {
+				t.Errorf("%s[%d]: %+v", c.name, i, p)
+			}
+		}
+		for k, v := range c.labels {
+			if k == "venue" {
+				v = "venue-token"
+			}
+			if pts[0].Labels[k] != v {
+				t.Errorf("%s: label %s = %q, want %q", c.name, k, pts[0].Labels[k], v)
+			}
+		}
+	}
+	// bar without vwap writes five metrics; book level 1 carries lvl=1
+	bar := cases[1].env
+	bar.GetBar().Vwap = nil
+	if n := len(BarPoints(bar, "v")); n != 5 {
+		t.Fatalf("bar without vwap: %d points", n)
+	}
+	if bk := BookPoints(cases[2].env, "v"); bk[2].Labels["lvl"] != "1" || bk[4].Labels["lvl"] != "0" {
+		t.Fatalf("book levels: %+v", bk)
+	}
+	// Different lvl values are distinct series when encoded.
+	b, err := Encode(BookPoints(cases[2].env, "v"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(strings.Split(strings.TrimSpace(string(b)), "\n")); n != 6 {
+		t.Fatalf("book encode: %d lines, want 6", n)
+	}
+}

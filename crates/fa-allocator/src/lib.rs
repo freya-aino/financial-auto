@@ -41,20 +41,9 @@ impl Allocator for RiskParityCapped {
     }
 
     fn allocate(&self, stats: &[StrategyStats]) -> Allocation {
-        let eligible: Vec<_> = stats
-            .iter()
-            .filter(|s| s.mean_return > 0.0 && s.volatility > 0.0)
-            .collect();
+        let eligible: Vec<_> = stats.iter().filter(|s| s.mean_return > 0.0 && s.volatility > 0.0).collect();
         let inv: f64 = eligible.iter().map(|s| 1.0 / s.volatility).sum();
-        eligible
-            .iter()
-            .map(|s| {
-                (
-                    s.strategy_id.clone(),
-                    ((1.0 / s.volatility) / inv).min(self.max_weight),
-                )
-            })
-            .collect()
+        eligible.iter().map(|s| (s.strategy_id.clone(), ((1.0 / s.volatility) / inv).min(self.max_weight))).collect()
     }
 }
 
@@ -77,8 +66,7 @@ impl Allocator for FractionalKelly {
             .map(|s| {
                 (
                     s.strategy_id.clone(),
-                    (self.fraction * s.mean_return / s.volatility.powi(2))
-                        .clamp(0.0, self.max_weight),
+                    (self.fraction * s.mean_return / s.volatility.powi(2)).clamp(0.0, self.max_weight),
                 )
             })
             .filter(|(_, w)| *w > 0.0)
@@ -117,10 +105,7 @@ pub fn by_name(name: &str, max_weight: f64, kelly_fraction: f64) -> Option<Box<d
     Some(match name {
         "equal_weight" => Box::new(EqualWeight { max_weight }),
         "risk_parity" | "risk_parity_capped" => Box::new(RiskParityCapped { max_weight }),
-        "fractional_kelly" | "kelly" => Box::new(FractionalKelly {
-            fraction: kelly_fraction,
-            max_weight,
-        }),
+        "fractional_kelly" | "kelly" => Box::new(FractionalKelly { fraction: kelly_fraction, max_weight }),
         _ => return None,
     })
 }
@@ -186,11 +171,7 @@ impl PerformanceTracker {
                 StrategyStats {
                     strategy_id: id.to_owned(),
                     mean_return: e.map_or(0.0, |e| e.mean),
-                    volatility: if vol > 0.0 {
-                        vol
-                    } else {
-                        self.prior_volatility
-                    },
+                    volatility: if vol > 0.0 { vol } else { self.prior_volatility },
                 }
             })
             .collect()
@@ -217,8 +198,7 @@ pub fn net_targets(
         }
         let per_asset = w * deployable_eur / d.exposures.len() as f64;
         for e in &d.exposures {
-            *out.entry(e.instrument).or_insert(0.0) +=
-                per_asset * e.mean.clamp(-1.0, 1.0) / (1.0 + e.stddev.max(0.0));
+            *out.entry(e.instrument).or_insert(0.0) += per_asset * e.mean.clamp(-1.0, 1.0) / (1.0 + e.stddev.max(0.0));
         }
     }
     out
@@ -232,21 +212,9 @@ mod tests {
 
     fn stats() -> Vec<StrategyStats> {
         vec![
-            StrategyStats {
-                strategy_id: "a".into(),
-                mean_return: 0.01,
-                volatility: 0.1,
-            },
-            StrategyStats {
-                strategy_id: "b".into(),
-                mean_return: 0.01,
-                volatility: 0.2,
-            },
-            StrategyStats {
-                strategy_id: "c".into(),
-                mean_return: -0.01,
-                volatility: 0.1,
-            },
+            StrategyStats { strategy_id: "a".into(), mean_return: 0.01, volatility: 0.1 },
+            StrategyStats { strategy_id: "b".into(), mean_return: 0.01, volatility: 0.2 },
+            StrategyStats { strategy_id: "c".into(), mean_return: -0.01, volatility: 0.1 },
         ]
     }
 
@@ -262,11 +230,7 @@ mod tests {
 
     #[test]
     fn kelly_scales_and_normalises() {
-        let a = FractionalKelly {
-            fraction: 0.25,
-            max_weight: 1.0,
-        }
-        .allocate(&stats());
+        let a = FractionalKelly { fraction: 0.25, max_weight: 1.0 }.allocate(&stats());
         assert!(a.values().sum::<f64>() <= 1.0 + 1e-12);
         assert!(a["a"] > a["b"]);
         assert!(!a.contains_key("c"));
@@ -276,51 +240,28 @@ mod tests {
     fn equal_weight_caps_and_lookup_by_name() {
         let a = EqualWeight { max_weight: 0.4 }.allocate(&stats());
         assert_eq!(a.len(), 3);
-        assert!(
-            (a["c"] - 1.0 / 3.0).abs() < 1e-12,
-            "negative-return strategies still get the control weight"
-        );
-        assert_eq!(
-            EqualWeight { max_weight: 0.25 }.allocate(&stats())["a"],
-            0.25
-        );
+        assert!((a["c"] - 1.0 / 3.0).abs() < 1e-12, "negative-return strategies still get the control weight");
+        assert_eq!(EqualWeight { max_weight: 0.25 }.allocate(&stats())["a"], 0.25);
         assert!(EqualWeight { max_weight: 1.0 }.allocate(&[]).is_empty());
-        assert_eq!(
-            by_name("risk_parity", 1.0, 0.25).unwrap().id(),
-            "risk_parity_capped"
-        );
+        assert_eq!(by_name("risk_parity", 1.0, 0.25).unwrap().id(), "risk_parity_capped");
         assert!(by_name("evolved", 1.0, 0.25).is_none());
     }
 
     #[test]
     fn performance_tracker_estimates_mean_and_vol() {
         let i = InstrumentId::new();
-        let h = Horizon {
-            timescale: Timescale::Second,
-            steps: 1,
-        };
+        let h = Horizon { timescale: Timescale::Second, steps: 1 };
         let d = ExposureDistribution {
             strategy_id: "s".into(),
             genome_id: String::new(),
             horizon: h,
             as_of_ms: 0,
-            exposures: vec![AssetExposure {
-                instrument: i,
-                mean: 1.0,
-                stddev: 0.0,
-            }],
+            exposures: vec![AssetExposure { instrument: i, mean: 1.0, stddev: 0.0 }],
         };
         let mut t = PerformanceTracker::new(0.9, 0.01);
-        assert_eq!(
-            t.stats_for(["s"])[0].volatility,
-            0.01,
-            "prior before observations"
-        );
+        assert_eq!(t.stats_for(["s"])[0].volatility, 0.01, "prior before observations");
         for k in 0..50 {
-            t.observe(
-                &d,
-                &BTreeMap::from([(i, if k % 2 == 0 { 0.02 } else { -0.01 })]),
-            );
+            t.observe(&d, &BTreeMap::from([(i, if k % 2 == 0 { 0.02 } else { -0.01 })]));
         }
         let s = &t.stats_for(["s"])[0];
         assert!(s.mean_return > 0.0 && s.mean_return < 0.02);
@@ -331,20 +272,13 @@ mod tests {
     #[test]
     fn netting_offsets_opposing_strategies() {
         let i = InstrumentId::new();
-        let h = Horizon {
-            timescale: Timescale::Hour,
-            steps: 2,
-        };
+        let h = Horizon { timescale: Timescale::Hour, steps: 2 };
         let d = |id: &str, m| ExposureDistribution {
             strategy_id: id.into(),
             genome_id: String::new(),
             horizon: h,
             as_of_ms: 0,
-            exposures: vec![AssetExposure {
-                instrument: i,
-                mean: m,
-                stddev: 0.0,
-            }],
+            exposures: vec![AssetExposure { instrument: i, mean: m, stddev: 0.0 }],
         };
         let alloc = Allocation::from([("a".to_string(), 0.5), ("b".to_string(), 0.5)]);
         let t = net_targets(&[d("a", 1.0), d("b", -1.0)], &alloc, 10_000.0);

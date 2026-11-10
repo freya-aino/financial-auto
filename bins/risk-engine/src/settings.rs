@@ -33,6 +33,10 @@ pub struct Settings {
     pub volume_window_secs: u64,
     /// Pending (unfilled) intents older than this stop counting as position.
     pub pending_ttl_secs: u64,
+    /// `ledger.position_snapshot` interval when Postgres is configured (also on every halt).
+    pub snapshot_secs: u64,
+    /// In-memory book vs Postgres-derived book comparison interval (`reconciliation_run`).
+    pub reconcile_secs: u64,
     /// Non-evolvable hard limits.
     pub limits: RiskConfig,
 }
@@ -53,6 +57,8 @@ impl Default for Settings {
             default_asset_class: AssetClass::Equity,
             volume_window_secs: 3_600,
             pending_ttl_secs: 10,
+            snapshot_secs: 60,
+            reconcile_secs: 300,
             limits: RiskConfig::default(),
         }
     }
@@ -79,13 +85,7 @@ impl Settings {
         if self.mode != "paper" {
             return Err(SettingsError::Mode(self.mode.clone()));
         }
-        if fa_allocator::by_name(
-            &self.allocator,
-            self.max_strategy_weight,
-            self.kelly_fraction,
-        )
-        .is_none()
-        {
+        if fa_allocator::by_name(&self.allocator, self.max_strategy_weight, self.kelly_fraction).is_none() {
             return Err(SettingsError::Allocator(self.allocator.clone()));
         }
         Ok(())
@@ -101,13 +101,8 @@ mod tests {
         let s = Settings::parse(include_str!("../risk.toml")).unwrap();
         assert_eq!(s.mode, "paper");
         assert_eq!(s.starting_cash_eur, PAPER_CASH_EUR);
-        assert!(matches!(
-            Settings::parse("mode = 'live'"),
-            Err(SettingsError::Mode(_))
-        ));
-        assert!(matches!(
-            Settings::parse("allocator = 'evolved'"),
-            Err(SettingsError::Allocator(_))
-        ));
+        assert_eq!((s.snapshot_secs, s.reconcile_secs), (60, 300));
+        assert!(matches!(Settings::parse("mode = 'live'"), Err(SettingsError::Mode(_))));
+        assert!(matches!(Settings::parse("allocator = 'evolved'"), Err(SettingsError::Allocator(_))));
     }
 }

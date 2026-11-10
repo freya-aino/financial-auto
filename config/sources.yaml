@@ -67,7 +67,10 @@ sources:
     auth: api_key
     status: stub
     tos_notes: ""
-    notes: "First wave. EU broker; prior code fetched XMUN instruments, venues, OHLC."
+    notes: "First wave. EU broker; connector implemented (quotes/trades/OHLC via data.lemon.markets), unverified against the live API (no key). Symbols are ISINs."
+    config:
+      symbols: [US0378331005, US88160R1014, DE0007164600]
+      extra: {mic: XMUN}
   - id: ig
     name: IG
     category: broker
@@ -87,7 +90,10 @@ sources:
     auth: api_key
     status: stub
     tos_notes: ""
-    notes: "First wave. v20 REST + HTTP streaming; practice account for paper."
+    notes: "First wave. v20 pricing stream + candles implemented, unverified against the live API (no key); practice account for paper."
+    config:
+      symbols: [EUR_USD, GBP_USD, USD_JPY]
+      extra: {env: practice}
   - id: ctrader
     name: cTrader Open API
     category: broker
@@ -341,9 +347,13 @@ sources:
     asset_classes: [equity, etf, fx, crypto, index, fundamentals]
     transport: [rest]
     auth: none
-    status: stub
+    status: live
     tos_notes: "Unofficial endpoints; personal/research use only, may break without notice."
-    notes: "First wave. Covers user's 'yfinance' entry; prior code fetched OHLC + metadata."
+    notes: "First wave. Chart endpoint polled per minute (bars + synthetic trades), verified live 2026-11-10."
+    rate_limit: {per_second: 1, burst: 3}
+    config:
+      symbols: [AAPL, MSFT, SPY, BTC-USD, EURUSD=X]
+      timeframe: 1m
   - id: dukascopy
     name: Dukascopy
     category: market_data
@@ -701,9 +711,10 @@ sources:
     asset_classes: [news]
     transport: [rest]
     auth: none
-    status: stub
+    status: live
     tos_notes: ""
-    notes: "First wave. Firebase API; prior code had full blob fetch."
+    notes: "First wave. Firebase top/new stories polled per minute, Algolia for backfill; verified live 2026-11-10."
+    rate_limit: {per_second: 5, burst: 10}
   - id: google_news
     name: Google News
     category: news
@@ -711,9 +722,12 @@ sources:
     asset_classes: [news]
     transport: [rest]
     auth: none
-    status: stub
-    tos_notes: "RSS endpoints; unofficial for programmatic use."
-    notes: "First wave. Prior code fetched per search-term list."
+    status: live
+    tos_notes: "RSS endpoints; unofficial for programmatic use. Feed copyright limits use to personal, non-commercial readers."
+    notes: "First wave. RSS search feed per query every 5 minutes; verified live 2026-11-10."
+    rate_limit: {per_second: 0.5, burst: 2}
+    config:
+      queries: ["stock market", "Federal Reserve", "Apple stock", "Bitcoin"]
 
   # ── Broadcast media ─────────────────────────────────────────────────
   - id: youtube

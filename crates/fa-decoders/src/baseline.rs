@@ -1,12 +1,16 @@
 //! Baseline, CPU-only, deterministic decoders over a single price series (spec 34 §6.1,
-//! provisional). They need no ML backend and no expert view; they exist so the evolution
-//! loop can be exercised end to end with real scores. Conditioning on `ExpertView`
-//! latents is the next step once `model-runtime` publishes `latent.state.*`.
+//! provisional). They need no ML backend; they exist so the evolution loop can be exercised
+//! end to end with real scores. Optional conditioning: [`build_with`] hands the retrieval
+//! decoder a [`DecodeCtx`] of `latent.state.*` latents, which it uses as an extra similarity
+//! term (gene `lat`) looked up **as of** each window end, so no future latent leaks in.
 //!
-//! Both decoders are **point-in-time**: `forecast(series, t)` only reads `series[..=t]`.
+//! Both decoders are **point-in-time**: `forecast(series, t)` only reads `series[..=t]` (and
+//! latents with `as_of ≤ ts[t]`).
+
+use std::sync::Arc;
 
 use crate::{
-    Analog, analog_forecast, analog_weight,
+    Analog, DecodeCtx, analog_forecast, analog_weight, cosine,
     genome::{BaselineFamily, DecoderGenome, Metric},
 };
 
@@ -86,11 +90,16 @@ pub trait SeriesDecoder: Send + Sync {
     fn ops_per_forecast(&self, series_len: usize) -> f64;
 }
 
-/// Instantiates the decoder a genome describes.
+/// Instantiates the decoder a genome describes, without latent conditioning.
 pub fn build(genome: &DecoderGenome) -> Box<dyn SeriesDecoder> {
+    build_with(genome, Arc::new(DecodeCtx::default()))
+}
+
+/// Instantiates the decoder with a conditioning context (used by the retrieval family).
+pub fn build_with(genome: &DecoderGenome, ctx: Arc<DecodeCtx>) -> Box<dyn SeriesDecoder> {
     match genome.family {
         BaselineFamily::Forecast => Box::new(QuantileForecaster { genome: genome.clone() }),
-        BaselineFamily::Retrieval => Box::new(AnalogRetriever { genome: genome.clone() }),
+        BaselineFamily::Retrieval => Box::new(AnalogRetriever { genome: genome.clone(), ctx }),
     }
 }
 
@@ -182,11 +191,39 @@ impl SeriesDecoder for QuantileForecaster {
 /// Analog retrieval: the query is the z-scored shape of the last `lookback` returns; every
 /// earlier window whose outcome is fully known (`min_gap` leakage guard) is a candidate;
 /// the `k` best by `similarity · exp(−Δt/τ)` vote, weighted, on what followed them.
+/// With latents in the context for the instrument, `similarity` becomes
+/// `(1 − lat) · shape + lat · cos(latent as of query, latent as of candidate)` whenever both
+/// latents exist (otherwise the shape similarity alone).
 pub struct AnalogRetriever {
     genome: DecoderGenome,
+    ctx: Arc<DecodeCtx>,
 }
 
 impl AnalogRetriever {
+    /// Whether the context can condition this series at all.
+    pub fn conditioned(&self, s: &Series) -> bool {
+        self.genome.latent_weight > 0.0 && self.ctx.latents.contains_key(&crate::instrument_token(&s.instrument_id))
+    }
+
+    fn combined_similarity(
+        &self,
+        s: &Series,
+        query_shape: &[f64],
+        query_latent: Option<&[f32]>,
+        e: usize,
+        shape: &[f64],
+    ) -> f64 {
+        let base = self.similarity(query_shape, shape);
+        let Some(q) = query_latent else { return base };
+        match self.ctx.latent_as_of(&s.instrument_id, s.ts_ms[e]) {
+            Some(l) => {
+                let w = self.genome.latent_weight;
+                (1.0 - w) * base + w * cosine(q, &l.vec)
+            }
+            None => base,
+        }
+    }
+
     fn shape(s: &Series, end: usize, lb: usize) -> Option<Vec<f64>> {
         if end < lb {
             return None;
@@ -230,13 +267,18 @@ impl SeriesDecoder for AnalogRetriever {
             return None;
         }
         let query = Self::shape(s, t, g.lookback)?;
+        let query_latent = if self.conditioned(s) {
+            self.ctx.latent_as_of(&s.instrument_id, s.ts_ms[t]).map(|l| l.vec.as_slice())
+        } else {
+            None
+        };
         // Candidate window ends `e` with outcome window [e, e+h] ending ≤ t − min_gap.
         let last_end = t.checked_sub(g.min_gap.max(g.horizon))?.checked_sub(g.horizon)?;
         let step_days = s.step_ms as f64 / 86_400_000.0;
         let mut scored: Vec<Analog> = (g.lookback..=last_end)
             .filter_map(|e| {
                 let shape = Self::shape(s, e, g.lookback)?;
-                let sim = self.similarity(&query, &shape);
+                let sim = self.combined_similarity(s, &query, query_latent, e, &shape);
                 let outcome = s.forward_return(e, g.horizon)?;
                 Some(Analog {
                     window_id: format!("{}@{}", s.instrument_id, s.ts_ms[e]),
@@ -341,6 +383,42 @@ mod tests {
             assert!(a.similarity <= 1.0 + 1e-9);
         }
         assert!(f.quantiles.windows(2).all(|w| w[0] <= w[1] + 1e-12));
+    }
+
+    #[test]
+    fn latent_context_changes_ranking_deterministically_and_point_in_time() {
+        use crate::LatentPoint;
+        let s = synthetic(400, 3);
+        let g = DecoderGenome::parse("retrieval:h=2,lb=8,k=5,gap=2,lat=0.9").unwrap();
+        let t = 300;
+        let plain = build(&g).forecast(&s, t).unwrap();
+        // Latents: one regime vector for early windows, the query's regime for a late band.
+        let mut ctx = DecodeCtx::default();
+        for i in (0..400).step_by(5) {
+            let v = if (150..200).contains(&i) || i >= 290 { vec![1.0, 0.0] } else { vec![0.0, 1.0] };
+            ctx.push(&s.instrument_id, LatentPoint { as_of_ms: s.ts_ms[i], vec: v });
+        }
+        // a future-only latent must not matter at t
+        ctx.push(&s.instrument_id, LatentPoint { as_of_ms: s.ts_ms[t] + 1, vec: vec![-1.0, -1.0] });
+        let ctx = Arc::new(ctx);
+        let cond = build_with(&g, ctx.clone()).forecast(&s, t).unwrap();
+        assert_eq!(cond, build_with(&g, ctx.clone()).forecast(&s, t).unwrap(), "deterministic");
+        assert_ne!(cond.analogs, plain.analogs, "latents must influence retrieval");
+        for a in &cond.analogs {
+            let dt_steps = (a.time_distance_days * 86_400_000.0 / 1000.0).round() as usize;
+            let e = t - dt_steps;
+            // windows ending in the early band or in the current regime (≥ 290, ≤ t − gap − h)
+            assert!((150..205).contains(&e) || e >= 290, "analog at step {e} is outside the matching regime");
+        }
+        // Truncating the future (series and latents) does not change the forecast.
+        let mut shorter = s.clone();
+        shorter.log_price.truncate(t + 1);
+        shorter.ts_ms.truncate(t + 1);
+        assert_eq!(build_with(&g, ctx).forecast(&shorter, t).unwrap(), cond);
+        // other instruments' latents are ignored
+        let mut other = DecodeCtx::default();
+        other.push("someone-else", LatentPoint { as_of_ms: 0, vec: vec![1.0] });
+        assert_eq!(build_with(&g, Arc::new(other)).forecast(&s, t).unwrap(), plain);
     }
 
     #[test]

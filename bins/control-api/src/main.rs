@@ -2,11 +2,14 @@
 //! Local only, no auth (ADR 0006).
 
 mod bus_tap;
+mod graph_routes;
+mod ledger_routes;
 mod live;
 mod live_routes;
 mod routes;
 mod sources;
 mod state;
+mod streams_routes;
 
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -55,8 +58,12 @@ async fn main() -> anyhow::Result<()> {
     let state = state::AppState::new(cfg, args.sources, Some(nats));
     state.spawn_heartbeat_collector();
     state.spawn_live_collector();
+    streams_routes::spawn_ensure_streams(&state);
 
-    let app = routes::router(state, Some(args.frontend));
+    let app = routes::router(state.clone(), Some(args.frontend))
+        .merge(graph_routes::router().with_state(state.clone()))
+        .merge(streams_routes::router().with_state(state.clone()));
+    let app = ledger_routes::install(state, app).await; // Postgres pool + paper-book seed + ledger routes (D-047)
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     tracing::info!(%bind, "control-api listening");
     axum::serve(listener, app).await?;

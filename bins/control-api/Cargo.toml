@@ -13,6 +13,7 @@ chrono.workspace = true
 clap.workspace = true
 fa-bus.workspace = true
 fa-core.workspace = true
+fa-hub.workspace = true
 fa-ledger.workspace = true
 fa-proto.workspace = true
 futures.workspace = true

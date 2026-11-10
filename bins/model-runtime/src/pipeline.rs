@@ -179,6 +179,14 @@ impl TimescalePipeline {
         self.encoder.sizing().context_steps as usize
     }
 
+    pub fn n_experts(&self) -> u32 {
+        self.regions.len() as u32
+    }
+
+    pub fn latent_dim(&self) -> u32 {
+        self.encoder.sizing().latent_dim
+    }
+
     pub fn live_regions(&self) -> usize {
         self.regions.iter().map(|r| r.regions().len()).sum()
     }

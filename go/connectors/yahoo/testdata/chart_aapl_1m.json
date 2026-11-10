@@ -1,0 +1,108 @@
+{
+ "chart": {
+  "result": [
+   {
+    "meta": {
+     "currency": "USD",
+     "symbol": "AAPL",
+     "exchangeName": "NMS",
+     "fullExchangeName": "NasdaqGS",
+     "instrumentType": "EQUITY",
+     "firstTradeDate": 345479400,
+     "regularMarketTime": 1794258001,
+     "hasPrePostMarketData": true,
+     "gmtoffset": -18000,
+     "timezone": "EST",
+     "exchangeTimezoneName": "America/New_York",
+     "regularMarketPrice": 350.69,
+     "regularMarketChangePercent": 2.43,
+     "fulldayPrice": 351.16,
+     "fulldayChange": 8.79,
+     "fulldayChangePercent": 2.567,
+     "fiftyTwoWeekHigh": 355.38,
+     "fiftyTwoWeekLow": 243.42,
+     "regularMarketDayHigh": 352.28,
+     "regularMarketDayLow": 344.78,
+     "regularMarketVolume": 47499490,
+     "longName": "Apple Inc.",
+     "shortName": "Apple Inc.",
+     "chartPreviousClose": 342.37,
+     "previousClose": 342.37,
+     "scale": 3,
+     "priceHint": 2,
+     "currentTradingPeriod": {
+      "pre": {
+       "timezone": "EST",
+       "start": 1794214800,
+       "end": 1794234600,
+       "gmtoffset": -18000
+      },
+      "regular": {
+       "timezone": "EST",
+       "start": 1794234600,
+       "end": 1794258000,
+       "gmtoffset": -18000
+      },
+      "post": {
+       "timezone": "EST",
+       "start": 1794258000,
+       "end": 1794272400,
+       "gmtoffset": -18000
+      }
+     },
+     "dataGranularity": "1m",
+     "range": "1d"
+    },
+    "timestamp": [
+     1794234600,
+     1794234660,
+     1794234720,
+     1794234780,
+     1794234840
+    ],
+    "indicators": {
+     "quote": [
+      {
+       "high": [
+        347.0400085449219,
+        348.9798889160156,
+        348.7950134277344,
+        348.5780944824219,
+        348.4700012207031
+       ],
+       "open": [
+        344.93499755859375,
+        347.0249938964844,
+        348.6400146484375,
+        348.260009765625,
+        348.3900146484375
+       ],
+       "volume": [
+        1599598,
+        295873,
+        194729,
+        173433,
+        135633
+       ],
+       "close": [
+        347.0400085449219,
+        348.67999267578125,
+        348.2049865722656,
+        348.385009765625,
+        347.9075012207031
+       ],
+       "low": [
+        344.7900085449219,
+        346.8399963378906,
+        347.6700134277344,
+        347.6499938964844,
+        347.07000732421875
+       ]
+      }
+     ]
+    }
+   }
+  ],
+  "error": null
+ }
+}

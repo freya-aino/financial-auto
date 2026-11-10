@@ -14,6 +14,8 @@ min_order_eur = 25.0
 default_asset_class = "equity" # synthetic/unknown instruments are treated as equities
 volume_window_secs = 3600   # traded volume window behind the liquidity cap
 pending_ttl_secs = 10
+snapshot_secs = 60          # ledger.position_snapshot cadence when [postgres] is reachable (also on halt)
+reconcile_secs = 300        # in-memory book vs Postgres-derived book → ledger.reconciliation_run
 
 [limits]
 max_drawdown = 0.10         # risk.portfolio_max_drawdown → kill switch, manual re-arm

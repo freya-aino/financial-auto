@@ -60,10 +60,10 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let cfg = PlatformConfig::load(&args.config).context("loading platform config")?;
     let file = match &args.strategies {
-        Some(p) => StrategyFile::parse(
-            &std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?,
-        )
-        .with_context(|| format!("parsing {}", p.display()))?,
+        Some(p) => {
+            StrategyFile::parse(&std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)
+                .with_context(|| format!("parsing {}", p.display()))?
+        }
         None => StrategyFile::baselines(),
     };
     let baselines = file.strategy.iter().filter(|s| s.is_baseline()).count();
@@ -75,20 +75,13 @@ async fn main() -> anyhow::Result<()> {
         "strategy-runtime starting (baseline programs are hand-written, not evolved)"
     );
 
-    let bus = Bus::connect(&cfg.nats.url)
-        .await
-        .context("connecting to NATS")?;
+    let bus = Bus::connect(&cfg.nats.url).await.context("connecting to NATS")?;
     let instance_id = ulid::Ulid::generate().to_string();
     let published = Arc::new(Mutex::new(0u64));
 
     // heartbeat
     {
-        let (bus, rt, published, instance_id) = (
-            bus.clone(),
-            rt.clone(),
-            published.clone(),
-            instance_id.clone(),
-        );
+        let (bus, rt, published, instance_id) = (bus.clone(), rt.clone(), published.clone(), instance_id.clone());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(args.heartbeat_secs));
             loop {
@@ -101,10 +94,7 @@ async fn main() -> anyhow::Result<()> {
                         ("trades_seen".to_owned(), r.trades_seen as f64),
                         ("latent_seen".to_owned(), r.latent_seen as f64),
                         ("signals_emitted".to_owned(), r.signals_emitted as f64),
-                        (
-                            "signals_published".to_owned(),
-                            *published.lock().await as f64,
-                        ),
+                        ("signals_published".to_owned(), *published.lock().await as f64),
                     ])
                 };
                 let hb = Heartbeat {
@@ -124,9 +114,7 @@ async fn main() -> anyhow::Result<()> {
     // trades
     {
         let (bus, rt) = (bus.clone(), rt.clone());
-        let mut trades = bus
-            .subscribe::<Envelope>(subjects::ALL_MD_TRADES.into())
-            .await?;
+        let mut trades = bus.subscribe::<Envelope>(subjects::ALL_MD_TRADES.into()).await?;
         tokio::spawn(async move {
             while let Some((_, env)) = trades.next().await {
                 if let Some(Payload::Trade(t)) = &env.payload
@@ -142,9 +130,7 @@ async fn main() -> anyhow::Result<()> {
     // latent states (optional feed)
     {
         let (bus, rt) = (bus.clone(), rt.clone());
-        let mut states = bus
-            .subscribe::<LatentState>("latent.state.>".into())
-            .await?;
+        let mut states = bus.subscribe::<LatentState>("latent.state.>".into()).await?;
         tokio::spawn(async move {
             while let Some((_, st)) = states.next().await {
                 rt.lock().await.on_latent(&st);
@@ -159,10 +145,7 @@ async fn main() -> anyhow::Result<()> {
         let dists = rt.lock().await.tick(now_ms());
         for d in dists {
             let proto = d.to_proto();
-            match bus
-                .publish(subjects::signal_exposure(&d.strategy_id), &proto)
-                .await
-            {
+            match bus.publish(subjects::signal_exposure(&d.strategy_id), &proto).await {
                 Ok(()) => *published.lock().await += 1,
                 Err(e) => {
                     tracing::warn!(strategy = %d.strategy_id, error = %e, "signal publish failed")

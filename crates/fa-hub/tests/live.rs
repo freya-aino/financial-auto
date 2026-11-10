@@ -276,3 +276,146 @@ async fn latent_vector_search_is_scoped_to_the_expert_space() {
 
     cleanup(&c, &p).await;
 }
+
+#[tokio::test]
+async fn ensure_upsert_and_lifecycle_queries_are_idempotent() {
+    let Some(c) = client() else { return };
+    c.ensure_schema_ready(WAIT).await.expect("schema");
+    let p = prefix();
+
+    let new_snap = NewSnapshot {
+        snapshot_id: format!("{p}stat"),
+        timescale: "1m".into(),
+        encoder_family: "statistical".into(),
+        generation: 1,
+        garage_key: String::new(),
+        status: "active".into(),
+    };
+    let snap = c.ensure_snapshot(&new_snap).await.expect("ensure_snapshot create");
+    let again = c.ensure_snapshot(&NewSnapshot { generation: 99, ..new_snap.clone() }).await.expect("ensure again");
+    assert_eq!(again, snap, "existing row is returned unchanged");
+
+    let new_space = NewExpertSpace {
+        expert_space_id: format!("{p}stat-e0"),
+        snapshot_id: snap.snapshot_id.clone(),
+        index: 0,
+        dim: 8,
+    };
+    let space = c.ensure_expert_space(snap.id, &new_space).await.expect("ensure_expert_space");
+    assert_eq!(c.ensure_expert_space(snap.id, &new_space).await.expect("ensure again"), space);
+    assert_eq!(c.snapshot_spaces(snap.id).await.expect("spaces").len(), 1, "no duplicate HasSpace");
+    assert_eq!(c.space_by_id(&space.expert_space_id).await.expect("space_by_id"), Some(space.clone()));
+
+    let mk = |n: &str, radius: f64| NewRegion {
+        region_id: format!("{p}r{n}"),
+        lineage_id: format!("{p}r{n}"),
+        expert_space_id: space.expert_space_id.clone(),
+        method: "leader".into(),
+        radius,
+        density: 1.0,
+    };
+    let r1 = c.upsert_region(space.id, &mk("1", 1.0)).await.expect("upsert_region create");
+    assert_eq!(r1.status.as_deref(), Some("live"));
+    let r2 = c.upsert_region(space.id, &mk("2", 1.0)).await.expect("upsert_region create");
+    let r1b = c.upsert_region(space.id, &mk("1", 2.0)).await.expect("upsert_region revive");
+    assert_eq!((r1b.id, r1b.radius), (r1.id, 2.0));
+    assert_eq!(c.space_regions(space.id).await.expect("regions").len(), 2, "no duplicate region / InSpace");
+
+    let merged = c.mark_region_status(&r1.region_id, "merged", &r2.region_id).await.expect("mark merged");
+    assert_eq!(
+        (merged.status.as_deref(), merged.related_region_id.as_deref()),
+        (Some("merged"), Some(r2.region_id.as_str()))
+    );
+    assert!(merged.updated_at.is_some());
+    let missing = c.mark_region_status(&format!("{p}nope"), "retired", "").await;
+    assert!(matches!(missing, Err(HubError::NotFound { .. })), "{missing:?}");
+    assert_eq!(c.region_by_id(&r2.region_id).await.expect("region_by_id"), Some(r2.clone()));
+
+    let row = |to: &LatentRegion, count: i64, mean: f64| TransitionUpsert {
+        from_region_id: r1.region_id.clone(),
+        to_region_id: to.region_id.clone(),
+        transition: NewTransition {
+            sampler_id: "conjugate".into(),
+            count,
+            mean,
+            lower: mean - 0.05,
+            upper: mean + 0.05,
+            kernel_params: "{}".into(),
+        },
+    };
+    let t = c.upsert_transition(&row(&r2, 1, 0.5)).await.expect("upsert_transition create");
+    assert_eq!((t.from, t.to, t.count, t.to_region_id.as_deref()), (r1.id, r2.id, 1, Some(r2.region_id.as_str())));
+    let both = c.upsert_transitions(&[row(&r2, 2, 0.6), row(&r1, 1, 0.4)]).await.expect("upsert_transitions");
+    assert_eq!(both.len(), 2);
+    assert_eq!((both[0].id, both[0].count, both[0].mean), (t.id, 2, 0.6), "same edge updated in place");
+    assert_eq!((both[1].from, both[1].to), (r1.id, r1.id), "self loop created");
+    assert_eq!(c.region_transitions(r1.id).await.expect("transitions").len(), 2);
+    let unknown = c.upsert_transition(&TransitionUpsert { to_region_id: format!("{p}nope"), ..row(&r2, 1, 0.1) }).await;
+    assert!(matches!(unknown, Err(HubError::NotFound { .. })), "{unknown:?}");
+
+    let g = c.snapshot_graph(&snap.snapshot_id).await.expect("snapshot_graph").expect("exists");
+    assert_eq!((g.snapshot.id, g.spaces.len(), g.regions.len(), g.transitions.len()), (snap.id, 1, 2, 2));
+    assert!(c.snapshot_graph(&format!("{p}nope")).await.expect("snapshot_graph").is_none());
+
+    // resolve_node by business id and by numeric id.
+    let n = c.resolve_node(&r2.region_id).await.expect("resolve").expect("found");
+    assert_eq!((n.id, n.label.as_str()), (r2.id, "LatentRegion"));
+    assert_eq!(c.resolve_node(&snap.id.to_string()).await.expect("resolve").map(|n| n.id), Some(snap.id));
+    assert!(c.resolve_node(&format!("{p}nothing")).await.expect("resolve").is_none());
+
+    // Named-query catalog.
+    let v = c.run_named("snapshotGraph", &serde_json::json!({ "snapshot_id": snap.snapshot_id })).await.expect("named");
+    assert_eq!(v["regions"].as_array().map(Vec::len), Some(2));
+    let v = c.run_named("regionTransitions", &serde_json::json!({ "region_id": r1.region_id })).await.expect("named");
+    assert_eq!(v.as_array().map(Vec::len), Some(2));
+    let v = c.run_named("neighborhood", &serde_json::json!({ "node": r1.region_id, "depth": 1 })).await.expect("named");
+    assert!(v["nodes"].as_array().is_some_and(|n| n.len() >= 2));
+    let e = c.run_named("getRegion", &serde_json::json!({})).await;
+    assert!(matches!(e, Err(HubError::BadParam(_))), "{e:?}");
+    let e = c.run_named("spaceRegions", &serde_json::json!({ "expert_space_id": format!("{p}nope") })).await;
+    assert!(matches!(e, Err(HubError::NotFound { .. })), "{e:?}");
+
+    cleanup(&c, &p).await;
+}
+
+#[tokio::test]
+async fn genome_business_id_writes_for_evo_worker() {
+    let Some(c) = client() else { return };
+    c.ensure_schema_ready(WAIT).await.expect("schema");
+    let p = prefix();
+    let mk = |n: &str| NewGenome {
+        genome_id: format!("{p}g{n}"),
+        kind: "decoder".into(),
+        family: "forecast".into(),
+        params: "{\"h\":5}".into(),
+    };
+    let g0 = c.upsert_genome(&mk("0")).await.expect("upsert_genome");
+    assert_eq!(c.upsert_genome(&mk("0")).await.expect("upsert again"), g0);
+    let g1 = c.upsert_genome(&mk("1")).await.expect("upsert_genome");
+    c.link_parent(&g0.genome_id, &g1.genome_id, "mutate").await.expect("link_parent");
+    let bad = c.link_parent(&g0.genome_id, &format!("{p}nope"), "mutate").await;
+    assert!(matches!(bad, Err(HubError::NotFound { .. })), "{bad:?}");
+    let f = c
+        .add_fitness_record(&NewFitness {
+            genome_id: g1.genome_id.clone(),
+            generation: 2,
+            objectives: "{\"crps_skill\":0.1}".into(),
+            pareto_rank: 0,
+        })
+        .await
+        .expect("add_fitness_record");
+    assert_eq!(c.genome_fitness(g1.id).await.expect("fitness"), vec![f]);
+    assert_eq!(c.genome_parents(g1.id).await.expect("parents"), vec![g0.clone()]);
+    let v = c.run_named("genomeAncestry", &serde_json::json!({ "genome_id": g1.genome_id })).await.expect("named");
+    assert_eq!(v[0][0]["genome_id"], g0.genome_id);
+    let bad = c
+        .add_fitness_record(&NewFitness {
+            genome_id: format!("{p}nope"),
+            generation: 0,
+            objectives: "{}".into(),
+            pareto_rank: 0,
+        })
+        .await;
+    assert!(matches!(bad, Err(HubError::NotFound { .. })), "{bad:?}");
+    cleanup(&c, &p).await;
+}

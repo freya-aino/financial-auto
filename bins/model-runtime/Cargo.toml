@@ -12,6 +12,7 @@ fa-bus.workspace = true
 fa-core.workspace = true
 fa-encoders.workspace = true
 fa-expert-space.workspace = true
+fa-hub.workspace = true
 fa-mcmc.workspace = true
 fa-patterns.workspace = true
 fa-proto.workspace = true

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +23,24 @@ import (
 const (
 	MetricTradePrice = "fa_trade_price"
 	MetricTradeSize  = "fa_trade_size"
+	MetricQuoteBidPx = "fa_quote_bid_px"
+	MetricQuoteBidSz = "fa_quote_bid_sz"
+	MetricQuoteAskPx = "fa_quote_ask_px"
+	MetricQuoteAskSz = "fa_quote_ask_sz"
+	MetricBarOpen    = "fa_bar_open"
+	MetricBarHigh    = "fa_bar_high"
+	MetricBarLow     = "fa_bar_low"
+	MetricBarClose   = "fa_bar_close"
+	MetricBarVolume  = "fa_bar_volume"
+	MetricBarVwap    = "fa_bar_vwap"
+	MetricBookBidPx  = "fa_book_bid_px"
+	MetricBookBidSz  = "fa_book_bid_sz"
+	MetricBookAskPx  = "fa_book_ask_px"
+	MetricBookAskSz  = "fa_book_ask_sz"
 )
+
+// MaxBookLevels bounds the `lvl` label (spec 20 §5.3: N ≤ 20).
+const MaxBookLevels = 20
 
 // Point is one sample of one series.
 type Point struct {
@@ -101,29 +119,119 @@ func (w *Writer) Add(pts ...Point) {
 	}
 }
 
-// AddEnvelope converts a canonical envelope to points (trades only for now)
-// and buffers them. venue is the connector's subject venue token.
+// AddEnvelope converts a canonical market envelope (trade, quote, bar, book)
+// to points and buffers them. venue is the connector's subject venue token.
 func (w *Writer) AddEnvelope(e *fav1.Envelope, venue string) {
-	w.Add(TradePoints(e, venue)...)
+	w.Add(Points(e, venue)...)
+}
+
+// Points maps any market-data envelope to its samples; other payloads yield nothing.
+func Points(e *fav1.Envelope, venue string) []Point {
+	switch e.GetPayload().(type) {
+	case *fav1.Envelope_Trade:
+		return TradePoints(e, venue)
+	case *fav1.Envelope_Quote:
+		return QuotePoints(e, venue)
+	case *fav1.Envelope_Bar:
+		return BarPoints(e, venue)
+	case *fav1.Envelope_Book:
+		return BookPoints(e, venue)
+	}
+	return nil
+}
+
+// base returns the common labels and ms timestamp, or ok=false when the
+// envelope has no instrument.
+func base(e *fav1.Envelope, venue string) (map[string]string, int64, bool) {
+	if e.GetInstrumentId() == "" {
+		return nil, 0, false
+	}
+	ts := e.GetEventTime()
+	if ts == nil {
+		ts = e.GetIngestTime()
+	}
+	labels := map[string]string{"inst": bus.SubjectToken(e.InstrumentId), "venue": venue, "src": e.SourceId}
+	return labels, ts.AsTime().UnixMilli(), true
 }
 
 // TradePoints maps a Trade envelope to fa_trade_price / fa_trade_size samples.
 // Non-trade envelopes yield nothing.
 func TradePoints(e *fav1.Envelope, venue string) []Point {
 	t := e.GetTrade()
-	if t == nil || e.GetInstrumentId() == "" {
+	labels, ms, ok := base(e, venue)
+	if t == nil || !ok {
 		return nil
 	}
-	ts := e.GetEventTime()
-	if ts == nil {
-		ts = e.GetIngestTime()
-	}
-	ms := ts.AsTime().UnixMilli()
-	labels := map[string]string{"inst": bus.SubjectToken(e.InstrumentId), "venue": venue, "src": e.SourceId}
 	return []Point{
 		{Metric: MetricTradePrice, Labels: labels, Value: t.Price, TsMs: ms},
 		{Metric: MetricTradeSize, Labels: labels, Value: t.Size, TsMs: ms},
 	}
+}
+
+// QuotePoints maps a Quote envelope to fa_quote_{bid,ask}_{px,sz}.
+func QuotePoints(e *fav1.Envelope, venue string) []Point {
+	q := e.GetQuote()
+	labels, ms, ok := base(e, venue)
+	if q == nil || !ok {
+		return nil
+	}
+	return []Point{
+		{Metric: MetricQuoteBidPx, Labels: labels, Value: q.BidPrice, TsMs: ms},
+		{Metric: MetricQuoteBidSz, Labels: labels, Value: q.BidSize, TsMs: ms},
+		{Metric: MetricQuoteAskPx, Labels: labels, Value: q.AskPrice, TsMs: ms},
+		{Metric: MetricQuoteAskSz, Labels: labels, Value: q.AskSize, TsMs: ms},
+	}
+}
+
+// BarPoints maps a Bar envelope to fa_bar_{open,high,low,close,volume[,vwap]}
+// with the extra `tf` label. VWAP is written only when the source set it.
+func BarPoints(e *fav1.Envelope, venue string) []Point {
+	b := e.GetBar()
+	labels, ms, ok := base(e, venue)
+	if b == nil || !ok {
+		return nil
+	}
+	labels["tf"] = b.GetTimeframe()
+	pts := []Point{
+		{Metric: MetricBarOpen, Labels: labels, Value: b.Open, TsMs: ms},
+		{Metric: MetricBarHigh, Labels: labels, Value: b.High, TsMs: ms},
+		{Metric: MetricBarLow, Labels: labels, Value: b.Low, TsMs: ms},
+		{Metric: MetricBarClose, Labels: labels, Value: b.Close, TsMs: ms},
+		{Metric: MetricBarVolume, Labels: labels, Value: b.Volume, TsMs: ms},
+	}
+	if b.Vwap != nil {
+		pts = append(pts, Point{Metric: MetricBarVwap, Labels: labels, Value: b.GetVwap(), TsMs: ms})
+	}
+	return pts
+}
+
+// BookPoints maps a BookSnapshot to fa_book_{bid,ask}_{px,sz} per level with
+// the `lvl` label (0 = top of book), truncated to MaxBookLevels.
+func BookPoints(e *fav1.Envelope, venue string) []Point {
+	bk := e.GetBook()
+	labels, ms, ok := base(e, venue)
+	if bk == nil || !ok {
+		return nil
+	}
+	var pts []Point
+	side := func(levels []*fav1.BookLevel, px, sz string) {
+		for i, l := range levels {
+			if i >= MaxBookLevels {
+				break
+			}
+			ll := make(map[string]string, len(labels)+1)
+			for k, v := range labels {
+				ll[k] = v
+			}
+			ll["lvl"] = strconv.Itoa(i)
+			pts = append(pts,
+				Point{Metric: px, Labels: ll, Value: l.Price, TsMs: ms},
+				Point{Metric: sz, Labels: ll, Value: l.Size, TsMs: ms})
+		}
+	}
+	side(bk.Bids, MetricBookBidPx, MetricBookBidSz)
+	side(bk.Asks, MetricBookAskPx, MetricBookAskSz)
+	return pts
 }
 
 // Stats returns a copy of the counters.

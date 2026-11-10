@@ -8,21 +8,27 @@
 //! `decoder.output.<family>`. It publishes `JobProgress`, holds a GPU lease from the arbiter
 //! while evaluating (preemption → `STATUS_PREEMPTED`), extends the JetStream ack window
 //! with in-progress acks, and acks every message after a result was published. Other job
-//! kinds get `STATUS_FAILED` ("not implemented").
+//! kinds get `STATUS_FAILED` ("not implemented"). When `config/secrets.toml` (or `FA_GARAGE_*`)
+//! holds Garage credentials, every OK result JSON is also written to
+//! `fa-artifacts/evals/<generation>/<job>.json` (`report_ref.persisted`).
 
+mod data;
 mod gpu;
 mod job;
+mod latent;
 mod market;
+mod vary;
 
 use std::time::Duration;
 
 use clap::Parser;
+use fa_blob::S3BlobStore;
 use fa_bus::{
     Bus,
     async_nats::jetstream::{AckKind, consumer::pull, stream},
     subjects,
 };
-use fa_core::config::PlatformConfig;
+use fa_core::{Secrets, config::PlatformConfig};
 use fa_proto::{
     Message,
     v1::{Heartbeat, Job, JobResult, job_result::Status},
@@ -42,6 +48,12 @@ struct Args {
     /// GPU memory requested from the arbiter per job (0 disables leasing).
     #[arg(long, env = "FA_EVO_GPU_LEASE_MB", default_value_t = 512)]
     gpu_lease_mb: u32,
+    /// Default evaluation window (hours) read from VictoriaMetrics when the job has none.
+    #[arg(long, env = "FA_EVO_DATA_WINDOW_HOURS", default_value_t = 6.0)]
+    data_window_hours: f64,
+    /// Disable VictoriaMetrics reads (buffer only).
+    #[arg(long, env = "FA_EVO_NO_TSDB", default_value_t = false)]
+    no_tsdb: bool,
 }
 
 #[tokio::main]
@@ -51,6 +63,25 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let cfg = PlatformConfig::load(&args.config)?;
+    // Secrets: `$FA_SECRETS` / config/secrets.toml + FA_GARAGE_* env (D-020). Missing = none.
+    let secrets = Secrets::load()?;
+    let blob = match S3BlobStore::from_config(&cfg, &secrets) {
+        Ok(s) => {
+            tracing::info!(endpoint = %cfg.garage.endpoint, "eval reports persist to Garage");
+            Some(s)
+        }
+        Err(fa_blob::BlobError::NotConfigured) => {
+            tracing::warn!(
+                secrets = %fa_core::secrets::default_path().display(),
+                "no Garage credentials; eval reports are not persisted"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Garage client unavailable; eval reports are not persisted");
+            None
+        }
+    };
     let bus = Bus::connect(&cfg.nats.url).await?;
     let worker_id = format!("evo-worker-{}", ulid::Ulid::generate());
 
@@ -76,6 +107,28 @@ async fn main() -> anyhow::Result<()> {
 
     let market = market::MarketBuffer::default();
     tokio::spawn(market.clone().run(bus.clone()));
+    let latents = latent::LatentBuffer::default();
+    tokio::spawn(latents.clone().run(bus.clone()));
+    let tsdb = if args.no_tsdb {
+        None
+    } else {
+        let vm_url = std::env::var("FA_VM_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| cfg.victoriametrics.url.clone());
+        let t = fa_tsdb::Tsdb::new(vm_url);
+        match t.health().await {
+            Ok(()) => tracing::info!(
+                url = t.base_url(),
+                "VictoriaMetrics reachable; evaluation data comes from fa_trade_price"
+            ),
+            Err(e) => {
+                tracing::warn!(url = t.base_url(), error = %e, "VictoriaMetrics unreachable at startup; jobs fall back to the md.trade.> buffer until it answers")
+            }
+        }
+        Some(t)
+    };
+    let hub = Some(fa_hub::HubClient::new(fa_hub::HubClient::url_from_env_or(&cfg.helix.url)));
     let (notices, _) = broadcast::channel(256);
     tokio::spawn(gpu::run_notices(bus.clone(), notices.clone()));
 
@@ -84,15 +137,19 @@ async fn main() -> anyhow::Result<()> {
         let bus = bus.clone();
         let worker_id = worker_id.clone();
         let market = market.clone();
+        let latents = latents.clone();
         let counters = counters.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
             loop {
                 tick.tick().await;
                 let (inst, trades) = market.stats();
+                let (linst, lpoints) = latents.stats();
                 let mut c = counters.lock().map(|c| c.clone()).unwrap_or_default();
                 c.insert("market.instruments".into(), inst as f64);
                 c.insert("market.trades".into(), trades as f64);
+                c.insert("latents.instruments".into(), linst as f64);
+                c.insert("latents.points".into(), lpoints as f64);
                 let hb = Heartbeat {
                     service: "evo-worker".into(),
                     instance_id: worker_id.clone(),
@@ -116,6 +173,11 @@ async fn main() -> anyhow::Result<()> {
         market,
         notices,
         gpu_lease_mb: args.gpu_lease_mb,
+        tsdb,
+        data_window_hours: args.data_window_hours,
+        latents,
+        hub,
+        blob,
     };
     tracing::info!(%worker_id, gpu_lease_mb = args.gpu_lease_mb, "pulling jobs from {STREAM}");
     // One message at a time so idle workers do not hoard jobs other replicas could take.

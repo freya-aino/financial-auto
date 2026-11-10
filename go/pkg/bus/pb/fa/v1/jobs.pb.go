@@ -29,6 +29,7 @@ const (
 	JobResult_STATUS_FAILED          JobResult_Status = 1
 	JobResult_STATUS_PREEMPTED       JobResult_Status = 2
 	JobResult_STATUS_BUDGET_EXCEEDED JobResult_Status = 3
+	JobResult_STATUS_CANCELLED       JobResult_Status = 4 // orchestrator-side cancel (ctl.evo.cancel, D-037)
 )
 
 // Enum value maps for JobResult_Status.
@@ -38,12 +39,14 @@ var (
 		1: "STATUS_FAILED",
 		2: "STATUS_PREEMPTED",
 		3: "STATUS_BUDGET_EXCEEDED",
+		4: "STATUS_CANCELLED",
 	}
 	JobResult_Status_value = map[string]int32{
 		"STATUS_OK":              0,
 		"STATUS_FAILED":          1,
 		"STATUS_PREEMPTED":       2,
 		"STATUS_BUDGET_EXCEEDED": 3,
+		"STATUS_CANCELLED":       4,
 	}
 )
 
@@ -217,6 +220,11 @@ type JobResult struct {
 	UsedGpuMs     uint64                 `protobuf:"varint,6,opt,name=used_gpu_ms,json=usedGpuMs,proto3" json:"used_gpu_ms,omitempty"`
 	WorkerId      string                 `protobuf:"bytes,7,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
 	Error         string                 `protobuf:"bytes,8,opt,name=error,proto3" json:"error,omitempty"`
+	// Multi-objective fitness (spec 34 §6.3): objective name -> value, with its direction
+	// ("min" | "max"). Mirrors the JSON `objectives`/`directions` in `result`; the
+	// orchestrator's NSGA-II ranking reads these first and falls back to the JSON.
+	Objectives    map[string]float64 `protobuf:"bytes,9,rep,name=objectives,proto3" json:"objectives,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"fixed64,2,opt,name=value"`
+	Directions    map[string]string  `protobuf:"bytes,10,rep,name=directions,proto3" json:"directions,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -307,6 +315,20 @@ func (x *JobResult) GetError() string {
 	return ""
 }
 
+func (x *JobResult) GetObjectives() map[string]float64 {
+	if x != nil {
+		return x.Objectives
+	}
+	return nil
+}
+
+func (x *JobResult) GetDirections() map[string]string {
+	if x != nil {
+		return x.Directions
+	}
+	return nil
+}
+
 type JobProgress struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
@@ -387,7 +409,7 @@ const file_fa_v1_jobs_proto_rawDesc = "" +
 	"\rbudget_gpu_ms\x18\n" +
 	" \x01(\x04R\vbudgetGpuMs\x12%\n" +
 	"\x0echeckpoint_ref\x18\v \x01(\tR\rcheckpointRef\x12\x12\n" +
-	"\x04seed\x18\f \x01(\x04R\x04seed\"\xe4\x02\n" +
+	"\x04seed\x18\f \x01(\x04R\x04seed\"\xfc\x04\n" +
 	"\tJobResult\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12/\n" +
 	"\x06status\x18\x02 \x01(\x0e2\x17.fa.v1.JobResult.StatusR\x06status\x12\x16\n" +
@@ -397,12 +419,26 @@ const file_fa_v1_jobs_proto_rawDesc = "" +
 	"\x0echeckpoint_ref\x18\x05 \x01(\tR\rcheckpointRef\x12\x1e\n" +
 	"\vused_gpu_ms\x18\x06 \x01(\x04R\tusedGpuMs\x12\x1b\n" +
 	"\tworker_id\x18\a \x01(\tR\bworkerId\x12\x14\n" +
-	"\x05error\x18\b \x01(\tR\x05error\"\\\n" +
+	"\x05error\x18\b \x01(\tR\x05error\x12@\n" +
+	"\n" +
+	"objectives\x18\t \x03(\v2 .fa.v1.JobResult.ObjectivesEntryR\n" +
+	"objectives\x12@\n" +
+	"\n" +
+	"directions\x18\n" +
+	" \x03(\v2 .fa.v1.JobResult.DirectionsEntryR\n" +
+	"directions\x1a=\n" +
+	"\x0fObjectivesEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\x01R\x05value:\x028\x01\x1a=\n" +
+	"\x0fDirectionsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"r\n" +
 	"\x06Status\x12\r\n" +
 	"\tSTATUS_OK\x10\x00\x12\x11\n" +
 	"\rSTATUS_FAILED\x10\x01\x12\x14\n" +
 	"\x10STATUS_PREEMPTED\x10\x02\x12\x1a\n" +
-	"\x16STATUS_BUDGET_EXCEEDED\x10\x03\"Z\n" +
+	"\x16STATUS_BUDGET_EXCEEDED\x10\x03\x12\x14\n" +
+	"\x10STATUS_CANCELLED\x10\x04\"Z\n" +
 	"\vJobProgress\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x1a\n" +
 	"\bfraction\x18\x02 \x01(\x02R\bfraction\x12\x18\n" +
@@ -422,22 +458,26 @@ func file_fa_v1_jobs_proto_rawDescGZIP() []byte {
 }
 
 var file_fa_v1_jobs_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_fa_v1_jobs_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_fa_v1_jobs_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
 var file_fa_v1_jobs_proto_goTypes = []any{
 	(JobResult_Status)(0),         // 0: fa.v1.JobResult.Status
 	(*Job)(nil),                   // 1: fa.v1.Job
 	(*JobResult)(nil),             // 2: fa.v1.JobResult
 	(*JobProgress)(nil),           // 3: fa.v1.JobProgress
-	(*timestamppb.Timestamp)(nil), // 4: google.protobuf.Timestamp
+	nil,                           // 4: fa.v1.JobResult.ObjectivesEntry
+	nil,                           // 5: fa.v1.JobResult.DirectionsEntry
+	(*timestamppb.Timestamp)(nil), // 6: google.protobuf.Timestamp
 }
 var file_fa_v1_jobs_proto_depIdxs = []int32{
-	4, // 0: fa.v1.Job.deadline:type_name -> google.protobuf.Timestamp
+	6, // 0: fa.v1.Job.deadline:type_name -> google.protobuf.Timestamp
 	0, // 1: fa.v1.JobResult.status:type_name -> fa.v1.JobResult.Status
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	4, // 2: fa.v1.JobResult.objectives:type_name -> fa.v1.JobResult.ObjectivesEntry
+	5, // 3: fa.v1.JobResult.directions:type_name -> fa.v1.JobResult.DirectionsEntry
+	4, // [4:4] is the sub-list for method output_type
+	4, // [4:4] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_fa_v1_jobs_proto_init() }
@@ -451,7 +491,7 @@ func file_fa_v1_jobs_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_fa_v1_jobs_proto_rawDesc), len(file_fa_v1_jobs_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   3,
+			NumMessages:   5,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

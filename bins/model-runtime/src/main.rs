@@ -11,6 +11,7 @@
 //! models can replace the baselines without touching the bus contract.
 
 mod bars;
+mod hub_sink;
 mod pipeline;
 
 use std::{
@@ -45,6 +46,23 @@ struct Args {
     /// Hard cap on live regions per (timescale, expert).
     #[arg(long, default_value_t = 64)]
     max_regions: usize,
+    /// HelixDB base URL (default: `FA_HELIX_URL`, else `helix.url` of the platform config).
+    #[arg(long)]
+    hub_url: Option<String>,
+    /// Coalescing window for Transition edge writes to Helix: at most one write per edge per
+    /// this many seconds (spec 33 `helix_flush_interval`).
+    #[arg(long, default_value_t = 10)]
+    hub_flush_secs: u64,
+    /// Timescales whose closed-bar latents are stored as `LatentVec`s in Helix (comma separated;
+    /// empty disables latent storage).
+    #[arg(long, default_value = "1m,1h,1d,1w", value_delimiter = ',')]
+    hub_latent_timescales: Vec<String>,
+    /// Bounded queue between the pipeline and the Helix writer; overflow drops writes.
+    #[arg(long, default_value_t = 4096)]
+    hub_queue: usize,
+    /// Do not persist anything to HelixDB.
+    #[arg(long)]
+    no_hub: bool,
 }
 
 type Counters = Arc<Mutex<BTreeMap<String, f64>>>;
@@ -107,6 +125,28 @@ async fn main() -> anyhow::Result<()> {
     let counters: Counters = Arc::default();
     let instance_id = ulid::Ulid::generate().to_string();
     spawn_heartbeat(bus.clone(), counters.clone(), instance_id, args.heartbeat_secs);
+    let sink = (!args.no_hub).then(|| {
+        let sink = hub_sink::HubSink::spawn(
+            hub_sink::SinkConfig {
+                url: args.hub_url.clone().unwrap_or_else(|| fa_hub::HubClient::url_from_env_or(&cfg.helix.url)),
+                flush: Duration::from_secs(args.hub_flush_secs.max(1)),
+                latent_timescales: args.hub_latent_timescales.iter().filter_map(|t| t.trim().parse().ok()).collect(),
+                queue: args.hub_queue,
+                region_method: "leader".into(),
+            },
+            counters.clone(),
+        );
+        for st in &states {
+            sink.announce_snapshot(hub_sink::SnapshotDesc {
+                snapshot_id: st.pipeline.snapshot_id().to_owned(),
+                timescale: st.pipeline.timescale(),
+                n_experts: st.pipeline.n_experts(),
+                dim: st.pipeline.latent_dim(),
+            });
+        }
+        sink
+    });
+    let region_radius = f64::from(args.region_radius);
 
     let preview = Duration::from_secs(args.preview_secs);
     let mut trades = bus.subscribe::<Envelope>(subjects::ALL_MD_TRADES.into()).await?;
@@ -145,6 +185,9 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
                 };
+            if let Some(sink) = &sink {
+                sink.observe(ts, closed, &out, region_radius);
+            }
             publish_step(&bus, &counters, ts, inst, closed, out, &st.pipeline).await;
         }
     }

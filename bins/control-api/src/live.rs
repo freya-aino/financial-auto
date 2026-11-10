@@ -234,6 +234,12 @@ impl Default for Live {
 }
 
 impl Live {
+    /// Replaces the paper book with one loaded from Postgres (startup seed; `ledger_routes`).
+    pub fn seed_ledger(&mut self, ledger: Ledger) {
+        self.ledger = ledger;
+        self.update_peak();
+    }
+
     /// Routes one bus message by subject. Undecodable payloads are logged and ignored.
     pub fn ingest(&mut self, subject: &str, payload: &[u8]) {
         let r = if subject.starts_with("latent.state.") {
@@ -531,6 +537,7 @@ impl Live {
             job_result::Status::Failed => "failed",
             job_result::Status::Preempted => "preempted",
             job_result::Status::BudgetExceeded => "budget_exceeded",
+            job_result::Status::Cancelled => "cancelled",
         }
         .into();
         if j.status == "ok" {

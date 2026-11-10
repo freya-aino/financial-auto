@@ -18,11 +18,7 @@ pub enum ParseError {
     #[error("unknown operator or primitive `{0}`")]
     Unknown(String),
     #[error("`{op}` takes {expected} argument(s), got {got}")]
-    Arity {
-        op: String,
-        expected: usize,
-        got: usize,
-    },
+    Arity { op: String, expected: usize, got: usize },
     #[error("trailing input after expression: `{0}`")]
     Trailing(String),
 }
@@ -127,15 +123,7 @@ fn atom(a: &str) -> Result<Expr, ParseError> {
 
 fn form(op: &str, args: Vec<Arg>) -> Result<Expr, ParseError> {
     let arity = |n: usize| {
-        if args.len() == n {
-            Ok(())
-        } else {
-            Err(ParseError::Arity {
-                op: op.into(),
-                expected: n,
-                got: args.len(),
-            })
-        }
+        if args.len() == n { Ok(()) } else { Err(ParseError::Arity { op: op.into(), expected: n, got: args.len() }) }
     };
     let b = |a: &Arg| -> Result<Box<Expr>, ParseError> {
         match a {
@@ -146,9 +134,7 @@ fn form(op: &str, args: Vec<Arg>) -> Result<Expr, ParseError> {
     let num = |a: &Arg| -> Result<f64, ParseError> {
         match a {
             Arg::Expr(Expr::Const(c)) => Ok(*c),
-            Arg::Expr(_) => Err(ParseError::Unexpected(
-                "non-constant literal argument".into(),
-            )),
+            Arg::Expr(_) => Err(ParseError::Unexpected("non-constant literal argument".into())),
             Arg::Word(w) => Err(ParseError::Unknown(w.clone())),
         }
     };
@@ -168,11 +154,7 @@ fn form(op: &str, args: Vec<Arg>) -> Result<Expr, ParseError> {
         "neg" | "tanh" => {
             arity(1)?;
             let x = b(&args[0])?;
-            if op == "neg" {
-                Expr::Neg(x)
-            } else {
-                Expr::Tanh(x)
-            }
+            if op == "neg" { Expr::Neg(x) } else { Expr::Tanh(x) }
         }
         "if_gt" => {
             arity(4)?;
@@ -202,10 +184,7 @@ fn form(op: &str, args: Vec<Arg>) -> Result<Expr, ParseError> {
 /// Parses one program.
 pub fn parse(src: &str) -> Result<Expr, ParseError> {
     let toks = tokenize(src);
-    let mut p = Parser {
-        toks: &toks,
-        pos: 0,
-    };
+    let mut p = Parser { toks: &toks, pos: 0 };
     let e = p.expr()?;
     if p.pos != toks.len() {
         return Err(ParseError::Trailing(format!("{:?}", &toks[p.pos..])));
@@ -257,14 +236,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_programs() {
-        assert_eq!(
-            parse("(add 1)"),
-            Err(ParseError::Arity {
-                op: "add".into(),
-                expected: 2,
-                got: 1
-            })
-        );
+        assert_eq!(parse("(add 1)"), Err(ParseError::Arity { op: "add".into(), expected: 2, got: 1 }));
         assert_eq!(parse("(rsi 14)"), Err(ParseError::Unknown("rsi".into())));
         assert!(matches!(parse("(add 1 2"), Err(ParseError::Eof)));
         assert!(matches!(parse("1 2"), Err(ParseError::Trailing(_))));

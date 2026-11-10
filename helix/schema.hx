@@ -84,7 +84,10 @@ N::LatentRegion {
     method: String, // codebook | density | mapper | ...
     radius: F64,
     density: F64,
+    status: String, // live | merged | retired (model-runtime lifecycle, spec 30 §4)
+    related_region_id: String, // merged: absorbed region; retired: survivor it merged into
     created_at: Date DEFAULT NOW,
+    updated_at: Date,
 }
 
 E::InSpace {
@@ -97,6 +100,8 @@ E::Transition {
     From: LatentRegion,
     To: LatentRegion,
     Properties: {
+        from_region_id: String, // denormalised business ids so the edge can be upserted
+        to_region_id: String,   // (lookup: From::OutE<Transition>::WHERE(to_region_id, sampler_id))
         sampler_id: String,
         count: I64,
         mean: F64,

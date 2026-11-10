@@ -1,4 +1,11 @@
 //! Genomes, variation operators, NSGA-II selection and successive halving (specs 34, 35).
+//!
+//! The NSGA-II functions ([`non_dominated_sort`], [`crowding_distance`], [`nsga2_select`]) are
+//! the reference implementation; `go/services/evo-orchestrator/nsga.go` is a line-by-line port
+//! and both test suites read `testdata/nsga_fixture.json` so they cannot drift.
+
+pub mod objectives;
+pub mod vary;
 
 use std::collections::BTreeMap;
 
@@ -160,7 +167,9 @@ pub fn crowding_distance(objs: &[Vec<f64>], front: &[usize]) -> Vec<f64> {
         let hi = objs[front[order[n - 1]]][k];
         d[order[0]] = f64::INFINITY;
         d[order[n - 1]] = f64::INFINITY;
-        if hi > lo {
+        // A non-finite span (a member with an infinite objective, e.g. a missing value) would
+        // make every interior distance NaN; the extremes are already infinite, so skip it.
+        if hi > lo && (hi - lo).is_finite() {
             for w in 1..n - 1 {
                 d[order[w]] += (objs[front[order[w + 1]]][k] - objs[front[order[w - 1]]][k]) / (hi - lo);
             }
@@ -169,7 +178,8 @@ pub fn crowding_distance(objs: &[Vec<f64>], front: &[usize]) -> Vec<f64> {
     d
 }
 
-/// NSGA-II survivor selection: fill by fronts, break the last front by crowding distance.
+/// NSGA-II survivor selection: fill by fronts, break the last front by crowding distance
+/// (descending; ties keep front order — both sorts are stable, as in the Go port).
 pub fn nsga2_select(objs: &[Vec<f64>], k: usize) -> Vec<usize> {
     let mut out = Vec::with_capacity(k);
     for front in non_dominated_sort(objs) {
@@ -265,6 +275,80 @@ mod tests {
         assert!(cd[0].is_infinite() && cd[3].is_infinite());
         let sel = nsga2_select(&objs, 3);
         assert!(sel.contains(&0) && sel.contains(&3));
+    }
+
+    /// Shared with `go/services/evo-orchestrator/nsga_test.go`.
+    #[test]
+    fn matches_shared_fixture() {
+        #[derive(serde::Deserialize)]
+        struct Crowding {
+            front: Vec<usize>,
+            distance: Vec<serde_json::Value>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Select {
+            k: usize,
+            expected: Vec<usize>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            objectives: Vec<Vec<serde_json::Value>>,
+            fronts: Vec<Vec<usize>>,
+            crowding: Vec<Crowding>,
+            select: Vec<Select>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Named {
+            directions: BTreeMap<String, String>,
+            candidates: Vec<BTreeMap<String, f64>>,
+            keys: Vec<String>,
+            minimised: Vec<Vec<serde_json::Value>>,
+            fronts: Vec<Vec<usize>>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            cases: Vec<Case>,
+            named: Named,
+        }
+        fn num(v: &serde_json::Value) -> f64 {
+            match v {
+                serde_json::Value::String(s) if s == "inf" => f64::INFINITY,
+                serde_json::Value::String(s) if s == "-inf" => f64::NEG_INFINITY,
+                other => other.as_f64().expect("number"),
+            }
+        }
+        fn close(a: f64, b: f64) -> bool {
+            (a.is_infinite() && b.is_infinite() && a.signum() == b.signum()) || (a - b).abs() < 1e-9
+        }
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/nsga_fixture.json");
+        let fx: Fixture = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(fx.cases.len() >= 5);
+        for c in &fx.cases {
+            let objs: Vec<Vec<f64>> = c.objectives.iter().map(|r| r.iter().map(num).collect()).collect();
+            assert_eq!(non_dominated_sort(&objs), c.fronts, "{}: fronts", c.name);
+            for cr in &c.crowding {
+                let got = crowding_distance(&objs, &cr.front);
+                let want: Vec<f64> = cr.distance.iter().map(num).collect();
+                assert!(
+                    got.len() == want.len() && got.iter().zip(&want).all(|(a, b)| close(*a, *b)),
+                    "{}: crowding {got:?} != {want:?}",
+                    c.name
+                );
+            }
+            for s in &c.select {
+                assert_eq!(nsga2_select(&objs, s.k), s.expected, "{}: select k={}", c.name, s.k);
+            }
+        }
+        let n = &fx.named;
+        assert_eq!(objectives::ranked_keys(&n.directions), n.keys);
+        let vecs: Vec<Vec<f64>> =
+            n.candidates.iter().map(|c| objectives::minimised(c, &n.directions, &n.keys)).collect();
+        let want: Vec<Vec<f64>> = n.minimised.iter().map(|r| r.iter().map(num).collect()).collect();
+        for (g, w) in vecs.iter().zip(&want) {
+            assert!(g.iter().zip(w).all(|(a, b)| close(*a, *b)), "named: {g:?} != {w:?}");
+        }
+        assert_eq!(non_dominated_sort(&vecs), n.fronts);
     }
 
     #[test]

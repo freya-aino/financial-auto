@@ -1,5 +1,7 @@
-//! NATS JetStream access: subject taxonomy and typed protobuf pub/sub (spec 21).
+//! NATS JetStream access: subject taxonomy, typed protobuf pub/sub and the JetStream
+//! stream table (spec 21).
 
+pub mod streams;
 pub mod subjects;
 
 use bytes::Bytes;

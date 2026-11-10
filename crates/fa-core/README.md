@@ -2,7 +2,7 @@
 
 Shared domain types: Instrument, Venue, Timescale, Horizon, canonical event structs, ids.
 
-**Status:** implemented — ids, timescales/horizons, platform config, deterministic RNG + samplers (tested).
+**Status:** implemented — ids, timescales/horizons, platform config, secrets (`secrets.rs`: `config/secrets.toml` with `FA_<SECTION>_<KEY>` env overrides per D-020, `$FA_SECRETS` path, missing file = empty; `Debug` and `secrets::redact*` hide every `*key*|*secret*|*token*` value per spec 60 §6.7), deterministic RNG + samplers (tested).
 
 ## Owns
 Core Rust types used by every crate.

@@ -65,8 +65,16 @@ pub struct LatentRegion {
     pub method: String,
     pub radius: f64,
     pub density: f64,
+    /// `live | merged | retired` (absent on rows written before the lifecycle marks existed).
+    #[serde(default)]
+    pub status: Option<String>,
+    /// merged: the absorbed region; retired: the survivor this region merged into.
+    #[serde(default)]
+    pub related_region_id: Option<String>,
     #[serde(default)]
     pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 /// A `Transition` edge row (`edge_properties`).
@@ -78,6 +86,11 @@ pub struct Transition {
     pub from: u64,
     #[serde(rename = "$to")]
     pub to: u64,
+    /// Business ids, denormalised onto the edge (absent on rows written by `add_transition`).
+    #[serde(default)]
+    pub from_region_id: Option<String>,
+    #[serde(default)]
+    pub to_region_id: Option<String>,
     pub sampler_id: String,
     pub count: i64,
     pub mean: f64,
@@ -164,6 +177,16 @@ pub struct RegionGraph {
     pub transitions: Vec<Transition>,
 }
 
+/// Everything persisted for one snapshot: its expert spaces, their regions and the transitions
+/// among them (spec 50 `/api/latent/{snapshot}/regions`, `/api/mcmc/{snapshot}/graph`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct SnapshotGraph {
+    pub snapshot: Snapshot,
+    pub spaces: Vec<ExpertSpace>,
+    pub regions: Vec<LatentRegion>,
+    pub transitions: Vec<Transition>,
+}
+
 /// Subgraph around a node (spec 50 `/api/graph/neighborhood`).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct Neighborhood {
@@ -217,6 +240,14 @@ pub struct NewTransition {
     pub lower: f64,
     pub upper: f64,
     pub kernel_params: String,
+}
+
+/// One `upsertTransition` row: the edge `from_region_id → to_region_id` for `sampler_id`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransitionUpsert {
+    pub from_region_id: String,
+    pub to_region_id: String,
+    pub transition: NewTransition,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -338,6 +369,51 @@ impl HubClient {
         resp.take_one("row")
     }
 
+    /// `ensureSnapshot`: get-or-create by `snapshot_id` (idempotent across service restarts;
+    /// an existing row is returned unchanged so operator status changes survive).
+    pub async fn ensure_snapshot(&self, snap: &NewSnapshot) -> Result<Snapshot> {
+        let props = vec![
+            ("snapshot_id", s(&snap.snapshot_id)),
+            ("timescale", s(&snap.timescale)),
+            ("encoder_family", s(&snap.encoder_family)),
+            ("generation", snap.generation.into()),
+            ("garage_key", s(&snap.garage_key)),
+            ("status", s(&snap.status)),
+            ("created_at", Input::Now),
+        ];
+        let batch = get_or_create(
+            Batch::write().named("ensure_snapshot"),
+            node::SNAPSHOT,
+            "snapshot_id",
+            &snap.snapshot_id,
+            props,
+        );
+        take_existing_or_created(self.batch(&batch).await?)
+    }
+
+    /// `ensureExpertSpace`: get-or-create by `expert_space_id`; a new space gets its `HasSpace` edge.
+    pub async fn ensure_expert_space(&self, snapshot: u64, space: &NewExpertSpace) -> Result<ExpertSpace> {
+        let props = vec![
+            ("expert_space_id", s(&space.expert_space_id)),
+            ("snapshot_id", s(&space.snapshot_id)),
+            ("index", space.index.into()),
+            ("dim", space.dim.into()),
+        ];
+        let batch = get_or_create(
+            Batch::write().named("ensure_expert_space"),
+            node::EXPERT_SPACE,
+            "expert_space_id",
+            &space.expert_space_id,
+            props,
+        )
+        .var_if(
+            "edge",
+            Cond::VarNotEmpty("created".into()),
+            Op::nodes(snapshot).add_e(edge::HAS_SPACE, NodeRef::var("created"), vec![]),
+        );
+        take_existing_or_created(self.batch(&batch).await?)
+    }
+
     /// `listSnapshots`
     pub async fn list_snapshots(&self) -> Result<Vec<Snapshot>> {
         let op = Op::nodes_with_label(node::SNAPSHOT).order_by("snapshot_id", false).value_map(None);
@@ -349,6 +425,14 @@ impl HubClient {
     pub async fn snapshot_by_id(&self, snapshot_id: &str) -> Result<Option<Snapshot>> {
         let mut resp =
             self.batch(&Batch::read().ret("row", by_key(node::SNAPSHOT, "snapshot_id", snapshot_id))).await?;
+        resp.take_opt("row")
+    }
+
+    /// Lookup an expert space by business id.
+    pub async fn space_by_id(&self, expert_space_id: &str) -> Result<Option<ExpertSpace>> {
+        let mut resp = self
+            .batch(&Batch::read().ret("row", by_key(node::EXPERT_SPACE, "expert_space_id", expert_space_id)))
+            .await?;
         resp.take_opt("row")
     }
 
@@ -385,6 +469,81 @@ impl HubClient {
         resp.take_one("row")
     }
 
+    /// `upsertRegion`: by `region_id`. An existing row (same id after a model-runtime restart,
+    /// D-039 ids are process-local) is revived: `status = live`, radius/density refreshed.
+    /// A new row is inserted with its `InSpace` edge to `space`.
+    pub async fn upsert_region(&self, space: u64, region: &NewRegion) -> Result<LatentRegion> {
+        let existing = by_key_nodes(node::LATENT_REGION, "region_id", &region.region_id);
+        let updated = Op::nodes(NodeRef::var("existing"))
+            .set_property("status", "live")
+            .set_property("related_region_id", "")
+            .set_property("radius", region.radius)
+            .set_property("density", region.density)
+            .set_property("updated_at", Input::Now)
+            .value_map(None);
+        let created = Op::add_n(
+            node::LATENT_REGION,
+            vec![
+                ("region_id", s(&region.region_id)),
+                ("lineage_id", s(&region.lineage_id)),
+                ("expert_space_id", s(&region.expert_space_id)),
+                ("method", s(&region.method)),
+                ("radius", region.radius.into()),
+                ("density", region.density.into()),
+                ("status", s("live")),
+                ("related_region_id", s("")),
+                ("created_at", Input::Now),
+                ("updated_at", Input::Now),
+            ],
+        );
+        let batch = Batch::write()
+            .named("upsert_region")
+            .var("existing", existing)
+            .var_if("updated", Cond::VarNotEmpty("existing".into()), updated)
+            .var_if("created", Cond::VarEmpty("existing".into()), created)
+            .var_if(
+                "edge",
+                Cond::VarNotEmpty("created".into()),
+                Op::nodes(NodeRef::var("created")).add_e(edge::IN_SPACE, space, vec![]),
+            )
+            .var_if(
+                "created_row",
+                Cond::VarNotEmpty("created".into()),
+                Op::nodes(NodeRef::var("created")).value_map(None),
+            )
+            .returning(["updated", "created_row"]);
+        let mut resp = self.batch(&batch).await?;
+        if let Some(row) = resp.take_opt::<LatentRegion>("updated")? {
+            return Ok(row);
+        }
+        resp.take_one("created_row")
+    }
+
+    /// `getRegion`: lookup by business id.
+    pub async fn region_by_id(&self, region_id: &str) -> Result<Option<LatentRegion>> {
+        let mut resp =
+            self.batch(&Batch::read().ret("row", by_key(node::LATENT_REGION, "region_id", region_id))).await?;
+        resp.take_opt("row")
+    }
+
+    /// `markRegionStatus`: lifecycle mark (`merged` | `retired`, or back to `live`) with the
+    /// related region (absorbed region / survivor). Returns the updated row, `NotFound` if none.
+    pub async fn mark_region_status(
+        &self,
+        region_id: &str,
+        status: &str,
+        related_region_id: &str,
+    ) -> Result<LatentRegion> {
+        let op = by_key_nodes(node::LATENT_REGION, "region_id", region_id)
+            .set_property("status", status)
+            .set_property("related_region_id", related_region_id)
+            .set_property("updated_at", Input::Now)
+            .value_map(None);
+        let mut resp = self.batch(&Batch::write().named("mark_region_status").ret("row", op)).await?;
+        resp.take_opt("row")?
+            .ok_or_else(|| HubError::NotFound { label: node::LATENT_REGION.into(), id: region_id.into() })
+    }
+
     /// `spaceRegions`: `N<ExpertSpace>(space)::In<InSpace>`
     pub async fn space_regions(&self, space: u64) -> Result<Vec<LatentRegion>> {
         let op = Op::nodes(space).r#in(Some(edge::IN_SPACE)).value_map(None);
@@ -409,6 +568,95 @@ impl HubClient {
             .ret("row", Op::edges(EdgeRef::Var("e".into())).edge_properties());
         let mut resp = self.batch(&batch).await?;
         resp.take_one("row")
+    }
+
+    /// `upsertTransition` for one edge; see [`Self::upsert_transitions`].
+    pub async fn upsert_transition(&self, row: &TransitionUpsert) -> Result<Transition> {
+        let mut rows = self.upsert_transitions(std::slice::from_ref(row)).await?;
+        Ok(rows.pop().expect("one row in, one row out"))
+    }
+
+    /// `upsertTransition` for several edges in one write batch (what model-runtime flushes
+    /// every `--hub-flush-secs`): for each row the edge `from → to` with the same `sampler_id`
+    /// is updated in place (count, mean, interval, kernel params, `updated_at`), else inserted.
+    /// Fails with [`HubError::NotFound`] when either region is unknown; the whole batch is then
+    /// rolled back by the server (one transaction).
+    pub async fn upsert_transitions(&self, rows: &[TransitionUpsert]) -> Result<Vec<Transition>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut batch = Batch::write().named("upsert_transitions");
+        for (i, r) in rows.iter().enumerate() {
+            let t = &r.transition;
+            let (from, to, existing, updated, probe, created, created_row) = (
+                format!("from{i}"),
+                format!("to{i}"),
+                format!("existing{i}"),
+                format!("updated{i}"),
+                format!("probe{i}"),
+                format!("created{i}"),
+                format!("created_row{i}"),
+            );
+            let mut set = Op::edges(EdgeRef::Var(existing.clone()));
+            for (k, v) in transition_mutable_props(t) {
+                set = set.set_property(k, v);
+            }
+            batch = batch
+                .var(&from, by_key_nodes(node::LATENT_REGION, "region_id", &r.from_region_id))
+                .var(&to, by_key_nodes(node::LATENT_REGION, "region_id", &r.to_region_id))
+                .var(
+                    &existing,
+                    Op::nodes(NodeRef::var(&from)).out_e(Some(edge::TRANSITION)).where_(Pred::and([
+                        Pred::eq("to_region_id", r.to_region_id.as_str()),
+                        Pred::eq("sampler_id", t.sampler_id.as_str()),
+                    ])),
+                )
+                .var_if(&updated, Cond::VarNotEmpty(existing.clone()), set.edge_properties())
+                // `add_e` with an empty target is a server error (500 `invalid_query`), not an empty
+                // result: `probe` is non-empty only when there is no edge yet AND `to` exists.
+                .var_if(&probe, Cond::VarEmpty(existing.clone()), Op::nodes(NodeRef::var(&to)))
+                .var_if(
+                    &created,
+                    Cond::VarNotEmpty(probe.clone()),
+                    Op::nodes(NodeRef::var(&from)).add_e(
+                        edge::TRANSITION,
+                        NodeRef::var(&to),
+                        [
+                            vec![
+                                ("from_region_id", s(&r.from_region_id)),
+                                ("to_region_id", s(&r.to_region_id)),
+                                ("sampler_id", s(&t.sampler_id)),
+                            ],
+                            transition_mutable_props(t),
+                        ]
+                        .concat(),
+                    ),
+                )
+                .var_if(
+                    &created_row,
+                    Cond::VarNotEmpty(created.clone()),
+                    Op::edges(EdgeRef::Var(created.clone())).edge_properties(),
+                )
+                .returning([updated.clone(), created_row.clone()]);
+        }
+        let mut resp = self.batch(&batch).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (i, r) in rows.iter().enumerate() {
+            let row = match resp.take_opt::<Transition>(&format!("updated{i}"))? {
+                Some(row) => row,
+                None => match resp.take_opt::<Transition>(&format!("created_row{i}"))? {
+                    Some(row) => row,
+                    None => {
+                        return Err(HubError::NotFound {
+                            label: node::LATENT_REGION.into(),
+                            id: format!("{} -> {}", r.from_region_id, r.to_region_id),
+                        });
+                    }
+                },
+            };
+            out.push(row);
+        }
+        Ok(out)
     }
 
     /// `regionTransitions`: outgoing `Transition` edges of a region.
@@ -441,6 +689,30 @@ impl HubClient {
             .ret("transitions", Op::nodes(NodeRef::var("regions")).out_e(Some(edge::TRANSITION)).edge_properties());
         let mut resp = self.batch(&batch).await?;
         Ok(RegionGraph { regions: resp.take("region_rows")?, transitions: resp.take("transitions")? })
+    }
+
+    /// `snapshotGraph`: the snapshot, its spaces, their regions and all transitions among them,
+    /// by business id, in one round trip. `None` when the snapshot does not exist.
+    pub async fn snapshot_graph(&self, snapshot_id: &str) -> Result<Option<SnapshotGraph>> {
+        let batch = Batch::read()
+            .named("snapshot_graph")
+            .var("snap", by_key_nodes(node::SNAPSHOT, "snapshot_id", snapshot_id))
+            .ret("snap_row", Op::nodes(NodeRef::var("snap")).value_map(None))
+            .var("spaces", Op::nodes(NodeRef::var("snap")).out(Some(edge::HAS_SPACE)))
+            .ret("space_rows", Op::nodes(NodeRef::var("spaces")).value_map(None))
+            .var("regions", Op::nodes(NodeRef::var("spaces")).r#in(Some(edge::IN_SPACE)))
+            .ret("region_rows", Op::nodes(NodeRef::var("regions")).value_map(None))
+            .ret("transitions", Op::nodes(NodeRef::var("regions")).out_e(Some(edge::TRANSITION)).edge_properties());
+        let mut resp = self.batch(&batch).await?;
+        let Some(snapshot) = resp.take_opt::<Snapshot>("snap_row")? else {
+            return Ok(None);
+        };
+        Ok(Some(SnapshotGraph {
+            snapshot,
+            spaces: resp.take("space_rows")?,
+            regions: resp.take("region_rows")?,
+            transitions: resp.take("transitions")?,
+        }))
     }
 
     // ── latent vectors ──────────────────────────────────────────────────────
@@ -512,6 +784,67 @@ impl HubClient {
         resp.take_one("row")
     }
 
+    /// `upsertGenome`: get-or-create by `genome_id` (evo-worker re-evaluating a known genome).
+    pub async fn upsert_genome(&self, g: &NewGenome) -> Result<Genome> {
+        let props = vec![
+            ("genome_id", s(&g.genome_id)),
+            ("kind", s(&g.kind)),
+            ("family", s(&g.family)),
+            ("params", s(&g.params)),
+            ("created_at", Input::Now),
+        ];
+        let batch =
+            get_or_create(Batch::write().named("upsert_genome"), node::GENOME, "genome_id", &g.genome_id, props);
+        take_existing_or_created(self.batch(&batch).await?)
+    }
+
+    /// `linkParent`: `ParentOf{op}` by business ids; returns the edge id, `NotFound` when a
+    /// genome is missing.
+    pub async fn link_parent(&self, parent_id: &str, child_id: &str, op: &str) -> Result<u64> {
+        let batch = Batch::write()
+            .named("link_parent")
+            .var("parent", by_key_nodes(node::GENOME, "genome_id", parent_id))
+            .var("child", by_key_nodes(node::GENOME, "genome_id", child_id))
+            // An empty `add_e` target is a server error; only add when the child exists.
+            .var_if(
+                "e",
+                Cond::VarNotEmpty("child".into()),
+                Op::nodes(NodeRef::var("parent")).add_e(
+                    edge::PARENT_OF,
+                    NodeRef::var("child"),
+                    vec![("op", op.into())],
+                ),
+            )
+            .returning(["e"]);
+        let mut resp = self.batch(&batch).await?;
+        resp.take_opt::<IdRow>("e")?
+            .map(|r| r.id)
+            .ok_or_else(|| HubError::NotFound { label: node::GENOME.into(), id: format!("{parent_id} -> {child_id}") })
+    }
+
+    /// `addFitnessRecord`: like [`Self::add_fitness`] but keyed by `genome_id`.
+    pub async fn add_fitness_record(&self, f: &NewFitness) -> Result<FitnessRecord> {
+        let props = vec![
+            ("genome_id", s(&f.genome_id)),
+            ("generation", f.generation.into()),
+            ("objectives", s(&f.objectives)),
+            ("pareto_rank", f.pareto_rank.into()),
+        ];
+        let batch = Batch::write()
+            .named("add_fitness_record")
+            .var("genome", by_key_nodes(node::GENOME, "genome_id", &f.genome_id))
+            .var_if("n", Cond::VarNotEmpty("genome".into()), Op::add_n(node::FITNESS_RECORD, props))
+            .var_if(
+                "edge",
+                Cond::VarNotEmpty("genome".into()),
+                Op::nodes(NodeRef::var("genome")).add_e(edge::SCORED, NodeRef::var("n"), vec![]),
+            )
+            .var_if("row", Cond::VarNotEmpty("genome".into()), Op::nodes(NodeRef::var("n")).value_map(None))
+            .returning(["row"]);
+        let mut resp = self.batch(&batch).await?;
+        resp.take_opt("row")?.ok_or_else(|| HubError::NotFound { label: node::GENOME.into(), id: f.genome_id.clone() })
+    }
+
     pub async fn genome_by_id(&self, genome_id: &str) -> Result<Option<Genome>> {
         let mut resp = self.batch(&Batch::read().ret("row", by_key(node::GENOME, "genome_id", genome_id))).await?;
         resp.take_opt("row")
@@ -573,6 +906,23 @@ impl HubClient {
 
     // ── generic graph reads ─────────────────────────────────────────────────
 
+    /// `resolveNode`: the node carrying `business_id` as any unique business key
+    /// (`region_id`, `snapshot_id`, `expert_space_id`, `genome_id`, `instrument_id`), or a node
+    /// addressed directly by its numeric `$id`.
+    pub async fn resolve_node(&self, id: &str) -> Result<Option<NodeRow>> {
+        if let Ok(n) = id.parse::<u64>() {
+            let mut resp =
+                self.batch(&Batch::read().named("resolve_node").ret("row", Op::nodes(n).value_map(None))).await?;
+            return resp.take_opt("row");
+        }
+        let pred = Pred::or(BUSINESS_KEYS.iter().map(|k| Pred::eq(k, id)));
+        let mut resp =
+            self.batch(&Batch::read().named("resolve_node").ret("row", Op::nodes_where(pred).value_map(None))).await?;
+        let mut rows: Vec<NodeRow> = resp.take("row")?;
+        rows.truncate(1);
+        Ok(rows.pop())
+    }
+
     /// Nodes within `depth` hops (any edge label, both directions) of `node`, and every edge
     /// touching the inner frontier (spec 50 `/api/graph/neighborhood`). Includes `node` itself.
     pub async fn neighborhood(&self, node_id: u64, depth: usize) -> Result<Neighborhood> {
@@ -621,10 +971,52 @@ impl HubClient {
     }
 }
 
+/// Unique business keys a node can be addressed by ([`HubClient::resolve_node`]).
+pub const BUSINESS_KEYS: [&str; 5] = ["region_id", "snapshot_id", "expert_space_id", "genome_id", "instrument_id"];
+
 #[derive(Deserialize)]
 struct IdRow {
     #[serde(rename = "$id")]
     id: u64,
+}
+
+/// Lookup by label + unique key as a bare node stream (for traversals / mutations).
+fn by_key_nodes(label: &str, key: &str, value: &str) -> Op {
+    Op::nodes_with_label_where(label, Pred::eq(key, value))
+}
+
+/// Get-or-create skeleton: `existing` (lookup, read back as `existing_row`), `created` (only when
+/// empty, read back as `created_row`). Callers may hang more conditional entries off `created`.
+fn get_or_create(batch: Batch, label: &str, key: &str, value: &str, props: Vec<(&str, Input)>) -> Batch {
+    batch
+        .var("existing", by_key_nodes(label, key, value))
+        .var_if(
+            "existing_row",
+            Cond::VarNotEmpty("existing".into()),
+            Op::nodes(NodeRef::var("existing")).value_map(None),
+        )
+        .var_if("created", Cond::VarEmpty("existing".into()), Op::add_n(label, props))
+        .var_if("created_row", Cond::VarNotEmpty("created".into()), Op::nodes(NodeRef::var("created")).value_map(None))
+        .returning(["existing_row", "created_row"])
+}
+
+fn take_existing_or_created<T: serde::de::DeserializeOwned>(mut resp: crate::Response) -> Result<T> {
+    if let Some(row) = resp.take_opt::<T>("existing_row")? {
+        return Ok(row);
+    }
+    resp.take_one("created_row")
+}
+
+/// Transition properties that change on every posterior update (shared by insert and update).
+fn transition_mutable_props(t: &NewTransition) -> Vec<(&'static str, Input)> {
+    vec![
+        ("count", t.count.into()),
+        ("mean", t.mean.into()),
+        ("lower", t.lower.into()),
+        ("upper", t.upper.into()),
+        ("kernel_params", s(&t.kernel_params)),
+        ("updated_at", Input::Now),
+    ]
 }
 
 #[cfg(test)]
@@ -648,6 +1040,43 @@ mod tests {
         assert_eq!(h.ref_id, "w2");
         let n: NodeRow = serde_json::from_value(json!({ "$id": 1, "$label": "Snapshot", "status": "active" })).unwrap();
         assert_eq!(n.properties["status"], "active");
+    }
+
+    #[test]
+    fn get_or_create_batch_is_conditional() {
+        let b = get_or_create(Batch::write(), node::GENOME, "genome_id", "g1", vec![("genome_id", s("g1"))]).to_json();
+        let entries = b["query"]["write"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[1]["query"]["condition"], json!({ "var_not_empty": "existing" }));
+        assert_eq!(entries[2]["query"]["condition"], json!({ "var_empty": "existing" }));
+        assert_eq!(entries[2]["query"]["root"]["add_n"]["label"], "Genome");
+        assert_eq!(b["query"]["write"]["returns"], json!(["existing_row", "created_row"]));
+    }
+
+    #[test]
+    fn upsert_transition_rows_deserialize_with_denormalised_ids() {
+        let t: Transition = serde_json::from_value(json!({
+            "$from": 2, "$id": 0, "$label": "Transition", "$to": 3, "from_region_id": "a", "to_region_id": "b",
+            "sampler_id": "conjugate", "count": 1, "mean": 0.5, "lower": 0.1, "upper": 0.9, "kernel_params": "{}"
+        }))
+        .unwrap();
+        assert_eq!(t.to_region_id.as_deref(), Some("b"));
+        let r: LatentRegion = serde_json::from_value(json!({
+            "$id": 1, "region_id": "r", "lineage_id": "l", "expert_space_id": "sp", "method": "codebook",
+            "radius": 1.0, "density": 2.0
+        }))
+        .unwrap();
+        assert_eq!(r.status, None);
+        let props = transition_mutable_props(&NewTransition {
+            sampler_id: "x".into(),
+            count: 3,
+            mean: 0.1,
+            lower: 0.0,
+            upper: 0.2,
+            kernel_params: "{}".into(),
+        });
+        assert_eq!(props.len(), 6);
+        assert!(matches!(props[5], ("updated_at", Input::Now)));
     }
 
     #[test]

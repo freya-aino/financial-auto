@@ -113,12 +113,7 @@ pub struct RiskEngine {
 
 impl RiskEngine {
     pub fn new(cfg: RiskConfig, equity: f64) -> Self {
-        Self {
-            cfg,
-            peak_equity: equity,
-            day_start_equity: equity,
-            halts: BTreeMap::new(),
-        }
+        Self { cfg, peak_equity: equity, day_start_equity: equity, halts: BTreeMap::new() }
     }
 
     /// Deployable capital = equity − daily payout quota (never negative).
@@ -136,19 +131,11 @@ impl RiskEngine {
     pub fn on_equity(&mut self, equity: f64) -> Vec<(HaltScope, HaltReason)> {
         self.peak_equity = self.peak_equity.max(equity);
         let mut new = Vec::new();
-        let dd = if self.peak_equity > 0.0 {
-            1.0 - equity / self.peak_equity
-        } else {
-            0.0
-        };
+        let dd = if self.peak_equity > 0.0 { 1.0 - equity / self.peak_equity } else { 0.0 };
         if dd >= self.cfg.max_drawdown && !self.halts.contains_key(&HaltScope::Portfolio) {
             new.push((HaltScope::Portfolio, HaltReason::Drawdown(dd)));
         }
-        let dl = if self.day_start_equity > 0.0 {
-            1.0 - equity / self.day_start_equity
-        } else {
-            0.0
-        };
+        let dl = if self.day_start_equity > 0.0 { 1.0 - equity / self.day_start_equity } else { 0.0 };
         if dl >= self.cfg.max_daily_loss && !self.halts.contains_key(&HaltScope::DailyLoss) {
             new.push((HaltScope::DailyLoss, HaltReason::DailyLoss(dl)));
         }
@@ -209,21 +196,13 @@ impl RiskEngine {
             return clipped.clone();
         }
         if !self.reduce_only() {
-            return clipped
-                .keys()
-                .chain(current.keys())
-                .map(|k| (*k, 0.0))
-                .collect();
+            return clipped.keys().chain(current.keys()).map(|k| (*k, 0.0)).collect();
         }
         clipped
             .iter()
             .map(|(i, &t)| {
                 let c = current.get(i).copied().unwrap_or(0.0);
-                let v = if c == 0.0 || t.signum() != c.signum() {
-                    0.0
-                } else {
-                    t.abs().min(c.abs()) * c.signum()
-                };
+                let v = if c == 0.0 || t.signum() != c.signum() { 0.0 } else { t.abs().min(c.abs()) * c.signum() };
                 (*i, v)
             })
             .collect()
@@ -294,13 +273,7 @@ mod tests {
     use super::*;
 
     fn engine() -> RiskEngine {
-        RiskEngine::new(
-            RiskConfig {
-                daily_payout_quota_eur: 1_000.0,
-                ..RiskConfig::default()
-            },
-            11_000.0,
-        )
+        RiskEngine::new(RiskConfig { daily_payout_quota_eur: 1_000.0, ..RiskConfig::default() }, 11_000.0)
     }
 
     #[test]
@@ -315,20 +288,8 @@ mod tests {
         let (a, b) = (InstrumentId::new(), InstrumentId::new());
         let t = BTreeMap::from([(a, 5_000.0), (b, -5_000.0)]);
         let m = BTreeMap::from([
-            (
-                a,
-                MarketInfo {
-                    asset_class: AssetClass::Equity,
-                    horizon_volume_eur: 1e9,
-                },
-            ),
-            (
-                b,
-                MarketInfo {
-                    asset_class: AssetClass::Crypto,
-                    horizon_volume_eur: 50_000.0,
-                },
-            ),
+            (a, MarketInfo { asset_class: AssetClass::Equity, horizon_volume_eur: 1e9 }),
+            (b, MarketInfo { asset_class: AssetClass::Crypto, horizon_volume_eur: 50_000.0 }),
         ]);
         let c = e.clip_targets(&t, &m, 11_000.0);
         assert_eq!(c[&a], 1_000.0); // 10% of 10k deployable
@@ -344,15 +305,7 @@ mod tests {
         let t = BTreeMap::from([(a, 4_000.0), (b, -6_000.0)]);
         let m: BTreeMap<_, _> = [a, b]
             .into_iter()
-            .map(|i| {
-                (
-                    i,
-                    MarketInfo {
-                        asset_class: AssetClass::Fx,
-                        horizon_volume_eur: 1e12,
-                    },
-                )
-            })
+            .map(|i| (i, MarketInfo { asset_class: AssetClass::Fx, horizon_volume_eur: 1e12 }))
             .collect();
         let c = e.clip_targets(&t, &m, 11_000.0);
         assert!((c[&a].abs() + c[&b].abs() - 5_000.0).abs() < 1e-6);
@@ -360,13 +313,7 @@ mod tests {
 
     #[test]
     fn scope_strings_round_trip_and_qualify() {
-        for s in [
-            HaltScope::Portfolio,
-            HaltScope::DailyLoss,
-            HaltScope::Source,
-            HaltScope::Model,
-            HaltScope::Broker,
-        ] {
+        for s in [HaltScope::Portfolio, HaltScope::DailyLoss, HaltScope::Source, HaltScope::Model, HaltScope::Broker] {
             assert_eq!(HaltScope::parse(s.as_str()), Some(s));
         }
         assert_eq!(HaltScope::parse("venue:lemon"), Some(HaltScope::Broker));
@@ -376,11 +323,7 @@ mod tests {
 
     #[test]
     fn gate_flattens_or_reduces_only() {
-        let (a, b, c) = (
-            InstrumentId::new(),
-            InstrumentId::new(),
-            InstrumentId::new(),
-        );
+        let (a, b, c) = (InstrumentId::new(), InstrumentId::new(), InstrumentId::new());
         let targets = BTreeMap::from([(a, 500.0), (b, -300.0), (c, 200.0)]);
         let current = BTreeMap::from([(a, 200.0), (b, -800.0), (c, -100.0)]);
         let mut e = RiskEngine::new(RiskConfig::default(), 10_000.0);
@@ -405,10 +348,7 @@ mod tests {
         assert_eq!(h[0].0, HaltScope::DailyLoss);
         assert!(!e.trading_allowed());
         let i = InstrumentId::new();
-        assert_eq!(
-            e.clip_targets(&BTreeMap::from([(i, 100.0)]), &BTreeMap::new(), 9_650.0)[&i],
-            0.0
-        );
+        assert_eq!(e.clip_targets(&BTreeMap::from([(i, 100.0)]), &BTreeMap::new(), 9_650.0)[&i], 0.0);
         e.start_day(9_650.0);
         assert!(e.trading_allowed());
         let h = e.on_equity(8_400.0);
@@ -418,9 +358,6 @@ mod tests {
         e.rearm(8_400.0);
         assert!(e.trading_allowed());
         assert_eq!(e.peak_equity(), 8_400.0);
-        assert!(
-            e.on_equity(8_300.0).is_empty(),
-            "drawdown measured from the re-armed peak"
-        );
+        assert!(e.on_equity(8_300.0).is_empty(), "drawdown measured from the re-armed peak");
     }
 }

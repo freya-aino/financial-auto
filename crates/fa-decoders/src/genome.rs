@@ -25,9 +25,15 @@
 //! Forecast genes: `kernel` (exponential half-life in steps), `scale` (spread multiplier),
 //! `shrink` (drift shrinkage in [0, 1]).
 //! Retrieval genes: `k` (analogs kept), `tau` (time-decay in days), `gap` (leakage guard in
-//! steps, ≥ `h`), `metric` (`cos` | `euclid`).
+//! steps, ≥ `h`), `metric` (`cos` | `euclid`), `lat` (weight of the latent-similarity term in
+//! [0, 1], used only when a [`crate::DecodeCtx`] carries latents for the instrument).
+//!
+//! [`DecoderGenome`] implements `Display`: the canonical kv form, which [`DecoderGenome::parse`]
+//! reads back to an equal genome (round-trip tested). [`DecoderGenome::params`] /
+//! [`DecoderGenome::with_params`] expose the numeric genes as a `name → f64` map for the
+//! `fa-evolution` operators (clamped back into their valid ranges).
 
-use std::{collections::BTreeMap, hash::Hasher};
+use std::{collections::BTreeMap, fmt, hash::Hasher};
 
 use fa_core::Timescale;
 use serde::{Deserialize, Serialize};
@@ -106,9 +112,19 @@ pub struct DecoderGenome {
     /// Retrieval: minimum gap (steps) between an analog's outcome window and now.
     pub min_gap: usize,
     pub metric: Metric,
+    /// Retrieval: weight of the latent-similarity term in [0, 1] (`lat` gene).
+    #[serde(default = "default_latent_weight")]
+    pub latent_weight: f64,
     /// How the genome was obtained: `kv`, `json` or `derived`.
     pub encoding: String,
 }
+
+fn default_latent_weight() -> f64 {
+    0.5
+}
+
+/// Numeric gene names exposed to the evolution operators (`params()` keys).
+pub const NUMERIC_GENES: [&str; 9] = ["h", "lb", "kernel", "scale", "shrink", "k", "tau", "gap", "lat"];
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum GenomeError {
@@ -140,8 +156,52 @@ impl DecoderGenome {
             tau_days: 30.0,
             min_gap: 5,
             metric: Metric::Cosine,
+            latent_weight: 0.5,
             encoding: "default".into(),
         }
+    }
+
+    /// Numeric genes as `name → value` (see [`NUMERIC_GENES`]); integers are exact.
+    pub fn params(&self) -> BTreeMap<String, f64> {
+        BTreeMap::from([
+            ("h".to_owned(), self.horizon as f64),
+            ("lb".to_owned(), self.lookback as f64),
+            ("kernel".to_owned(), self.kernel),
+            ("scale".to_owned(), self.scale),
+            ("shrink".to_owned(), self.shrink),
+            ("k".to_owned(), self.k as f64),
+            ("tau".to_owned(), self.tau_days),
+            ("gap".to_owned(), self.min_gap as f64),
+            ("lat".to_owned(), self.latent_weight),
+        ])
+    }
+
+    /// Copy of this genome with the numeric genes replaced by `params` (missing keys keep
+    /// their value, unknown keys are ignored). Values are rounded/clamped into the valid
+    /// range instead of rejected, so mutated children are always evaluable. The id becomes
+    /// the canonical kv string and `encoding` is `kv`.
+    pub fn with_params(&self, params: &BTreeMap<String, f64>) -> Result<Self, GenomeError> {
+        let mut g = self.clone();
+        let int = |v: f64, lo: usize| if v.is_finite() { (v.round().max(lo as f64)) as usize } else { lo };
+        let pos = |v: f64, cur: f64| if v.is_finite() && v > 0.0 { v.max(1e-3) } else { cur };
+        for (k, v) in params {
+            match k.as_str() {
+                "h" => g.horizon = int(*v, 1),
+                "lb" => g.lookback = int(*v, 2),
+                "kernel" => g.kernel = pos(*v, g.kernel),
+                "scale" => g.scale = pos(*v, g.scale),
+                "shrink" => g.shrink = if v.is_finite() { v.clamp(0.0, 1.0) } else { g.shrink },
+                "k" => g.k = int(*v, 1),
+                "tau" => g.tau_days = pos(*v, g.tau_days),
+                "gap" => g.min_gap = int(*v, 0),
+                "lat" => g.latent_weight = if v.is_finite() { v.clamp(0.0, 1.0) } else { g.latent_weight },
+                _ => {}
+            }
+        }
+        g.validate()?;
+        g.encoding = "kv".into();
+        g.id = g.to_string();
+        Ok(g)
     }
 
     /// Parses any of the three accepted forms (see module docs). Never fails for a bare id.
@@ -266,6 +326,7 @@ impl DecoderGenome {
                     _ => return Err(err("expected cos|euclid")),
                 }
             }
+            "lat" | "latent" => self.latent_weight = num(v)?,
             _ => return Err(err("unknown gene")),
         }
         Ok(())
@@ -299,6 +360,9 @@ impl DecoderGenome {
         if self.tau_days.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             return Err(gene("tau", "must be > 0"));
         }
+        if !(0.0..=1.0).contains(&self.latent_weight) {
+            return Err(gene("lat", "must be in [0, 1]"));
+        }
         // Leakage guard (spec 34 §6.1): an analog's outcome window must end before now.
         self.min_gap = self.min_gap.max(self.horizon);
         Ok(())
@@ -316,6 +380,40 @@ impl DecoderGenome {
                 self.timescale, self.horizon, self.lookback, self.k, self.tau_days, self.min_gap, self.metric
             ),
         }
+    }
+}
+
+impl fmt::Display for DecoderGenome {
+    /// Canonical kv form: `<family>:ts=..;h=..;lb=..;levels=a/b/c;kernel=..;scale=..;shrink=..;
+    /// k=..;tau=..;gap=..;metric=..;lat=..[;inst=..]`. Every gene is printed (also the other
+    /// family's, so a child keeps them when its family gene flips) and floats print in Rust's
+    /// shortest round-trip form, so `parse(to_string())` is lossless.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let levels: Vec<String> = self.levels.iter().map(|l| l.to_string()).collect();
+        write!(
+            f,
+            "{}:ts={};h={};lb={};levels={};kernel={};scale={};shrink={};k={};tau={};gap={};metric={};lat={}",
+            self.family.as_str(),
+            self.timescale,
+            self.horizon,
+            self.lookback,
+            levels.join("/"),
+            self.kernel,
+            self.scale,
+            self.shrink,
+            self.k,
+            self.tau_days,
+            self.min_gap,
+            match self.metric {
+                Metric::Cosine => "cos",
+                Metric::Euclid => "euclid",
+            },
+            self.latent_weight
+        )?;
+        if let Some(inst) = &self.instrument {
+            write!(f, ";inst={inst}")?;
+        }
+        Ok(())
     }
 }
 
@@ -383,6 +481,62 @@ mod tests {
         assert_eq!(g.k, 12);
         assert_eq!(g.levels, vec![0.2, 0.8]);
         assert_eq!(g.timescale, Timescale::Minute);
+    }
+
+    /// Equality modulo the bookkeeping fields (`id`, `encoding`).
+    fn same_genes(a: &DecoderGenome, b: &DecoderGenome) -> bool {
+        let mut x = a.clone();
+        let mut y = b.clone();
+        x.id = String::new();
+        y.id = String::new();
+        x.encoding = String::new();
+        y.encoding = String::new();
+        x == y
+    }
+
+    #[test]
+    fn to_string_round_trips() {
+        let samples = [
+            "forecast:h=3;lb=20;levels=0.1/0.5/0.9;kernel=8.25;scale=1.7;shrink=0.33",
+            "retrieval:k=7;tau=10.5;gap=1;h=4;metric=euclid;lat=0.2;ts=1m",
+            "retrieval:k=7;inst=01900000-0000-7000-8000-000000000001",
+            "g1",
+            "g2",
+            "forecast",
+        ];
+        for raw in samples {
+            let g = DecoderGenome::parse(raw).unwrap();
+            let s = g.to_string();
+            assert!(!s.contains(','), "{s}");
+            let back = DecoderGenome::parse(&s).unwrap();
+            assert!(same_genes(&g, &back), "{raw}: {s} → {back:?}");
+            assert_eq!(back.id, s);
+            assert_eq!(back.encoding, "kv");
+            assert_eq!(back.to_string(), s, "canonical form is a fixed point");
+        }
+        // derived genomes have non-trivial floats
+        let d = DecoderGenome::derive("ulid-like-id");
+        assert!(same_genes(&d, &DecoderGenome::parse(&d.to_string()).unwrap()));
+    }
+
+    #[test]
+    fn params_round_trip_and_clamp() {
+        let g = DecoderGenome::parse("retrieval:k=7;tau=10;gap=2;h=4;lb=12").unwrap();
+        let p = g.params();
+        assert_eq!(p.len(), NUMERIC_GENES.len());
+        assert_eq!(p["k"], 7.0);
+        assert!(same_genes(&g, &g.with_params(&p).unwrap()));
+        let mut m = p.clone();
+        m.insert("k".into(), 0.2); // → 1
+        m.insert("h".into(), 6.4); // → 6, gap raised to 6
+        m.insert("lat".into(), 3.0); // → 1
+        m.insert("tau".into(), -5.0); // invalid → unchanged
+        m.insert("bogus".into(), 1.0); // ignored
+        let c = g.with_params(&m).unwrap();
+        assert_eq!((c.k, c.horizon, c.min_gap, c.latent_weight, c.tau_days), (1, 6, 6, 1.0, 10.0));
+        assert_eq!(c.id, c.to_string());
+        assert_eq!(c.family, g.family);
+        assert!(matches!(DecoderGenome::parse("retrieval:lat=2"), Err(GenomeError::Gene { .. })));
     }
 
     #[test]

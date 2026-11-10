@@ -14,6 +14,7 @@
 //! `*_ready` helpers) before relying on uniqueness or vector search.
 
 pub mod ast;
+pub mod catalog;
 pub mod queries;
 pub mod schema;
 
@@ -50,6 +51,15 @@ pub enum HubError {
     IndexAborted(String),
     #[error("timed out waiting for index operation {0}")]
     IndexTimeout(String),
+    /// A business id (`region_id`, `genome_id`, ...) that no node carries.
+    #[error("{label} `{id}` not found")]
+    NotFound { label: String, id: String },
+    /// `catalog::run_named` was given a name outside the whitelist.
+    #[error("unknown named query `{0}`")]
+    UnknownQuery(String),
+    /// `catalog::run_named` was given a missing or ill-typed parameter.
+    #[error("bad parameter: {0}")]
+    BadParam(String),
 }
 
 impl HubError {
@@ -62,6 +72,15 @@ impl HubError {
     /// `true` for `unique_constraint_violation` (HTTP 409).
     pub fn is_unique_violation(&self) -> bool {
         self.server_code() == Some("unique_constraint_violation")
+    }
+    /// The server could not be reached at all (connection refused, DNS, timeout): what callers
+    /// map to "Helix unavailable" as opposed to a query the server rejected.
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, HubError::Http(e) if e.is_connect() || e.is_timeout() || e.is_request())
+    }
+    /// A caller-side problem: unknown query name, bad parameter, or an id that does not exist.
+    pub fn is_client_error(&self) -> bool {
+        matches!(self, HubError::NotFound { .. } | HubError::UnknownQuery(_) | HubError::BadParam(_))
     }
 }
 
@@ -165,9 +184,25 @@ impl HubClient {
         Self { base: base_url.into().trim_end_matches('/').to_owned(), http: reqwest::Client::new() }
     }
 
+    /// Like [`Self::new`] with a per-request timeout (and a short connect timeout), so a slow or
+    /// unreachable server cannot stall a live pipeline or an HTTP handler.
+    pub fn with_timeout(base_url: impl Into<String>, timeout: Duration) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(timeout.min(Duration::from_secs(2)))
+            .build()
+            .unwrap_or_default();
+        Self { base: base_url.into().trim_end_matches('/').to_owned(), http }
+    }
+
     /// `FA_HELIX_URL` or [`DEFAULT_URL`].
     pub fn from_env() -> Self {
         Self::new(std::env::var(URL_ENV).unwrap_or_else(|_| DEFAULT_URL.to_owned()))
+    }
+
+    /// `FA_HELIX_URL` when set, else `fallback` (what a service read from `config/platform.toml`).
+    pub fn url_from_env_or(fallback: &str) -> String {
+        std::env::var(URL_ENV).ok().filter(|u| !u.is_empty()).unwrap_or_else(|| fallback.to_owned())
     }
 
     pub fn base_url(&self) -> &str {
@@ -363,6 +398,15 @@ mod tests {
         assert!(r.take_opt::<Row>("none").unwrap().is_none());
         assert_eq!(r.take::<u64>("n").unwrap(), 7);
         assert!(matches!(r.take::<u64>("n"), Err(HubError::MissingReturn(_))));
+    }
+
+    #[test]
+    fn url_from_env_or_prefers_fallback_when_unset() {
+        // The live tests set FA_HELIX_URL; either way the result is a usable URL.
+        let u = HubClient::url_from_env_or("http://helix:8080");
+        assert!(u.starts_with("http"));
+        assert!(!HubError::UnknownQuery("x".into()).is_unreachable());
+        assert!(HubError::NotFound { label: "Genome".into(), id: "g".into() }.is_client_error());
     }
 
     #[test]

@@ -29,18 +29,27 @@ pub struct AppState {
     pub cfg: Arc<PlatformConfig>,
     pub sources_path: Arc<PathBuf>,
     pub nats: Option<async_nats::Client>,
+    /// HelixDB client for the persisted graph/latent routes (`graph_routes`, D-048); `FA_HELIX_URL` overrides `helix.url`.
+    pub hub: fa_hub::HubClient,
     pub services: Arc<RwLock<BTreeMap<String, ServiceStatus>>>,
     pub live: Arc<RwLock<Live>>,
+    /// Postgres pool, set once by `ledger_routes::install` when Postgres is reachable.
+    pub pg: Arc<std::sync::OnceLock<sqlx::PgPool>>,
 }
 
 impl AppState {
     pub fn new(cfg: PlatformConfig, sources_path: PathBuf, nats: Option<async_nats::Client>) -> Self {
         Self {
+            hub: fa_hub::HubClient::with_timeout(
+                fa_hub::HubClient::url_from_env_or(&cfg.helix.url),
+                std::time::Duration::from_secs(5),
+            ),
             cfg: Arc::new(cfg),
             sources_path: Arc::new(sources_path),
             nats,
             services: Arc::default(),
             live: Arc::default(),
+            pg: Arc::default(),
         }
     }
 

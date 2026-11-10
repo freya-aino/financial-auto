@@ -9,8 +9,71 @@
 pub mod baseline;
 pub mod genome;
 
+use std::collections::HashMap;
+
 use fa_expert_space::ExpertView;
 use serde::{Deserialize, Serialize};
+
+/// One latent observation of an instrument (concatenated expert means of a `LatentState`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LatentPoint {
+    pub as_of_ms: i64,
+    pub vec: Vec<f32>,
+}
+
+/// Point-in-time conditioning context handed to decoders: the latest known latents per
+/// instrument (key = instrument token, lowercase UUID without dashes), sorted by `as_of_ms`.
+/// Decoders look latents up **as of** the step they forecast at, never later, so results stay
+/// deterministic and leakage-free. An empty context disables conditioning.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DecodeCtx {
+    pub latents: HashMap<String, Vec<LatentPoint>>,
+}
+
+/// Lowercase UUID without dashes (D-017 subject token), the key of [`DecodeCtx::latents`].
+pub fn instrument_token(id: &str) -> String {
+    id.trim().to_ascii_lowercase().replace('-', "")
+}
+
+impl DecodeCtx {
+    /// Appends a latent (kept sorted by time; out-of-order points are inserted in place).
+    pub fn push(&mut self, instrument: &str, p: LatentPoint) {
+        let v = self.latents.entry(instrument_token(instrument)).or_default();
+        let pos = v.partition_point(|x| x.as_of_ms <= p.as_of_ms);
+        v.insert(pos, p);
+    }
+
+    /// Latest latent of `instrument` with `as_of_ms ≤ ts_ms`.
+    pub fn latent_as_of(&self, instrument: &str, ts_ms: i64) -> Option<&LatentPoint> {
+        let v = self.latents.get(&instrument_token(instrument))?;
+        let n = v.partition_point(|x| x.as_of_ms <= ts_ms);
+        (n > 0).then(|| &v[n - 1])
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.latents.values().all(Vec::is_empty)
+    }
+
+    /// `(instruments, points)`.
+    pub fn stats(&self) -> (usize, usize) {
+        (self.latents.len(), self.latents.values().map(Vec::len).sum())
+    }
+}
+
+/// Cosine similarity in [-1, 1]; 0 when either vector is empty / zero or lengths differ.
+pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    if a.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+    for (x, y) in a.iter().zip(b) {
+        let (x, y) = (f64::from(*x), f64::from(*y));
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na > 0.0 && nb > 0.0 { (dot / (na.sqrt() * nb.sqrt())).clamp(-1.0, 1.0) } else { 0.0 }
+}
 
 /// Decoder families; string forms match `fa.v1.DecoderOutput.family`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -169,6 +232,22 @@ mod tests {
         let sharp = crps_quantiles(&[-0.1, 0.0, 0.1], &levels, 0.0);
         let wide = crps_quantiles(&[-1.0, 0.0, 1.0], &levels, 0.0);
         assert!(sharp < wide);
+    }
+
+    #[test]
+    fn decode_ctx_is_point_in_time() {
+        let mut ctx = DecodeCtx::default();
+        assert!(ctx.is_empty());
+        ctx.push("0190-AB", LatentPoint { as_of_ms: 20, vec: vec![1.0, 0.0] });
+        ctx.push("0190ab", LatentPoint { as_of_ms: 10, vec: vec![0.0, 1.0] });
+        assert_eq!(ctx.stats(), (1, 2));
+        assert_eq!(ctx.latent_as_of("0190ab", 9), None);
+        assert_eq!(ctx.latent_as_of("0190AB", 15).unwrap().as_of_ms, 10);
+        assert_eq!(ctx.latent_as_of("0190ab", 20).unwrap().as_of_ms, 20);
+        assert_eq!(ctx.latent_as_of("other", 20), None);
+        assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-12);
+        assert_eq!(cosine(&[1.0, 0.0], &[0.0, 1.0]), 0.0);
+        assert_eq!(cosine(&[1.0], &[1.0, 2.0]), 0.0);
     }
 
     #[test]

@@ -14,9 +14,15 @@ integration tests, see below). Supersedes the D-012 assumption of CLI-compiled
 - `schema` – labels, property names and the index DDL mirroring `helix/schema.hx`.
 - `queries` – typed functions on `HubClient` (`add_snapshot`, `add_region`, `add_transition`,
   `search_latent`, `genome_parents`, … plus `region_graph`, `genome_ancestry`, `neighborhood`
-  for spec 50 §4.4/§4.5).
-- `HubClient::{health, ready, diagnostics, batch, query, ensure_schema, ensure_latent_index,
-  wait_for_index}`.
+  for spec 50 §4.4/§4.5). Idempotent writers for live services (D-048): `ensure_snapshot`,
+  `ensure_expert_space` (get-or-create), `upsert_region`, `mark_region_status`,
+  `upsert_transition(s)` (edge keyed by `from_region_id, to_region_id, sampler_id`),
+  `snapshot_graph`, `resolve_node`; business-id variants for evo-worker: `upsert_genome`,
+  `link_parent`, `add_fitness_record`.
+- `catalog` – the **whitelist** of read-only named queries behind `POST /api/graph/query`
+  (`NAMED_QUERIES`, `HubClient::run_named(name, params)`); business-id parameters, no raw trees.
+- `HubClient::{new, with_timeout, from_env, url_from_env_or, health, ready, diagnostics, batch,
+  query, ensure_schema, ensure_latent_index, wait_for_index}`.
 
 ## Usage
 ```rust
@@ -32,6 +38,23 @@ let space = hub.add_expert_space(snap.id, &NewExpertSpace { /* … */ }).await?;
 let r1 = hub.add_region(space.id, &NewRegion { /* … */ }).await?;
 let graph = hub.region_graph(space.id).await?;                      // regions + Transition edges
 let hits = hub.search_latent(&space.expert_space_id, &query_vec, 20).await?; // k-NN, $distance asc
+
+// Live-service writers (model-runtime `hub_sink`): idempotent across restarts.
+let snap = hub.ensure_snapshot(&NewSnapshot { /* stat-v1-1m … */ }).await?;   // existing row returned as is
+let space = hub.ensure_expert_space(snap.id, &NewExpertSpace { /* stat-v1-1m-e0 … */ }).await?;
+let region = hub.upsert_region(space.id, &NewRegion { /* 1m-e0-r000 … */ }).await?; // revives a known id: status=live
+hub.mark_region_status("1m-e0-r003", "retired", "1m-e0-r001").await?;      // merged | retired
+hub.upsert_transitions(&[TransitionUpsert { from_region_id, to_region_id, transition }]).await?; // one write batch
+let g = hub.snapshot_graph("stat-v1-1m").await?;                            // snapshot + spaces + regions + transitions
+let hit = hub.resolve_node("1m-e0-r000").await?;                            // any unique business id, or a numeric $id
+
+// evo-worker (business ids; D-048):
+let g = hub.upsert_genome(&NewGenome { /* … */ }).await?;
+hub.link_parent("parent-genome-id", "child-genome-id", "mutate").await?;
+hub.add_fitness_record(&NewFitness { genome_id, generation, objectives, pareto_rank }).await?;
+
+// Named queries (what control-api forwards from `POST /api/graph/query`):
+let rows = hub.run_named("regionTransitions", &serde_json::json!({ "region_id": "1m-e0-r000" })).await?;
 
 // Ad-hoc trees when no typed function fits:
 let n = hub.query(Op::nodes_with_label("Snapshot").count()).await?;
@@ -63,6 +86,12 @@ The server is **schemaless**: node/edge labels and property types are inferred o
   which retries retryable errors with backoff. Do not use it for non-idempotent data writes.
 - DDL and data mutations **cannot share a write batch** (500 `internal_error: … mixes incompatible
   request transaction modes`); `ensure_*` run DDL-only batches.
+- **Upserts** are conditional batches (lookup → `set_property`, else `add_n`/`add_e`, entries
+  guarded by `var_empty`/`var_not_empty`). An `add_e` whose **target variable is empty is a
+  server error** (500 `invalid_query: addE() requires at least one target vertex`), not an empty
+  result, so edge creation is gated on a probe entry that is non-empty only when the target
+  exists (`upsert_transitions`, `link_parent`). `set_property` works on edge streams
+  (`edges{var}` → `set_property` → `edge_properties`).
 
 ## Wire contract (verified against v0.0.14)
 Request: `POST /v2/query`, JSON. `request_type` must match the batch variant; entries are named
@@ -121,14 +150,23 @@ Shapes:
 Also available but unused: `GET /healthz`, `GET /readyz` (503 while indexes catch up),
 `GET /v2/diagnostics`, and `POST /v2/cypher` / `/v2/sql` text endpoints.
 
+## Who writes what (D-048)
+| Writer | Rows |
+|---|---|
+| `bins/model-runtime` (`hub_sink`) | `Snapshot stat-v1-<ts>`, `ExpertSpace <snapshot>-e<k>`, `LatentRegion` (+ `status`), `Transition` (coalesced), `LatentVec kind=observation` for 1m and slower |
+| `bins/evo-worker` (pending; functions ready) | `Genome` via `upsert_genome`, `ParentOf` via `link_parent`, `FitnessRecord`+`Scored` via `add_fitness_record` |
+| `bins/control-api` (`graph_routes`) | reads only: `list_snapshots`, `snapshot_graph`, `resolve_node` + `neighborhood`, `genome_ancestry`, `run_named` |
+
 ## Tests
 ```sh
-cargo test -p fa-hub                                   # unit tests (JSON shapes, parsing)
+cargo test -p fa-hub                                   # unit tests (JSON shapes, parsing, catalog validation)
 FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test live   # against `just up`'s helix
 ```
 The live tests create `test-<nanos>-…` rows and drop them afterwards; the indexes created by
-`ensure_schema` and the `vec4` latent index remain.
+`ensure_schema` and the `vec4` latent index remain. `live.rs` covers the typed queries, the
+idempotent `ensure_*`/`upsert_*` writers, lifecycle marks, `snapshot_graph`, `resolve_node`, the
+named-query catalog and the evo-worker business-id writers.
 
 ## Governing specs
-- [20-storage](../../specs/20-storage.md) §5.2, [ADR 0002](../../specs/adr/0002-helixdb-hub.md), D-012, D-033
+- [20-storage](../../specs/20-storage.md) §5.2, [ADR 0002](../../specs/adr/0002-helixdb-hub.md), D-012, D-033, D-043, D-048
 - [helix/](../../helix/README.md) – the readable catalog this crate mirrors

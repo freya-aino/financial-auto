@@ -51,10 +51,7 @@ pub struct UnknownTimescale(String);
 impl FromStr for Timescale {
     type Err = UnknownTimescale;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::LADDER
-            .into_iter()
-            .find(|t| t.as_str() == s)
-            .ok_or_else(|| UnknownTimescale(s.to_owned()))
+        Self::LADDER.into_iter().find(|t| t.as_str() == s).ok_or_else(|| UnknownTimescale(s.to_owned()))
     }
 }
 

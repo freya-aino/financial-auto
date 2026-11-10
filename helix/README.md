@@ -21,6 +21,13 @@ JSON operation tree). The executable counterpart of these files is
 When changing the model, edit the `.hx` file first (it is the review surface), then mirror the
 change in `fa-hub::schema` / `fa-hub::queries` and run the live tests.
 
+**Who writes (D-048):** `bins/model-runtime` (`hub_sink.rs`) persists its snapshot
+(`stat-v1-<ts>`), expert spaces (`<snapshot>-e<k>`), regions with lifecycle `status`,
+coalesced `Transition` posteriors and closed-bar `LatentVec` observations (1m and slower);
+`bins/control-api` (`graph_routes.rs`) serves spec 50 §4.4/§4.5 from these rows, including the
+named-query whitelist of `fa-hub::catalog` behind `POST /api/graph/query`. evo-worker writes
+genomes/lineage/fitness through `upsert_genome` / `link_parent` / `add_fitness_record` (pending).
+
 ## Contents
 | Area | Nodes / vectors | Edges |
 |---|---|---|
@@ -35,9 +42,13 @@ change in `fa-hub::schema` / `fa-hub::queries` and run the live tests.
   `(label, property)` with a fixed dimension, so `LatentVec` stores a `d`-dimensional vector in
   `vec<d>` and gets one index per `d`, each partitioned per expert space via `tenant_property =
   expert_space_id`. Searches are therefore always scoped to one expert space (what spec 34 wants).
-- **Upserts:** no server-side upsert; `fa-hub` implements `upsert_instrument` as a conditional
-  batch (lookup → `set_property`, else `add_n`). Other `add*` queries rely on the unique indexes
-  and fail with 409 `unique_constraint_violation` on duplicates.
+- **Upserts:** no server-side upsert; `fa-hub` implements `upsert_*` / `ensure_*`
+  (`ensureSnapshot`, `ensureExpertSpace`, `upsertRegion`, `upsertTransition`, `upsertGenome`) as
+  conditional batches (lookup → `UPDATE`, else `AddN`/`AddE`). `Transition` edges carry
+  `from_region_id`/`to_region_id` so an edge can be found again (`From::OutE<Transition>::WHERE`)
+  and updated in place; `LatentRegion` has `status` (live | merged | retired) and
+  `related_region_id` for the lifecycle marks (`markRegionStatus`). Plain `add*` queries rely on
+  the unique indexes and fail with 409 `unique_constraint_violation` on duplicates.
 - **Index DDL is asynchronous** and cannot share a batch with data writes; `fa-hub` waits for
   builds (`wait_for_index`) in its `*_ready` helpers.
 - `NewsDoc` / `MediaSegment` vector indexes are not created yet (dims unknown); use

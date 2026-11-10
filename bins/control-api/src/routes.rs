@@ -38,19 +38,14 @@ pub fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         .route("/api/ingest/{source}/{action}", post(lr::ingest_control))
         // 4.3 Bus tap
         .route("/ws/bus", get(bus_tap::ws_bus))
-        .route("/api/bus/streams", get(not_implemented))
-        // 4.4 Hub / graph
-        .route("/api/graph/neighborhood", get(not_implemented))
-        .route("/api/graph/query", post(not_implemented))
-        .route("/api/graph/lineage/{genome_id}", get(not_implemented))
-        // 4.5 Latent / MCMC
+        // 4.4 Hub / graph: `graph_routes` (Helix-backed, merged in main)
+        // 4.5 Latent / MCMC (in-memory views; the persisted `/api/latent/snapshots`, `/api/latent/{snapshot}/regions`
+        // and `/api/mcmc/{snapshot}/graph` live in `graph_routes`)
         .route("/api/latent/timescales", get(lr::latent_timescales))
         .route("/api/latent/timescales/{ts}/{view}", get(lr::latent_view))
         .route("/api/decoders/outputs", get(lr::decoder_outputs))
-        .route("/api/latent/snapshots", get(not_implemented))
         .route("/api/latent/snapshots/{id}/{action}", post(not_implemented))
         .route("/api/latent/{snapshot}/{view}", get(not_implemented))
-        .route("/api/mcmc/{snapshot}/graph", get(not_implemented))
         .route("/ws/latent", get(not_implemented))
         // 4.6 Evolution
         .route("/api/evolution/jobs", get(lr::jobs))

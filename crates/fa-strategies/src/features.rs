@@ -32,10 +32,7 @@ pub struct PriceSeries {
 
 impl PriceSeries {
     pub fn new(max_points: usize) -> Self {
-        Self {
-            points: VecDeque::new(),
-            max_points: max_points.max(2),
-        }
+        Self { points: VecDeque::new(), max_points: max_points.max(2) }
     }
 
     pub fn push(&mut self, at_ms: i64, price: f64) {
@@ -126,29 +123,13 @@ pub struct FallbackContext {
 
 impl FallbackContext {
     pub fn new(closes: &[f64], latent: Option<LatentInfo>, book: VirtualBook) -> Self {
-        let returns: Vec<f64> = closes
-            .windows(2)
-            .filter(|w| w[0] > 0.0 && w[1] > 0.0)
-            .map(|w| (w[1] / w[0]).ln())
-            .collect();
+        let returns: Vec<f64> =
+            closes.windows(2).filter(|w| w[0] > 0.0 && w[1] > 0.0).map(|w| (w[1] / w[0]).ln()).collect();
         let n = returns.len() as f64;
-        let mean = if n > 0.0 {
-            returns.iter().sum::<f64>() / n
-        } else {
-            0.0
-        };
-        let std = if n > 1.0 {
-            (returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt()
-        } else {
-            0.0
-        };
-        Self {
-            returns,
-            mean,
-            std,
-            latent,
-            book,
-        }
+        let mean = if n > 0.0 { returns.iter().sum::<f64>() / n } else { 0.0 };
+        let std =
+            if n > 1.0 { (returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt() } else { 0.0 };
+        Self { returns, mean, std, latent, book }
     }
 
     pub fn n_returns(&self) -> usize {
@@ -174,13 +155,8 @@ pub fn norm_quantile(p: f64) -> f64 {
         -3.066479806614716e1,
         2.506628277459239,
     ];
-    const B: [f64; 5] = [
-        -5.447609879822406e1,
-        1.615858368580409e2,
-        -1.556989798598866e2,
-        6.680131188771972e1,
-        -1.328068155288572e1,
-    ];
+    const B: [f64; 5] =
+        [-5.447609879822406e1, 1.615858368580409e2, -1.556989798598866e2, 6.680131188771972e1, -1.328068155288572e1];
     const C: [f64; 6] = [
         -7.784894002430293e-3,
         -3.223964580411365e-1,
@@ -189,12 +165,7 @@ pub fn norm_quantile(p: f64) -> f64 {
         4.374664141464968,
         2.938163982698783,
     ];
-    const D: [f64; 4] = [
-        7.784695709041462e-3,
-        3.224671290700398e-1,
-        2.445134137142996,
-        3.754408661907416,
-    ];
+    const D: [f64; 4] = [7.784695709041462e-3, 3.224671290700398e-1, 2.445134137142996, 3.754408661907416];
     let p = p.clamp(1e-12, 1.0 - 1e-12);
     let (lo, hi) = (0.02425, 1.0 - 0.02425);
     if p < lo {
@@ -229,11 +200,7 @@ impl StrategyContext for FallbackContext {
         if self.returns.len() < 2 {
             return 0.5;
         }
-        let same = self
-            .returns
-            .windows(2)
-            .filter(|w| w[0].signum() == w[1].signum())
-            .count();
+        let same = self.returns.windows(2).filter(|w| w[0].signum() == w[1].signum()).count();
         same as f64 / (self.returns.len() - 1) as f64
     }
 
@@ -291,10 +258,7 @@ mod tests {
         s.push(0, 100.0);
         s.push(500, 101.0); // same 1s bucket → close 101
         s.push(3_000, 103.0); // buckets 1 and 2 empty → carried forward
-        assert_eq!(
-            s.closes(Timescale::Second, 10),
-            vec![101.0, 101.0, 101.0, 103.0]
-        );
+        assert_eq!(s.closes(Timescale::Second, 10), vec![101.0, 101.0, 101.0, 103.0]);
         assert_eq!(s.closes(Timescale::Second, 2), vec![101.0, 103.0]);
         assert_eq!(s.closes(Timescale::Minute, 10), vec![103.0]);
         s.push(2_000, 50.0); // late tick dropped
@@ -319,20 +283,9 @@ mod tests {
         assert_eq!(empty.path_up_prob(3), 0.5);
         assert_eq!(empty.region_entropy(), 1.0);
 
-        let l = LatentInfo {
-            region_id: "r7".into(),
-            uncertainty: 0.3,
-            dwell: 3,
-        };
-        let with = FallbackContext::new(
-            &closes,
-            Some(l),
-            VirtualBook {
-                exposure: -0.4,
-                unrealised: 0.01,
-                steps_in_trade: 2,
-            },
-        );
+        let l = LatentInfo { region_id: "r7".into(), uncertainty: 0.3, dwell: 3 };
+        let with =
+            FallbackContext::new(&closes, Some(l), VirtualBook { exposure: -0.4, unrealised: 0.01, steps_in_trade: 2 });
         assert_eq!(with.current_region(), Some("r7"));
         assert_eq!(with.stay_prob(), 0.75);
         assert_eq!(with.region_entropy(), 0.3);

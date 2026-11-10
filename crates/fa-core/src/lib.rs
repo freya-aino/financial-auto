@@ -3,9 +3,11 @@
 pub mod config;
 pub mod ids;
 pub mod rng;
+pub mod secrets;
 pub mod time;
 
 pub use ids::{EventId, InstrumentId, JobId};
+pub use secrets::Secrets;
 pub use time::{Horizon, Timescale};
 
 /// Asset classes; leverage caps and concentration limits are keyed by these (spec 40).

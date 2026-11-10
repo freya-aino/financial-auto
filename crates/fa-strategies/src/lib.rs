@@ -134,11 +134,7 @@ impl Expr {
             Mul(a, b) => a.eval(ctx) * b.eval(ctx),
             Div(a, b) => {
                 let d = b.eval(ctx);
-                if d.abs() < 1e-12 {
-                    0.0
-                } else {
-                    a.eval(ctx) / d
-                }
+                if d.abs() < 1e-12 { 0.0 } else { a.eval(ctx) / d }
             }
             Neg(a) => -a.eval(ctx),
             Tanh(a) => a.eval(ctx).tanh(),
@@ -160,9 +156,7 @@ impl Expr {
         match self {
             Const(_) | Graph(_) | Decoder(_) | Portfolio(_) => 1,
             Neg(a) | Tanh(a) => 1 + a.size(),
-            Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Min(a, b) | Max(a, b) => {
-                1 + a.size() + b.size()
-            }
+            Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Min(a, b) | Max(a, b) => 1 + a.size() + b.size(),
             IfGt(a, b, c, d) => 1 + a.size() + b.size() + c.size() + d.size(),
         }
     }
@@ -172,11 +166,7 @@ impl Expr {
 pub trait Strategy: Send {
     fn id(&self) -> &str;
     fn horizon(&self) -> Horizon;
-    fn step(
-        &mut self,
-        as_of_ms: i64,
-        assets: &[(InstrumentId, &dyn StrategyContext)],
-    ) -> ExposureDistribution;
+    fn step(&mut self, as_of_ms: i64, assets: &[(InstrumentId, &dyn StrategyContext)]) -> ExposureDistribution;
 }
 
 /// GP strategy: `mean = tanh(signal)`, `stddev = sigmoid(uncertainty)`.
@@ -198,11 +188,7 @@ impl Strategy for GpStrategy {
         self.horizon
     }
 
-    fn step(
-        &mut self,
-        as_of_ms: i64,
-        assets: &[(InstrumentId, &dyn StrategyContext)],
-    ) -> ExposureDistribution {
+    fn step(&mut self, as_of_ms: i64, assets: &[(InstrumentId, &dyn StrategyContext)]) -> ExposureDistribution {
         let exposures = assets
             .iter()
             .map(|(inst, ctx)| AssetExposure {
@@ -281,18 +267,10 @@ mod tests {
     fn interpreter_evaluates_primitives_and_ops() {
         let ctx = Ctx { up: 0.8, pos: 0.0 };
         // 4 * (path_up(3) - 0.5)
-        let e = Expr::Mul(
-            b(Expr::Const(4.0)),
-            b(Expr::Sub(
-                b(Expr::Graph(GraphOp::PathUpProb(3))),
-                b(Expr::Const(0.5)),
-            )),
-        );
+        let e =
+            Expr::Mul(b(Expr::Const(4.0)), b(Expr::Sub(b(Expr::Graph(GraphOp::PathUpProb(3))), b(Expr::Const(0.5)))));
         assert!((e.eval(&ctx) - 1.2).abs() < 1e-12);
-        assert_eq!(
-            Expr::Div(b(Expr::Const(1.0)), b(Expr::Const(0.0))).eval(&ctx),
-            0.0
-        );
+        assert_eq!(Expr::Div(b(Expr::Const(1.0)), b(Expr::Const(0.0))).eval(&ctx), 0.0);
         let cond = Expr::IfGt(
             b(Expr::Portfolio(PortfolioOp::Position)),
             b(Expr::Const(0.0)),
@@ -308,14 +286,8 @@ mod tests {
         let mut s = GpStrategy {
             id: "s1".into(),
             genome_id: "g1".into(),
-            horizon: Horizon {
-                timescale: Timescale::Hour,
-                steps: 2,
-            },
-            signal: Expr::Mul(
-                b(Expr::Const(100.0)),
-                b(Expr::Decoder(DecoderOp::AnalogForecast)),
-            ),
+            horizon: Horizon { timescale: Timescale::Hour, steps: 2 },
+            signal: Expr::Mul(b(Expr::Const(100.0)), b(Expr::Decoder(DecoderOp::AnalogForecast))),
             uncertainty: Expr::Graph(GraphOp::RegionEntropy),
         };
         let ctx = Ctx { up: 0.5, pos: 0.0 };

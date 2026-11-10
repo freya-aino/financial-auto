@@ -1,0 +1,14 @@
+{
+  "_comment": "JetStream stream table from specs/21-bus-and-contracts.md §5. Single source of truth embedded by crates/fa-bus (streams.rs) and go/pkg/bus (streams.go); both sides test against it. JOBS_<kind> work queues are not listed: their owners create them (ensure_work_queue / EnsureWorkQueue) with the work_queue consumer tunables below.",
+  "streams": [
+    { "name": "MD",          "subjects": ["md.>"],                "max_age_hours": 24,   "storage": "file", "description": "market data: live + short replay; long history in VictoriaMetrics/Garage" },
+    { "name": "TEXT",        "subjects": ["news.>", "filing.>"],  "max_age_hours": 168,  "storage": "file", "description": "news and filing events" },
+    { "name": "MEDIA",       "subjects": ["media.>"],             "max_age_hours": 168,  "storage": "file", "description": "media chunk refs; blobs live in Garage" },
+    { "name": "MACRO",       "subjects": ["macro.>", "onchain.>"],"max_age_hours": 720,  "storage": "file", "description": "macro observations and on-chain events" },
+    { "name": "LATENT",      "subjects": ["latent.>", "decoder.>"],"max_age_hours": 168, "storage": "file", "description": "latent states, regions, transitions and decoder outputs" },
+    { "name": "SIGNAL",      "subjects": ["signal.>"],            "max_age_hours": 720,  "storage": "file", "description": "strategy exposure distributions" },
+    { "name": "ORDERS",      "subjects": ["order.>", "risk.>"],   "max_age_hours": 8760, "storage": "file", "description": "order intents/events and risk state; ledger is source of truth, stream is audit aid" },
+    { "name": "JOB_RESULTS", "subjects": ["jobs.result.>"],       "max_age_hours": 720,  "storage": "file", "description": "work-queue job results" }
+  ],
+  "work_queue": { "ack_wait_secs": 60, "max_deliver": 5 }
+}

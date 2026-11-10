@@ -1,8 +1,6 @@
 package connectors_test
 
 import (
-	"context"
-	"errors"
 	"testing"
 
 	"github.com/fey/financial-auto/go/pkg/connector"
@@ -15,21 +13,20 @@ import (
 	_ "github.com/fey/financial-auto/go/connectors/yahoo"
 )
 
-func TestFirstWaveRegisteredAndStubbed(t *testing.T) {
-	for _, id := range []string{"yahoo", "lemon", "oanda", "hackernews", "google_news"} {
+// TestFirstWaveRegistered checks every first-wave connector registers under
+// its catalog id, implements Normalizer and that the declared capabilities
+// match the implemented interfaces.
+func TestFirstWaveRegistered(t *testing.T) {
+	for _, id := range []string{"heartbeat", "yahoo", "lemon", "oanda", "hackernews", "google_news"} {
 		c, err := connector.New(id)
 		if err != nil {
 			t.Fatalf("%s: %v", id, err)
 		}
-		if err := c.Init(context.Background(), connector.SourceConfig{}, connector.Deps{}); err != nil {
-			t.Fatalf("%s init: %v", id, err)
+		if c.ID() != id {
+			t.Errorf("%s: ID() = %q", id, c.ID())
 		}
-		n, ok := c.(connector.Normalizer)
-		if !ok {
+		if _, ok := c.(connector.Normalizer); !ok {
 			t.Fatalf("%s: must implement Normalizer", id)
-		}
-		if _, _, err := n.Normalize(connector.RawMessage{}); !errors.Is(err, connector.ErrNotImplemented) {
-			t.Errorf("%s: want ErrNotImplemented, got %v", id, err)
 		}
 		caps := c.Capabilities()
 		if _, isS := c.(connector.Streamer); isS != caps.Stream {
@@ -40,6 +37,9 @@ func TestFirstWaveRegisteredAndStubbed(t *testing.T) {
 		}
 		if _, isB := c.(connector.Backfiller); isB != caps.Backfill {
 			t.Errorf("%s: Backfill capability mismatch", id)
+		}
+		if len(caps.Events) == 0 {
+			t.Errorf("%s: declares no events", id)
 		}
 	}
 }

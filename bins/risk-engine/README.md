@@ -2,7 +2,7 @@
 
 Live service: meta-allocation across strategy signals, non-evolvable hard risk limits, the halt state machine and the paper book (specs 40, 42; D-028, D-029, D-030).
 
-**Status:** running (paper only) — `signal.exposure.>` → allocator (`fa-allocator`) → EUR targets → caps + halt gate (`fa-risk`) → diff against the paper book (`fa-ledger`) → `order.intent.paper` + `order.approved.paper`; books fills from `order.event.>`, marks from `md.trade.>`; publishes `risk.state` (equity, deployable, gross exposure, drawdown, daily P&L, active halts) and raises `risk.halt.portfolio` / `risk.halt.daily_loss` itself; honours `risk.halt.>` (incl. the UI kill switch) and `risk.resume.<scope>`. No persistence: restarting resets the book to 100 000 EUR.
+**Status:** running (paper only) — `signal.exposure.>` → allocator (`fa-allocator`) → EUR targets → caps + halt gate (`fa-risk`) → diff against the paper book (`fa-ledger`) → `order.intent.paper` + `order.approved.paper`; books fills from `order.event.>`, marks from `md.trade.>`; publishes `risk.state` (equity, deployable, gross exposure, drawdown, daily P&L, active halts) and raises `risk.halt.portfolio` / `risk.halt.daily_loss` itself; honours `risk.halt.>` (incl. the UI kill switch) and `risk.resume.<scope>`. With `[postgres]` reachable the paper book is persisted (D-047): the 100 000 EUR opening deposit is a `cash_movement` booked once, every own and foreign intent and every fill is written to `ledger.*` (idempotent), a `position_snapshot` is taken every `snapshot_secs` (60) and on each halt, halts/resumes/limit loads go to `audit.log`, and every `reconcile_secs` (300) the in-memory book is compared with the Postgres-derived one into `reconciliation_run` (`ok`/`diff`; a diff is logged as an error but does not halt yet — spec 42 follow-up). Restarting reloads the book from Postgres (drawdown peak and day-start equity restart from the loaded equity; intents pending at shutdown are not restored). Without Postgres it logs once and stays in memory.
 
 ## Pipeline per tick (spec 40 §6.1)
 1. Latest signal per strategy (stale after `signal_ttl_secs`).
@@ -34,6 +34,7 @@ Then `GET /api/trading/{signals,orders,positions,risk}` on control-api shows the
 ## Layout
 - `src/engine.rs` — pure, deterministic engine (`on_signal`, `on_trade`, `on_intent_seen`, `on_order_event`, `on_halt`, `on_resume`, `tick`, `state`), tested end-to-end with synthetic signals/fills.
 - `src/settings.rs` — `risk.toml` schema and validation.
+- `src/persist.rs` — Postgres side effects (`fa-ledger::pg::PgLedger`, `fa-warehouse::audit`): intents, fills, snapshots, reconciliation runs, audit entries; best effort, idempotent.
 - `src/main.rs` — NATS wiring, heartbeat `svc.heartbeat.risk-engine` (counters: signals, trades, intents.ours, fills, halts.*, equity_eur, cash_eur, gross_exposure_eur, positions, halted).
 
 ## Governing specs

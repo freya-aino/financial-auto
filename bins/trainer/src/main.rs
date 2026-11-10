@@ -43,9 +43,10 @@ enum Cmd {
 }
 
 fn parse_family(s: &str) -> Result<FamilyId, String> {
-    FamilyId::ALL.into_iter().find(|f| f.as_str() == s).ok_or_else(|| {
-        format!("unknown family `{s}`; one of: {}", FamilyId::ALL.map(FamilyId::as_str).join(", "))
-    })
+    FamilyId::ALL
+        .into_iter()
+        .find(|f| f.as_str() == s)
+        .ok_or_else(|| format!("unknown family `{s}`; one of: {}", FamilyId::ALL.map(FamilyId::as_str).join(", ")))
 }
 
 fn check_family(family: FamilyId, ts: Timescale) -> anyhow::Result<()> {
@@ -59,12 +60,19 @@ fn main() -> anyhow::Result<()> {
     match Args::parse().cmd {
         Cmd::Pretrain { timescale, family, seed } => {
             check_family(family, timescale)?;
-            println!("plan: gen-0 pretrain {} @ {timescale} seed={seed} sizing={:?}", family.as_str(), default_sizing(timescale));
+            println!(
+                "plan: gen-0 pretrain {} @ {timescale} seed={seed} sizing={:?}",
+                family.as_str(),
+                default_sizing(timescale)
+            );
         }
         Cmd::Generation { timescale, family, generation, elite_k } => {
             check_family(family, timescale)?;
             anyhow::ensure!(generation >= 1, "generation 0 is `pretrain`");
-            println!("plan: generation {generation} {} @ {timescale} with top-{elite_k} elite decoders", family.as_str());
+            println!(
+                "plan: generation {generation} {} @ {timescale} with top-{elite_k} elite decoders",
+                family.as_str()
+            );
         }
         Cmd::Adapter { snapshot } => println!("plan: online adapter update for snapshot {snapshot}"),
     }

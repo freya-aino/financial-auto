@@ -135,7 +135,18 @@ type Deps struct {
 	Resolver SymbolResolver
 	Archive  RawArchive
 	Clock    Clock
+	// Cursors persists progress; nil means connectors start from "now" every run.
+	Cursors CursorStore
 }
+
+// Meta keys connectors put in RawMessage.TransportMeta.
+const (
+	MetaEndpoint = "endpoint" // which API shape the payload has
+	MetaSymbol   = "symbol"   // venue symbol the payload is about
+	MetaTf       = "tf"       // bar timeframe
+	MetaBackfill = "backfill" // "1" when produced by Backfill (no live de-dup)
+	MetaURL      = "url"      // request URL, for the raw archive
+)
 
 // RateLimiter blocks until a request may proceed.
 type RateLimiter interface {

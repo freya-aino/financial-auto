@@ -1,13 +1,15 @@
 //! Ledger: positions, cash and P&L in EUR, fees, idempotent intents, reconciliation (spec 42).
-//! This in-memory model mirrors the Postgres ledger tables; persistence is added in the
-//! ledger service.
+//! [`Ledger`] is the in-memory book; [`pg::PgLedger`] persists intents, fills, cash movements,
+//! snapshots and reconciliation runs to the `ledger.*` tables and rebuilds a `Ledger` from them.
+
+pub mod pg;
 
 use std::collections::{BTreeMap, HashSet};
 
 use fa_core::InstrumentId;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fill {
     /// Unique per venue fill; used for idempotency.
     pub fill_id: String,
@@ -47,12 +49,35 @@ pub struct Ledger {
     pub paid_out_eur: f64,
 }
 
+/// Cash and position differences between two books (reconciliation, spec 42 §6).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BookDiff {
+    pub cash_ours: f64,
+    pub cash_theirs: f64,
+    pub positions: Vec<ReconDiff>,
+}
+
+impl BookDiff {
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty() && self.cash_ours == self.cash_theirs
+    }
+}
+
+/// Compares two books: cash beyond `cash_tol` and position quantities beyond `qty_tol`.
+pub fn diff_books(ours: &Ledger, theirs: &Ledger, cash_tol: f64, qty_tol: f64) -> BookDiff {
+    let theirs_q: BTreeMap<InstrumentId, f64> = theirs.positions.iter().map(|(i, p)| (*i, p.quantity)).collect();
+    let positions = reconcile(ours, &theirs_q, qty_tol);
+    let (cash_ours, cash_theirs) = if (ours.cash_eur - theirs.cash_eur).abs() > cash_tol {
+        (ours.cash_eur, theirs.cash_eur)
+    } else {
+        (ours.cash_eur, ours.cash_eur)
+    };
+    BookDiff { cash_ours, cash_theirs, positions }
+}
+
 impl Ledger {
     pub fn with_cash(cash_eur: f64) -> Self {
-        Self {
-            cash_eur,
-            ..Self::default()
-        }
+        Self { cash_eur, ..Self::default() }
     }
 
     /// Registers an order intent; intent ids are idempotency keys.
@@ -119,23 +144,14 @@ pub struct ReconDiff {
 
 /// Compares positions with the broker's statement; differences above `tol` are reported.
 pub fn reconcile(ours: &Ledger, broker: &BTreeMap<InstrumentId, f64>, tol: f64) -> Vec<ReconDiff> {
-    let mut keys: Vec<InstrumentId> = ours
-        .positions
-        .keys()
-        .chain(broker.keys())
-        .copied()
-        .collect();
+    let mut keys: Vec<InstrumentId> = ours.positions.keys().chain(broker.keys()).copied().collect();
     keys.sort();
     keys.dedup();
     keys.into_iter()
         .filter_map(|i| {
             let o = ours.positions.get(&i).map_or(0.0, |p| p.quantity);
             let b = broker.get(&i).copied().unwrap_or(0.0);
-            ((o - b).abs() > tol).then_some(ReconDiff {
-                instrument: i,
-                ours: o,
-                broker: b,
-            })
+            ((o - b).abs() > tol).then_some(ReconDiff { instrument: i, ours: o, broker: b })
         })
         .collect()
 }
@@ -161,10 +177,7 @@ mod tests {
         let i = InstrumentId::new();
         let mut l = Ledger::with_cash(10_000.0);
         assert!(l.apply_fill(&fill("f1", i, 10.0, 100.0)));
-        assert!(
-            !l.apply_fill(&fill("f1", i, 10.0, 100.0)),
-            "replayed fill ignored"
-        );
+        assert!(!l.apply_fill(&fill("f1", i, 10.0, 100.0)), "replayed fill ignored");
         l.apply_fill(&fill("f2", i, -10.0, 110.0));
         assert_eq!(l.positions[&i].quantity, 0.0);
         assert!((l.positions[&i].realised_eur - 100.0).abs() < 1e-9);
@@ -197,23 +210,28 @@ mod tests {
     }
 
     #[test]
+    fn diff_books_reports_cash_and_positions() {
+        let i = InstrumentId::new();
+        let mut a = Ledger::with_cash(100.0);
+        let mut b = Ledger::with_cash(100.0);
+        a.apply_fill(&fill("f", i, 1.0, 10.0));
+        b.apply_fill(&fill("f", i, 1.0, 10.0));
+        assert!(diff_books(&a, &b, 1e-9, 1e-9).is_empty());
+        b.record_payout(5.0);
+        let d = diff_books(&a, &b, 1e-9, 1e-9);
+        assert!(!d.is_empty());
+        assert_eq!((d.cash_ours, d.cash_theirs), (89.0, 84.0));
+        assert!(d.positions.is_empty());
+    }
+
+    #[test]
     fn idempotent_intents_and_reconciliation() {
         let mut l = Ledger::default();
         l.register_intent("x").unwrap();
-        assert_eq!(
-            l.register_intent("x"),
-            Err(LedgerError::DuplicateIntent("x".into()))
-        );
+        assert_eq!(l.register_intent("x"), Err(LedgerError::DuplicateIntent("x".into())));
         let (a, b) = (InstrumentId::new(), InstrumentId::new());
         l.apply_fill(&fill("f", a, 2.0, 1.0));
         let d = reconcile(&l, &BTreeMap::from([(a, 2.0), (b, 1.0)]), 1e-9);
-        assert_eq!(
-            d,
-            vec![ReconDiff {
-                instrument: b,
-                ours: 0.0,
-                broker: 1.0
-            }]
-        );
+        assert_eq!(d, vec![ReconDiff { instrument: b, ours: 0.0, broker: 1.0 }]);
     }
 }

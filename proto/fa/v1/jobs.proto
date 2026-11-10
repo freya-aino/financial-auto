@@ -26,6 +26,7 @@ message JobResult {
     STATUS_FAILED = 1;
     STATUS_PREEMPTED = 2;
     STATUS_BUDGET_EXCEEDED = 3;
+    STATUS_CANCELLED = 4; // orchestrator-side cancel (ctl.evo.cancel, D-037)
   }
   string job_id = 1;
   Status status = 2;
@@ -35,6 +36,11 @@ message JobResult {
   uint64 used_gpu_ms = 6;
   string worker_id = 7;
   string error = 8;
+  // Multi-objective fitness (spec 34 §6.3): objective name -> value, with its direction
+  // ("min" | "max"). Mirrors the JSON `objectives`/`directions` in `result`; the
+  // orchestrator's NSGA-II ranking reads these first and falls back to the JSON.
+  map<string, double> objectives = 9;
+  map<string, string> directions = 10;
 }
 
 message JobProgress {
