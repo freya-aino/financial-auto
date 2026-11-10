@@ -91,7 +91,10 @@ services:
     environment: &rust-env
       FA_CONFIG: /app/config/platform.docker.toml
       FA_SOURCES: /app/config/sources.yaml
+      FA_SECRETS: /app/config/secrets.toml
       RUST_LOG: info
+    volumes: &secrets-volume
+      - ./config/secrets.toml:/app/config/secrets.toml:ro # git-ignored; create with docker/garage-init.sh (D-045)
     ports:
       - "127.0.0.1:7700:7700"
     depends_on: &core-deps
@@ -132,6 +135,7 @@ services:
     image: financial-auto/rust:dev
     command: ["model-runtime"]
     environment: *rust-env
+    volumes: *secrets-volume
     depends_on: *core-deps
     restart: unless-stopped
     # deploy:
@@ -147,6 +151,7 @@ services:
     image: financial-auto/rust:dev
     command: ["strategy-runtime"]
     environment: *rust-env # FA_STRATEGIES=<file> for a non-baseline population
+    volumes: *secrets-volume
     depends_on: *core-deps
     restart: unless-stopped
 
@@ -159,6 +164,7 @@ services:
       FA_RISK: /app/risk.toml
     volumes:
       - ./bins/risk-engine/risk.toml:/app/risk.toml:ro # limits editable without a rebuild (D-041)
+      - ./config/secrets.toml:/app/config/secrets.toml:ro
     depends_on: *core-deps
     restart: unless-stopped
 
@@ -167,6 +173,7 @@ services:
     image: financial-auto/rust:dev
     command: ["evo-worker"]
     environment: *rust-env
+    volumes: *secrets-volume
     depends_on: *core-deps
     restart: unless-stopped
     # Scale with: docker compose --profile app up -d --scale evo-worker=N
@@ -186,6 +193,9 @@ services:
     image: financial-auto/go:dev
     entrypoint: ["ingestor"]
     command: ["-nats", "nats://nats:4222", "-catalog", "/app/config/sources.yaml", "-connectors", "heartbeat", "-tsdb-url", "http://victoriametrics:8428"]
+    volumes: *secrets-volume
+    environment:
+      FA_SECRETS: /app/config/secrets.toml
     depends_on:
       victoriametrics:
         condition: service_healthy
@@ -198,6 +208,9 @@ services:
     image: financial-auto/go:dev
     entrypoint: ["broker-gateway"]
     command: ["-nats", "nats://nats:4222"]
+    volumes: *secrets-volume
+    environment:
+      FA_SECRETS: /app/config/secrets.toml
     depends_on:
       nats:
         condition: service_healthy
@@ -210,6 +223,8 @@ services:
     command: ["-nats", "nats://nats:4222"]
     environment:
       FA_GPU_MEM_MB: "24000" # reported as gpu.capacity_mb (D-031); set to the real card
+      FA_SECRETS: /app/config/secrets.toml
+    volumes: *secrets-volume
     depends_on:
       nats:
         condition: service_healthy
@@ -223,6 +238,7 @@ services:
     build: *rust-build
     entrypoint: ["trainer"]
     environment: *rust-env
+    volumes: *secrets-volume
     depends_on: *core-deps
     # deploy:
     #   resources:
