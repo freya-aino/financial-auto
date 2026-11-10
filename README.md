@@ -2,7 +2,7 @@
 
 Automated multi-asset trading platform. Real-time multimodal market, macro, on-chain and media data is embedded by per-timescale expert encoders into decorrelated **expert spaces**. **Regions** of those latent spaces form a Markov state graph with Bayesian transitions. A population of **decoders** and **strategies** evolves over that graph, and promoted strategies trade through a meta-allocator under hard risk limits.
 
-**Status:** scaffold. The specs are drafted and the services run end to end on a synthetic heartbeat feed; the ML, trading and connector internals are mostly typed skeletons. Start at [`specs/README.md`](specs/README.md); implementation decisions are logged in [`specs/DECISIONS.md`](specs/DECISIONS.md).
+**Status:** integrated baseline. Every service runs in compose on real keyless feeds (Yahoo bars, Hacker News, Google News) plus the synthetic heartbeat; trades, bars and quotes land in VictoriaMetrics, raw payloads in Garage, reference data and the paper ledger in Postgres, regions/transitions/latents in HelixDB, and the bus has its JetStream streams. Evolution runs multi-generation NSGA-II over baseline CPU decoders. The ML substance is still statistical baselines: no neural encoders/decoders, no trainer, no live broker. Start at [`specs/README.md`](specs/README.md); implementation decisions (D-001..D-050) are in [`specs/DECISIONS.md`](specs/DECISIONS.md).
 
 ## Quick start
 Needs Rust and Docker. Go, Node and buf run in Docker when not installed. Install `just` with `cargo install just`.

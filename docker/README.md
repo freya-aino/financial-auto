@@ -38,7 +38,7 @@ just app-ps / just app-logs [service]
 just app-down                  # stops everything, keeps volumes
 ```
 
-- **Default feed:** the ingestor starts only the synthetic `heartbeat` connector. To change that, edit `-connectors` in `compose.yaml`.
+- **Default feed:** the ingestor starts `heartbeat,yahoo,hackernews,google_news` with Postgres reference resolution and the Garage raw archive (D-050). Edit `-connectors` in `compose.yaml` to change the set; `lemon`/`oanda` need keys in `config/secrets.toml`.
 - **Migrations:** `control-api` applies the Postgres migrations on startup.
 - **Scaling workers:** `just app-scale-workers 4`, or `docker compose --profile app up -d --scale evo-worker=4`. Workers are stateless and pull jobs from a NATS work queue. For more machines later, point more `evo-worker` containers at the same NATS.
 - **Trainer:** a one-off CLI in the `tools` profile, not started by default. Run it with `just trainer pretrain --help` or `docker compose --profile tools run --rm trainer …`.

@@ -192,7 +192,9 @@ services:
       dockerfile: docker/go.Dockerfile
     image: financial-auto/go:dev
     entrypoint: ["ingestor"]
-    command: ["-nats", "nats://nats:4222", "-catalog", "/app/config/sources.yaml", "-connectors", "heartbeat", "-tsdb-url", "http://victoriametrics:8428"]
+    # Keyless live sources + the synthetic heartbeat (D-050); add lemon/oanda once keys are in config/secrets.toml.
+    command: ["-nats", "nats://nats:4222", "-catalog", "/app/config/sources.yaml", "-connectors", "heartbeat,yahoo,hackernews,google_news",
+              "-tsdb-url", "http://victoriametrics:8428", "-postgres", "postgres://fa:fa@postgres:5432/fa", "-garage", "http://garage:3900"]
     volumes: *secrets-volume
     environment:
       FA_SECRETS: /app/config/secrets.toml
@@ -200,6 +202,8 @@ services:
       victoriametrics:
         condition: service_healthy
       nats:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     restart: unless-stopped
 
