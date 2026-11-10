@@ -118,6 +118,8 @@ message JobResult {
 
 Consumers: durable pull consumers per service; `AckExplicit`; `MaxAckPending` set per consumer for backpressure; work queues use `AckWait` + heartbeat `in-progress` acks for long jobs.
 
+**Implemented today (D-046):** the limits streams above are declared once in `crates/fa-bus/streams.json` (mirrored byte-for-byte in `go/pkg/bus/streams.json`) and ensured idempotently by control-api when NATS connects and by the ingestor at start; `GET /api/bus/streams` lists them. `ctl.*`, `svc.heartbeat.*`, `ingest.*` and `jobs.progress.*` stay core-only. No `max_bytes` caps yet.
+
 ## 6. Behaviour & algorithms
 - **Versioning:** package `fa.v1`; additive changes only (new fields, new messages); breaking change → `fa.v2` side by side. `buf breaking` against `main` in CI.
 - **Ordering:** per-subject ordering relied on only within an instrument subject; consumers must tolerate out-of-order across subjects and use `event_time`.

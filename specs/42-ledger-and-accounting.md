@@ -88,6 +88,8 @@ Strategy virtual sub-positions are derived from `fill_attribution`.
 - **Payout quota**: each day a quota (rule TBD, see open questions) is reserved; deployable capital = equity − reserved; payouts are recorded as `cash_movement(kind='payout')`.
 - **Audit log**: every status change, manual action, limit change, promotion, kill switch, reconciliation adjustment and config reload is appended; never updated or deleted.
 
+**Implemented today (D-047):** `fa-ledger::pg::PgLedger` persists intents, fills (with even strategy attribution), cash movements, position snapshots, reconciliation runs and payout quota to `ledger.*`; idempotency is DB-enforced (`ON CONFLICT DO NOTHING`, cash movements keyed by `(book, venue_id, kind, ref)`). risk-engine is the single writer, opens the `paper` book with a one-time 100 000 EUR deposit, reloads it on start, snapshots every 60 s and on halts, and reconciles the in-memory book against Postgres every 300 s into `reconciliation_run`. A diff is logged and audited; halting on diff is the pending step. FX is fixed at 1.0.
+
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
 |---|---|---|

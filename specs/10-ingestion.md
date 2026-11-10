@@ -123,6 +123,8 @@ Postgres `ingest_quarantine(source_id, venue_symbol, first_seen, last_seen, coun
 - Requests carry `(source_id, instruments | query, timeframe, from, to)`; split into chunks; cursors persisted in Postgres so backfill is resumable and idempotent.
 - Default depth per timescale per §3; scheduler runs backfill in low-priority lanes so live streams are never rate-starved.
 
+**Implemented today (D-050):** `yahoo`, `hackernews` and `google_news` run live without keys; `lemon` and `oanda` are implemented against the public docs but unverified. Yahoo bars are stamped at bar close and also emit a synthetic `Trade` per completed bar so `md.trade.>` consumers see keyless data. Each connector implements `Backfill` with cursors in `ingest.backfill_cursor`; the job queue that triggers it (`jobs.ingest.backfill`) is the next step.
+
 ### 6.5 News & text
 - Dedup key = normalized URL hash, fallback title+outlet+time-bucket hash **(proposal)**; near-duplicate (syndicated) detection is an open question.
 - Entity/ticker tagging is downstream (31); ingestion only passes through source-provided tags.

@@ -104,10 +104,14 @@ Vectors: indexed per `ExpertSpace` (one vector index per space/dim), plus text/m
 | `fa-ckpt` | preemptible job checkpoints (60) |
 | `fa-artifacts` | decoder outputs (rendered charts, generated text), reports |
 
+**Implemented today (D-045, D-050):** `fa-blob::S3BlobStore` (hand-rolled SigV4, no SDK) and `go/pkg/archive` (aws-sdk-go-v2) write to Garage. Keys in use: `fa-raw/raw/<source>/<yyyy>/<mm>/<dd>/<hh>/<ulid>.raw.gz` (one gzip object per source and UTC minute, envelopes carry `raw_ref{key, offset, length}` into the decompressed stream; gzip instead of zstd for now), `fa-artifacts/evals/<generation>/<job>.json` (decoder eval reports). Credentials come from `config/secrets.toml` `[garage]` (D-020), mounted read-only into the compose services.
+
 ## 6. Behaviour & algorithms
 
 ### 6.1 Write paths
 Ingestor → NATS → (a) VM writer (Go, batched), (b) Postgres writer for macro/filings/fundamentals, (c) raw already in Garage. Model runtime → Helix (regions, transitions, observations). Ledger writes are synchronous and transactional (42).
+
+**Implemented today:** ingestor → VictoriaMetrics (`fa_trade_*`, `fa_quote_*`, `fa_bar_*`, `fa_book_*`, D-038/D-050), ingestor → Garage raw archive and Postgres `ref.*`/`ingest.*`/`catalog.source` (D-050); model-runtime → HelixDB snapshots, expert spaces, regions, transitions, latent vectors through a non-blocking sink (D-048); risk-engine → Postgres `ledger.*` and `audit.log` as the single ledger writer (D-047); evo-worker → Garage eval reports (D-045) and Helix genome lineage (D-049). Every store is reachable from `/api/health`.
 
 ### 6.2 Read paths
 Training/backtest read VM ranges + Postgres vintages + Helix graph; live runtime reads mostly from the bus and Helix.

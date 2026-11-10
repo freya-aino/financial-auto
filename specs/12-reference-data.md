@@ -63,6 +63,8 @@ Helix mirror: nodes `Instrument`, `Entity`, `Venue`; edges `ISSUED_BY`, `LISTED_
 - **FX:** ECB daily reference rate as official EUR conversion for accounting (42); intraday FX mid from FX feeds for live risk; source of each conversion recorded.
 - **Change propagation:** update → `ref.changed.*` → caches invalidated, Helix edges synced.
 
+**Implemented today (D-050):** `go/pkg/refdata` resolves `(source, symbol)` through `ref.listing`/`ref.identifier`. Unknown pairs are **provisioned** as `status='provisional'` instruments (`uuid5(namespace, source\0symbol)`) with venue, listing and identifier rows plus an open `ingest.quarantine` row for manual review. This relaxes the "global identifier only" rule above so keyless sources can flow before FIGI/ISIN enrichment exists; `resolver.auto_create` is effectively `provisional`.
+
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
 |---|---|---|
