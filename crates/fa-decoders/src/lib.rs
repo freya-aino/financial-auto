@@ -8,6 +8,8 @@
 
 pub mod baseline;
 pub mod genome;
+pub mod text_baseline;
+pub mod visual_baseline;
 
 use std::collections::HashMap;
 

@@ -25,7 +25,26 @@ pub struct DataWindow {
     pub end_ms: Option<i64>,
 }
 
+/// Now-relative windows of replays end on this grid (see [`DataWindow::pinned`]).
+pub const PIN_MS: i64 = 60_000;
+
 impl DataWindow {
+    /// A now-relative window (no `end_ms`) pinned to end at `now` rounded down to `align_ms`, so
+    /// the jobs of one rung replay the identical window (recorded-stream cache hits, comparable
+    /// candidates) and consecutive rungs extend it. Explicit windows are returned unchanged.
+    pub fn pinned(&self, now: i64, align_ms: i64) -> Self {
+        if self.end_ms.is_some() {
+            return *self;
+        }
+        Self { end_ms: Some(now.div_euclid(align_ms.max(1)) * align_ms.max(1)), ..*self }
+    }
+
+    /// Whether the window ends at least `live_edge_ms` before `now` (a historical window whose
+    /// recorded inputs are complete).
+    pub fn is_historical(&self, now: i64, live_edge_ms: i64) -> bool {
+        self.end_ms.is_some_and(|e| e < now - live_edge_ms)
+    }
+
     /// Resolves to `[start_ms, end_ms]`, capped to `MAX_POINTS_PER_SERIES` steps of `step_ms`
     /// (the start moves forward). `default_hours` applies when neither `hours` nor `start_ms` is set.
     pub fn resolve(&self, now: i64, default_hours: f64, step_ms: i64) -> (i64, i64) {
@@ -245,6 +264,20 @@ mod tests {
         assert_eq!(w.resolve(now, 6.0, 1000), (now - 5000, now));
         let parsed: DataWindow = serde_json::from_str(r#"{"hours": 3}"#).unwrap();
         assert_eq!(parsed.hours, Some(3.0));
+        // pinning: now-relative windows end on the minute grid; explicit windows are kept
+        let p = parsed.pinned(10_000_059_999, PIN_MS);
+        assert_eq!((p.end_ms, p.hours), (Some(10_000_020_000), Some(3.0)));
+        assert_eq!(p.resolve(10_000_059_999, 6.0, 1000), (10_000_020_000 - 3 * 3_600_000, 10_000_020_000));
+        assert_eq!(
+            parsed.pinned(10_000_000_001, PIN_MS),
+            parsed.pinned(10_000_019_999, PIN_MS),
+            "same minute, same window"
+        );
+        let explicit = DataWindow { start_ms: Some(1), end_ms: Some(5), hours: None };
+        assert_eq!(explicit.pinned(99_999, PIN_MS), explicit);
+        assert!(explicit.is_historical(1_000_000, 60_000));
+        assert!(!parsed.is_historical(1_000_000, 60_000), "now-relative is live");
+        assert!(!DataWindow { end_ms: Some(990_000), ..Default::default() }.is_historical(1_000_000, 60_000));
     }
 
     #[tokio::test]

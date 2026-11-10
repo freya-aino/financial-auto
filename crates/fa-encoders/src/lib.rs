@@ -12,8 +12,8 @@ pub use baseline::{EXPERT_DIM, EXPERT_NAMES, FitConfig, MARKET_ROW_LEN, MarketBa
 use fa_core::Timescale;
 use serde::{Deserialize, Serialize};
 pub use snapshot::{
-    DataRef, MANIFEST_FILE, NormAccumulator, NormStats, ProbeSetRef, REGION_MAP_FILE, REGIONS_FILE, STATISTICAL_FAMILY,
-    SnapshotManifest, WEIGHTS_FILE,
+    AdapterGuard, DataRef, InstrumentDataRef, MANIFEST_FILE, NormAccumulator, NormStats, ProbeSetRef, REGION_MAP_FILE,
+    REGIONS_FILE, STATISTICAL_FAMILY, SnapshotManifest, WEIGHTS_FILE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

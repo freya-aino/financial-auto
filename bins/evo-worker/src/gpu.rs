@@ -19,25 +19,33 @@ use tokio::sync::broadcast;
 pub const CLASS: &str = "evolution_eval";
 const CTL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Arbiter notification.
+/// Arbiter / operator notification for running jobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notice {
     Granted(String),
     Preempt(String),
+    /// `ctl.evo.cancel` (arg `job_id`): the orchestrator answers the request; every worker also
+    /// sees it and cancels the job if it is running it (`crate::run::JobRun::watch`).
+    Cancel(String),
 }
 
-/// Fans `ctl.gpu.granted` / `ctl.gpu.preempt` out to job handlers.
+/// Fans `ctl.gpu.granted` / `ctl.gpu.preempt` / `ctl.evo.cancel` out to job handlers.
 pub async fn run_notices(bus: Bus, tx: broadcast::Sender<Notice>) {
     let granted = bus.subscribe::<CtlRequest>(subjects::ctl("gpu", "granted")).await;
     let preempt = bus.subscribe::<CtlRequest>(subjects::ctl("gpu", "preempt")).await;
-    let (Ok(granted), Ok(preempt)) = (granted, preempt) else {
-        tracing::error!("cannot subscribe to ctl.gpu notifications");
+    let cancel = bus.subscribe::<CtlRequest>(subjects::ctl("evo", "cancel")).await;
+    let (Ok(granted), Ok(preempt), Ok(cancel)) = (granted, preempt, cancel) else {
+        tracing::error!("cannot subscribe to ctl.gpu / ctl.evo.cancel notifications");
         return;
     };
-    let mut merged = futures::stream::select(granted, preempt);
+    let mut merged = futures::stream::select(futures::stream::select(granted, preempt), cancel);
     while let Some((subject, req)) = merged.next().await {
-        let lease = req.args.get("lease_id").cloned().unwrap_or_default();
-        let n = if subject.ends_with(".preempt") { Notice::Preempt(lease) } else { Notice::Granted(lease) };
+        let n = if subject.ends_with(".cancel") {
+            Notice::Cancel(req.args.get("job_id").cloned().unwrap_or_default())
+        } else {
+            let lease = req.args.get("lease_id").cloned().unwrap_or_default();
+            if subject.ends_with(".preempt") { Notice::Preempt(lease) } else { Notice::Granted(lease) }
+        };
         let _ = tx.send(n);
     }
 }

@@ -7,9 +7,13 @@ publish.workspace = true
 
 [dependencies]
 fa-core.workspace = true
+fa-evolution.workspace = true
 fa-strategies.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

@@ -8,10 +8,13 @@
 //! `decoder.output.<family>`. It publishes `JobProgress`, holds a GPU lease from the arbiter
 //! while evaluating (preemption → `STATUS_PREEMPTED`), extends the JetStream ack window
 //! with in-progress acks, and acks every message after a result was published. Other job
-//! kinds get `STATUS_FAILED` ("not implemented"). When `config/secrets.toml` (or `FA_GARAGE_*`)
+//! kinds get `STATUS_FAILED` ("not implemented"). Strategy (`evo.eval|vary.strategy`,
+//! `evo.eval.strategy.holdout`) and allocator (`evo.eval|vary.allocator`) jobs are handled too;
+//! every kind runs under `run::JobRun` (deadline, budget, preempt / cancel-while-running). When `config/secrets.toml` (or `FA_GARAGE_*`)
 //! holds Garage credentials, every OK result JSON is also written to
 //! `fa-artifacts/evals/<generation>/<job>.json` (`report_ref.persisted`).
 
+mod allocator;
 mod data;
 mod gpu;
 mod holdout;
@@ -19,6 +22,7 @@ mod job;
 mod latent;
 mod market;
 mod recorded;
+mod run;
 mod strategy;
 mod trials;
 mod vary;
@@ -181,12 +185,14 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(gpu::run_notices(bus.clone(), notices.clone()));
 
     let counters = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<String, f64>::new()));
+    let recorded = recorded::RecordedStore::from_env();
     {
         let bus = bus.clone();
         let worker_id = worker_id.clone();
         let market = market.clone();
         let latents = latents.clone();
         let counters = counters.clone();
+        let recorded = recorded.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
             loop {
@@ -198,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
                 c.insert("market.trades".into(), trades as f64);
                 c.insert("latents.instruments".into(), linst as f64);
                 c.insert("latents.points".into(), lpoints as f64);
+                recorded.export(&mut c); // latents.cache_hit|extend|miss, latents.messages_read, signals.*
                 let hb = Heartbeat {
                     service: "evo-worker".into(),
                     instance_id: worker_id.clone(),
@@ -209,11 +216,12 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-    let bump = |k: &str| {
+    let add = |k: &str, v: f64| {
         if let Ok(mut c) = counters.lock() {
-            *c.entry(k.to_owned()).or_insert(0.0) += 1.0;
+            *c.entry(k.to_owned()).or_insert(0.0) += v;
         }
     };
+    let bump = |k: &str| add(k, 1.0);
 
     let worker = job::Worker {
         bus: bus.clone(),
@@ -228,7 +236,7 @@ async fn main() -> anyhow::Result<()> {
         blob,
         trials,
         cost,
-        recorded: recorded::RecordedStore::from_env(),
+        recorded,
     };
     tracing::info!(%worker_id, gpu_lease_mb = args.gpu_lease_mb, "pulling jobs from {STREAM}");
     // One message at a time so idle workers do not hoard jobs other replicas could take.
@@ -270,7 +278,12 @@ async fn main() -> anyhow::Result<()> {
 
         let result = outcome.result;
         let status = Status::try_from(result.status).unwrap_or(Status::Failed);
-        bump(&format!("jobs.{}", format!("{status:?}").to_ascii_lowercase()));
+        let status_name = status_name(status);
+        bump(&format!("jobs.{status_name}"));
+        // per kind (spec 60 §6.3): jobs.<kind>.ok|failed|preempted|cancelled|budget_exceeded, jobs.<kind>.ms (total)
+        let kind = if worker::KINDS.contains(&job.kind.as_str()) { job.kind.as_str() } else { "other" };
+        bump(&format!("jobs.{kind}.{status_name}"));
+        add(&format!("jobs.{kind}.ms"), result.used_gpu_ms as f64);
         for out in &outcome.outputs {
             if let Err(e) = bus.publish(subjects::decoder_output(&out.family), out).await {
                 tracing::warn!(error = %e, "decoder output publish failed");
@@ -287,6 +300,21 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(job = %job.job_id, ?status, used_ms = result.used_gpu_ms, error = %result.error, outputs = outcome.outputs.len(), "job done");
     }
     Ok(())
+}
+
+/// Counter suffix of a status.
+fn status_name(s: Status) -> &'static str {
+    match s {
+        Status::Ok => "ok",
+        Status::Failed => "failed",
+        Status::Preempted => "preempted",
+        Status::BudgetExceeded => "budget_exceeded",
+        Status::Cancelled => "cancelled",
+    }
+}
+
+mod worker {
+    pub const KINDS: [&str; 7] = crate::job::Worker::KINDS;
 }
 
 async fn publish_result(bus: &Bus, kind: &str, result: &JobResult) -> anyhow::Result<()> {

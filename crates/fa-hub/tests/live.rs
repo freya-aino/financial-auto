@@ -29,6 +29,7 @@ const WAIT: Duration = Duration::from_secs(20);
 async fn cleanup(c: &HubClient, p: &str) {
     for (label, key) in [
         (node::SNAPSHOT, "snapshot_id"),
+        (node::ADAPTER_STATE, "snapshot_id"),
         (node::EXPERT_SPACE, "expert_space_id"),
         (node::LATENT_REGION, "region_id"),
         (node::LATENT_VEC, "expert_space_id"),
@@ -488,5 +489,74 @@ async fn snapshot_lineage_and_status_lookup() {
     let cands = c.snapshots_by_status(&ts, "statistical", "candidate").await.expect("candidates");
     assert_eq!(cands.len(), 1);
     assert!(c.active_snapshot(&ts, "fsq_hybrid").await.expect("other family").is_none());
+    cleanup(&c, &p).await;
+}
+
+#[tokio::test]
+async fn adapter_state_round_trip_and_snapshot_manifest() {
+    let Some(c) = client() else { return };
+    c.ensure_schema_ready(WAIT).await.expect("schema");
+    let p = prefix();
+    let snap = c
+        .ensure_snapshot(&NewSnapshot {
+            snapshot_id: format!("{p}snap"),
+            timescale: format!("{p}ts"),
+            encoder_family: "statistical".into(),
+            generation: 1,
+            garage_key: format!("snapshots/{p}snap/manifest.json"),
+            status: "candidate".into(),
+        })
+        .await
+        .expect("snapshot");
+    assert!(snap.manifest.is_none() && snap.carried_mass.is_none());
+    assert!(c.latest_adapter(&snap.snapshot_id).await.expect("none yet").is_none());
+
+    let row = c
+        .set_snapshot_manifest(snap.id, r#"{"snapshot_id":"x","metrics":{"carried_mass":0.75}}"#, 0.75)
+        .await
+        .expect("manifest");
+    assert_eq!(row.carried_mass, Some(0.75));
+    assert!(row.manifest.as_deref().unwrap_or("").contains("carried_mass"));
+    let back = c.snapshot_by_id(&snap.snapshot_id).await.expect("lookup").expect("row");
+    assert_eq!(back.carried_mass, Some(0.75));
+
+    let mk = |version: u64, drift: Option<f64>, frozen: bool| NewAdapterState {
+        snapshot_id: snap.snapshot_id.clone(),
+        timescale: format!("{p}ts"),
+        version,
+        garage_key: format!("adapters/{p}snap/{version}.json"),
+        drift,
+        max_drift: 1.0,
+        frozen,
+        n_windows: 50 + version,
+        window_start_ms: 1_700_000_000_000,
+        window_end_ms: 1_700_003_600_000,
+    };
+    let a1 = c.add_adapter_state(snap.id, &mk(1, None, false)).await.expect("adapter 1");
+    assert_eq!(a1.adapter_id, format!("{p}snap@1"));
+    assert_eq!(a1.drift, None, "no reference statistics → no drift property");
+    assert!(!a1.frozen);
+    assert_eq!(a1.n_windows, 51);
+    assert!(a1.window_start.as_deref().unwrap_or("").starts_with("2023-11-14"));
+    let a2 = c.add_adapter_state(snap.id, &mk(2, Some(1.7), true)).await.expect("adapter 2");
+    assert_eq!(a2.drift, Some(1.7));
+    assert!(a2.frozen);
+    // duplicate version → unique violation
+    let dup = c.add_adapter_state(snap.id, &mk(2, Some(0.1), false)).await;
+    assert!(dup.err().is_some_and(|e| e.is_unique_violation()), "duplicate adapter_id must be refused");
+
+    let latest = c.latest_adapter(&snap.snapshot_id).await.expect("latest").expect("two versions");
+    assert_eq!(latest.id, a2.id);
+    let all = c.snapshot_adapters(&snap.snapshot_id, 10).await.expect("list");
+    assert_eq!(all.iter().map(|a| a.version).collect::<Vec<_>>(), vec![2, 1]);
+    // edge Snapshot → AdapterState
+    let out: Vec<AdapterState> = {
+        let mut resp = c
+            .batch(&Batch::read().ret("rows", Op::nodes(snap.id).out(Some("HasAdapter")).value_map(None)))
+            .await
+            .expect("edge read");
+        resp.take("rows").expect("rows")
+    };
+    assert_eq!(out.len(), 2);
     cleanup(&c, &p).await;
 }

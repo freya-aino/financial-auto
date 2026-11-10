@@ -2,8 +2,11 @@
 //! interface (replay runs through the live code path), [`eval`], the sequential
 //! point-in-time scorer for series decoders, [`replay`], the pipeline replay of
 //! `fa_strategies` programs with execution simulation through the [`cost`] model, and
-//! [`validation`], the per-generation statistics over a trial set (deflated Sharpe, PBO).
+//! [`validation`], the per-generation statistics over a trial set (deflated Sharpe, PBO), and
+//! [`allocator_replay`], the portfolio replay of recorded strategy signals through one
+//! allocator genome (allocator tournament, spec 40 §6.2).
 
+pub mod allocator_replay;
 pub mod cost;
 pub mod eval;
 pub mod latents;

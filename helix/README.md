@@ -32,7 +32,7 @@ genomes/lineage/fitness through `upsert_genome` / `link_parent` / `add_fitness_r
 | Area | Nodes / vectors | Edges |
 |---|---|---|
 | Reference (mirror of Postgres `ref`) | Instrument, Entity, Venue | IssuedBy, ListedOn, SameExposure |
-| Snapshots | Snapshot, ExpertSpace | HasSpace |
+| Snapshots | Snapshot, ExpertSpace, AdapterState | HasSpace, SnapshotParent, HasAdapter |
 | Regions / Markov graph | LatentRegion, Window, `V::LatentVec` | InSpace, Transition, Hier, RegionMatch, Contains |
 | Evolution | Genome, FitnessRecord | ParentOf, Scored, TrainedOn, FeedbackFrom |
 | Text / media | `V::NewsDoc`, `V::MediaSegment` | Mentions |

@@ -27,10 +27,7 @@
 //! The equity curve and the per-trade log go to the Garage report only (not on the bus).
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -46,12 +43,13 @@ use fa_hub::queries::{NewFitness, NewGenome};
 use fa_proto::v1::{Job, JobResult, job_result::Status};
 use fa_strategies::genome::StrategyGenome;
 use serde_json::{Value, json};
-use tokio::sync::watch;
 
 use crate::{
-    data::{self, DataWindow, LoadedBars},
+    data::{self, DataWindow, LoadedBars, PIN_MS},
     job::{Outcome, Worker},
+    market::now_ms,
     recorded::LoadedLatents,
+    run::JobRun,
     trials::{self, TrialRow},
 };
 
@@ -168,69 +166,56 @@ pub struct Replayed {
 
 impl Worker {
     /// Loads the recorded latents for `rspec` and runs the replay within the job budget
-    /// (blocking task, cancellable, progress every 500 ms). `Err` is the failure `Outcome` (boxed).
+    /// (blocking task, stops on the [`JobRun`] flags, progress every 500 ms). `Err` is the
+    /// failure or interruption `Outcome` (boxed).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn replay_within_budget(
         &self,
         job: &Job,
+        run: &JobRun,
         def: &fa_strategies::population::StrategyDef,
         rspec: &ReplaySpec,
         bars: Vec<replay::BarSeries>,
         holdouts: Vec<Holdout>,
         started: Instant,
     ) -> Result<Replayed, Box<Outcome>> {
-        let budget_ms = if job.budget_gpu_ms == 0 { DEFAULT_BUDGET_MS } else { job.budget_gpu_ms };
-        let budget = Duration::from_millis(budget_ms);
+        let budget_ms = run.budget_ms();
         let latents = self.recorded.load(&self.bus.jetstream(), rspec).await;
-        self.progress(
-            &job.job_id,
+        run.progress(
             0.0,
             match &latents.latents {
                 Some(r) => format!(
-                    "recorded latents: {} messages ({})",
+                    "recorded latents: {} messages (cache {}, {} read)",
                     r.len(),
-                    if latents.cached { "cached" } else { "read" }
+                    latents.plan,
+                    latents.messages_read
                 ),
                 None => format!("no recorded latents ({})", latents.error.as_deref().unwrap_or("none")),
             },
         )
         .await;
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (ptx, mut prx) = watch::channel((0usize, 0usize));
-        let eval_started = Instant::now();
+        run.start_budget();
         let cost: Arc<CostModel> = self.cost.clone();
         let rec = latents.latents.clone();
         let task = {
-            let cancel = cancel.clone();
             let def = def.clone();
             let rspec = rspec.clone();
+            let run = run.clone();
             tokio::task::spawn_blocking(move || {
                 let controls = ReplayControls {
                     max_steps: None,
-                    should_stop: Some(Box::new(move |_| {
-                        cancel.load(Ordering::Relaxed) || eval_started.elapsed() > budget
-                    })),
-                    on_progress: Some(Box::new(move |done, total| {
-                        let _ = ptx.send((done, total));
-                    })),
+                    should_stop: Some(run.stopper()),
+                    on_progress: Some(run.on_progress()),
                     progress_every: 32,
                 };
                 PipelineReplay { data: &bars, cost: &cost, holdouts: &holdouts, controls, latents: rec.as_deref() }
                     .evaluate(&rspec, &def)
             })
         };
-        let mut tick = tokio::time::interval(Duration::from_millis(500));
-        tick.tick().await;
-        let mut task = task;
-        let result = loop {
-            tokio::select! {
-                r = &mut task => break r,
-                _ = tick.tick() => {
-                    let (done, total) = *prx.borrow_and_update();
-                    let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                    self.progress(&job.job_id, frac.min(0.99), format!("step {done}/{total}")).await;
-                }
-            }
-        };
+        let result = run.drive(task, &def.id).await;
+        if let Some(out) = run.interrupted(&self.worker_id) {
+            return Err(Box::new(out));
+        }
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let report: EvalReport = match result {
             Ok(Ok(r)) => r,
@@ -245,7 +230,7 @@ impl Worker {
             Err(e) => return Err(Box::new(self.failed(job, format!("replay task failed: {e}"), elapsed_ms))),
         };
         if report.n_steps == 0 {
-            let status = if eval_started.elapsed() > budget { Status::BudgetExceeded } else { Status::Failed };
+            let status = if run.over_budget() { Status::BudgetExceeded } else { Status::Failed };
             return Err(Box::new(Outcome {
                 result: JobResult {
                     job_id: job.job_id.clone(),
@@ -263,11 +248,13 @@ impl Worker {
     }
 
     /// `evo.eval.strategy`.
-    pub async fn evaluate_strategy(&self, job: &Job) -> Outcome {
+    pub async fn evaluate_strategy(&self, job: &Job, run: &JobRun) -> Outcome {
         let started = Instant::now();
 
         // 1. genome + envelope
-        let spec = parse_spec(job);
+        let mut spec = parse_spec(job);
+        // now-relative windows end on the minute grid: one window per rung (cache hits)
+        spec.window = spec.window.pinned(now_ms(), PIN_MS);
         if let Err(e) = admit(&spec) {
             return self.failed(job, format!("rejected: {e}"), 0);
         }
@@ -276,7 +263,7 @@ impl Worker {
             Err(e) => return self.failed(job, format!("strategy genome: {e}"), 0),
         };
         let def = genome.def();
-        self.progress(&job.job_id, 0.0, format!("parsed strategy {} ({} nodes)", def.id, genome.size())).await;
+        run.progress(0.0, format!("parsed strategy {} ({} nodes)", def.id, genome.size())).await;
 
         // 2. bars at the strategy's timescale (VictoriaMetrics, buffer fallback)
         let need = genome.lookback_bars + genome.steps as usize + 2;
@@ -339,7 +326,7 @@ impl Worker {
         // 4. recorded latents + replay within budget
         let n_holdouts = holdouts.len();
         let data_block = data_json(&loaded);
-        let run = match self.replay_within_budget(job, &def, &rspec, loaded.bars, holdouts, started).await {
+        let run = match self.replay_within_budget(job, run, &def, &rspec, loaded.bars, holdouts, started).await {
             Ok(r) => r,
             Err(outcome) => return *outcome,
         };
@@ -482,7 +469,7 @@ mod tests {
         let text = r#"{ id = "gp-1", timescale = "1s", signal = "1" }"#;
         let env = format!(r#"{{"genome": {}, "purpose": "promotion"}}"#, serde_json::to_string(text).unwrap());
         let job = Job { job_id: "j1".into(), kind: KIND.into(), spec: env.into_bytes(), ..Default::default() };
-        let out = worker.evaluate_strategy(&job).await;
+        let out = worker.handle(&job).await;
         assert_eq!(out.result.status, Status::Failed as i32);
         assert!(out.result.error.contains("evo.eval.strategy.holdout"), "{}", out.result.error);
         eprintln!("promotion purpose → {}", out.result.error);

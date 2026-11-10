@@ -42,6 +42,39 @@ pub struct Snapshot {
     pub status: String,
     #[serde(default)]
     pub created_at: Option<String>,
+    /// `manifest.metrics.carried_mass` of a trained snapshot ([`HubClient::set_snapshot_manifest`]).
+    #[serde(default)]
+    pub carried_mass: Option<f64>,
+    /// The snapshot's `manifest.json` as written by the trainer, when mirrored.
+    #[serde(default)]
+    pub manifest: Option<String>,
+    /// `snapshot_id` of the snapshot this one replaced when it was promoted; `rollback` restores it.
+    #[serde(default)]
+    pub previous_active: Option<String>,
+}
+
+/// One online-adapter version of a snapshot (`AdapterState`, spec 36 §5).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct AdapterState {
+    #[serde(rename = "$id")]
+    pub id: u64,
+    pub adapter_id: String,
+    pub snapshot_id: String,
+    pub timescale: String,
+    pub version: u64,
+    pub garage_key: String,
+    #[serde(default)]
+    pub drift: Option<f64>,
+    pub max_drift: f64,
+    pub frozen: bool,
+    #[serde(default)]
+    pub n_windows: u64,
+    #[serde(default)]
+    pub window_start: Option<String>,
+    #[serde(default)]
+    pub window_end: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -256,6 +289,33 @@ pub struct NewSnapshot {
     pub generation: u32,
     pub garage_key: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewAdapterState {
+    pub snapshot_id: String,
+    pub timescale: String,
+    /// Unix ms of the adapter fit; `adapter_id` becomes `<snapshot_id>@<version>`.
+    pub version: u64,
+    pub garage_key: String,
+    /// `None` when the snapshot had no fitted reference statistics.
+    pub drift: Option<f64>,
+    pub max_drift: f64,
+    pub frozen: bool,
+    pub n_windows: u64,
+    pub window_start_ms: i64,
+    pub window_end_ms: i64,
+}
+
+impl NewAdapterState {
+    pub fn adapter_id(&self) -> String {
+        adapter_id(&self.snapshot_id, self.version)
+    }
+}
+
+/// Business id of an adapter version: `<snapshot_id>@<version>`.
+pub fn adapter_id(snapshot_id: &str, version: u64) -> String {
+    format!("{snapshot_id}@{version}")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -535,6 +595,75 @@ impl HubClient {
         let op = Op::nodes(snapshot).set_property("status", status).value_map(None);
         let mut resp = self.batch(&Batch::write().named("set_snapshot_status").ret("row", op)).await?;
         resp.take_one("row")
+    }
+
+    /// Record which snapshot `snapshot` replaced on promotion, so `rollback` can restore exactly
+    /// that one instead of guessing from creation times. Returns the updated row.
+    pub async fn set_snapshot_previous_active(&self, snapshot: u64, previous: &str) -> Result<Snapshot> {
+        let op = Op::nodes(snapshot).set_property("previous_active", previous).value_map(None);
+        let mut resp = self.batch(&Batch::write().named("set_snapshot_previous_active").ret("row", op)).await?;
+        resp.take_one("row")
+    }
+
+    /// Mirrors a trained snapshot's manifest on its node (`manifest` JSON + `carried_mass`) so
+    /// control-api's promotion checklist can answer without Garage. Returns the updated row.
+    pub async fn set_snapshot_manifest(
+        &self,
+        snapshot: u64,
+        manifest_json: &str,
+        carried_mass: f64,
+    ) -> Result<Snapshot> {
+        let op = Op::nodes(snapshot)
+            .set_property("manifest", manifest_json)
+            .set_property("carried_mass", carried_mass)
+            .value_map(None);
+        let mut resp = self.batch(&Batch::write().named("set_snapshot_manifest").ret("row", op)).await?;
+        resp.take_one("row")
+    }
+
+    // ── adapters (spec 36 §5 `AdapterState`) ────────────────────────────────
+
+    /// `addAdapterState`: inserts the adapter version and its `HasAdapter` edge from `snapshot`
+    /// (the Helix id of the `Snapshot` row). Fails with a unique violation when
+    /// `<snapshot_id>@<version>` exists.
+    pub async fn add_adapter_state(&self, snapshot: u64, a: &NewAdapterState) -> Result<AdapterState> {
+        let mut props = vec![
+            ("adapter_id", s(&a.adapter_id())),
+            ("snapshot_id", s(&a.snapshot_id)),
+            ("timescale", s(&a.timescale)),
+            ("version", Input::Lit(Val::I64(i64::try_from(a.version).unwrap_or(i64::MAX)))),
+            ("garage_key", s(&a.garage_key)),
+            ("max_drift", a.max_drift.into()),
+            ("frozen", a.frozen.into()),
+            ("n_windows", Input::Lit(Val::I64(i64::try_from(a.n_windows).unwrap_or(i64::MAX)))),
+            ("window_start", Input::Lit(Val::DateTime(a.window_start_ms))),
+            ("window_end", Input::Lit(Val::DateTime(a.window_end_ms))),
+            ("updated_at", Input::Now),
+        ];
+        if let Some(d) = a.drift.filter(|d| d.is_finite()) {
+            props.push(("drift", d.into()));
+        }
+        let batch = add_node(Batch::write().named("add_adapter_state"), node::ADAPTER_STATE, props)
+            .var("edge", Op::nodes(snapshot).add_e(edge::HAS_ADAPTER, NodeRef::var("n"), vec![]));
+        let mut resp = self.batch(&batch).await?;
+        resp.take_one("row")
+    }
+
+    /// Adapter versions of a snapshot by business id, newest `version` first, at most `limit`.
+    pub async fn snapshot_adapters(&self, snapshot_id: &str, limit: usize) -> Result<Vec<AdapterState>> {
+        let op = Op::nodes_with_label_where(node::ADAPTER_STATE, Pred::eq("snapshot_id", snapshot_id))
+            .order_by("version", true)
+            .limit(limit.max(1))
+            .value_map(None);
+        let mut resp = self.batch(&Batch::read().named("snapshot_adapters").ret("rows", op)).await?;
+        let mut rows: Vec<AdapterState> = resp.take("rows")?;
+        rows.sort_by_key(|a| std::cmp::Reverse(a.version));
+        Ok(rows)
+    }
+
+    /// `latestAdapter`: the newest adapter version of a snapshot, if any.
+    pub async fn latest_adapter(&self, snapshot_id: &str) -> Result<Option<AdapterState>> {
+        Ok(self.snapshot_adapters(snapshot_id, 1).await?.into_iter().next())
     }
 
     // ── regions and transitions ─────────────────────────────────────────────

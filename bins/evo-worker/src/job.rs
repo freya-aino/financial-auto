@@ -28,10 +28,7 @@
 //! and leaves `persisted: false`.
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -49,17 +46,23 @@ use fa_proto::{
 };
 use fa_tsdb::Tsdb;
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::broadcast;
 
 use crate::{
+    allocator,
     data::{self, DataWindow},
     gpu::{self, Lease, Notice},
     latent::LatentBuffer,
     market::{MarketBuffer, now_ms},
+    run::{GRACE, JobRun, guard},
     strategy,
     trials::{self, TrialRow, TrialStore},
     vary, vary_strategy,
 };
+
+/// A decoder window ending at least this long ago is historical: its latents come from the
+/// recorded `LATENT` stream instead of the live buffer (reproducible trials).
+pub const LIVE_EDGE_MS: i64 = 60_000;
 
 pub const KIND: &str = "evo.eval.decoder";
 pub const PROTOCOL: &str = "evo.eval.decoder/v0";
@@ -115,18 +118,6 @@ fn directions_json() -> Value {
     Value::Object(DIRECTIONS.iter().map(|(k, d)| ((*k).to_owned(), json!(d))).collect())
 }
 
-fn deadline_of(job: &Job, budget: Duration) -> Instant {
-    let fallback = Instant::now() + budget * 10 + Duration::from_secs(60);
-    match &job.deadline {
-        Some(t) => {
-            let ms = t.seconds * 1000 + i64::from(t.nanos) / 1_000_000;
-            let left = ms.saturating_sub(now_ms());
-            if left <= 0 { Instant::now() } else { Instant::now() + Duration::from_millis(left as u64) }
-        }
-        None => fallback,
-    }
-}
-
 impl Worker {
     pub(crate) fn failed(&self, job: &Job, error: String, used_ms: u64) -> Outcome {
         Outcome {
@@ -149,22 +140,49 @@ impl Worker {
         }
     }
 
-    /// Handles one job. Never panics on bad input; every path yields a `JobResult`.
+    /// Every job kind this worker runs.
+    pub const KINDS: [&'static str; 7] = [
+        KIND,
+        vary::KIND,
+        strategy::KIND,
+        vary_strategy::KIND,
+        crate::holdout::KIND,
+        allocator::KIND,
+        allocator::VARY_KIND,
+    ];
+
+    /// Handles one job under a [`JobRun`] (deadline, budget, preempt / cancel watch, progress):
+    /// an interruption always ends as `STATUS_PREEMPTED` / `STATUS_CANCELLED` (see
+    /// [`crate::run::guard`]). Never panics on bad input; every path yields a `JobResult`.
     pub async fn handle(&self, job: &Job) -> Outcome {
+        let default_budget = match job.kind.as_str() {
+            KIND => DEFAULT_BUDGET_MS,
+            _ => strategy::DEFAULT_BUDGET_MS,
+        };
+        let run = JobRun::new(job, default_budget, Some(self.bus.clone()));
+        let watcher = run.watch(self.notices.subscribe());
+        let out = guard(&run, &self.worker_id, GRACE, self.dispatch(job, &run)).await;
+        watcher.abort();
+        out
+    }
+
+    async fn dispatch(&self, job: &Job, run: &JobRun) -> Outcome {
+        if run.past_deadline() {
+            return self.failed(job, "job deadline already passed".into(), 0);
+        }
         match job.kind.as_str() {
-            KIND => self.evaluate(job).await,
+            KIND => self.evaluate(job, run).await,
             vary::KIND => self.vary(job).await,
-            strategy::KIND => self.evaluate_strategy(job).await,
+            strategy::KIND => self.evaluate_strategy(job, run).await,
             vary_strategy::KIND => self.vary_strategy(job).await,
-            crate::holdout::KIND => self.evaluate_holdout(job).await,
+            crate::holdout::KIND => self.evaluate_holdout(job, run).await,
+            allocator::KIND => self.evaluate_allocator(job, run).await,
+            allocator::VARY_KIND => self.vary_allocator(job).await,
             other => self.failed(
                 job,
                 format!(
-                    "job kind `{other}` not implemented (only `{KIND}`, `{}`, `{}`, `{}`, `{}`)",
-                    vary::KIND,
-                    strategy::KIND,
-                    vary_strategy::KIND,
-                    crate::holdout::KIND
+                    "job kind `{other}` not implemented (only {})",
+                    Self::KINDS.map(|k| format!("`{k}`")).join(", ")
                 ),
                 0,
             ),
@@ -279,14 +297,9 @@ impl Worker {
     }
 
     /// `evo.eval.decoder`.
-    async fn evaluate(&self, job: &Job) -> Outcome {
+    async fn evaluate(&self, job: &Job, run: &JobRun) -> Outcome {
         let started = Instant::now();
-        let budget_ms = if job.budget_gpu_ms == 0 { DEFAULT_BUDGET_MS } else { job.budget_gpu_ms };
-        let budget = Duration::from_millis(budget_ms);
-        let deadline = deadline_of(job, budget);
-        if deadline <= Instant::now() {
-            return self.failed(job, "job deadline already passed".into(), 0);
-        }
+        let budget_ms = run.budget_ms();
 
         // 1. genome (Job.spec overrides the id string when present) + data window
         let (raw, window) = Self::parse_spec(job);
@@ -297,18 +310,19 @@ impl Worker {
         if !job.checkpoint_ref.is_empty() {
             tracing::info!(job = %job.job_id, checkpoint = %job.checkpoint_ref, "resuming preempted job (re-evaluating from the start; evaluation is cheap)");
         }
-        self.progress(&job.job_id, 0.0, format!("parsed genome: {}", genome.summary())).await;
+        run.progress(0.0, format!("parsed genome: {}", genome.summary())).await;
 
         // 2. GPU lease (optional)
         let mut notices = self.notices.subscribe();
         let lease = if self.gpu_lease_mb > 0 {
-            match gpu::acquire(&self.bus, &mut notices, &job.job_id, self.gpu_lease_mb, deadline).await {
+            match gpu::acquire(&self.bus, &mut notices, &job.job_id, self.gpu_lease_mb, run.deadline).await {
                 Ok(l) => l,
                 Err(e) => return self.failed(job, e, started.elapsed().as_millis() as u64),
             }
         } else {
             Lease::Unavailable
         };
+        drop(notices);
         let release = async {
             if lease == Lease::Granted {
                 gpu::release(&self.bus, &job.job_id).await;
@@ -338,67 +352,39 @@ impl Worker {
                 started.elapsed().as_millis() as u64,
             );
         }
-        let ctx = self.latents.ctx();
+        // Latent conditioning: recorded `LATENT` traffic over [start − preload, end] for a
+        // historical window (reproducible), the live buffer for windows ending at now.
+        let (ctx, latent_block) = self.decoder_latents(&window, data_src.window_start_ms, data_src.window_end_ms).await;
         let (latent_inst, latent_points) = ctx.stats();
 
-        // 4. evaluate within budget, preemptible
-        let cancel = Arc::new(AtomicBool::new(false));
-        let preempted = Arc::new(AtomicBool::new(false));
-        let (ptx, mut prx) = watch::channel((0usize, 0usize, String::new()));
-        let eval_started = Instant::now();
+        // 4. evaluate within budget, preemptible / cancellable
+        run.start_budget();
         let eval_inputs: Vec<Series> = usable;
         let eval_task = {
-            let cancel = cancel.clone();
             let genome = genome.clone();
             let ctx = ctx.clone();
+            let run = run.clone();
             tokio::task::spawn_blocking(move || {
                 let decoder = build_with(&genome, ctx);
                 let mut reports: Vec<EvalReport> = Vec::new();
                 let n = eval_inputs.len();
                 for (i, s) in eval_inputs.iter().enumerate() {
-                    let inst = s.instrument_id.clone();
-                    let ptx = ptx.clone();
-                    let stop_flag = cancel.clone();
+                    let progress = run.on_progress();
                     let spec = EvalSpec {
-                        should_stop: Some(Box::new(move |_| {
-                            stop_flag.load(Ordering::Relaxed) || eval_started.elapsed() > budget
-                        })),
-                        on_progress: Some(Box::new(move |done, total| {
-                            let _ = ptx.send((done + total * i, total * n, format!("{inst}: step {done}/{total}")));
-                        })),
+                        should_stop: Some(run.stopper()),
+                        on_progress: Some(Box::new(move |done, total| progress(done + total * i, total * n))),
                         progress_every: 16,
                         ..EvalSpec::standard()
                     };
                     reports.push(evaluate(decoder.as_ref(), s, &spec));
-                    if cancel.load(Ordering::Relaxed) || eval_started.elapsed() > budget {
+                    if run.should_stop() {
                         break;
                     }
                 }
                 reports
             })
         };
-
-        let mut tick = tokio::time::interval(Duration::from_millis(500));
-        tick.tick().await;
-        let mut eval_task = eval_task;
-        let reports = loop {
-            tokio::select! {
-                r = &mut eval_task => break r,
-                _ = tick.tick() => {
-                    let (done, total, msg) = prx.borrow_and_update().clone();
-                    let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                    let budget_frac = eval_started.elapsed().as_secs_f32() / budget.as_secs_f32();
-                    self.progress(&job.job_id, frac.max(budget_frac.min(0.99)), msg).await;
-                }
-                n = notices.recv() => {
-                    if let Ok(Notice::Preempt(id)) = n && id == job.job_id {
-                        tracing::warn!(job = %job.job_id, "preempted by the gpu arbiter");
-                        preempted.store(true, Ordering::Relaxed);
-                        cancel.store(true, Ordering::Relaxed);
-                    }
-                }
-            }
-        };
+        let reports = run.drive(eval_task, &genome.summary()).await;
         release.await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let reports = match reports {
@@ -407,22 +393,11 @@ impl Worker {
         };
 
         // 5. results
-        let (done, _, _) = prx.borrow().clone();
-        if preempted.load(Ordering::Relaxed) {
-            return Outcome {
-                result: JobResult {
-                    job_id: job.job_id.clone(),
-                    status: Status::Preempted as i32,
-                    checkpoint_ref: format!("{PROTOCOL}:step={done}"),
-                    used_gpu_ms: elapsed_ms,
-                    worker_id: self.worker_id.clone(),
-                    ..Default::default()
-                },
-                outputs: Vec::new(),
-            };
+        if let Some(out) = run.interrupted(&self.worker_id) {
+            return out;
         }
         let Some(pooled) = pool(&reports) else {
-            let status = if eval_started.elapsed() > budget { Status::BudgetExceeded } else { Status::Failed };
+            let status = if run.over_budget() { Status::BudgetExceeded } else { Status::Failed };
             return Outcome {
                 result: JobResult {
                     job_id: job.job_id.clone(),
@@ -479,7 +454,7 @@ impl Worker {
             "data": {"source": data_src.source, "timescale": data_src.timescale, "step_ms": data_src.step_ms,
                      "window_start_ms": data_src.window_start_ms, "window_end_ms": data_src.window_end_ms,
                      "vm_url": data_src.vm_url, "vm_series": data_src.vm_series, "vm_error": data_src.vm_error,
-                     "latents": {"instruments": latent_inst, "points": latent_points},
+                     "latents": {"instruments": latent_inst, "points": latent_points, "source": latent_block["source"], "recorded": latent_block},
                      "instruments": instruments},
             "generation_stats": generation_stats,
             "budget": {"budget_ms": budget_ms, "elapsed_ms": elapsed_ms, "truncated": truncated},
@@ -512,6 +487,33 @@ impl Worker {
             },
             outputs,
         }
+    }
+
+    /// Decoder conditioning for an evaluation window: `recorded` (the `LATENT` stream over
+    /// `[start − preload, end]`, through the incremental cache) when the job's window ends
+    /// [`LIVE_EDGE_MS`] or more in the past, else `live` (the `latent.state.>` buffer). A failed
+    /// recorded read falls back to the live buffer and says so.
+    pub(crate) async fn decoder_latents(
+        &self,
+        window: &DataWindow,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> (Arc<fa_decoders::DecodeCtx>, Value) {
+        if window.is_historical(now_ms(), LIVE_EDGE_MS) && self.recorded.enabled {
+            let l = self.recorded.load_window(&self.bus.jetstream(), start_ms - self.recorded.preload_ms, end_ms).await;
+            if let Some(rec) = &l.latents {
+                let ctx = Arc::new(crate::recorded::decode_ctx(rec));
+                let mut j = self.recorded.json(&l);
+                j["source"] = json!("recorded");
+                return (ctx, j);
+            }
+            let ctx = self.latents.ctx();
+            return (
+                ctx,
+                json!({"source": "live", "reason": format!("recorded read failed: {}", l.error.unwrap_or_default())}),
+            );
+        }
+        (self.latents.ctx(), json!({"source": "live"}))
     }
 
     /// Writes the report JSON to Garage. Returns whether it was persisted; failures only warn,
@@ -558,16 +560,30 @@ impl Worker {
             as_of: Some(ts_ms(r.last_ts_ms)),
             // Decoder outputs are not stored as Garage artifacts yet; these refs locate the
             // forecast target (the eval report lives at the result's `report_ref`).
-            output_refs: vec![format!("inst:{}", r.instrument_id), format!("job:{}", job.job_id)],
+            // `h:<bars>` = forecast horizon in bars of the genome's timescale: strategy-runtime's
+            // `fc_quantile(q, k)` / `fc_dist(k)` pick the output whose horizon is closest to `k`.
+            output_refs: horizon_refs(&r.instrument_id, &job.job_id, genome.horizon),
             quantiles: f.quantiles.clone(),
             analogs,
         }
     }
 }
 
+/// `output_refs` of a published `DecoderOutput`: `inst:<id>`, `job:<id>`, `h:<horizon bars>`.
+pub fn horizon_refs(instrument_id: &str, job_id: &str, horizon: usize) -> Vec<String> {
+    vec![format!("inst:{instrument_id}"), format!("job:{job_id}"), format!("h:{horizon}")]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoder_output_refs_carry_the_horizon() {
+        let g = DecoderGenome::parse("forecast:h=7;lb=16").unwrap();
+        assert_eq!(g.horizon, 7);
+        assert_eq!(horizon_refs("0190ab", "j1", g.horizon), ["inst:0190ab", "job:j1", "h:7"]);
+    }
 
     #[test]
     fn timestamp_conversion() {
@@ -590,5 +606,105 @@ mod tests {
         assert_eq!(directions_json()["crps_skill"], "max");
         assert_eq!(Worker::parse_position(&job(r#"{"genome":"g1","generation":2,"rung":1}"#)), (2, 1));
         assert_eq!(Worker::parse_position(&job("retrieval:k=4")), (0, 0));
+    }
+
+    /// `FA_NATS_TEST=1 cargo test -p evo-worker -- --nocapture cancel_while_running`: a running
+    /// decoder evaluation (SYNTHETIC buffered trades, a slow retrieval genome) receives
+    /// `ctl.evo.cancel {job_id}` on the bus and ends with `STATUS_CANCELLED` well before it
+    /// would have finished.
+    #[tokio::test]
+    async fn cancel_while_running() {
+        if std::env::var("FA_NATS_TEST").is_err() {
+            eprintln!("skipping (set FA_NATS_TEST=1)");
+            return;
+        }
+        use fa_proto::{Message, v1::CtlRequest};
+        let worker = crate::holdout::tests::offline_worker().await;
+        tokio::spawn(gpu::run_notices(worker.bus.clone(), worker.notices.clone()));
+        tokio::time::sleep(Duration::from_millis(300)).await; // subscriptions in place
+        let mut p = 100.0;
+        for i in 0..40_000i64 {
+            p *= 1.0 + 0.001 * ((i * 7919 % 13) as f64 - 6.0) / 6.0;
+            worker.market.push("01900000-0000-7000-8000-00000000c0de", "sim", i * 1000, p);
+        }
+        let job_id = format!("cancel-{}", ulid::Ulid::generate());
+        let job = Job {
+            job_id: job_id.clone(),
+            kind: KIND.into(),
+            budget_gpu_ms: 600_000,
+            spec: b"retrieval:h=3;lb=64;k=50;gap=3".to_vec(),
+            ..Default::default()
+        };
+        let canceller = {
+            let bus = worker.bus.clone();
+            let job_id = job_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let req = CtlRequest { verb: "cancel".into(), args: [("job_id".to_owned(), job_id)].into() };
+                bus.client().publish(subjects::ctl("evo", "cancel"), req.encode_to_vec().into()).await.unwrap();
+                bus.client().flush().await.unwrap();
+            })
+        };
+        let started = Instant::now();
+        let out = worker.handle(&job).await;
+        canceller.await.unwrap();
+        eprintln!(
+            "cancel_while_running: status {:?} error {:?} after {:?}",
+            Status::try_from(out.result.status),
+            out.result.error,
+            started.elapsed()
+        );
+        assert_eq!(out.result.status, Status::Cancelled as i32, "{:?}", out.result);
+        assert!(started.elapsed() < Duration::from_secs(15), "{:?}", started.elapsed());
+        assert!(out.result.error.contains("ctl.evo.cancel"));
+    }
+
+    /// `FA_NATS_TEST=1` against the compose stack (NATS + VictoriaMetrics at 127.0.0.1:8428):
+    /// a decoder evaluation over a historical window takes its latents from the recorded
+    /// `LATENT` stream (`data.latents.source = recorded`), a now-relative one from the live
+    /// buffer (`live`).
+    #[tokio::test]
+    async fn decoder_latents_recorded_for_historical_windows() {
+        if std::env::var("FA_NATS_TEST").is_err() {
+            eprintln!("skipping (set FA_NATS_TEST=1)");
+            return;
+        }
+        let mut worker = crate::holdout::tests::offline_worker().await;
+        worker.tsdb = Some(Tsdb::new(std::env::var("FA_VM_URL").unwrap_or_else(|_| "http://127.0.0.1:8428".into())));
+        worker.recorded = crate::recorded::RecordedStore::default();
+        worker.recorded.preload_ms = 600_000;
+        let now = now_ms();
+        let job = |spec: String| Job {
+            job_id: format!("lat-{}", ulid::Ulid::generate()),
+            kind: KIND.into(),
+            budget_gpu_ms: 30_000,
+            spec: spec.into_bytes(),
+            ..Default::default()
+        };
+        let hist = format!(
+            r#"{{"genome":"retrieval:h=3;lb=8;k=10","data_window":{{"start_ms":{},"end_ms":{}}}}}"#,
+            now - 25 * 60_000,
+            now - 5 * 60_000
+        );
+        let out = worker.handle(&job(hist)).await;
+        assert_eq!(out.result.status, Status::Ok as i32, "{}", out.result.error);
+        let v: Value = serde_json::from_slice(&out.result.result).unwrap();
+        let l = &v["data"]["latents"];
+        eprintln!(
+            "historical: source {} points {} plan {} read {}",
+            l["source"], l["points"], l["recorded"]["plan"], l["recorded"]["messages_read"]
+        );
+        assert_eq!(l["source"], "recorded");
+        assert!(l["points"].as_u64().unwrap() > 0, "{l}");
+        let live = out_of(
+            &worker.handle(&job(r#"{"genome":"retrieval:h=3;lb=8;k=10","data_window":{"hours":0.3}}"#.into())).await,
+        );
+        eprintln!("now-relative: source {}", live["data"]["latents"]["source"]);
+        assert_eq!(live["data"]["latents"]["source"], "live");
+    }
+
+    fn out_of(o: &Outcome) -> Value {
+        assert_eq!(o.result.status, Status::Ok as i32, "{}", o.result.error);
+        serde_json::from_slice(&o.result.result).unwrap()
     }
 }

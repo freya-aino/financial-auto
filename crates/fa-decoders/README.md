@@ -2,7 +2,7 @@
 
 Decoder families: visual, retrieval, text, RNN-prior.
 
-**Status:** partial — `Decoder` trait and family enum; CRPS (ensemble + quantile), pinball loss, time-discounted analog weighting; **baseline genome encoding** (`genome`: parse, canonical `Display`, numeric `params()` / `with_params()` for evolution) and two **CPU point-in-time series decoders** (`baseline`: empirical quantile forecaster, analog retrieval with leakage guard and optional **latent conditioning** through `DecodeCtx`), all tested. No ML-backend models; `ExpertView` conditioning is limited to the latent-similarity term below.
+**Status:** partial — `Decoder` trait and family enum; CRPS (ensemble + quantile), pinball loss, time-discounted analog weighting; **baseline genome encoding** (`genome`: parse, canonical `Display`, numeric `params()` / `with_params()` for evolution) and two **CPU point-in-time series decoders** (`baseline`: empirical quantile forecaster, analog retrieval with leakage guard and optional **latent conditioning** through `DecodeCtx`), all tested; and the **baseline text and visual decoders** served live by model-runtime (`text_baseline`, `visual_baseline`, D-062). No ML-backend models; `ExpertView` conditioning is limited to the latent-similarity term below.
 
 ## Genome format (`genome::DecoderGenome::parse`)
 | Form | Example | Notes |
@@ -24,8 +24,23 @@ Families: `forecast` (aliases `quantile`, `rnn_prior`; published on `decoder.out
 - `SeriesDecoder::forecast(series, t)` reads only `series[..=t]` (tested).
 - `build(genome)` / `build_with(genome, Arc<DecodeCtx>)`: the context holds `LatentPoint`s (`as_of_ms`, concatenated expert means of a `LatentState`) per instrument token. When latents exist for the series' instrument, the retriever's similarity becomes `(1 − lat)·shape + lat·cos(latent as of query, latent as of candidate)`; both lookups are **as of** the respective window end (`latent_as_of`), so a later latent never leaks in (tested: truncating the future leaves the forecast unchanged; other instruments' latents are ignored). An empty context reproduces the unconditioned decoder exactly.
 
+## Baseline text decoder (`text_baseline`, decoder id `text-stat-v1`)
+Pure and deterministic; model-runtime feeds it `news.item.>` and publishes `text.news` / `text.summary` (contract in [model-runtime](../../bins/model-runtime/README.md)).
+- `tokenize`: lower-case alphanumeric tokens (`n't` → `not`), length ≥ 2.
+- `score_text`: embedded finance lexicon (`LEXICON_POS`, `LEXICON_NEG`, ~100 words each); a negator (`NEGATORS`) flips the polarity of the next `NEGATION_SCOPE = 3` tokens; polarity `(pos − neg)/(pos + neg)`, confidence `1 − exp(−hits/2)`.
+- `TextWindow::score_at(now, W)`: `text.news = Σ d·w·s / (Σ d·w + SHRINK)` over items in `[now − W, now]` with recency decay `d = exp(−age/(W/2))`, confidence `w`, polarity `s`, `SHRINK = 0.5` (volume normalisation: one weak item cannot saturate the score); `text.summary` novelty `= 1 − cos(tf_current, tf_trailing)` of FNV-1a hashed term frequencies (`HASH_DIM = 1024`) of the current window vs `[now − 2W, now − W)` (0 when either is empty). Items after `now` are invisible (point-in-time).
+- `InstrumentIndex::match_doc`: case-sensitive ticker tokens (`SPY`, `$SPY`, pair base `BTC` of `BTC-USD`), name phrases (lower-cased, legal suffixes and `(…)` dropped, word-bounded; ticker-only names are matched as symbols only) and `entities_raw` values (`query:Apple stock`).
+
+## Baseline visual decoder (`visual_baseline`, decoder id `visual-stat-v1`)
+`chart_scores(bars)` over ≥ `MIN_BARS = 8` OHLCV bars (model-runtime uses the last 60 closed bars):
+- `breakout = tanh(4·(close − R)/W)` above the resistance `R`, `tanh(4·(close − S)/W)` below the support `S` (band of the bars before the last one, `W = R − S`), else 0;
+- `trend = tanh(t/3)` with `t` the OLS t-statistic of `ln close` on the bar index;
+- `compression = 1 − min(1, (range_k/range_n)·√(n/k))`, `k = max(3, n/5)` (recent range squeezed inside the window, corrected for the random-walk √span growth);
+- `future = clamp(0.5·breakout + 0.35·trend + 0.15·sign(trend)·compression, −1, 1)`.
+Tested on synthetic shapes: flat → all 0, box breakouts up/down mirrored, ramps up/down, a squeeze.
+
 ## Owns
-`Decoder` trait and family implementations; genome encoding of the baseline families; `DecodeCtx` / `LatentPoint` / `instrument_token` / `cosine` conditioning primitives.
+`Decoder` trait and family implementations (incl. the baseline text / visual scorers); genome encoding of the baseline families; `DecodeCtx` / `LatentPoint` / `instrument_token` / `cosine` conditioning primitives.
 
 ## Governing specs
 - [34-decoder-population](../../specs/34-decoder-population.md)

@@ -67,6 +67,9 @@ fn db_err(e: sqlx::Error) -> Response {
 pub fn directions_for(kind: &str) -> BTreeMap<String, String> {
     let pairs: &[(&str, &str)] = if kind.ends_with(".strategy") || kind == "holdout" {
         &fa_backtest::replay::DIRECTIONS
+    } else if kind.ends_with("allocator") {
+        // D-064: portfolio objectives of the allocator tournament
+        &fa_backtest::allocator_replay::DIRECTIONS
     } else {
         // spec 34 §6.3 as reported by evo-worker (D-044)
         &[

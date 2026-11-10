@@ -172,11 +172,13 @@ pub trait StrategyContext {
     fn analog_age(&self) -> f64 {
         0.0
     }
-    /// `text_score(topic)`: no text decoder publishes yet → 0.
+    /// `text_score(topic)`: score in [-1, 1] of the latest `text.<topic>` decoder output
+    /// (news reconstruction / narrative similarity); contexts without decoders answer 0.
     fn text_score(&self, _topic: &str) -> f64 {
         0.0
     }
-    /// `visual_score(kind)`: no visual decoder publishes yet → 0.
+    /// `visual_score(kind)`: score in [-1, 1] of the latest `visual.<kind>` decoder output
+    /// (chart reconstruction, future-chart direction); contexts without decoders answer 0.
     fn visual_score(&self, _kind: &str) -> f64 {
         0.0
     }
@@ -256,6 +258,17 @@ pub enum Expr {
     IfGt(Box<Expr>, Box<Expr>, Box<Expr>, Box<Expr>),
 }
 
+thread_local! {
+    static NON_FINITE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Non-finite intermediate values (NaN / ±inf) [`Expr::eval`] replaced by 0 on this thread
+/// since the last [`take_non_finite`]. Evaluation stays total (a NaN node yields 0), but the
+/// runtime reads this counter around a step to treat the step as a NaN output (spec 35 §8).
+pub fn take_non_finite() -> u64 {
+    NON_FINITE.with(|c| c.replace(0))
+}
+
 impl Expr {
     pub fn eval(&self, ctx: &dyn StrategyContext) -> f64 {
         use Expr::*;
@@ -302,7 +315,12 @@ impl Expr {
                 }
             }
         };
-        if v.is_finite() { v } else { 0.0 }
+        if v.is_finite() {
+            v
+        } else {
+            NON_FINITE.with(|c| c.set(c.get() + 1));
+            0.0
+        }
     }
 
     pub fn size(&self) -> usize {
@@ -433,6 +451,11 @@ mod tests {
         );
         assert_eq!(cond.eval(&ctx), -1.0);
         assert_eq!(e.size(), 5);
+        take_non_finite();
+        let inf = Expr::Mul(b(Expr::Const(1e308)), b(Expr::Const(1e308)));
+        assert_eq!(inf.eval(&ctx), 0.0);
+        assert_eq!(take_non_finite(), 1);
+        assert_eq!(take_non_finite(), 0);
     }
 
     #[test]

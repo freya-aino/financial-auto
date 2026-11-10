@@ -7,10 +7,19 @@
 //! (`STATUS_PREEMPTED`, the message is NAKed so JetStream redelivers it and the run resumes from
 //! the checkpoint), stops at `budget_gpu_ms` (`STATUS_BUDGET_EXCEEDED`) and publishes the
 //! `JobResult` on `jobs.result.train.<kind>`.
+//!
+//! **Cancel:** `ctl.train.cancel {job_id}` (request/reply `CtlRequest`/`CtlReply`, the
+//! counterpart of the orchestrator's `ctl.evo.cancel`) stops a running job between chunks
+//! (`STATUS_CANCELLED`, acked, not redelivered; its checkpoint is kept for inspection) or marks a
+//! queued one so it is answered `STATUS_CANCELLED` on delivery without running.
+//!
+//! **Planner:** with `--adapter-every` / `--generation-every` the worker also runs
+//! [`crate::plan`], which enqueues adapter / generation jobs for every active snapshot.
 
 use std::{
+    collections::{HashMap, HashSet},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
     time::{Duration, Instant},
@@ -19,7 +28,7 @@ use std::{
 use fa_bus::{Bus, async_nats::jetstream::AckKind, streams::ensure_work_queue, subjects};
 use fa_proto::{
     Message,
-    v1::{Heartbeat, Job, JobProgress, JobResult, job_result::Status},
+    v1::{CtlReply, CtlRequest, Heartbeat, Job, JobProgress, JobResult, job_result::Status},
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
@@ -27,7 +36,8 @@ use tokio::sync::broadcast;
 use crate::{
     fit::FitSpec,
     gpu::{self, Lease, Notice},
-    run::{self, AdapterSpec, Control, Kind, Outcome, PREEMPT, RUN, Services},
+    plan::PlanConfig,
+    run::{self, AdapterSpec, CANCEL, Control, Kind, Outcome, PREEMPT, RUN, Services},
 };
 
 pub const KIND: &str = "train";
@@ -39,6 +49,62 @@ const REDELIVER_AFTER: Duration = Duration::from_secs(5);
 pub struct WorkerConfig {
     pub gpu_lease_mb: u32,
     pub checkpoint_secs: u64,
+    pub plan: PlanConfig,
+}
+
+/// Stop flags of running jobs and ids cancelled before delivery.
+#[derive(Default)]
+pub struct Cancels {
+    running: Mutex<HashMap<String, Arc<AtomicU8>>>,
+    pending: Mutex<HashSet<String>>,
+}
+
+impl Cancels {
+    /// Handles one cancel request; the reply text says what happened.
+    pub fn cancel(&self, job_id: &str) -> (bool, String) {
+        if job_id.is_empty() {
+            return (false, "job_id required".into());
+        }
+        if let Some(flag) = self.running.lock().expect("cancels").get(job_id) {
+            flag.store(CANCEL, Ordering::Relaxed);
+            return (true, format!("cancelling running job {job_id}"));
+        }
+        self.pending.lock().expect("cancels").insert(job_id.to_owned());
+        (true, format!("job {job_id} not running here; it is cancelled when delivered"))
+    }
+
+    fn take_pending(&self, job_id: &str) -> bool {
+        self.pending.lock().expect("cancels").remove(job_id)
+    }
+
+    fn register(&self, job_id: &str, flag: Arc<AtomicU8>) {
+        self.running.lock().expect("cancels").insert(job_id.to_owned(), flag);
+    }
+
+    fn unregister(&self, job_id: &str) {
+        self.running.lock().expect("cancels").remove(job_id);
+    }
+}
+
+async fn run_cancels(bus: Bus, cancels: Arc<Cancels>) {
+    let mut sub = match bus.client().subscribe(subjects::ctl("train", "cancel")).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot subscribe to ctl.train.cancel");
+            return;
+        }
+    };
+    while let Some(msg) = sub.next().await {
+        let job_id = CtlRequest::decode(msg.payload.as_ref())
+            .ok()
+            .and_then(|r| r.args.get("job_id").cloned())
+            .unwrap_or_default();
+        let (ok, message) = cancels.cancel(&job_id);
+        tracing::info!(%job_id, ok, %message, "ctl.train.cancel");
+        if let Some(reply) = msg.reply {
+            let _ = bus.client().publish(reply, CtlReply { ok, message }.encode_to_vec().into()).await;
+        }
+    }
 }
 
 pub async fn serve(bus: Bus, svc: Services<'_>, cfg: WorkerConfig) -> anyhow::Result<()> {
@@ -46,6 +112,13 @@ pub async fn serve(bus: Bus, svc: Services<'_>, cfg: WorkerConfig) -> anyhow::Re
     let (_, consumer) = ensure_work_queue(&bus.jetstream(), KIND, CONSUMER).await?;
     let (notices, _) = broadcast::channel(256);
     tokio::spawn(gpu::run_notices(bus.clone(), notices.clone()));
+    let cancels = Arc::new(Cancels::default());
+    tokio::spawn(run_cancels(bus.clone(), cancels.clone()));
+    for (kind, every) in [(Kind::Adapter, cfg.plan.adapter_every), (Kind::Generation, cfg.plan.generation_every)] {
+        if let Some(every) = every {
+            tokio::spawn(crate::plan::run(bus.clone(), svc.stores.hub.clone(), kind, every, cfg.plan.clone()));
+        }
+    }
     let counters = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<String, f64>::new()));
     spawn_heartbeat(bus.clone(), worker_id.clone(), counters.clone());
     let bump = |k: &str| {
@@ -76,7 +149,21 @@ pub async fn serve(bus: Bus, svc: Services<'_>, cfg: WorkerConfig) -> anyhow::Re
 
         let mut keepalive = tokio::time::interval(ACK_PROGRESS_EVERY);
         keepalive.tick().await;
-        let handle = handle(&bus, &svc, &cfg, &notices, &job);
+        if cancels.take_pending(&job.job_id) {
+            let outcome = Outcome {
+                status: Status::Cancelled,
+                result: serde_json::json!({ "protocol": run::PROTOCOL, "kind": job.kind, "reason": "cancelled before start" }),
+                checkpoint_ref: String::new(),
+                output_refs: vec![],
+                error: "cancelled".into(),
+                snapshot_id: None,
+            };
+            bump("jobs.cancelled");
+            publish_result(&bus, &job, &worker_id, &outcome).await;
+            let _ = msg.ack().await;
+            continue;
+        }
+        let handle = handle(&bus, &svc, &cfg, &notices, &cancels, &job);
         tokio::pin!(handle);
         let outcome = loop {
             tokio::select! {
@@ -89,20 +176,7 @@ pub async fn serve(bus: Bus, svc: Services<'_>, cfg: WorkerConfig) -> anyhow::Re
             }
         };
         bump(&format!("jobs.{}", format!("{:?}", outcome.status).to_ascii_lowercase()));
-        let result = JobResult {
-            job_id: job.job_id.clone(),
-            status: outcome.status as i32,
-            result: serde_json::to_vec(&outcome.result).unwrap_or_default(),
-            output_refs: outcome.output_refs.clone(),
-            checkpoint_ref: outcome.checkpoint_ref.clone(),
-            used_gpu_ms: outcome.result.get("elapsed_ms").and_then(serde_json::Value::as_u64).unwrap_or(0),
-            worker_id: worker_id.clone(),
-            error: outcome.error.clone(),
-            objectives: Default::default(),
-            directions: Default::default(),
-        };
-        if let Err(e) = bus.publish(subjects::job_result(&job.kind), &result).await {
-            tracing::error!(error = %e, job = %job.job_id, "result publish failed; not acking");
+        if !publish_result(&bus, &job, &worker_id, &outcome).await {
             continue;
         }
         let ack = if outcome.status == Status::Preempted {
@@ -119,11 +193,33 @@ pub async fn serve(bus: Bus, svc: Services<'_>, cfg: WorkerConfig) -> anyhow::Re
     Ok(())
 }
 
+/// Publishes the `JobResult`; `false` when publishing failed (the job is then not acked).
+async fn publish_result(bus: &Bus, job: &Job, worker_id: &str, outcome: &Outcome) -> bool {
+    let result = JobResult {
+        job_id: job.job_id.clone(),
+        status: outcome.status as i32,
+        result: serde_json::to_vec(&outcome.result).unwrap_or_default(),
+        output_refs: outcome.output_refs.clone(),
+        checkpoint_ref: outcome.checkpoint_ref.clone(),
+        used_gpu_ms: outcome.result.get("elapsed_ms").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        worker_id: worker_id.to_owned(),
+        error: outcome.error.clone(),
+        objectives: Default::default(),
+        directions: Default::default(),
+    };
+    if let Err(e) = bus.publish(subjects::job_result(&job.kind), &result).await {
+        tracing::error!(error = %e, job = %job.job_id, "result publish failed; not acking");
+        return false;
+    }
+    true
+}
+
 async fn handle(
     bus: &Bus,
     svc: &Services<'_>,
     cfg: &WorkerConfig,
     notices: &broadcast::Sender<Notice>,
+    cancels: &Cancels,
     job: &Job,
 ) -> Outcome {
     let Some(kind) = Kind::parse_job_kind(&job.kind) else {
@@ -139,6 +235,7 @@ async fn handle(
         Err(e) => return failed(&job.kind, e),
     };
     let stop = Arc::new(AtomicU8::new(RUN));
+    cancels.register(&job.job_id, stop.clone());
     let watcher = {
         let stop = stop.clone();
         let id = job.job_id.clone();
@@ -146,7 +243,7 @@ async fn handle(
         tokio::spawn(async move {
             while let Ok(n) = rx.recv().await {
                 if n == Notice::Preempt(id.clone()) {
-                    stop.store(PREEMPT, Ordering::Relaxed);
+                    let _ = stop.compare_exchange(RUN, PREEMPT, Ordering::Relaxed, Ordering::Relaxed);
                     break;
                 }
             }
@@ -193,6 +290,7 @@ async fn handle(
         },
     };
     watcher.abort();
+    cancels.unregister(&job.job_id);
     if lease == Lease::Granted {
         gpu::release(bus, &job.job_id).await;
     }
@@ -235,4 +333,25 @@ fn spawn_heartbeat(
             let _ = bus.publish(subjects::heartbeat("trainer"), &hb).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_running_and_pending_jobs() {
+        let c = Cancels::default();
+        let flag = Arc::new(AtomicU8::new(RUN));
+        c.register("run-1", flag.clone());
+        let (ok, msg) = c.cancel("run-1");
+        assert!(ok && msg.contains("running"));
+        assert_eq!(flag.load(Ordering::Relaxed), CANCEL);
+        c.unregister("run-1");
+        let (ok, msg) = c.cancel("queued-1");
+        assert!(ok && msg.contains("when delivered"));
+        assert!(c.take_pending("queued-1"));
+        assert!(!c.take_pending("queued-1"), "consumed once");
+        assert_eq!(c.cancel(""), (false, "job_id required".to_owned()));
+    }
 }

@@ -37,6 +37,12 @@ pub struct Settings {
     pub snapshot_secs: u64,
     /// In-memory book vs Postgres-derived book comparison interval (`reconciliation_run`).
     pub reconcile_secs: u64,
+    /// Reference-data reload interval (`ref.instrument` / `ref.listing` / `ref.venue` →
+    /// asset class, venue, quote currency, status, source per instrument); also reloaded on
+    /// `ref.changed.*` and `ingest.unresolved.*` notices.
+    pub refdata_refresh_secs: u64,
+    /// EUR accounting FX (spec 42 §6, spec 12 §6).
+    pub fx: FxSettings,
     /// Status given to a strategy the first time one of its signals is seen: `active` (allocated
     /// paper capital at once, the integrated-baseline behaviour) or `shadow` (virtual book only,
     /// needs `promote` through the gate).
@@ -67,11 +73,49 @@ impl Default for Settings {
             pending_ttl_secs: 10,
             snapshot_secs: 60,
             reconcile_secs: 300,
+            refdata_refresh_secs: 300,
+            fx: FxSettings::default(),
             new_strategy_status: "active".into(),
             shadow_sleeve_eur: 10_000.0,
             promotion: PromotionGate::default(),
             limits: RiskConfig::default(),
         }
+    }
+}
+
+/// `[fx]`: the ECB daily reference rate is the accounting conversion (spec 12 §7
+/// `fx.accounting_source = ecb_daily`); marks and fills convert as of the event time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FxSettings {
+    /// How often the ECB `eurofxref-daily.xml` is fetched and upserted into `ref.fx_rate`.
+    pub ecb_refresh_secs: u64,
+    /// A rate older than this at the event time is `stale` (spec 42 §8: last known rate, flagged).
+    pub max_age_hours: f64,
+    /// Raise the reduce-only halt scope `fx` while any used currency is stale (spec 42 §8
+    /// "block risk-increasing orders in that currency after threshold"; off = warning only).
+    pub halt_on_stale: bool,
+    /// `ref.fx_rate.source_id` the engine reads (and the ECB task writes).
+    pub source: String,
+    /// Days of history loaded into the in-memory as-of table at start.
+    pub history_days: u32,
+}
+
+impl Default for FxSettings {
+    fn default() -> Self {
+        Self {
+            ecb_refresh_secs: 86_400,
+            max_age_hours: 72.0,
+            halt_on_stale: false,
+            source: fa_warehouse::fx::ECB_SOURCE.into(),
+            history_days: 60,
+        }
+    }
+}
+
+impl FxSettings {
+    pub fn max_age(&self) -> chrono::Duration {
+        chrono::Duration::milliseconds((self.max_age_hours.max(0.0) * 3_600_000.0) as i64)
     }
 }
 
@@ -117,7 +161,11 @@ mod tests {
         let s = Settings::parse(include_str!("../risk.toml")).unwrap();
         assert_eq!(s.mode, "paper");
         assert_eq!(s.starting_cash_eur, PAPER_CASH_EUR);
-        assert_eq!((s.snapshot_secs, s.reconcile_secs), (60, 300));
+        assert_eq!((s.snapshot_secs, s.reconcile_secs, s.refdata_refresh_secs), (60, 300, 300));
+        assert_eq!((s.fx.ecb_refresh_secs, s.fx.max_age_hours, s.fx.halt_on_stale), (86_400, 72.0, false));
+        assert_eq!(s.fx.source, "ecb_daily");
+        assert_eq!(s.limits.provisional_position_frac, None);
+        assert_eq!(s.limits.provisional_position_frac(), 0.025);
         assert!(matches!(Settings::parse("mode = 'live'"), Err(SettingsError::Mode(_))));
         assert!(matches!(Settings::parse("allocator = 'evolved'"), Err(SettingsError::Allocator(_))));
         assert!(matches!(Settings::parse("new_strategy_status = 'live'"), Err(SettingsError::NewStatus(_))));

@@ -3,6 +3,11 @@
 //! Allocators turn per-strategy performance posteriors ([`StrategyStats`]) into capital
 //! weights; [`net_targets`] nets exposure distributions into EUR targets per instrument.
 //! [`PerformanceTracker`] estimates the posteriors online from signals and realised returns.
+//! [`genome`] carries the evolvable form of an allocator ([`genome::AllocatorGenome`]: name +
+//! genes, text round trip, variation operators) and [`WeightedBlend`] is the parametric family
+//! mixing the fixed allocators (spec 40 §6.2 "evolved allocator").
+
+pub mod genome;
 
 use std::collections::BTreeMap;
 
@@ -100,7 +105,56 @@ impl Allocator for EqualWeight {
     }
 }
 
-/// Builds the allocator named in config: `equal_weight` | `risk_parity` | `fractional_kelly`.
+/// Parametric blend of the three fixed allocators (spec 40 §6.2 "evolved allocator"): the
+/// equal-weight, risk-parity and fractional-Kelly allocations (each uncapped) are mixed with
+/// the normalised weights `w_equal : w_risk_parity : w_kelly`, then every strategy weight is
+/// capped at `max_weight` and the sum scaled to ≤ 1.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeightedBlend {
+    pub max_weight: f64,
+    pub kelly_fraction: f64,
+    pub w_equal: f64,
+    pub w_risk_parity: f64,
+    pub w_kelly: f64,
+}
+
+impl Allocator for WeightedBlend {
+    fn id(&self) -> &str {
+        "weighted_blend"
+    }
+
+    fn allocate(&self, stats: &[StrategyStats]) -> Allocation {
+        let ws = [self.w_equal.max(0.0), self.w_risk_parity.max(0.0), self.w_kelly.max(0.0)];
+        let total_w: f64 = ws.iter().sum();
+        if total_w <= 0.0 || stats.is_empty() {
+            return Allocation::new();
+        }
+        let legs: [Allocation; 3] = [
+            EqualWeight { max_weight: 1.0 }.allocate(stats),
+            RiskParityCapped { max_weight: 1.0 }.allocate(stats),
+            FractionalKelly { fraction: self.kelly_fraction, max_weight: 1.0 }.allocate(stats),
+        ];
+        let mut out = Allocation::new();
+        for (w, leg) in ws.iter().zip(&legs) {
+            if *w <= 0.0 {
+                continue;
+            }
+            for (id, v) in leg {
+                *out.entry(id.clone()).or_insert(0.0) += w / total_w * v;
+            }
+        }
+        out.retain(|_, v| *v > 0.0);
+        out.values_mut().for_each(|v| *v = v.min(self.max_weight));
+        let total: f64 = out.values().sum();
+        if total > 1.0 {
+            out.values_mut().for_each(|v| *v /= total);
+        }
+        out
+    }
+}
+
+/// Builds the allocator named in config: `equal_weight` | `risk_parity` | `fractional_kelly`
+/// (`weighted_blend` needs its blend weights: use [`genome::AllocatorGenome::build`]).
 pub fn by_name(name: &str, max_weight: f64, kelly_fraction: f64) -> Option<Box<dyn Allocator>> {
     Some(match name {
         "equal_weight" => Box::new(EqualWeight { max_weight }),
@@ -190,6 +244,18 @@ pub fn net_targets(
     alloc: &Allocation,
     deployable_eur: f64,
 ) -> BTreeMap<InstrumentId, f64> {
+    net_targets_shrunk(dists, alloc, deployable_eur, 1.0)
+}
+
+/// [`net_targets`] with a tunable shrink exponent: `mean / (1 + stddev)^shrink` (`0` ignores
+/// the uncertainty, `1` is the live default). Also returns nothing for strategies without a
+/// weight. Used by evolved allocators (`genome::AllocatorGenome::shrink`).
+pub fn net_targets_shrunk(
+    dists: &[ExposureDistribution],
+    alloc: &Allocation,
+    deployable_eur: f64,
+    shrink: f64,
+) -> BTreeMap<InstrumentId, f64> {
     let mut out: BTreeMap<InstrumentId, f64> = BTreeMap::new();
     for d in dists {
         let w = alloc.get(&d.strategy_id).copied().unwrap_or(0.0);
@@ -198,7 +264,8 @@ pub fn net_targets(
         }
         let per_asset = w * deployable_eur / d.exposures.len() as f64;
         for e in &d.exposures {
-            *out.entry(e.instrument).or_insert(0.0) += per_asset * e.mean.clamp(-1.0, 1.0) / (1.0 + e.stddev.max(0.0));
+            let denom = (1.0 + e.stddev.max(0.0)).powf(shrink.max(0.0));
+            *out.entry(e.instrument).or_insert(0.0) += per_asset * e.mean.clamp(-1.0, 1.0) / denom;
         }
     }
     out
@@ -285,5 +352,35 @@ mod tests {
         assert!(t[&i].abs() < 1e-9);
         let t = net_targets(&[d("a", 1.0), d("b", 0.5)], &alloc, 10_000.0);
         assert!((t[&i] - 7_500.0).abs() < 1e-9);
+        // uncertainty shrink: stddev 1 halves with shrink 1, leaves alone with shrink 0, quarters with 2
+        let u = ExposureDistribution {
+            exposures: vec![AssetExposure { instrument: i, mean: 1.0, stddev: 1.0 }],
+            ..d("a", 1.0)
+        };
+        let one = Allocation::from([("a".to_string(), 1.0)]);
+        assert!((net_targets(std::slice::from_ref(&u), &one, 1_000.0)[&i] - 500.0).abs() < 1e-9);
+        assert!((net_targets_shrunk(std::slice::from_ref(&u), &one, 1_000.0, 0.0)[&i] - 1_000.0).abs() < 1e-9);
+        assert!((net_targets_shrunk(std::slice::from_ref(&u), &one, 1_000.0, 2.0)[&i] - 250.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn weighted_blend_mixes_caps_and_normalises() {
+        let s = stats();
+        let pure_rp =
+            WeightedBlend { max_weight: 1.0, kelly_fraction: 0.25, w_equal: 0.0, w_risk_parity: 1.0, w_kelly: 0.0 };
+        let rp = RiskParityCapped { max_weight: 1.0 }.allocate(&s);
+        let b = pure_rp.allocate(&s);
+        for (k, v) in &rp {
+            assert!((b[k] - v).abs() < 1e-12, "pure leg equals the leg itself");
+        }
+        let mix =
+            WeightedBlend { max_weight: 0.3, kelly_fraction: 0.25, w_equal: 2.0, w_risk_parity: 2.0, w_kelly: 0.0 };
+        let m = mix.allocate(&s);
+        assert!(m.values().all(|w| *w <= 0.3 + 1e-12), "{m:?}");
+        assert!(m.values().sum::<f64>() <= 1.0 + 1e-12);
+        assert!(m.contains_key("c"), "the equal-weight leg keeps the negative-return strategy");
+        assert!(WeightedBlend { w_equal: 0.0, w_risk_parity: 0.0, w_kelly: 0.0, ..mix }.allocate(&s).is_empty());
+        assert!(mix.allocate(&[]).is_empty());
+        assert_eq!(mix.id(), "weighted_blend");
     }
 }

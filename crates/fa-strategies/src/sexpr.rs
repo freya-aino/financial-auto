@@ -496,6 +496,33 @@ mod tests {
     }
 
     #[test]
+    fn text_visual_and_dotted_score_forms_round_trip() {
+        let cases = [
+            "(mul 3 (mul (text_score news) (visual_score future)))",
+            "(sub 1 (score text.news))",
+            "(max (sub 1 (score text.summary)) (sub 1 (score visual.chart)))",
+            "(if_gt (mul (visual_score chart) (add (text_score narrative) (text_score summary))) 0 (mul 2 (add (text_score narrative) (text_score summary))) 0)",
+            "(score rnn_prior)",
+        ];
+        for src in cases {
+            let e = parse(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            assert_eq!(e.to_string(), src);
+            assert_eq!(parse(&e.to_string()).unwrap(), e);
+        }
+        assert_eq!(parse("(score text.news)").unwrap(), Expr::Decoder(DecoderOp::Score("text.news".into())));
+        assert_eq!(parse("(text_score)"), Err(ParseError::Arity { op: "text_score".into(), expected: 1, got: 0 }));
+        assert!(matches!(parse("(text_score 1)"), Err(ParseError::Type(_))));
+        assert!(matches!(parse("(visual_score (cur_region 0))"), Err(ParseError::Type(_))));
+        // every baseline program round-trips
+        for def in crate::population::StrategyFile::baselines().strategy {
+            for src in [&def.signal, &def.uncertainty] {
+                let e = parse(src).unwrap();
+                assert_eq!(parse(&e.to_string()).unwrap(), e, "{}", def.id);
+            }
+        }
+    }
+
+    #[test]
     fn rejects_type_errors() {
         assert!(matches!(parse("(cur_region 0)"), Err(ParseError::Type(_))));
         assert!(matches!(parse("(add (cur_region 0) 1)"), Err(ParseError::Type(_))));

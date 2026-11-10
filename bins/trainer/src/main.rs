@@ -6,15 +6,20 @@
 //! `region_map.json` to `fa-models/snapshots/<snapshot_id>/` (and/or `--out`), mirrors the
 //! snapshot in Helix as a `candidate` with `SnapshotParent` / `RegionMatch` edges, and the
 //! region lineage is carried over by probe-set alignment against the parent (D-007).
-//! Promotion is control-api's `POST /api/latent/snapshots/{id}/promote`, which reloads
-//! model-runtime (`ctl.model.reload`).
+//! Promotion is control-api's `POST /api/latent/snapshots/{id}/promote`, which checks the
+//! spec 36 §6.4 checklist (carried mass, shadow serving) and reloads model-runtime
+//! (`ctl.model.reload`). Fits read connector bars (`fa_bar_*`) and fall back to trade prices
+//! per instrument; `generation` runs the feedback search of [`search`]; `adapter` writes an
+//! `AdapterState` node; `serve` can plan adapter / generation jobs periodically.
 
 mod artifact;
 mod data;
 mod feedback;
 mod fit;
 mod gpu;
+mod plan;
 mod run;
+mod search;
 mod worker;
 
 use std::path::PathBuf;
@@ -55,9 +60,21 @@ struct FitArgs {
     /// History length ending now.
     #[arg(long, default_value_t = 6.0)]
     window_hours: f64,
-    /// Instrument (VM token or UUID); default: the one with the most trades.
+    /// Instrument (VM token or UUID); default: the one with the most bars.
     #[arg(long)]
     instrument: Option<String>,
+    /// Multi-instrument fit: comma-separated tokens/UUIDs or `all`.
+    #[arg(long)]
+    instruments: Option<String>,
+    /// Pool normalisation statistics with equal weight per instrument (`params.per_instrument_norm`).
+    #[arg(long, default_value_t = false)]
+    per_instrument_norm: bool,
+    /// Feedback-search candidates of a `generation` (1 disables the search).
+    #[arg(long, default_value_t = 12)]
+    search_candidates: usize,
+    /// Adapter drift guard recorded in the manifest (`params.adapter_guard.max_drift`).
+    #[arg(long, default_value_t = 1.0)]
+    adapter_max_drift: f64,
     /// Snapshot to align with (default: the active snapshot of the timescale in Helix).
     #[arg(long)]
     parent: Option<String>,
@@ -78,6 +95,10 @@ impl FitArgs {
         FitSpec {
             window_hours: self.window_hours,
             instrument: self.instrument.clone(),
+            instruments: self.instruments.as_deref().map(data::Instruments::parse_cli),
+            params: fit::FitParams { per_instrument_norm: self.per_instrument_norm },
+            search: search::SearchSpec { candidates: self.search_candidates.max(1), ..Default::default() },
+            adapter_guard: Some(fa_encoders::AdapterGuard { max_drift: self.adapter_max_drift, ..Default::default() }),
             parent_snapshot_id: self.parent.clone(),
             seed: self.seed,
             fit: fa_encoders::FitConfig { stride: self.stride.max(1), ..Default::default() },
@@ -106,10 +127,22 @@ enum Cmd {
         window_hours: f64,
         #[arg(long)]
         instrument: Option<String>,
-        #[arg(long, default_value_t = 1.0)]
-        max_drift: f64,
+        /// Override the snapshot's `params.adapter_guard.max_drift`.
+        #[arg(long)]
+        max_drift: Option<f64>,
     },
-    /// Work-queue worker for `jobs.train.>`.
+    /// List the `AdapterState` versions of a snapshot (Helix), newest first.
+    Adapters {
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Print the planner schedule and the jobs its next tick would enqueue.
+    Plan(PlanArgs),
+    /// Cancel a training job (`ctl.train.cancel {job_id}`).
+    Cancel { job_id: String },
+    /// Work-queue worker for `jobs.train.>` (+ the periodic planner).
     Serve {
         /// GPU memory requested from the arbiter per job (0 disables leasing).
         #[arg(long, env = "FA_TRAIN_GPU_LEASE_MB", default_value_t = 256)]
@@ -117,7 +150,36 @@ enum Cmd {
         /// Checkpoint the fit to `fa-ckpt/<job_id>/state.json` this often (0 = only on preemption).
         #[arg(long, env = "FA_TRAIN_CHECKPOINT_SECS", default_value_t = 30)]
         checkpoint_secs: u64,
+        #[command(flatten)]
+        plan: PlanArgs,
     },
+}
+
+#[derive(clap::Args, Clone)]
+struct PlanArgs {
+    /// Enqueue an adapter job per active snapshot this often (`off` disables).
+    #[arg(long, env = "FA_TRAIN_ADAPTER_EVERY", default_value = "1h")]
+    adapter_every: String,
+    /// Enqueue a generation job per active snapshot this often (default `off`).
+    #[arg(long, env = "FA_TRAIN_GENERATION_EVERY", default_value = "off")]
+    generation_every: String,
+    /// `instruments` of planned generation jobs.
+    #[arg(long, default_value = "all")]
+    generation_instruments: String,
+    #[arg(long, default_value_t = 6.0)]
+    generation_window_hours: f64,
+}
+
+impl PlanArgs {
+    fn config(&self) -> anyhow::Result<plan::PlanConfig> {
+        Ok(plan::PlanConfig {
+            adapter_every: plan::parse_every(&self.adapter_every).map_err(anyhow::Error::msg)?,
+            generation_every: plan::parse_every(&self.generation_every).map_err(anyhow::Error::msg)?,
+            generation_window_hours: self.generation_window_hours,
+            generation_instruments: self.generation_instruments.clone(),
+            ..Default::default()
+        })
+    }
 }
 
 #[tokio::main]
@@ -180,9 +242,45 @@ async fn main() -> anyhow::Result<()> {
             };
             run::run_adapter(spec, &svc, &Control::local("")).await
         }
-        Cmd::Serve { gpu_lease_mb, checkpoint_secs } => {
+        Cmd::Adapters { snapshot, limit } => {
+            let hub = stores.hub.as_ref().ok_or_else(|| anyhow::anyhow!("Helix unavailable"))?;
+            let rows = hub.snapshot_adapters(&snapshot, limit).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "snapshot_id": snapshot, "adapters": rows }))?
+            );
+            return Ok(());
+        }
+        Cmd::Plan(p) => {
+            let pc = p.config()?;
+            let active = match stores.hub.as_ref() {
+                Some(h) => plan::active_snapshots(h).await?,
+                None => Vec::new(),
+            };
+            println!("{}", serde_json::to_string_pretty(&plan::describe(&pc, &active))?);
+            return Ok(());
+        }
+        Cmd::Cancel { job_id } => {
             let bus = fa_bus::Bus::connect(&cfg.nats.url).await?;
-            return worker::serve(bus, svc, worker::WorkerConfig { gpu_lease_mb, checkpoint_secs }).await;
+            let req = fa_proto::v1::CtlRequest {
+                verb: "cancel".into(),
+                args: [("job_id".to_owned(), job_id)].into_iter().collect(),
+            };
+            let msg = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                bus.client()
+                    .request(fa_bus::subjects::ctl("train", "cancel"), fa_proto::Message::encode_to_vec(&req).into()),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("no trainer answered ctl.train.cancel within 5 s"))??;
+            let reply = <fa_proto::v1::CtlReply as fa_proto::Message>::decode(msg.payload.as_ref())?;
+            println!("{}: {}", if reply.ok { "ok" } else { "refused" }, reply.message);
+            return Ok(());
+        }
+        Cmd::Serve { gpu_lease_mb, checkpoint_secs, plan } => {
+            let bus = fa_bus::Bus::connect(&cfg.nats.url).await?;
+            let plan = plan.config()?;
+            return worker::serve(bus, svc, worker::WorkerConfig { gpu_lease_mb, checkpoint_secs, plan }).await;
         }
     };
     println!("{}", serde_json::to_string_pretty(&outcome.result)?);

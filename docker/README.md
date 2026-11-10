@@ -46,6 +46,14 @@ just app-down                  # stops everything, keeps volumes
 - **HelixDB:** the `helix` service, reached at `http://helix:8080` inside compose and `127.0.0.1:6969` from the host. The image is distroless, so it has no in-container healthcheck; `control-api` only waits for it to start.
 - **UI:** the `ui` service is the only thing serving the frontend in compose; the control-api container has no `frontend/build`, so `:7700` is API only. On the host, `cargo run -p control-api` still serves `frontend/build` when it exists.
 - **No host processes:** don't run `cargo run -p control-api` at the same time, because it also binds port 7700.
+- **Service control from the API/UI (D-060):** `POST /api/services/{name}/start|stop|restart` and `GET /api/services/{name}/container` work through the Docker socket, which `compose.yaml` mounts read-write into `control-api` **only** (`${FA_DOCKER_SOCK:-/var/run/docker.sock}` → `/var/run/docker.sock`, `FA_COMPOSE_PROJECT=financial-auto`). Infra services and control-api itself are refused (409); `risk-engine` stop/restart needs `{"confirm": true}`. See `bins/control-api/README.md` → Supervisor.
+  - **Rootless Docker** (this machine): the daemon listens on `$XDG_RUNTIME_DIR/docker.sock` and `/var/run/docker.sock` is root-owned, so point compose at the right socket with `export FA_DOCKER_SOCK=$XDG_RUNTIME_DIR/docker.sock` or, better, a git-ignored `.env` at the repo root (compose reads it):
+    ```sh
+    FA_DOCKER_SOCK=/run/user/1000/docker.sock
+    FA_DOCKER_GID=131
+    ```
+  - **Permissions:** the Rust image runs as uid 10001 (`rust.Dockerfile`), and the socket is `0660` with group `docker`, so control-api joins that group through `group_add: ["${FA_DOCKER_GID:-999}"]` instead of running as root. The gid must be the one the socket has *as the daemon sees it*: rootful → the host's `docker` group (`getent group docker`, often 999 or 998); rootless → the `docker` gid inside the daemon's user namespace, which the host sees as a subgid (here `100130`), so read it from a throwaway container: `docker run --rm -v "$FA_DOCKER_SOCK":/s alpine stat -c %g /s` (→ `131` here). Verified: without `group_add` the mount is there but `connect` fails (`EACCES`); with it `GET /_ping` answers `OK`.
+  - **Host runs** (`cargo run -p control-api`) use `DOCKER_HOST`/`FA_DOCKER_SOCK` or the default sockets directly; with none reachable the routes answer `501 no_supervisor` and everything else keeps working.
 
 ## Metrics (spec 60 §4/§6.5, D-056)
 Every service exposes Prometheus text on `GET /metrics` (`crates/fa-metrics`, re-exported as `fa_bus::metrics`; Go: `go/pkg/bus/metrics.go`). Inside compose each listens on `0.0.0.0:9100` (`FA_METRICS_BIND`), published on 127.0.0.1 as:

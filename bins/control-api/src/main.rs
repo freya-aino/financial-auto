@@ -3,6 +3,7 @@
 
 mod bus_tap;
 mod config_routes;
+mod docker;
 mod evolution_routes;
 mod graph_routes;
 mod latent_routes;
@@ -10,6 +11,7 @@ mod ledger_routes;
 mod live;
 mod live_routes;
 mod routes;
+mod services_routes;
 mod sources;
 mod sources_routes;
 mod state;
@@ -81,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(ws_routes::router().with_state(state.clone()))
         .merge(validation_routes::router().with_state(state.clone())); // holdout, trial reports, populations (D-052)
     let app = ledger_routes::install(state.clone(), app).await; // Postgres pool + paper-book seed + ledger routes (D-047)
+    let app = services_routes::install(state.clone(), app); // start/stop/restart via the Docker socket (D-060)
     let app = trading_routes::install(state, app); // strategy lifecycle + limits via ctl.risk.* (D-051)
     let app = app.layer(fa_bus::metrics::http::layer()); // fa_http_requests_total / fa_http_request_duration_seconds (D-056)
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;

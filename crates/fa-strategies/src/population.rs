@@ -124,7 +124,9 @@ mod tests {
     #[test]
     fn baselines_parse_and_are_labelled() {
         let f = StrategyFile::baselines();
-        assert!(f.strategy.len() >= 4);
+        assert!(f.strategy.len() >= 9);
+        assert!(f.strategy.iter().any(|s| s.id == "baseline-text-visual-1s"));
+        assert!(f.strategy.iter().any(|s| s.id == "baseline-narrative-chart-1m"));
         assert!(f.strategy.iter().all(StrategyDef::is_baseline));
         assert_eq!(f.strategy[0].step_secs(), 1);
         assert_eq!(f.strategy.iter().find(|s| s.id == "baseline-regime-1m").unwrap().step_secs(), 10);

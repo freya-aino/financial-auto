@@ -3,6 +3,18 @@
 # HelixDB runs from the official standalone image (D-033); the CLI-driven `helix push dev` flow is no longer needed.
 name: financial-auto
 
+# Shared environment and secrets mount of the Rust services (and the trainer). Defined up here because
+# control-api's own `environment` / `volumes` add the Docker socket, which must not spread to the other services (D-060).
+x-rust-defaults:
+  environment: &rust-env
+    FA_CONFIG: /app/config/platform.docker.toml
+    FA_SOURCES: /app/config/sources.yaml
+    FA_SECRETS: /app/config/secrets.toml
+    FA_METRICS_BIND: 0.0.0.0:9100 # GET /metrics, scraped by victoriametrics; host ports 91xx below (D-056)
+    RUST_LOG: info
+  volumes: &secrets-volume
+    - ./config/secrets.toml:/app/config/secrets.toml:ro # git-ignored; create with docker/garage-init.sh (D-045)
+
 services:
   nats:
     image: nats:2.12-alpine
@@ -91,14 +103,20 @@ services:
       dockerfile: docker/rust.Dockerfile
     image: financial-auto/rust:dev
     command: ["control-api"]
-    environment: &rust-env
-      FA_CONFIG: /app/config/platform.docker.toml
-      FA_SOURCES: /app/config/sources.yaml
-      FA_SECRETS: /app/config/secrets.toml
-      FA_METRICS_BIND: 0.0.0.0:9100 # GET /metrics, scraped by victoriametrics; host ports 91xx below (D-056)
-      RUST_LOG: info
-    volumes: &secrets-volume
-      - ./config/secrets.toml:/app/config/secrets.toml:ro # git-ignored; create with docker/garage-init.sh (D-045)
+    environment:
+      <<: *rust-env
+      FA_COMPOSE_PROJECT: financial-auto # compose project whose containers the supervisor may act on (D-060)
+    volumes:
+      - ./config/secrets.toml:/app/config/secrets.toml:ro
+      # Service supervision (spec 50 §4.1, D-060): the Docker socket, read-write, mounted into control-api ONLY.
+      # Rootless Docker: export FA_DOCKER_SOCK=$XDG_RUNTIME_DIR/docker.sock (or put it in .env, see docker/README.md).
+      - ${FA_DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+    # The image runs as uid 10001 (docker/rust.Dockerfile); the socket is root:docker (rootful) or, under rootless
+    # Docker, 0:<docker gid inside the daemon's user namespace>, so the container user joins that group instead of
+    # running as root. FA_DOCKER_GID = `stat -c %g` of the socket as the daemon sees it
+    # (rootless: `docker run --rm -v $FA_DOCKER_SOCK:/s alpine stat -c %g /s`).
+    group_add:
+      - "${FA_DOCKER_GID:-999}"
     ports:
       - "127.0.0.1:7700:7700"
       - "127.0.0.1:9101:9100" # metrics

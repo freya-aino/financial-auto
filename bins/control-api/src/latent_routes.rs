@@ -5,7 +5,9 @@
 //! |---|---|
 //! | `GET /api/latent/{snapshot}/experts` | Helix `ExpertSpace` rows (+ region counts) joined with the bus-fed routing stats and norm covariance of `live::SnapshotStats` |
 //! | `GET /api/latent/{snapshot}/projection?expert=&range=&n=&dims=&kind=` | Helix `LatentVec` rows of the expert space, PCA (power iteration) server-side, cached 30 s |
-//! | `POST /api/latent/snapshots/{id}/promote\|rollback` | `HubClient::set_snapshot_status`, then `ctl.model.reload` (`timescale`, `snapshot_id` = the new active) so model-runtime hot-swaps the encoder (spec 36 §6.4) |
+//! | `POST /api/latent/snapshots/{id}/promote\|rollback` | `promote` first evaluates the spec 36 §6.4 checklist ([`promotion_checklist`]: manifest carried mass, shadow serving minutes, shadow region agreement) and answers 409 with it unless every item passes or the body says `{"force": true}`; then `HubClient::set_snapshot_status` and `ctl.model.reload` (`timescale`, `snapshot_id` = the new active) so model-runtime hot-swaps the encoder |
+//! | `POST\|DELETE /api/latent/snapshots/{id}/shadow`, `POST …/shadow/stop` | `ctl.model.shadow {timescale, snapshot_id \| "none"}`: model-runtime serves the candidate next to the active snapshot (`latent.shadow.<ts>.<inst>`, heartbeat gauges `shadow.<ts>.*`) |
+//! | `GET /api/latent/snapshots/{id}` | Helix row + manifest (Helix mirror, else Garage) + the promotion checklist + latest `AdapterState` |
 //! | `WS /ws/latent?snapshot=&instruments=` | `LatentState` changes from `live`, latest value per instrument, ≤ `runtime.ws.latent_hz` |
 use std::{
     collections::HashMap,
@@ -20,6 +22,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use bytes::Bytes;
 use chrono::Utc;
 use fa_hub::HubError;
 use fa_proto::{
@@ -44,6 +47,9 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/latent/{snapshot}/experts", get(experts))
         .route("/api/latent/{snapshot}/projection", get(projection))
+        .route("/api/latent/snapshots/{id}", get(snapshot_detail))
+        .route("/api/latent/snapshots/{id}/shadow", post(shadow_start).delete(shadow_stop))
+        .route("/api/latent/snapshots/{id}/shadow/stop", post(shadow_stop))
         .route("/api/latent/snapshots/{id}/{action}", post(snapshot_action))
         .route("/ws/latent", get(ws_latent))
 }
@@ -342,19 +348,341 @@ async fn projection(
     Json(body).into_response()
 }
 
-// ----------------------------------------------------- promote/rollback
+// ------------------------------------------------- promotion checklist
 
-/// `promote`: this snapshot → `active`, every other active snapshot of the same timescale →
-/// `retired`. `rollback`: this snapshot → `retired`; the newest other retired snapshot of the
-/// timescale (by `created_at`) → `active` when there is one.
-async fn snapshot_action(State(s): State<AppState>, Path((id, action)): Path<(String, String)>) -> Response {
-    if !matches!(action.as_str(), "promote" | "rollback") {
+/// Thresholds of the enforced spec 36 §6.4 checks, from the environment (fa-core's `[runtime]`
+/// config has no promotion section yet): `FA_PROMOTE_MIN_CARRIED_MASS` (default 0.5, spec 36
+/// §7 `min_carry_mass`), `FA_PROMOTE_MIN_SHADOW_MINUTES` (30) and
+/// `FA_PROMOTE_MIN_REGION_AGREEMENT` (0.3).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct PromotionThresholds {
+    pub min_carried_mass: f64,
+    pub min_shadow_minutes: f64,
+    pub min_region_agreement: f64,
+}
+
+impl Default for PromotionThresholds {
+    fn default() -> Self {
+        Self { min_carried_mass: 0.5, min_shadow_minutes: 30.0, min_region_agreement: 0.3 }
+    }
+}
+
+impl PromotionThresholds {
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let get = |k: &str, dflt: f64| {
+            std::env::var(k).ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite()).unwrap_or(dflt)
+        };
+        Self {
+            min_carried_mass: get("FA_PROMOTE_MIN_CARRIED_MASS", d.min_carried_mass),
+            min_shadow_minutes: get("FA_PROMOTE_MIN_SHADOW_MINUTES", d.min_shadow_minutes),
+            min_region_agreement: get("FA_PROMOTE_MIN_REGION_AGREEMENT", d.min_region_agreement),
+        }
+    }
+}
+
+/// Whether model-runtime's counters say `snapshot_id` is the shadow of `timescale`. Heartbeat
+/// counters only carry numbers, so model-runtime publishes the shadow's id as the marker
+/// `shadow.<ts>.snapshot_id.<id> = 1` next to `shadow.<ts>.snapshot` (= its generation).
+pub fn shadow_matches(counters: &std::collections::BTreeMap<String, f64>, timescale: &str, snapshot_id: &str) -> bool {
+    counters.get(&format!("shadow.{timescale}.snapshot_id.{snapshot_id}")).is_some_and(|v| *v > 0.0)
+}
+
+/// The id model-runtime currently shadows on `timescale`, from the marker counter.
+pub fn shadow_id(counters: &std::collections::BTreeMap<String, f64>, timescale: &str) -> Option<String> {
+    let prefix = format!("shadow.{timescale}.snapshot_id.");
+    counters.iter().find(|(k, v)| k.starts_with(&prefix) && **v > 0.0).map(|(k, _)| k[prefix.len()..].to_owned())
+}
+
+/// One item of the checklist.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Check {
+    pub name: &'static str,
+    pub ok: bool,
+    pub value: Option<f64>,
+    pub threshold: Option<f64>,
+    pub detail: String,
+}
+
+/// The spec 36 §6.4 promotion checklist as enforced today. Items 1 (SSL regression), 2 (expert
+/// health), 4 (ECE) and 5 (elite transfer) have no producer yet and are reported as
+/// `not_evaluated` entries in the route body, not as checks.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Checklist {
+    pub snapshot_id: String,
+    pub timescale: String,
+    pub passed: bool,
+    pub checks: Vec<Check>,
+    pub thresholds: PromotionThresholds,
+}
+
+/// Pure checklist: `carried_mass` from the candidate's manifest (`None` = no manifest),
+/// `counters` = model-runtime's heartbeat counters (`None` = no heartbeat, or stale),
+/// `representation_break` waives the carried-mass item (spec 36 §6.4 check 3).
+pub fn promotion_checklist(
+    snapshot_id: &str,
+    timescale: &str,
+    carried_mass: Option<f64>,
+    counters: Option<&std::collections::BTreeMap<String, f64>>,
+    representation_break: bool,
+    th: PromotionThresholds,
+) -> Checklist {
+    let mut checks = Vec::with_capacity(4);
+    checks.push(Check {
+        name: "carried_mass",
+        ok: representation_break || carried_mass.is_some_and(|m| m >= th.min_carried_mass),
+        value: carried_mass,
+        threshold: Some(th.min_carried_mass),
+        detail: match (carried_mass, representation_break) {
+            (_, true) => "waived: marked as a representation break".into(),
+            (None, _) => "no manifest.metrics.carried_mass (not a trained snapshot, or manifest unreadable)".into(),
+            (Some(m), _) => format!("manifest.metrics.carried_mass = {m:.3}"),
+        },
+    });
+    let g = |k: &str| counters.and_then(|c| c.get(&format!("shadow.{timescale}.{k}")).copied());
+    let served = counters.is_some_and(|c| shadow_matches(c, timescale, snapshot_id));
+    let current = counters.and_then(|c| shadow_id(c, timescale));
+    checks.push(Check {
+        name: "shadow_served",
+        ok: served,
+        value: g("snapshot"),
+        threshold: None,
+        detail: match (counters.is_some(), served, current) {
+            (false, ..) => "no fresh model-runtime heartbeat".into(),
+            (true, true, _) => {
+                format!("model-runtime serves {snapshot_id} as the {timescale} shadow (value = its generation)")
+            }
+            (true, false, Some(other)) => format!(
+                "the {timescale} shadow is {other}, not {snapshot_id} (POST /api/latent/snapshots/{snapshot_id}/shadow)"
+            ),
+            (true, false, None) => {
+                format!("no {timescale} shadow is served (POST /api/latent/snapshots/{snapshot_id}/shadow)")
+            }
+        },
+    });
+    let minutes = if served { g("minutes") } else { None };
+    checks.push(Check {
+        name: "shadow_minutes",
+        ok: minutes.is_some_and(|m| m >= th.min_shadow_minutes),
+        value: minutes,
+        threshold: Some(th.min_shadow_minutes),
+        detail: format!("shadow.{timescale}.minutes (only counted while this snapshot is the shadow)"),
+    });
+    let agreement = if served { g("region_agreement") } else { None };
+    checks.push(Check {
+        name: "shadow_region_agreement",
+        ok: agreement.is_some_and(|a| a >= th.min_region_agreement),
+        value: agreement,
+        threshold: Some(th.min_region_agreement),
+        detail: format!("shadow.{timescale}.region_agreement (live agreement of shadow vs active region lineages)"),
+    });
+    Checklist {
+        snapshot_id: snapshot_id.into(),
+        timescale: timescale.into(),
+        passed: checks.iter().all(|c| c.ok),
+        checks,
+        thresholds: th,
+    }
+}
+
+/// Heartbeats older than this do not count for the shadow checks.
+const HEARTBEAT_FRESH: Duration = Duration::from_secs(60);
+
+/// model-runtime's latest heartbeat counters, when fresh.
+fn runtime_counters(s: &AppState) -> Option<std::collections::BTreeMap<String, f64>> {
+    let services = s.services.read().expect("services lock");
+    let st = services.get("model-runtime")?;
+    let age = Utc::now().signed_duration_since(st.last_seen).to_std().unwrap_or_default();
+    (age <= HEARTBEAT_FRESH).then(|| st.counters.clone())
+}
+
+/// The candidate's manifest: the Helix mirror written by the trainer, else Garage.
+async fn snapshot_manifest(s: &AppState, row: &fa_hub::Snapshot) -> (Option<Value>, &'static str) {
+    if let Some(m) = row.manifest.as_deref().and_then(|m| serde_json::from_str::<Value>(m).ok()) {
+        return (Some(m), "helix");
+    }
+    if row.garage_key.is_empty() {
+        return (None, "none");
+    }
+    let Ok(secrets) = fa_core::Secrets::load() else { return (None, "none") };
+    let Ok(blob) = fa_blob::S3BlobStore::from_config(&s.cfg, &secrets) else { return (None, "none") };
+    let key = fa_blob::snapshot_file(&row.snapshot_id, "manifest.json");
+    match fa_blob::BlobStore::get(&blob, &key).await {
+        Ok(b) => (serde_json::from_slice(&b).ok(), "garage"),
+        Err(_) => (None, "none"),
+    }
+}
+
+fn carried_mass_of(row: &fa_hub::Snapshot, manifest: Option<&Value>) -> Option<f64> {
+    manifest.and_then(|m| m["metrics"]["carried_mass"].as_f64()).or(row.carried_mass)
+}
+
+async fn checklist_for(
+    s: &AppState,
+    row: &fa_hub::Snapshot,
+    representation_break: bool,
+) -> (Checklist, Option<Value>, &'static str) {
+    let (manifest, source) = snapshot_manifest(s, row).await;
+    let counters = runtime_counters(s);
+    let c = promotion_checklist(
+        &row.snapshot_id,
+        &row.timescale,
+        carried_mass_of(row, manifest.as_ref()),
+        counters.as_ref(),
+        representation_break,
+        PromotionThresholds::from_env(),
+    );
+    (c, manifest, source)
+}
+
+const NOT_EVALUATED: [&str; 4] = [
+    "1 ssl_regression (no SSL loss for the statistical family)",
+    "2 expert_space_health (K_eff / residual correlation not computed per snapshot)",
+    "4 mcmc_ece (no ECE producer yet)",
+    "5 elite_transfer (elites not re-evaluated on candidates yet)",
+];
+
+/// Promote body: `{"force": bool, "note": string, "representation_break": bool}`, all optional.
+#[derive(Debug, Default, Deserialize)]
+pub struct PromoteBody {
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub representation_break: bool,
+}
+
+fn parse_body(body: &Bytes) -> Result<PromoteBody, String> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(PromoteBody::default());
+    }
+    serde_json::from_slice(body).map_err(|e| format!("body: {e}"))
+}
+
+async fn snapshot_detail(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    let row = match s.hub.snapshot_by_id(&id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return not_found("Snapshot", &id),
+        Err(e) => return hub_error(e),
+    };
+    let (checklist, manifest, source) = checklist_for(&s, &row, false).await;
+    let adapter = s.hub.latest_adapter(&id).await.ok().flatten();
+    let shadow: serde_json::Map<String, Value> = runtime_counters(&s)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(k, _)| k.starts_with(&format!("shadow.{}.", row.timescale)))
+        .map(|(k, v)| (k, json!(v)))
+        .collect();
+    let mut snapshot = serde_json::to_value(&row).unwrap_or(Value::Null);
+    if let Some(o) = snapshot.as_object_mut() {
+        o.remove("manifest");
+    }
+    Json(json!({
+        "snapshot": snapshot,
+        "manifest": manifest,
+        "manifest_source": source,
+        "checklist": checklist,
+        "not_evaluated": NOT_EVALUATED,
+        "shadow_gauges": shadow,
+        "latest_adapter": adapter,
+    }))
+    .into_response()
+}
+
+// ----------------------------------------------------------- shadow
+
+async fn shadow_start(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    let row = match s.hub.snapshot_by_id(&id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return not_found("Snapshot", &id),
+        Err(e) => return hub_error(e),
+    };
+    if row.status == "active" {
         return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "unknown action", "action": action, "use": "promote|rollback" })),
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "conflict", "detail": "snapshot is active; shadow a candidate" })),
         )
             .into_response();
     }
+    shadow_request(&s, &row, &id, "start").await
+}
+
+async fn shadow_stop(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    let row = match s.hub.snapshot_by_id(&id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return not_found("Snapshot", &id),
+        Err(e) => return hub_error(e),
+    };
+    shadow_request(&s, &row, "none", "stop").await
+}
+
+/// `ctl.model.shadow {timescale, snapshot_id}`; on success the Helix status follows
+/// (`shadow` on start, back to `candidate` on stop when it was `shadow`).
+async fn shadow_request(s: &AppState, row: &fa_hub::Snapshot, target: &str, op: &str) -> Response {
+    let args = [("timescale", row.timescale.as_str()), ("snapshot_id", target)];
+    let reply = ctl_model(s, "shadow", &args, Duration::from_secs(15)).await;
+    let ok = reply["ok"].as_bool().unwrap_or(false);
+    let mut status_change = Value::Null;
+    if ok {
+        let new_status = match (op, row.status.as_str()) {
+            ("start", st) if st != "active" => Some("shadow"),
+            ("stop", "shadow") => Some("candidate"),
+            _ => None,
+        };
+        if let Some(st) = new_status {
+            status_change = match s.hub.set_snapshot_status(row.id, st).await {
+                Ok(r) => json!({ "snapshot_id": r.snapshot_id, "status": r.status }),
+                Err(e) => json!({ "error": e.to_string() }),
+            };
+        }
+    }
+    let audited = audit(
+        s,
+        &format!("latent.snapshot.shadow.{op}"),
+        &row.snapshot_id,
+        json!({ "timescale": row.timescale, "reply": reply, "status_change": status_change }),
+    )
+    .await;
+    let code = match reply["error"].as_str() {
+        _ if ok => StatusCode::OK,
+        Some("nats_unavailable") => StatusCode::SERVICE_UNAVAILABLE,
+        Some("runtime_timeout") => StatusCode::GATEWAY_TIMEOUT,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    (
+        code,
+        Json(json!({
+            "ok": ok, "snapshot_id": row.snapshot_id, "timescale": row.timescale, "op": op,
+            "runtime": reply, "status_change": status_change, "audited": audited,
+        })),
+    )
+        .into_response()
+}
+
+// ----------------------------------------------------- promote/rollback
+
+/// `promote`: refused with 409 and the checklist unless [`promotion_checklist`] passes or the
+/// body says `{"force": true}` (audited with the failing checklist and `note`); then this
+/// snapshot → `active`, every other active (or shadow) snapshot of the same timescale →
+/// `retired`, and the replaced active is recorded on the target as `previous_active`.
+/// `rollback`: this snapshot → `retired`; the snapshot it replaced ([`rollback_target`]) → `active`.
+async fn snapshot_action(
+    State(s): State<AppState>,
+    Path((id, action)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    if !matches!(action.as_str(), "promote" | "rollback") {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown action", "action": action, "use": "promote|rollback|shadow" })),
+        )
+            .into_response();
+    }
+    let opts = match parse_body(&body) {
+        Ok(b) => b,
+        Err(e) => return bad_request(e),
+    };
     let snaps = match s.hub.list_snapshots().await {
         Ok(v) => v,
         Err(e) => return hub_error(e),
@@ -363,6 +691,7 @@ async fn snapshot_action(State(s): State<AppState>, Path((id, action)): Path<(St
         return not_found("Snapshot", &id);
     };
     let mut changes: Vec<(u64, String, &str)> = Vec::new();
+    let mut gate = Value::Null;
     if action == "promote" {
         if target.status == "active" {
             return (
@@ -371,10 +700,40 @@ async fn snapshot_action(State(s): State<AppState>, Path((id, action)): Path<(St
             )
                 .into_response();
         }
+        let (checklist, _, source) = checklist_for(&s, target, opts.representation_break).await;
+        if !checklist.passed && !opts.force {
+            let failing: Vec<&str> = checklist.checks.iter().filter(|c| !c.ok).map(|c| c.name).collect();
+            let audited = audit(
+                &s,
+                "latent.snapshot.promote.refused",
+                &id,
+                json!({ "checklist": checklist, "failing": failing }),
+            )
+            .await;
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "promotion_checks_failed",
+                    "detail": "spec 36 §6.4 checks failed; shadow the candidate, or send {\"force\": true} to override (audited)",
+                    "failing": failing,
+                    "checklist": checklist,
+                    "manifest_source": source,
+                    "not_evaluated": NOT_EVALUATED,
+                    "audited": audited,
+                })),
+            )
+                .into_response();
+        }
+        gate = json!({
+            "checklist": checklist,
+            "forced": !checklist.passed && opts.force,
+            "note": opts.note,
+            "representation_break": opts.representation_break,
+        });
         changes.push((target.id, target.snapshot_id.clone(), "active"));
-        for other in
-            snaps.iter().filter(|o| o.id != target.id && o.timescale == target.timescale && o.status == "active")
-        {
+        for other in snaps.iter().filter(|o| {
+            o.id != target.id && o.timescale == target.timescale && matches!(o.status.as_str(), "active" | "shadow")
+        }) {
             changes.push((other.id, other.snapshot_id.clone(), "retired"));
         }
     } else {
@@ -387,14 +746,20 @@ async fn snapshot_action(State(s): State<AppState>, Path((id, action)): Path<(St
         }
         changes.push((target.id, target.snapshot_id.clone(), "retired"));
         if target.status == "active"
-            && let Some(prev) = snaps
-                .iter()
-                .filter(|o| o.id != target.id && o.timescale == target.timescale && o.status == "retired")
-                .max_by(|a, b| a.created_at.cmp(&b.created_at))
+            && let Some(prev) = rollback_target(&snaps, target)
         {
             changes.push((prev.id, prev.snapshot_id.clone(), "active"));
         }
     }
+    // The active snapshot this promotion replaces (recorded on the target for a later rollback).
+    let replaced = (action == "promote")
+        .then(|| {
+            snaps
+                .iter()
+                .find(|o| o.id != target.id && o.timescale == target.timescale && o.status == "active")
+                .map(|o| o.snapshot_id.clone())
+        })
+        .flatten();
     let mut applied = Vec::new();
     for (hid, sid, status) in &changes {
         match s.hub.set_snapshot_status(*hid, status).await {
@@ -402,35 +767,70 @@ async fn snapshot_action(State(s): State<AppState>, Path((id, action)): Path<(St
             Err(e) => return hub_error(e),
         }
     }
+    if let Some(prev) = replaced.as_deref()
+        && let Err(e) = s.hub.set_snapshot_previous_active(target.id, prev).await
+    {
+        return hub_error(e);
+    }
     // The runtime follows the status change: reload the timescale onto the new active snapshot
     // (promote: the target; rollback: the previous active when one exists, else the baseline).
     let new_active = changes.iter().find(|(_, _, st)| *st == "active").map(|(_, sid, _)| sid.clone());
-    let reload = reload_runtime(&s, &target.timescale, new_active.as_deref()).await;
-    let audited =
-        audit(&s, &format!("latent.snapshot.{action}"), &id, json!({ "changes": applied, "reload": reload })).await;
-    Json(json!({ "ok": true, "snapshot_id": id, "action": action, "changes": applied, "reload": reload, "audited": audited }))
-        .into_response()
+    let mut args = vec![("timescale", target.timescale.as_str())];
+    if let Some(id) = new_active.as_deref() {
+        args.push(("snapshot_id", id));
+    }
+    let reload = ctl_model(&s, "reload", &args, Duration::from_secs(30)).await;
+    let audited = audit(
+        &s,
+        &format!("latent.snapshot.{action}"),
+        &id,
+        json!({ "changes": applied, "reload": reload, "gate": gate }),
+    )
+    .await;
+    Json(json!({
+        "ok": true, "snapshot_id": id, "action": action, "changes": applied, "reload": reload,
+        "gate": gate, "audited": audited,
+    }))
+    .into_response()
 }
 
-/// `ctl.model.reload` request/reply; never fails the route (the Helix status is already set).
-async fn reload_runtime(s: &AppState, timescale: &str, snapshot_id: Option<&str>) -> Value {
-    let Some(client) = s.nats.as_ref().filter(|_| s.nats_connected()) else {
-        return json!({ "ok": false, "detail": "NATS not connected; model-runtime keeps its current encoder" });
-    };
-    let mut args = HashMap::from([("timescale".to_owned(), timescale.to_owned())]);
-    if let Some(id) = snapshot_id {
-        args.insert("snapshot_id".into(), id.to_owned());
+/// The snapshot a `rollback` of `target` re-activates: the one `target` replaced on promotion
+/// (`previous_active`, D-065) when it still exists in the same timescale; otherwise, for snapshots
+/// promoted before that field existed, the newest other retired snapshot of the timescale.
+fn rollback_target<'a>(snaps: &'a [fa_hub::Snapshot], target: &fa_hub::Snapshot) -> Option<&'a fa_hub::Snapshot> {
+    let same_ts = |o: &&fa_hub::Snapshot| o.id != target.id && o.timescale == target.timescale;
+    if let Some(prev_id) = target.previous_active.as_deref()
+        && let Some(prev) = snaps.iter().filter(same_ts).find(|o| o.snapshot_id == prev_id)
+    {
+        return Some(prev);
     }
-    let req = CtlRequest { verb: "reload".into(), args };
-    let subject = fa_bus::subjects::ctl("model", "reload");
+    snaps.iter().filter(same_ts).filter(|o| o.status == "retired").max_by(|a, b| a.created_at.cmp(&b.created_at))
+}
+
+/// `ctl.model.<verb>` request/reply; never fails: `{ok, detail, subject, error?}` where
+/// `error` is `nats_unavailable | runtime_timeout | runtime_error | bad_reply`.
+async fn ctl_model(s: &AppState, verb: &str, args: &[(&str, &str)], timeout: Duration) -> Value {
+    let subject = fa_bus::subjects::ctl("model", verb);
+    let Some(client) = s.nats.as_ref().filter(|_| s.nats_connected()) else {
+        return json!({ "ok": false, "error": "nats_unavailable", "detail": "NATS not connected; model-runtime keeps its current state", "subject": subject });
+    };
+    let args: HashMap<String, String> = args.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+    let req = CtlRequest { verb: verb.into(), args: args.clone() };
     let fut = client.request(subject.clone(), req.encode_to_vec().into());
-    match tokio::time::timeout(Duration::from_secs(30), fut).await {
+    match tokio::time::timeout(timeout, fut).await {
         Ok(Ok(msg)) => match CtlReply::decode(msg.payload.as_ref()) {
-            Ok(r) => json!({ "ok": r.ok, "detail": r.message, "subject": subject, "snapshot_id": snapshot_id }),
-            Err(e) => json!({ "ok": false, "detail": format!("bad reply: {e}"), "subject": subject }),
+            Ok(r) => json!({ "ok": r.ok, "detail": r.message, "subject": subject, "args": args }),
+            Err(e) => {
+                json!({ "ok": false, "error": "bad_reply", "detail": format!("bad reply: {e}"), "subject": subject })
+            }
         },
-        Ok(Err(e)) => json!({ "ok": false, "detail": format!("{e} (is model-runtime running?)"), "subject": subject }),
-        Err(_) => json!({ "ok": false, "detail": "no reply within 30s", "subject": subject }),
+        Ok(Err(e)) => {
+            json!({ "ok": false, "error": "runtime_error", "detail": format!("{e} (is model-runtime running?)"), "subject": subject })
+        }
+        Err(_) => json!({
+            "ok": false, "error": "runtime_timeout", "subject": subject,
+            "detail": format!("no reply within {}s (model-runtime without `{verb}` support?)", timeout.as_secs()),
+        }),
     }
 }
 
@@ -474,6 +874,35 @@ async fn ws_latent(ws: WebSocketUpgrade, State(state): State<AppState>, Query(q)
 
 #[cfg(test)]
 mod tests {
+    fn hsnap(id: u64, sid: &str, status: &str, created: &str, prev: Option<&str>) -> fa_hub::Snapshot {
+        fa_hub::Snapshot {
+            id,
+            snapshot_id: sid.into(),
+            timescale: "1m".into(),
+            encoder_family: "statistical".into(),
+            generation: 0,
+            garage_key: String::new(),
+            status: status.into(),
+            created_at: Some(created.into()),
+            carried_mass: None,
+            manifest: None,
+            previous_active: prev.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn rollback_restores_the_replaced_snapshot_not_the_newest_retired() {
+        let baseline = hsnap(1, "stat-v1-1m", "retired", "2026-11-10T01:00:00Z", None);
+        let newer_retired = hsnap(2, "bad-candidate", "retired", "2026-11-10T03:00:00Z", None);
+        let active = hsnap(3, "g1", "active", "2026-11-10T02:00:00Z", Some("stat-v1-1m"));
+        let snaps = vec![baseline.clone(), newer_retired.clone(), active.clone()];
+        assert_eq!(super::rollback_target(&snaps, &active).map(|s| s.snapshot_id.as_str()), Some("stat-v1-1m"));
+        // Legacy rows without `previous_active` keep the newest-retired fallback.
+        let legacy = hsnap(4, "g0", "active", "2026-11-10T02:30:00Z", None);
+        let snaps = vec![baseline, newer_retired, legacy.clone()];
+        assert_eq!(super::rollback_target(&snaps, &legacy).map(|s| s.snapshot_id.as_str()), Some("bad-candidate"));
+    }
+
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -573,5 +1002,227 @@ mod tests {
         let (s, _) = send(Request::post("/api/latent/snapshots/x/explode").body(Body::empty()).unwrap()).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert_eq!(expert_space_id("stat-v1-1m", 2), "stat-v1-1m-e2");
+        // new routes resolve (Helix down → 503), bad promote body → 400 before any lookup
+        for req in [
+            Request::get("/api/latent/snapshots/x").body(Body::empty()).unwrap(),
+            Request::post("/api/latent/snapshots/x/shadow").body(Body::empty()).unwrap(),
+            Request::delete("/api/latent/snapshots/x/shadow").body(Body::empty()).unwrap(),
+            Request::post("/api/latent/snapshots/x/shadow/stop").body(Body::empty()).unwrap(),
+        ] {
+            let (s, v) = send(req).await;
+            assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        }
+        let (s, v) = send(Request::post("/api/latent/snapshots/x/promote").body(Body::from("{nope")).unwrap()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    }
+
+    fn counters(pairs: &[(&str, f64)]) -> std::collections::BTreeMap<String, f64> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect()
+    }
+
+    #[test]
+    fn checklist_logic() {
+        let th = PromotionThresholds::default();
+        let id = "stat-v1-1m-g1-1794292853";
+        let marker = format!("shadow.1m.snapshot_id.{id}");
+        let good = counters(&[
+            ("shadow.1m.snapshot", 1.0),
+            (&marker, 1.0),
+            ("shadow.1m.minutes", 45.0),
+            ("shadow.1m.region_agreement", 0.6),
+            ("shadow.1m.states", 300.0),
+        ]);
+        let c = promotion_checklist(id, "1m", Some(0.8), Some(&good), false, th);
+        assert!(c.passed, "{c:?}");
+        assert_eq!(
+            c.checks.iter().map(|c| c.name).collect::<Vec<_>>(),
+            vec!["carried_mass", "shadow_served", "shadow_minutes", "shadow_region_agreement"]
+        );
+
+        // each item fails on its own
+        let fail = |c: &Checklist| c.checks.iter().filter(|x| !x.ok).map(|x| x.name).collect::<Vec<_>>();
+        assert_eq!(fail(&promotion_checklist(id, "1m", Some(0.2), Some(&good), false, th)), vec!["carried_mass"]);
+        assert_eq!(fail(&promotion_checklist(id, "1m", None, Some(&good), false, th)), vec!["carried_mass"]);
+        assert!(promotion_checklist(id, "1m", Some(0.2), Some(&good), true, th).passed, "representation break waives");
+        let short = counters(&[(&marker, 1.0), ("shadow.1m.minutes", 5.0), ("shadow.1m.region_agreement", 0.6)]);
+        assert_eq!(fail(&promotion_checklist(id, "1m", Some(0.8), Some(&short), false, th)), vec!["shadow_minutes"]);
+        let disagree = counters(&[(&marker, 1.0), ("shadow.1m.minutes", 50.0), ("shadow.1m.region_agreement", 0.1)]);
+        assert_eq!(
+            fail(&promotion_checklist(id, "1m", Some(0.8), Some(&disagree), false, th)),
+            vec!["shadow_region_agreement"]
+        );
+        // another snapshot in shadow: its minutes/agreement do not count for this one
+        let other = counters(&[
+            ("shadow.1m.snapshot", 1.0),
+            ("shadow.1m.snapshot_id.stat-v1-1m-g1-1", 1.0),
+            ("shadow.1m.minutes", 500.0),
+            ("shadow.1m.region_agreement", 0.9),
+        ]);
+        let c = promotion_checklist(id, "1m", Some(0.8), Some(&other), false, th);
+        assert_eq!(fail(&c), vec!["shadow_served", "shadow_minutes", "shadow_region_agreement"]);
+        assert_eq!(c.checks[2].value, None);
+        assert!(c.checks[1].detail.contains("stat-v1-1m-g1-1"), "{}", c.checks[1].detail);
+        assert_eq!(shadow_id(&other, "1m").as_deref(), Some("stat-v1-1m-g1-1"));
+        // wrong timescale gauges, and no heartbeat at all
+        let c = promotion_checklist(id, "1h", Some(0.8), Some(&good), false, th);
+        assert!(!c.passed);
+        let c = promotion_checklist(id, "1m", Some(0.8), None, false, th);
+        assert_eq!(c.checks[1].detail, "no fresh model-runtime heartbeat");
+        // thresholds are inclusive; a zeroed marker does not count
+        let edge = counters(&[(&marker, 1.0), ("shadow.1m.minutes", 30.0), ("shadow.1m.region_agreement", 0.3)]);
+        assert!(promotion_checklist(id, "1m", Some(0.5), Some(&edge), false, th).passed, "thresholds are inclusive");
+        let stopped = counters(&[(&marker, 0.0), ("shadow.1m.minutes", 30.0), ("shadow.1m.region_agreement", 0.3)]);
+        assert!(!promotion_checklist(id, "1m", Some(0.5), Some(&stopped), false, th).passed);
+    }
+
+    #[test]
+    fn thresholds_from_env_fall_back_to_defaults() {
+        // Only the defaults are asserted: tests share the process environment.
+        let d = PromotionThresholds::default();
+        assert_eq!((d.min_carried_mass, d.min_shadow_minutes, d.min_region_agreement), (0.5, 30.0, 0.3));
+        if std::env::var("FA_PROMOTE_MIN_CARRIED_MASS").is_err() {
+            assert_eq!(PromotionThresholds::from_env().min_carried_mass, 0.5);
+        }
+    }
+
+    /// Route behaviour with a fake Helix (Snapshot rows) and synthetic model-runtime heartbeat
+    /// counters: 409 + checklist, force → 200, then pass with good counters.
+    #[tokio::test]
+    async fn promote_route_enforces_checklist_with_synthetic_heartbeat() {
+        use axum::routing::post as axpost;
+        use std::sync::{Arc, Mutex as StdMutex};
+        let id = "stat-v1-1m-g1-1794292853";
+        let manifest = json!({ "snapshot_id": id, "metrics": { "carried_mass": 0.72 } }).to_string();
+        let rows = Arc::new(StdMutex::new(vec![
+            json!({ "$id": 1, "snapshot_id": "stat-v1-1m", "timescale": "1m", "encoder_family": "statistical", "generation": 0, "garage_key": "", "status": "active" }),
+            json!({ "$id": 2, "snapshot_id": id, "timescale": "1m", "encoder_family": "statistical", "generation": 1, "garage_key": "", "status": "candidate", "carried_mass": 0.72, "manifest": manifest }),
+        ]));
+        // Fake Helix: answers every batch from `rows`; a write with set_property flips a status.
+        let fake = {
+            let rows = rows.clone();
+            Router::new().route(
+                "/v2/query",
+                axpost(move |Json(req): Json<Value>| {
+                    let rows = rows.clone();
+                    async move {
+                        let text = req.to_string();
+                        let mut rows = rows.lock().unwrap();
+                        if text.contains("set_property") {
+                            let hid = if text.contains(r#""ids":[2]"#) { 2 } else { 1 };
+                            let status = ["active", "retired", "shadow", "candidate"]
+                                .into_iter()
+                                .find(|s| text.contains(&format!(r#""string":"{s}""#)))
+                                .unwrap_or("active");
+                            for r in rows.iter_mut() {
+                                if r["$id"] == hid {
+                                    r["status"] = json!(status);
+                                }
+                            }
+                            let row = rows.iter().find(|r| r["$id"] == hid).cloned().unwrap();
+                            return Json(json!({ "row": [row] }));
+                        }
+                        if text.contains("list_snapshots") {
+                            return Json(json!({ "rows": rows.clone() }));
+                        }
+                        if text.contains("AdapterState") {
+                            return Json(json!({ "rows": [] }));
+                        }
+                        let hit: Vec<Value> = rows
+                            .iter()
+                            .filter(|r| text.contains(r["snapshot_id"].as_str().unwrap()))
+                            .cloned()
+                            .collect();
+                        let best = hit.iter().max_by_key(|r| r["snapshot_id"].as_str().unwrap().len()).cloned();
+                        Json(json!({ "row": best.map(|b| vec![b]).unwrap_or_default() }))
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config");
+        let cfg = fa_core::config::PlatformConfig::load(format!("{root}/platform.toml")).unwrap();
+        let state = AppState::new(cfg, format!("{root}/sources.yaml").into(), None);
+        let state = AppState { hub: fa_hub::HubClient::new(format!("http://{addr}")), ..state };
+        let heartbeat = |pairs: &[(&str, f64)]| {
+            state.record_heartbeat(fa_proto::v1::Heartbeat {
+                service: "model-runtime".into(),
+                instance_id: "test".into(),
+                at: None,
+                version: "test".into(),
+                counters: pairs.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect(),
+            });
+        };
+        let app = router().with_state(state.clone());
+        let call = |req: Request<Body>| {
+            let app = app.clone();
+            async move {
+                let res = app.oneshot(req).await.unwrap();
+                let status = res.status();
+                let body = res.into_body().collect().await.unwrap().to_bytes();
+                (status, serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null))
+            }
+        };
+        let promote = |body: &str| {
+            Request::post(format!("/api/latent/snapshots/{id}/promote")).body(Body::from(body.to_owned())).unwrap()
+        };
+
+        // 1. no shadow yet (heartbeat without shadow gauges) → 409 with the checklist
+        heartbeat(&[("trades_total", 10.0)]);
+        let (s, v) = call(promote("")).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["error"], "promotion_checks_failed");
+        assert_eq!(v["failing"], json!(["shadow_served", "shadow_minutes", "shadow_region_agreement"]));
+        assert_eq!(v["checklist"]["checks"][0]["value"], 0.72);
+        assert_eq!(rows.lock().unwrap()[1]["status"], "candidate", "nothing changed");
+
+        // 2. detail route shows the same checklist and the shadow gauges
+        let marker = format!("shadow.1m.snapshot_id.{id}");
+        heartbeat(&[
+            ("shadow.1m.snapshot", 1.0),
+            (&marker, 1.0),
+            ("shadow.1m.minutes", 12.0),
+            ("shadow.1m.region_agreement", 0.5),
+        ]);
+        let (s, v) = call(Request::get(format!("/api/latent/snapshots/{id}")).body(Body::empty()).unwrap()).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["manifest_source"], "helix");
+        assert_eq!(v["checklist"]["passed"], false);
+        assert_eq!(v["shadow_gauges"]["shadow.1m.minutes"], 12.0);
+        let (s, v) = call(promote("")).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert_eq!(v["failing"], json!(["shadow_minutes"]));
+
+        // 3. force overrides (NATS absent: reload reports nats_unavailable, route still 200)
+        let (s, v) = call(promote(r#"{"force": true, "note": "test override"}"#)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["gate"]["forced"], true);
+        assert_eq!(v["gate"]["note"], "test override");
+        assert_eq!(v["reload"]["error"], "nats_unavailable");
+        assert_eq!(rows.lock().unwrap()[1]["status"], "active");
+        assert_eq!(rows.lock().unwrap()[0]["status"], "retired");
+
+        // 4. back to candidate; with enough shadow minutes it passes unforced
+        rows.lock().unwrap()[1]["status"] = json!("shadow");
+        rows.lock().unwrap()[0]["status"] = json!("active");
+        heartbeat(&[
+            ("shadow.1m.snapshot", 1.0),
+            (&marker, 1.0),
+            ("shadow.1m.minutes", 31.0),
+            ("shadow.1m.region_agreement", 0.5),
+        ]);
+        let (s, v) = call(promote("")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["gate"]["forced"], false);
+        assert_eq!(v["gate"]["checklist"]["passed"], true);
+
+        // 5. shadow start without NATS → 503 with the runtime error
+        rows.lock().unwrap()[1]["status"] = json!("candidate");
+        let (s, v) =
+            call(Request::post(format!("/api/latent/snapshots/{id}/shadow")).body(Body::empty()).unwrap()).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["runtime"]["error"], "nats_unavailable");
     }
 }

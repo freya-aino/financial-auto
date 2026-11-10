@@ -11,11 +11,24 @@ performance_decay = 0.95
 signal_ttl_secs = 60
 no_trade_band_frac = 0.005  # exec.no_trade_band
 min_order_eur = 25.0
-default_asset_class = "equity" # synthetic/unknown instruments are treated as equities
+default_asset_class = "equity" # instruments without reference data (ref.instrument) are treated as equities (counted: refdata.unknown)
+refdata_refresh_secs = 300  # reload ref.instrument/listing/venue (asset class, venue, quote ccy, status, source); also on ref.changed.* / ingest.unresolved.*
 volume_window_secs = 3600   # traded volume window behind the liquidity cap
 pending_ttl_secs = 10
 snapshot_secs = 60          # ledger.position_snapshot + ledger.strategy_state cadence when [postgres] is reachable (also on halt)
 reconcile_secs = 300        # in-memory book vs Postgres-derived book → ledger.reconciliation_run; a diff HALTS scope `broker` (spec 42)
+
+# EUR accounting FX (spec 42 §6, spec 12 §6/§7; D-061). Marks and fills are converted from the
+# instrument's quote currency (ref.instrument.quote_ccy; unknown = EUR) as of the event time with
+# the latest ref.fx_rate row of `source` at or before it. The engine fetches the ECB daily
+# reference rates itself and upserts them idempotently on (ccy, ts, source_id). Without
+# Postgres the table is empty and every conversion is 1.0 (D-028 behaviour).
+[fx]
+ecb_refresh_secs = 86400    # https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml (TARGET working days ~16:00 CET)
+max_age_hours = 72          # rate older than this at the event time → `stale` flag + fx.stale counter (long weekends briefly trip it)
+halt_on_stale = false       # true: reduce-only halt scope `fx` while any used currency is stale (spec 42 §8); false: warning only
+source = "ecb_daily"        # fx.accounting_source
+history_days = 60           # rates loaded into memory at start (older fills use the earliest known rate, flagged stale)
 
 # Strategy lifecycle (spec 40 §3, §6.6; D-051). A strategy first seen on signal.exposure.<id> gets
 # `new_strategy_status`: "active" allocates paper capital at once (baseline behaviour), "shadow"
@@ -36,11 +49,13 @@ max_drawdown = 0.10         # risk.portfolio_max_drawdown → kill switch, manua
 strategy_max_drawdown = 0.05 # risk.strategy_max_drawdown: attributed P&L drawdown vs sleeve → pause + flatten that strategy
 max_daily_loss = 0.02       # risk.daily_loss_limit → reduce-only for the rest of the UTC day
 max_position_frac = 0.05    # risk.max_position_pct per instrument
+# provisional_position_frac = 0.025 # per instrument whose ref.instrument.status is `provisional` (D-050); default = max_position_frac × 0.5, never above it
 max_class_frac = 0.40       # risk.max_class_pct: gross per asset class / deployable
 max_venue_frac = 0.50       # risk.max_venue_pct: gross per venue / deployable (counterparty risk)
 portfolio_gross_cap = 2.0   # risk.portfolio_gross_cap: total gross / deployable
 liquidity_k = 0.01          # |position| ≤ k × horizon volume (EUR)
-daily_payout_quota_eur = 0  # payout rule still open (spec 42 Q1)
+daily_payout_quota_eur = 0  # payout rule still open (spec 42 Q1); the larger of this and today's ledger.payout_quota row is reserved
+                            # (deployable = equity − reserve); ctl.risk.limits {set: {daily_payout_quota_eur}} raises both (tighten-only)
 
 [limits.leverage_cap]       # risk.gross_leverage_cap.<class>
 equity = 1.5

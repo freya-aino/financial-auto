@@ -83,7 +83,7 @@ fn holdout_json(h: &HoldoutRow) -> Value {
 
 impl Worker {
     /// `evo.eval.strategy.holdout`.
-    pub async fn evaluate_holdout(&self, job: &Job) -> Outcome {
+    pub async fn evaluate_holdout(&self, job: &Job, run: &crate::run::JobRun) -> Outcome {
         let started = Instant::now();
         let spec = match parse_spec(job) {
             Ok(s) => s,
@@ -127,7 +127,7 @@ impl Worker {
             return self.failed(job, format!("rejected: {e}"), 0);
         }
         let def = genome.def();
-        self.progress(&job.job_id, 0.0, format!("holdout {} for {}", holdout.id, def.id)).await;
+        run.progress(0.0, format!("holdout {} for {}", holdout.id, def.id)).await;
 
         // 3. bars over exactly the holdout window
         let need = genome.lookback_bars + genome.steps as usize + 2;
@@ -169,7 +169,7 @@ impl Worker {
         debug_assert!(replay::check_holdout(&rspec, std::slice::from_ref(&holdout.holdout)).is_ok());
         let data_block = data_json(&loaded);
         let run = match self
-            .replay_within_budget(job, &def, &rspec, loaded.bars, vec![holdout.holdout.clone()], started)
+            .replay_within_budget(job, run, &def, &rspec, loaded.bars, vec![holdout.holdout.clone()], started)
             .await
         {
             Ok(r) => r,
@@ -306,19 +306,19 @@ pub(crate) mod tests {
             spec: spec.into_bytes(),
             ..Default::default()
         };
-        let out = worker.evaluate_holdout(&job(r#"{"candidate": "gp-1"}"#.into())).await;
+        let out = worker.handle(&job(r#"{"candidate": "gp-1"}"#.into())).await;
         assert_eq!(out.result.status, Status::Failed as i32);
         assert!(out.result.error.contains("rejected: holdout spec"), "{}", out.result.error);
         let good = format!(
             r#"{{"candidate": "{{ id = \"gp-1\", timescale = \"1s\", signal = \"1\" }}", "holdout_id": "{id}"}}"#
         );
-        let out = worker.evaluate_holdout(&job(good.clone())).await;
+        let out = worker.handle(&job(good.clone())).await;
         assert!(out.result.error.contains("need the Postgres trial registry"), "{}", out.result.error);
         if std::env::var("FA_PG_TEST").ok().as_deref() == Some("1") {
             let url = std::env::var("FA_PG_URL").unwrap_or_else(|_| "postgres://fa:fa@127.0.0.1:5432/fa".into());
             worker.trials = trials::TrialStore::connect(&url).await;
             assert!(worker.trials.is_some());
-            let out = worker.evaluate_holdout(&job(good)).await;
+            let out = worker.handle(&job(good)).await;
             assert_eq!(out.result.status, Status::Failed as i32);
             assert!(out.result.error.contains("is not locked"), "{}", out.result.error);
             eprintln!("unknown holdout → {}", out.result.error);

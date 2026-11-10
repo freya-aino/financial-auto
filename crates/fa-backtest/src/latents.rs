@@ -15,8 +15,11 @@
 //!   `as_of ≤ t`, so a latent published or dated after the step is never visible (test);
 //! * [`check_snapshot`] enforces spec 41 §4 `ReplaySpec.snapshot`: latents of a different encoder
 //!   snapshot than the declared one are refused unless the purpose is `Diagnostic`;
-//! * [`LatentCache`] is a small bounded cache of loaded windows keyed by [`CacheKey`] (window,
-//!   timescale, instrument set) so one load serves every candidate of a generation.
+//! * [`RecordingCache`] / [`LatentCache`] cache loaded windows keyed by [`CacheKey`] (window,
+//!   timescale, instrument set) so one load serves every candidate of a generation, and **extend**
+//!   a cached recording when a new window overlaps it ([`CachePlan::Extend`]: only the missing
+//!   ranges are read and merged in knowledge-time order; eviction by total messages), so the
+//!   now-relative windows of consecutive jobs hit the cache instead of re-reading the stream.
 //!
 //! Windows that predate the recordings simply yield no graph/decoder data; every primitive then
 //! falls back to the price statistics and the report's `sources.fallback` counts it (D-053).
@@ -38,8 +41,6 @@ use crate::{
 
 /// Default recency window for decoder outputs (the live runtime's default).
 pub const DEFAULT_DECODER_MAX_AGE_MS: i64 = fa_strategies::decoders::DEFAULT_MAX_AGE_MS;
-/// Default [`LatentCache`] capacity (windows).
-pub const DEFAULT_CACHE_WINDOWS: usize = 8;
 
 /// What a recording contains.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,60 +269,174 @@ pub struct CacheKey {
 
 impl CacheKey {
     pub fn of(spec: &ReplaySpec) -> Self {
-        let mut instruments: Vec<String> = spec.instruments.iter().map(|i| fa_decoders::instrument_token(i)).collect();
+        Self::new(spec.window_ms.0, spec.window_ms.1, spec.timescale, &spec.instruments)
+    }
+
+    pub fn new(start_ms: i64, end_ms: i64, timescale: Timescale, instruments: &[String]) -> Self {
+        let mut instruments: Vec<String> = instruments.iter().map(|i| fa_decoders::instrument_token(i)).collect();
         instruments.sort();
         instruments.dedup();
-        Self { start_ms: spec.window_ms.0, end_ms: spec.window_ms.1, timescale: spec.timescale, instruments }
+        Self { start_ms, end_ms, timescale, instruments }
+    }
+
+    /// The window-free part: which recording this key addresses.
+    pub fn identity(&self) -> RecordingId {
+        RecordingId { timescale: self.timescale, instruments: self.instruments.clone() }
     }
 }
 
-/// Bounded least-recently-used cache of recorded windows.
+/// Identity of one cached recording: everything of a [`CacheKey`] but the time range.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RecordingId {
+    pub timescale: Timescale,
+    pub instruments: Vec<String>,
+}
+
+/// What a cache lookup needs the caller to read (D-059 open item: incremental extension).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CachePlan {
+    /// The cached recording covers the window: slice it.
+    Hit,
+    /// A cached recording overlaps (or touches) the window: read only `read` (at most a range
+    /// before and a range after the cached span, each `[start, end]` inclusive) and
+    /// [`RecordingCache::extend`].
+    Extend { read: Vec<(i64, i64)> },
+    /// Nothing usable: read the whole window and [`RecordingCache::insert`].
+    Miss,
+}
+
+/// Forward extensions re-read this much of the cached tail so messages that arrived at the live
+/// edge after the previous read are picked up (duplicates are dropped by stream sequence).
+pub const EXTEND_OVERLAP_MS: i64 = 5_000;
+/// Default [`RecordingCache`] budget in messages across every recording.
+pub const DEFAULT_CACHE_MESSAGES: usize = 2_000_000;
+
+/// One cached recording: raw messages in knowledge-time order covering `covered` (inclusive).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CachedRecording {
+    pub covered: (i64, i64),
+    pub records: Vec<RecordedMessage>,
+}
+
+impl CachedRecording {
+    /// Records published within `[start, end]` (the records are sorted by publish time).
+    pub fn slice(&self, start_ms: i64, end_ms: i64) -> Vec<RecordedMessage> {
+        let lo = self.records.partition_point(|r| r.published_ms < start_ms);
+        let hi = self.records.partition_point(|r| r.published_ms <= end_ms);
+        if lo >= hi { Vec::new() } else { self.records[lo..hi].to_vec() }
+    }
+}
+
+/// Bounded cache of **raw** stream recordings that grows a cached time range instead of
+/// re-reading it: a window overlapping a cached span is served by reading only the missing
+/// ranges and merging them in knowledge-time order ([`sort_records`]); the budget is counted in
+/// messages over every recording (least recently used recordings evicted first, the oldest
+/// records of a single oversized recording dropped). Pure: the caller does the stream reads.
 #[derive(Debug)]
-pub struct LatentCache {
-    cap: usize,
-    entries: VecDeque<(CacheKey, Arc<RecordedLatents>)>,
+pub struct RecordingCache {
+    max_messages: usize,
+    /// Least recently used first.
+    entries: VecDeque<(RecordingId, CachedRecording)>,
     pub hits: u64,
+    pub extends: u64,
     pub misses: u64,
 }
 
-impl Default for LatentCache {
+impl Default for RecordingCache {
     fn default() -> Self {
-        Self::new(DEFAULT_CACHE_WINDOWS)
+        Self::new(DEFAULT_CACHE_MESSAGES)
     }
 }
 
-impl LatentCache {
-    pub fn new(cap: usize) -> Self {
-        Self { cap: cap.max(1), entries: VecDeque::new(), hits: 0, misses: 0 }
+impl RecordingCache {
+    pub fn new(max_messages: usize) -> Self {
+        Self { max_messages: max_messages.max(1), entries: VecDeque::new(), hits: 0, extends: 0, misses: 0 }
     }
 
-    /// Looks a window up (and marks it most recently used).
-    pub fn get(&mut self, key: &CacheKey) -> Option<Arc<RecordedLatents>> {
-        let pos = self.entries.iter().position(|(k, _)| k == key);
-        match pos {
-            Some(i) => {
-                let e = self.entries.remove(i).expect("position exists");
-                let v = e.1.clone();
-                self.entries.push_back(e);
-                self.hits += 1;
-                Some(v)
-            }
-            None => {
-                self.misses += 1;
-                None
-            }
+    fn position(&self, id: &RecordingId) -> Option<usize> {
+        self.entries.iter().position(|(k, _)| k == id)
+    }
+
+    fn touch(&mut self, i: usize) -> &mut CachedRecording {
+        let e = self.entries.remove(i).expect("position exists");
+        self.entries.push_back(e);
+        &mut self.entries.back_mut().expect("just pushed").1
+    }
+
+    /// Decides how to serve `[start, end]` for `id` (counts the outcome, marks the entry used).
+    pub fn plan(&mut self, id: &RecordingId, start_ms: i64, end_ms: i64) -> CachePlan {
+        let Some(i) = self.position(id) else {
+            self.misses += 1;
+            return CachePlan::Miss;
+        };
+        let (c0, c1) = self.entries[i].1.covered;
+        if c0 <= start_ms && c1 >= end_ms {
+            self.hits += 1;
+            self.touch(i);
+            return CachePlan::Hit;
         }
+        // overlapping or touching (the next millisecond counts as touching)
+        if start_ms > c1 + 1 || end_ms < c0 - 1 {
+            self.misses += 1;
+            return CachePlan::Miss;
+        }
+        let mut read = Vec::new();
+        if start_ms < c0 {
+            read.push((start_ms, c0 - 1));
+        }
+        if end_ms > c1 {
+            read.push(((c1 - EXTEND_OVERLAP_MS).max(c0), end_ms));
+        }
+        self.extends += 1;
+        self.touch(i);
+        CachePlan::Extend { read }
     }
 
-    /// Inserts (or replaces) a window, evicting the least recently used beyond the capacity.
-    pub fn insert(&mut self, key: CacheKey, value: RecordedLatents) -> Arc<RecordedLatents> {
-        self.entries.retain(|(k, _)| *k != key);
-        let v = Arc::new(value);
-        self.entries.push_back((key, v.clone()));
-        while self.entries.len() > self.cap {
+    /// Records of `id` published within `[start, end]`, when the span is covered.
+    pub fn slice(&self, id: &RecordingId, start_ms: i64, end_ms: i64) -> Option<Vec<RecordedMessage>> {
+        let (_, rec) = self.entries.iter().find(|(k, _)| k == id)?;
+        (rec.covered.0 <= start_ms && rec.covered.1 >= end_ms).then(|| rec.slice(start_ms, end_ms))
+    }
+
+    /// Replaces the recording of `id` with `records` covering `[start, end]`.
+    pub fn insert(&mut self, id: &RecordingId, start_ms: i64, end_ms: i64, mut records: Vec<RecordedMessage>) {
+        sort_records(&mut records);
+        self.entries.retain(|(k, _)| k != id);
+        self.entries.push_back((id.clone(), CachedRecording { covered: (start_ms, end_ms), records }));
+        self.evict();
+    }
+
+    /// Merges `extra` (read for the ranges of a [`CachePlan::Extend`]) into the recording of
+    /// `id`; the covered span becomes the union with `[start, end]`. Falls back to an insert when
+    /// the recording was evicted meanwhile.
+    pub fn extend(&mut self, id: &RecordingId, start_ms: i64, end_ms: i64, extra: Vec<RecordedMessage>) {
+        let Some(i) = self.position(id) else {
+            return self.insert(id, start_ms, end_ms, extra);
+        };
+        let rec = self.touch(i);
+        rec.records.extend(extra);
+        sort_records(&mut rec.records);
+        rec.covered = (rec.covered.0.min(start_ms), rec.covered.1.max(end_ms));
+        self.evict();
+    }
+
+    /// Enforces the message budget: least recently used recordings go first; a single recording
+    /// above the budget loses its oldest records (its covered start moves to the first kept one).
+    fn evict(&mut self) {
+        while self.entries.len() > 1 && self.total_messages() > self.max_messages {
             self.entries.pop_front();
         }
-        v
+        if let Some((_, rec)) = self.entries.back_mut()
+            && rec.records.len() > self.max_messages
+        {
+            let drop = rec.records.len() - self.max_messages;
+            rec.records.drain(..drop);
+            rec.covered.0 = rec.records.first().map_or(rec.covered.1, |r| r.published_ms);
+        }
+    }
+
+    pub fn total_messages(&self) -> usize {
+        self.entries.iter().map(|(_, r)| r.records.len()).sum()
     }
 
     pub fn len(&self) -> usize {
@@ -330,6 +445,97 @@ impl LatentCache {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Covered span of a recording.
+    pub fn covered(&self, id: &RecordingId) -> Option<(i64, i64)> {
+        self.entries.iter().find(|(k, _)| k == id).map(|(_, r)| r.covered)
+    }
+}
+
+/// [`RecordingCache`] for `LATENT` recordings plus a small memo of decoded windows, so repeated
+/// identical windows share one [`RecordedLatents`] and overlapping windows share the raw records.
+#[derive(Debug)]
+pub struct LatentCache {
+    pub raw: RecordingCache,
+    decoded: VecDeque<(CacheKey, Arc<RecordedLatents>)>,
+}
+
+/// Decoded windows kept by [`LatentCache`].
+pub const DECODED_MEMO: usize = 4;
+
+impl Default for LatentCache {
+    fn default() -> Self {
+        Self::new(DEFAULT_CACHE_MESSAGES)
+    }
+}
+
+impl LatentCache {
+    pub fn new(max_messages: usize) -> Self {
+        Self { raw: RecordingCache::new(max_messages), decoded: VecDeque::new() }
+    }
+
+    /// How to serve `key` (see [`RecordingCache::plan`]).
+    pub fn plan(&mut self, key: &CacheKey) -> CachePlan {
+        self.raw.plan(&key.identity(), key.start_ms, key.end_ms)
+    }
+
+    /// The decoded window after a [`CachePlan::Hit`] (`None` when not covered).
+    pub fn get(&mut self, key: &CacheKey) -> Option<Arc<RecordedLatents>> {
+        if let Some(i) = self.decoded.iter().position(|(k, _)| k == key) {
+            let e = self.decoded.remove(i).expect("position exists");
+            let v = e.1.clone();
+            self.decoded.push_back(e);
+            return Some(v);
+        }
+        let raw = self.raw.slice(&key.identity(), key.start_ms, key.end_ms)?;
+        Some(self.memo(key, raw))
+    }
+
+    fn memo(&mut self, key: &CacheKey, raw: Vec<RecordedMessage>) -> Arc<RecordedLatents> {
+        let v = Arc::new(RecordedLatents::new(raw));
+        self.decoded.retain(|(k, _)| k != key);
+        self.decoded.push_back((key.clone(), v.clone()));
+        while self.decoded.len() > DECODED_MEMO {
+            self.decoded.pop_front();
+        }
+        v
+    }
+
+    /// Stores a freshly read window and returns it decoded.
+    pub fn insert(&mut self, key: &CacheKey, records: Vec<RecordedMessage>) -> Arc<RecordedLatents> {
+        self.raw.insert(&key.identity(), key.start_ms, key.end_ms, records);
+        self.decoded.clear();
+        let raw = self.raw.slice(&key.identity(), key.start_ms, key.end_ms).unwrap_or_default();
+        self.memo(key, raw)
+    }
+
+    /// Merges the records read for a [`CachePlan::Extend`] and returns the window decoded.
+    pub fn extend(&mut self, key: &CacheKey, extra: Vec<RecordedMessage>) -> Arc<RecordedLatents> {
+        self.raw.extend(&key.identity(), key.start_ms, key.end_ms, extra);
+        self.decoded.clear();
+        let raw = self.raw.slice(&key.identity(), key.start_ms, key.end_ms).unwrap_or_default();
+        self.memo(key, raw)
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.raw.hits
+    }
+    pub fn extends(&self) -> u64 {
+        self.raw.extends
+    }
+    pub fn misses(&self) -> u64 {
+        self.raw.misses
+    }
+    /// Recordings held.
+    pub fn len(&self) -> usize {
+        self.raw.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+    pub fn total_messages(&self) -> usize {
+        self.raw.total_messages()
     }
 }
 
@@ -479,9 +685,9 @@ pub(crate) mod tests {
         assert_eq!(feed.graph.at(Timescale::Second, 1_050).cur_region(inst, 0).as_deref(), Some("a"));
         // the forecast dated 5 000 is published at 5 100
         feed.advance(5_050);
-        assert_eq!(feed.decoders.at(inst, 5_050, DEFAULT_DECODER_MAX_AGE_MS).fc_dist(), None, "published at 5 100");
+        assert_eq!(feed.decoders.at(inst, 5_050, DEFAULT_DECODER_MAX_AGE_MS).fc_dist(1), None, "published at 5 100");
         feed.advance(5_100);
-        assert!(feed.decoders.at(inst, 5_100, DEFAULT_DECODER_MAX_AGE_MS).fc_dist().is_some());
+        assert!(feed.decoders.at(inst, 5_100, DEFAULT_DECODER_MAX_AGE_MS).fc_dist(1).is_some());
         // jump: everything up to 9 s; the switch to b (as_of 10 s) is not visible
         feed.advance(9_999);
         let v = feed.graph.at(Timescale::Second, 9_999);
@@ -529,7 +735,6 @@ pub(crate) mod tests {
         // empty recording: nothing to check
         assert_eq!(check_snapshot(&spec, &RecordedLatents::default()).unwrap().declared, "");
 
-        let mut cache = LatentCache::new(2);
         let k = |s: i64, insts: &[&str]| {
             CacheKey::of(&ReplaySpec {
                 instruments: insts.iter().map(|i| (*i).to_owned()).collect(),
@@ -541,15 +746,94 @@ pub(crate) mod tests {
             vec!["a".to_owned(), "b1".to_owned()],
             "tokens sorted, deduped"
         );
-        assert!(cache.get(&k(0, &[])).is_none());
-        cache.insert(k(0, &[]), clean.clone());
-        cache.insert(k(1, &[]), RecordedLatents::default());
-        assert!(cache.get(&k(0, &[])).is_some(), "touch makes it recent");
-        cache.insert(k(2, &[]), RecordedLatents::default());
-        assert_eq!(cache.len(), 2);
-        assert!(cache.get(&k(1, &[])).is_none(), "least recently used evicted");
-        assert!(cache.get(&k(0, &[])).is_some());
-        assert_eq!((cache.hits, cache.misses), (2, 2));
+        assert_eq!(k(0, &["a"]).identity(), k(5, &["A"]).identity(), "identity ignores the window");
+        assert_ne!(k(0, &["a"]).identity(), k(0, &[]).identity());
+    }
+
+    /// Pure cache extension logic (D-059 open item): overlapping windows read only the missing
+    /// ranges, hits are exact slices, misses replace, the message budget evicts.
+    #[test]
+    fn recording_cache_extends_slices_and_evicts() {
+        let inst = InstrumentId::new();
+        let msgs = |from: i64, to: i64| -> Vec<RecordedMessage> {
+            (from..=to)
+                .map(|t| raw("latent.state.1s.x", t as u64, t * 1000, state_msg("s", inst, t * 1000, "a")))
+                .collect()
+        };
+        let id = RecordingId { timescale: Timescale::Second, instruments: vec![] };
+        let other = RecordingId { timescale: Timescale::Minute, instruments: vec![] };
+        let mut c = RecordingCache::new(100);
+        assert_eq!(c.plan(&id, 10_000, 20_000), CachePlan::Miss);
+        c.insert(&id, 10_000, 20_000, msgs(10, 20));
+        assert_eq!(c.covered(&id), Some((10_000, 20_000)));
+        // exact and inner windows hit; the slice is exactly the requested publish range
+        assert_eq!(c.plan(&id, 10_000, 20_000), CachePlan::Hit);
+        assert_eq!(c.plan(&id, 12_000, 15_000), CachePlan::Hit);
+        let sl = c.slice(&id, 12_000, 15_000).unwrap();
+        assert_eq!(sl.iter().map(|r| r.published_ms).collect::<Vec<_>>(), [12_000, 13_000, 14_000, 15_000]);
+        assert!(c.slice(&id, 9_000, 15_000).is_none(), "not covered → no slice");
+        // a now-relative window moving forward: only the tail (with the overlap) is read
+        let plan = c.plan(&id, 13_000, 25_000);
+        assert_eq!(plan, CachePlan::Extend { read: vec![(20_000 - EXTEND_OVERLAP_MS, 25_000)] });
+        c.extend(&id, 13_000, 25_000, msgs(15, 25)); // overlap duplicates 15..20
+        assert_eq!(c.covered(&id), Some((10_000, 25_000)));
+        assert_eq!(c.total_messages(), 16, "duplicates dropped by stream sequence");
+        assert_eq!(c.plan(&id, 13_000, 25_000), CachePlan::Hit);
+        assert_eq!(c.slice(&id, 13_000, 25_000).unwrap().len(), 13);
+        // backward + forward at once; touching ranges count as overlapping
+        assert_eq!(
+            c.plan(&id, 5_000, 30_000),
+            CachePlan::Extend { read: vec![(5_000, 9_999), (25_000 - EXTEND_OVERLAP_MS, 30_000)] }
+        );
+        assert_eq!(c.plan(&id, 25_001, 30_000), CachePlan::Extend { read: vec![(20_000, 30_000)] });
+        // a disjoint window is a miss and the insert replaces the recording
+        assert_eq!(c.plan(&id, 40_000, 50_000), CachePlan::Miss);
+        assert_eq!(c.plan(&id, 0, 8_000), CachePlan::Miss);
+        assert_eq!((c.hits, c.extends, c.misses), (3, 3, 3));
+        // another identity is independent; the budget evicts least recently used recordings first
+        let mut c = RecordingCache::new(100);
+        c.insert(&id, 10_000, 20_000, msgs(10, 20));
+        c.insert(&other, 0, 1_000_000, msgs(0, 90));
+        assert_eq!(c.len(), 1, "11 + 91 > 100: least recently used recording evicted");
+        assert_eq!(c.plan(&id, 10_000, 20_000), CachePlan::Miss);
+        assert_eq!(c.plan(&other, 0, 1_000_000), CachePlan::Hit);
+        // a single oversized recording loses its oldest records and its covered start moves
+        c.extend(&other, 0, 1_000_000, msgs(91, 130));
+        assert_eq!(c.total_messages(), 100);
+        assert_eq!(c.covered(&other), Some((31_000, 1_000_000)));
+        assert_eq!(c.plan(&other, 0, 1_000_000), CachePlan::Extend { read: vec![(0, 30_999)] });
+        // extending an evicted identity falls back to an insert
+        c.extend(&id, 1, 2, msgs(1, 2));
+        assert_eq!(c.covered(&id), Some((1, 2)));
+    }
+
+    #[test]
+    fn latent_cache_decodes_slices_and_memoises() {
+        let inst = InstrumentId::new();
+        let mut cache = LatentCache::new(1_000);
+        let key = |s: i64, e: i64| CacheKey::new(s, e, Timescale::Second, &[]);
+        assert_eq!(cache.plan(&key(0, 30_000)), CachePlan::Miss);
+        let full = cache.insert(&key(0, 30_000), toy(inst, "snap-1"));
+        assert_eq!(full.len(), 25);
+        assert_eq!(cache.plan(&key(0, 30_000)), CachePlan::Hit);
+        assert!(Arc::ptr_eq(&cache.get(&key(0, 30_000)).unwrap(), &full), "memoised decode");
+        // an inner window is a different (smaller) recording: knowledge-time slice
+        assert_eq!(cache.plan(&key(1_000, 5_000)), CachePlan::Hit);
+        let inner = cache.get(&key(1_000, 5_000)).unwrap();
+        assert_eq!(inner.summary.states, 4, "states published 1 050 … 4 050");
+        assert_eq!(inner.summary.regions, 0, "regions published at 500 are outside the window");
+        assert!(cache.get(&key(-1, 5_000)).is_none(), "not covered");
+        // extension merges and re-slices
+        let more: Vec<RecordedMessage> = (21..=30i64)
+            .map(|t| {
+                raw("latent.state.1s.x", (100 + t) as u64, t * 1000 + 50, state_msg("snap-1", inst, t * 1000, "b"))
+            })
+            .collect();
+        assert!(matches!(cache.plan(&key(10_000, 40_000)), CachePlan::Extend { .. }));
+        let ext = cache.extend(&key(10_000, 40_000), more);
+        assert_eq!(ext.summary.states, 21, "states published 10 050 … 30 050");
+        assert_eq!((cache.hits(), cache.extends(), cache.misses(), cache.len()), (2, 1, 1, 1));
+        assert_eq!(cache.total_messages(), 35);
     }
 
     #[test]

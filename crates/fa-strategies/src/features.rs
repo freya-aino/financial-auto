@@ -20,19 +20,26 @@
 //! | `(region_feature r f)` | realised returns per region (`record_close`) | mass 0, mean/vol of lookback returns |
 //! | `(path_up k)`, `(path_value (sample_walk r k n) f)` | seeded walks, end-region statistics | share of positive k-bar windows |
 //! | `region_entropy` | normalised entropy of the current row | latent posterior std, else `std / (|mean| + std)` |
-//! | `(quantile q)`, `(fc_quantile q k)`, `(fc_dist k)` | latest `rnn_prior` quantiles | normal-approx quantile / mean of lookback returns |
-//! | `analog_forecast`, `(analog_outcome k)` | realised outcomes after the `retrieval` analogs | mean log return per bar |
+//! | `(quantile q)`, `(fc_quantile q k)`, `(fc_dist k)` | `rnn_prior` quantiles of the output with horizon closest to `k` (`quantile` uses the strategy's `steps`) | normal-approx quantile / mean of lookback returns |
+//! | `analog_forecast`, `(analog_outcome k)` | realised outcomes after the `retrieval` analogs (unpriced analogs are skipped and reported through [`LiveContext::take_analog_requests`]) | mean log return per bar |
 //! | `analog_age`, `(score family)` | analog time distance, output freshness | 0 |
-//! | `(text_score t)`, `(visual_score k)` | no producer yet | 0 |
+//! | `(text_score t)`, `(visual_score k)` | score of the latest fresh `text.<t>` / `visual.<k>` output | 0 |
+//!
+//! Besides the per-source counters, the context remembers **which primitives** answered from
+//! real data and which fell back ([`LiveContext::primitive_sources`]), so the runtime can flag a
+//! program that keeps referencing a primitive nobody produces (spec 35 §8, `starved`).
 //!
 //! Portfolio primitives read the strategy's **virtual book**: its own last emitted exposure.
-use std::{cell::Cell, collections::VecDeque};
+use std::{
+    cell::{Cell, RefCell},
+    collections::{BTreeSet, VecDeque},
+};
 
 use fa_core::{InstrumentId, Timescale};
 
 use crate::{
     HITTING_HORIZON, PathFn, RegionFeature, RegionRef, SetRef, StrategyContext,
-    decoders::{DecodersAt, PriceLookup},
+    decoders::{AnalogRequest, DecodersAt, PriceLookup},
     graph::{GraphAt, WALKS},
 };
 
@@ -314,6 +321,8 @@ pub struct LiveContext<'a> {
     inst: InstrumentId,
     /// Strategy horizon in bars (the `k` of `analog_forecast`).
     steps: u32,
+    /// Bar timescale of the strategy (the unit of `k`); set by `with_graph` / `with_bar`.
+    bar: Timescale,
     graph: Option<&'a GraphAt<'a>>,
     decoders: Option<DecodersAt<'a>>,
     prices: Option<&'a dyn PriceLookup>,
@@ -322,6 +331,28 @@ pub struct LiveContext<'a> {
     graph_n: Cell<u64>,
     decoder_n: Cell<u64>,
     fallback_n: Cell<u64>,
+    /// Primitive names that answered from real data / fell back in this context.
+    real_prims: RefCell<BTreeSet<&'static str>>,
+    fallback_prims: RefCell<BTreeSet<&'static str>>,
+    /// Analogs priced / skipped by `analog_outcome` calls so far.
+    analog_resolved: Cell<u64>,
+    analog_unresolved: Cell<u64>,
+    analog_requests: RefCell<Vec<AnalogRequest>>,
+    analog_done: RefCell<Vec<AnalogRequest>>,
+}
+
+/// Primitive names split by where they answered from (one context, one step).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrimitiveSources {
+    pub real: BTreeSet<&'static str>,
+    pub fallback: BTreeSet<&'static str>,
+}
+
+impl PrimitiveSources {
+    /// Primitives that only ever fell back in this context.
+    pub fn fallback_only(&self) -> BTreeSet<&'static str> {
+        self.fallback.difference(&self.real).copied().collect()
+    }
 }
 
 impl<'a> LiveContext<'a> {
@@ -331,6 +362,7 @@ impl<'a> LiveContext<'a> {
             fallback,
             inst,
             steps: steps.max(1),
+            bar: Timescale::Second,
             graph: None,
             decoders: None,
             prices: None,
@@ -338,6 +370,12 @@ impl<'a> LiveContext<'a> {
             graph_n: Cell::new(0),
             decoder_n: Cell::new(0),
             fallback_n: Cell::new(0),
+            real_prims: RefCell::new(BTreeSet::new()),
+            fallback_prims: RefCell::new(BTreeSet::new()),
+            analog_resolved: Cell::new(0),
+            analog_unresolved: Cell::new(0),
+            analog_requests: RefCell::new(Vec::new()),
+            analog_done: RefCell::new(Vec::new()),
         }
     }
 
@@ -350,7 +388,15 @@ impl<'a> LiveContext<'a> {
         if let Some(r) = graph.cur_region(self.inst, 0) {
             self.cur0 = Some(r);
         }
+        self.bar = graph.timescale();
         self.graph = Some(graph);
+        self
+    }
+
+    /// Bar timescale the decoder `k` arguments are measured in (defaults to the graph view's
+    /// timescale, else 1 s).
+    pub fn with_bar(mut self, bar: Timescale) -> Self {
+        self.bar = bar;
         self
     }
 
@@ -373,22 +419,54 @@ impl<'a> LiveContext<'a> {
         Sources { graph: self.graph_n.get(), decoder: self.decoder_n.get(), fallback: self.fallback_n.get() }
     }
 
-    fn count(&self, s: Source) {
+    /// Primitive names by source so far.
+    pub fn primitive_sources(&self) -> PrimitiveSources {
+        PrimitiveSources { real: self.real_prims.borrow().clone(), fallback: self.fallback_prims.borrow().clone() }
+    }
+
+    /// `(analogs priced, analogs skipped for missing prices)` so far.
+    pub fn analog_counts(&self) -> (u64, u64) {
+        (self.analog_resolved.get(), self.analog_unresolved.get())
+    }
+
+    /// Drains the analogs that could not be priced in this context (deduplicated), so the
+    /// caller can fetch their prices before the next step.
+    pub fn take_analog_requests(&self) -> Vec<AnalogRequest> {
+        let mut v = std::mem::take(&mut *self.analog_requests.borrow_mut());
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Drains the analogs that were priced in this context (deduplicated).
+    pub fn take_analog_resolved(&self) -> Vec<AnalogRequest> {
+        let mut v = std::mem::take(&mut *self.analog_done.borrow_mut());
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    fn count(&self, name: &'static str, s: Source) {
         match s {
             Source::Graph => self.graph_n.set(self.graph_n.get() + 1),
             Source::Decoder => self.decoder_n.set(self.decoder_n.get() + 1),
             Source::Fallback => self.fallback_n.set(self.fallback_n.get() + 1),
         }
+        if s == Source::Fallback {
+            self.fallback_prims.borrow_mut().insert(name);
+        } else {
+            self.real_prims.borrow_mut().insert(name);
+        }
     }
 
-    fn pick<T>(&self, real: Option<T>, src: Source, fallback: impl FnOnce() -> T) -> T {
+    fn pick<T>(&self, name: &'static str, real: Option<T>, src: Source, fallback: impl FnOnce() -> T) -> T {
         match real {
             Some(v) => {
-                self.count(src);
+                self.count(name, src);
                 v
             }
             None => {
-                self.count(Source::Fallback);
+                self.count(name, Source::Fallback);
                 fallback()
             }
         }
@@ -428,7 +506,12 @@ impl<'a> LiveContext<'a> {
 
     fn analog_outcome_at(&self, k: u32) -> Option<f64> {
         let (d, p) = (self.decoders.as_ref()?, self.prices?);
-        d.analog_outcome(k, self.graph.map_or(Timescale::Second, |g| g.timescale()), p)
+        let det = d.analog_outcome_detail(k, self.bar, p);
+        self.analog_resolved.set(self.analog_resolved.get() + det.resolved.len() as u64);
+        self.analog_unresolved.set(self.analog_unresolved.get() + det.unresolved.len() as u64);
+        self.analog_requests.borrow_mut().extend(det.unresolved);
+        self.analog_done.borrow_mut().extend(det.resolved);
+        det.value
     }
 }
 
@@ -442,7 +525,7 @@ impl StrategyContext for LiveContext<'_> {
             let cur = g.cur_region(self.inst, 0)?;
             g.p_trans(0, &cur, to_region, 1)
         });
-        self.pick(real, Source::Graph, || self.fallback.transition_prob(to_region))
+        self.pick("transition_prob", real, Source::Graph, || self.fallback.transition_prob(to_region))
     }
 
     fn stay_prob(&self) -> f64 {
@@ -450,7 +533,7 @@ impl StrategyContext for LiveContext<'_> {
             let cur = g.cur_region(self.inst, 0)?;
             g.p_trans(0, &cur, &cur, 1)
         });
-        self.pick(real, Source::Graph, || self.fallback.stay_prob())
+        self.pick("stay_prob", real, Source::Graph, || self.fallback.stay_prob())
     }
 
     fn path_up_prob(&self, k: u32) -> f64 {
@@ -458,7 +541,7 @@ impl StrategyContext for LiveContext<'_> {
             let cur = g.cur_region(self.inst, 0)?;
             g.path_value(0, &cur, k.max(1), WALKS, None)
         });
-        self.pick(real, Source::Graph, || self.fallback.path_up_prob(k))
+        self.pick("path_up_prob", real, Source::Graph, || self.fallback.path_up_prob(k))
     }
 
     fn region_entropy(&self) -> f64 {
@@ -466,17 +549,17 @@ impl StrategyContext for LiveContext<'_> {
             let cur = g.cur_region(self.inst, 0)?;
             g.row_entropy(0, &cur)
         });
-        self.pick(real, Source::Graph, || self.fallback.region_entropy())
+        self.pick("region_entropy", real, Source::Graph, || self.fallback.region_entropy())
     }
 
     fn cur_region(&self, expert: u32) -> Option<String> {
         let real = self.graph_q(|g| g.cur_region(self.inst, expert));
-        self.pick(real.map(Some), Source::Graph, || if expert == 0 { self.cur0.clone() } else { None })
+        self.pick("cur_region", real.map(Some), Source::Graph, || if expert == 0 { self.cur0.clone() } else { None })
     }
 
     fn neighbors(&self, r: RegionRef, n: u32) -> Vec<String> {
         let real = self.set(SetRef::Neighbors(r, n)).map(|x| x.1);
-        self.pick(real, Source::Graph, Vec::new)
+        self.pick("neighbors", real, Source::Graph, Vec::new)
     }
 
     fn p_trans(&self, a: RegionRef, b: RegionRef, k: u32) -> f64 {
@@ -486,7 +569,9 @@ impl StrategyContext for LiveContext<'_> {
             let (_, to) = self.region(b)?;
             g.p_trans(e, &from, &to, k.max(1))
         })();
-        self.pick(real, Source::Graph, || if a == b { self.fallback.stay_prob().powi(k.max(1) as i32) } else { 0.0 })
+        self.pick("p_trans", real, Source::Graph, || {
+            if a == b { self.fallback.stay_prob().powi(k.max(1) as i32) } else { 0.0 }
+        })
     }
 
     fn p_to_set(&self, r: RegionRef, s: SetRef, k: u32) -> f64 {
@@ -496,7 +581,7 @@ impl StrategyContext for LiveContext<'_> {
             let (_, set) = self.set(s)?;
             g.p_to_set(e, &from, &set, k.max(1))
         })();
-        self.pick(real, Source::Graph, || 0.0)
+        self.pick("p_to_set", real, Source::Graph, || 0.0)
     }
 
     fn hitting_time(&self, r: RegionRef, s: SetRef) -> f64 {
@@ -506,18 +591,18 @@ impl StrategyContext for LiveContext<'_> {
             let (_, set) = self.set(s)?;
             g.hitting_time(e, &from, &set)
         })();
-        self.pick(real, Source::Graph, || f64::from(HITTING_HORIZON))
+        self.pick("hitting_time", real, Source::Graph, || f64::from(HITTING_HORIZON))
     }
 
     fn dwell(&self, r: RegionRef) -> f64 {
         let RegionRef::Cur(e) = r;
         let real = self.graph_q(|g| g.dwell(self.inst, e));
-        self.pick(real, Source::Graph, || self.fallback.latent.as_ref().map_or(0.0, |l| f64::from(l.dwell)))
+        self.pick("dwell", real, Source::Graph, || self.fallback.latent.as_ref().map_or(0.0, |l| f64::from(l.dwell)))
     }
 
     fn novelty(&self, expert: u32) -> f64 {
         let real = self.graph_q(|g| g.novelty(self.inst, expert));
-        self.pick(real, Source::Graph, || self.fallback.region_entropy())
+        self.pick("novelty", real, Source::Graph, || self.fallback.region_entropy())
     }
 
     fn region_feature(&self, r: RegionRef, f: RegionFeature) -> f64 {
@@ -526,7 +611,7 @@ impl StrategyContext for LiveContext<'_> {
             let (e, id) = self.region(r)?;
             g.region_feature(e, &id, f)
         })();
-        self.pick(real, Source::Graph, || match f {
+        self.pick("region_feature", real, Source::Graph, || match f {
             RegionFeature::Mass => 0.0,
             RegionFeature::MeanFwdReturn => self.fallback.mean_return(),
             RegionFeature::Vol => self.fallback.std_return(),
@@ -543,7 +628,7 @@ impl StrategyContext for LiveContext<'_> {
             };
             g.path_value(e, &from, k.max(1), n.max(1), feat)
         })();
-        self.pick(real, Source::Graph, || match f {
+        self.pick("path_value", real, Source::Graph, || match f {
             PathFn::Up => self.fallback.path_up_prob(k),
             PathFn::Feature(RegionFeature::Mass) => 0.0,
             PathFn::Feature(RegionFeature::MeanFwdReturn) => self.fallback.mean_return(),
@@ -552,47 +637,48 @@ impl StrategyContext for LiveContext<'_> {
     }
 
     fn forecast_quantile(&self, level: f64) -> f64 {
-        let real = self.dec_q(|d| d.fc_quantile(level));
-        self.pick(real, Source::Decoder, || self.fallback.forecast_quantile(level))
+        let real = self.dec_q(|d| d.fc_quantile(level, self.steps));
+        self.pick("forecast_quantile", real, Source::Decoder, || self.fallback.forecast_quantile(level))
     }
 
     fn analog_forecast(&self) -> f64 {
-        let real = self.analog_outcome_at(self.steps).or_else(|| self.dec_q(|d| d.fc_dist()));
-        self.pick(real, Source::Decoder, || self.fallback.analog_forecast())
+        let real = self.analog_outcome_at(self.steps).or_else(|| self.dec_q(|d| d.fc_dist(self.steps)));
+        self.pick("analog_forecast", real, Source::Decoder, || self.fallback.analog_forecast())
     }
 
     fn decoder_score(&self, family: &str) -> f64 {
         let real = self.dec_q(|d| d.score(family));
-        self.pick(real, Source::Decoder, || 0.0)
+        self.pick("decoder_score", real, Source::Decoder, || 0.0)
     }
 
-    fn fc_quantile(&self, q: f64, _k: u32) -> f64 {
-        self.forecast_quantile(q)
+    fn fc_quantile(&self, q: f64, k: u32) -> f64 {
+        let real = self.dec_q(|d| d.fc_quantile(q, k));
+        self.pick("fc_quantile", real, Source::Decoder, || self.fallback.forecast_quantile(q))
     }
 
-    fn fc_dist(&self, _k: u32) -> f64 {
-        let real = self.dec_q(|d| d.fc_dist());
-        self.pick(real, Source::Decoder, || self.fallback.analog_forecast())
+    fn fc_dist(&self, k: u32) -> f64 {
+        let real = self.dec_q(|d| d.fc_dist(k));
+        self.pick("fc_dist", real, Source::Decoder, || self.fallback.analog_forecast())
     }
 
     fn analog_outcome(&self, k: u32) -> f64 {
         let real = self.analog_outcome_at(k);
-        self.pick(real, Source::Decoder, || self.fallback.analog_forecast())
+        self.pick("analog_outcome", real, Source::Decoder, || self.fallback.analog_forecast())
     }
 
     fn analog_age(&self) -> f64 {
         let real = self.dec_q(|d| d.analog_age());
-        self.pick(real, Source::Decoder, || 0.0)
+        self.pick("analog_age", real, Source::Decoder, || 0.0)
     }
 
     fn text_score(&self, topic: &str) -> f64 {
         let real = self.dec_q(|d| d.text_score(topic));
-        self.pick(real, Source::Decoder, || 0.0)
+        self.pick("text_score", real, Source::Decoder, || 0.0)
     }
 
     fn visual_score(&self, kind: &str) -> f64 {
         let real = self.dec_q(|d| d.visual_score(kind));
-        self.pick(real, Source::Decoder, || 0.0)
+        self.pick("visual_score", real, Source::Decoder, || 0.0)
     }
 
     fn position(&self) -> f64 {
@@ -671,6 +757,9 @@ mod tests {
         let view = g.at(Timescale::Second, 10_000);
         let mut d = DecoderOutputs::new();
         d.on_output(&crate::decoders::tests::forecast(Some(inst), 9_000, &[-0.02, -0.01, 0.0, 0.01, 0.02]), 9_000);
+        // text / visual decoders on the model-runtime contract: instrument-specific news, market-wide chart
+        d.on_output(&crate::decoders::tests::scored("text.news", Some(inst), 9_500, 0.5), 9_500);
+        d.on_output(&crate::decoders::tests::scored("visual.future", None, 9_000, -0.25), 9_000);
         let prices = PriceSeries::new(100);
         let ctx = LiveContext::new(FallbackContext::new(&closes, None, book), inst, 5)
             .with_graph(&view)
@@ -687,13 +776,22 @@ mod tests {
         assert_eq!(sexpr::parse("(quantile 0.5)").unwrap().eval(&ctx), 0.0);
         assert_eq!(sexpr::parse("(fc_quantile 0.75 5)").unwrap().eval(&ctx), 0.01);
         assert!(sexpr::parse("(score rnn_prior)").unwrap().eval(&ctx) > 0.99);
-        assert_eq!(sexpr::parse("(text_score news)").unwrap().eval(&ctx), 0.0);
+        assert_eq!(sexpr::parse("(text_score news)").unwrap().eval(&ctx), 0.5);
+        assert_eq!(sexpr::parse("(mul (text_score news) (visual_score future))").unwrap().eval(&ctx), -0.125);
+        assert!(sexpr::parse("(score text.news)").unwrap().eval(&ctx) > 0.99, "dotted family in `score`");
+        assert_eq!(sexpr::parse("(text_score narrative)").unwrap().eval(&ctx), 0.0, "no producer → fallback 0");
         // no region has return statistics yet → path_up falls back to prices
         let _ = sexpr::parse("(path_up 3)").unwrap().eval(&ctx);
         let s = ctx.sources();
         assert_eq!(s.graph, 5, "{s:?}");
-        assert_eq!(s.decoder, 3, "{s:?}");
+        assert_eq!(s.decoder, 7, "{s:?}");
         assert_eq!(s.fallback, 2, "{s:?}");
+        let ps = ctx.primitive_sources();
+        assert!(ps.real.contains("text_score") && ps.real.contains("visual_score") && ps.real.contains("p_to_set"));
+        assert_eq!(ps.fallback_only(), ["path_up_prob"].into_iter().collect::<BTreeSet<_>>(), "{ps:?}");
+        assert!(ps.fallback.contains("text_score"), "`narrative` fell back although `news` was real");
+        assert_eq!(ctx.analog_counts(), (0, 0));
+        assert!(ctx.take_analog_requests().is_empty());
 
         // every baseline evaluates on the synthetic graph with bounded output
         for def in StrategyFile::baselines().strategy {
@@ -704,6 +802,65 @@ mod tests {
             assert!((0.0..=1.0).contains(&x.stddev), "{}: {}", def.id, x.stddev);
         }
         assert!(ctx.sources().graph > s.graph, "graph baselines hit the graph");
+        assert!(ctx.sources().decoder > s.decoder, "text/visual baselines hit the decoder cache");
+        // the text/visual baselines answer from the decoders alone once every family they read is published
+        let mut d2 = DecoderOutputs::new();
+        for (family, inst_ref, score) in [
+            ("text.news", Some(inst), 0.5),
+            ("visual.future", None, -0.25),
+            ("text.narrative", Some(inst), 0.3),
+            ("text.summary", None, 0.2),
+            ("visual.chart", Some(inst), 0.6),
+        ] {
+            d2.on_output(&crate::decoders::tests::scored(family, inst_ref, 9_800, score), 9_800);
+        }
+        for id in ["baseline-text-visual-1s", "baseline-narrative-chart-1m"] {
+            let def = StrategyFile::baselines().strategy.into_iter().find(|d| d.id == id).unwrap();
+            let probe = LiveContext::new(FallbackContext::new(&closes, None, book), inst, 5)
+                .with_decoders(d2.at(inst, 10_000, 3_600_000));
+            let mut st = def.build().unwrap();
+            let before = probe.sources();
+            let x = st.step(10_000, &[(inst, &probe)]).exposures[0];
+            assert!(x.mean.abs() > 0.0 && x.mean.abs() <= 1.0, "{id}: {}", x.mean);
+            let after = probe.sources();
+            assert!(after.decoder > before.decoder && after.fallback == 0, "{id}: {after:?}");
+        }
+    }
+
+    #[test]
+    fn analog_outcome_reports_unpriced_analogs_for_prefetch() {
+        use crate::{decoders::DecoderOutputs, sexpr};
+        let inst = InstrumentId::new();
+        let mut d = DecoderOutputs::new();
+        d.on_output(
+            &crate::decoders::tests::retrieval(inst, 30_000, &[(10_000, 1.0, 2.0), (20_000, 3.0, 4.0)]),
+            30_000,
+        );
+        // in-memory history starts at 15 s: the 10 s analog cannot be priced
+        let mut prices = PriceSeries::new(100);
+        for t in 15..=30 {
+            prices.push(t * 1_000, 100.0 + t as f64);
+        }
+        let closes = prices.closes(Timescale::Second, 20);
+        let ctx = LiveContext::new(FallbackContext::new(&closes, None, VirtualBook::default()), inst, 5)
+            .with_decoders(d.at(inst, 30_000, 3_600_000))
+            .with_prices(&prices);
+        let v = sexpr::parse("(analog_outcome 5)").unwrap().eval(&ctx);
+        assert!((v - (125.0f64 / 120.0).ln()).abs() < 1e-12, "{v}");
+        assert_eq!(ctx.analog_counts(), (1, 1));
+        assert_eq!(ctx.sources(), Sources { graph: 0, decoder: 1, fallback: 0 });
+        let reqs = ctx.take_analog_requests();
+        assert_eq!(reqs, vec![AnalogRequest { window_end_ms: 10_000, k: 5, bar: Timescale::Second }]);
+        assert!(ctx.take_analog_requests().is_empty(), "drained");
+        // a layered lookup that also knows the fetched prices resolves everything
+        let fetched =
+            |at: i64| -> Option<f64> { prices.price_at(at).or_else(|| (at >= 0).then(|| 100.0 + at as f64 / 1000.0)) };
+        let ctx2 = LiveContext::new(FallbackContext::new(&closes, None, VirtualBook::default()), inst, 5)
+            .with_decoders(d.at(inst, 30_000, 3_600_000))
+            .with_prices(&fetched);
+        sexpr::parse("(analog_outcome 5)").unwrap().eval(&ctx2);
+        assert_eq!(ctx2.analog_counts(), (2, 0));
+        assert_eq!(ctx2.take_analog_resolved().len(), 2);
     }
 
     #[test]

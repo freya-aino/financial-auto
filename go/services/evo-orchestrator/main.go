@@ -19,9 +19,10 @@
 // The eval kind names the family (`evo.eval.<family>`); the variation kind is derived
 // (`evo.vary.<family>`), so decoder and strategy generations run through the same loop. Eval
 // results may carry `generation_stats` (trial registry, spec 41 §6.5); the latest one is
-// published in every summary as `validation`. When a strategy generation ends, its Pareto front
-// is written to Garage as `fa-artifacts/strategies/<generation>.toml` (`-garage`, secrets from
-// `-secrets`/FA_SECRETS) and announced as `artifact_key`.
+// published in every summary as `validation`. When a strategy (allocator) generation ends, its
+// Pareto front is written to Garage as `fa-artifacts/strategies/<generation>.toml`
+// (`fa-artifacts/allocators/<generation>.toml`; `-garage`, secrets from `-secrets`/FA_SECRETS)
+// and announced as `artifact_key`.
 //
 // Error replies carry a prefix control-api maps to HTTP: `not_found:` (404), `conflict:` (409).
 //
@@ -124,8 +125,8 @@ func main() {
 		} else if st, err := archive.NewS3(archive.Options{Endpoint: *garageURL, AccessKey: secrets.Get("garage", "access_key_id"), SecretKey: secrets.Get("garage", "secret_access_key")}); err != nil {
 			log.Warn("garage client unavailable; strategy fronts are not archived", "err", err)
 		} else {
-			promote = PromoteStrategies(st, func(err error) { log.Warn("promote", "err", err) })
-			log.Info("promoted strategy populations go to Garage", "endpoint", *garageURL, "bucket", ArtifactsBucket)
+			promote = PromoteFronts(st, func(err error) { log.Warn("promote", "err", err) })
+			log.Info("promoted strategy / allocator fronts go to Garage", "endpoint", *garageURL, "bucket", ArtifactsBucket)
 		}
 	}
 

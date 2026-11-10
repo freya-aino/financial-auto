@@ -5,6 +5,8 @@
 //! cargo run -p strategy-runtime --example ctl -- resume strategy_id=baseline-momentum-1s
 //! cargo run -p strategy-runtime --example ctl -- reload path=crates/fa-strategies/baselines.toml
 //! cargo run -p strategy-runtime --example ctl -- reload artifact_key=strategies/strategies.3.toml
+//! cargo run -p strategy-runtime --example ctl -- reload artifact_key=latest
+//! cargo run -p strategy-runtime --example ctl -- status          # JSON: population, stats, primitive sources
 //! ```
 use std::time::Duration;
 
@@ -18,7 +20,7 @@ use fa_proto::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let verb = args.next().ok_or_else(|| anyhow::anyhow!("usage: ctl <reload|pause|resume> [key=value...]"))?;
+    let verb = args.next().ok_or_else(|| anyhow::anyhow!("usage: ctl <reload|pause|resume|status> [key=value...]"))?;
     let req = CtlRequest {
         verb: verb.clone(),
         args: args.filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned()))).collect(),

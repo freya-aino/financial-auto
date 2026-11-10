@@ -1,8 +1,11 @@
 //! PostgreSQL warehouse access (specs 12, 20; D-013): reference data, catalog, macro vintages,
-//! the append-only [`audit`] log (spec 42) and the instrument search / quarantine review
-//! functions in [`refdata`] (D-054).
+//! the append-only [`audit`] log (spec 42), the instrument search / quarantine review
+//! functions in [`refdata`] (D-054), the instrument → asset class / venue / currency / source
+//! lookup in [`venues`] and the EUR accounting FX table in [`fx`] (D-061).
 pub mod audit;
+pub mod fx;
 pub mod refdata;
+pub mod venues;
 
 use std::path::Path;
 

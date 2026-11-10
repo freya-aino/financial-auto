@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use fa_core::{Timescale, rng::Rng};
 use fa_encoders::{EncoderFamily, EncoderInput, MarketBar, StatisticalEncoder};
 use fa_expert_space::{EvidenceSoftmaxRouter, Router};
-use fa_mcmc::MarkovGraph;
+use fa_mcmc::{MarkovGraph, RegionCarry};
 use fa_patterns::{OnlineRegionCfg, OnlineRegionDiscovery, OnlineRegionSet, RegionLifecycle, RegionMap};
 use fa_proto::{
     Timestamp,
@@ -29,11 +29,21 @@ pub struct PipelineConfig {
     /// Dirichlet draws for the credible interval (`mc_draws`).
     pub mc_draws: usize,
     pub seed: u64,
+    /// Kernel transfer on swap (spec 33 §6.6 `carry_discount`): carried observation mass is
+    /// multiplied by `score · carry_discount` so transferred evidence counts less than fresh.
+    pub carry_discount: f64,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
-        Self { regions: OnlineRegionCfg::default(), alpha_0: 1.0, ci_level: 0.9, mc_draws: 256, seed: 7 }
+        Self {
+            regions: OnlineRegionCfg::default(),
+            alpha_0: 1.0,
+            ci_level: 0.9,
+            mc_draws: 256,
+            seed: 7,
+            carry_discount: 0.5,
+        }
     }
 }
 
@@ -59,6 +69,10 @@ pub trait TransitionModel: Send {
     /// Posterior mean + credible interval of the row `from`.
     fn summarize(&mut self, from: &str) -> Vec<TransitionProb>;
     fn n_rows(&self) -> usize;
+    /// The underlying Dirichlet graph, when the model has one (used for kernel transfer).
+    fn graph(&self) -> Option<&MarkovGraph> {
+        None
+    }
 }
 
 /// Dirichlet–multinomial rows with forgetting, intervals by Monte Carlo (`fa_mcmc::ConjugateSampler` family).
@@ -71,7 +85,12 @@ pub struct DirichletTransitions {
 
 impl DirichletTransitions {
     pub fn new(alpha_0: f64, decay: f64, ci_level: f64, draws: usize, seed: u64) -> Self {
-        Self { graph: MarkovGraph::new(alpha_0, decay), rng: Rng::seed(seed), ci_level, draws }
+        Self::from_graph(MarkovGraph::new(alpha_0, decay), ci_level, draws, seed)
+    }
+
+    /// Wraps a graph produced by [`MarkovGraph::transfer`].
+    pub fn from_graph(graph: MarkovGraph, ci_level: f64, draws: usize, seed: u64) -> Self {
+        Self { graph, rng: Rng::seed(seed), ci_level, draws }
     }
 }
 
@@ -103,6 +122,10 @@ impl TransitionModel for DirichletTransitions {
     fn n_rows(&self) -> usize {
         self.graph.regions().count()
     }
+
+    fn graph(&self) -> Option<&MarkovGraph> {
+        Some(&self.graph)
+    }
 }
 
 /// One encoding step.
@@ -122,6 +145,19 @@ pub struct StepOutput {
     pub state: Option<LatentState>,
     pub region_events: Vec<RegionEvent>,
     pub transitions: Vec<TransitionUpdate>,
+}
+
+/// What [`TimescalePipeline::swap_encoder`] did.
+#[derive(Debug, Default)]
+pub struct SwapReport {
+    /// `Created` events for every seeded region of the new snapshot.
+    pub events: Vec<RegionEvent>,
+    /// Observation mass carried into the new posteriors (spec 33 §6.6), summed over experts.
+    pub carried: f64,
+    /// Old observation mass without a destination.
+    pub dropped: f64,
+    /// Rows that received carried mass.
+    pub rows_carried: usize,
 }
 
 /// Region sets and transition models, one of each per expert.
@@ -221,22 +257,73 @@ impl TimescalePipeline {
 
     /// Hot-swaps the encoder (spec 36 §6.4 promotion / rollback) without restarting: the region
     /// sets are rebuilt from the new snapshot's `region_map` (seeded) or start empty, the
-    /// transition posteriors restart (kernel transfer, spec 33 §6.6, is not implemented) and the
-    /// per-instrument chain positions are cleared. Returns `Created` events for every seeded
-    /// region so the bus and Helix learn the new snapshot's regions.
+    /// transition posteriors are **transferred** through the map (spec 33 §6.6,
+    /// [`MarkovGraph::transfer`]: a seeded region with a `parent_region_id` inherits the parent's
+    /// row scaled by `score · carry_discount`, unmatched regions start from the prior; without a
+    /// map the posteriors restart) and the per-instrument chain positions are cleared. Returns
+    /// `Created` events for every seeded region so the bus and Helix learn the new snapshot's
+    /// regions, plus what the transfer carried.
     pub fn swap_encoder(
         &mut self,
         cfg: &PipelineConfig,
         encoder: Box<dyn EncoderFamily>,
         region_map: Option<&RegionMap>,
-    ) -> Vec<RegionEvent> {
+    ) -> SwapReport {
         let n_experts = encoder.sizing().max_experts as usize;
         self.encoder = encoder;
-        let (regions, transitions) = Self::stages(self.ts, cfg, self.encoder.snapshot_id(), n_experts, region_map);
+        let (regions, mut transitions) = Self::stages(self.ts, cfg, self.encoder.snapshot_id(), n_experts, region_map);
+        let mut report = SwapReport::default();
+        if let Some(map) = region_map {
+            for (k, model) in transitions.iter_mut().enumerate() {
+                let Some(e) = map.expert(k as u32) else { continue };
+                let Some(old) = self.transitions.get(k).and_then(|t| t.graph()) else { continue };
+                let carries: Vec<RegionCarry> = e
+                    .regions
+                    .iter()
+                    .filter_map(|r| {
+                        r.parent_region_id.as_ref().map(|p| RegionCarry {
+                            new_id: r.region_id.clone(),
+                            old_id: p.clone(),
+                            score: r.score,
+                        })
+                    })
+                    .collect();
+                let support: Vec<String> = e.regions.iter().map(|r| r.region_id.clone()).collect();
+                let t = MarkovGraph::transfer(old, &carries, &support, cfg.carry_discount);
+                report.carried += t.carried;
+                report.dropped += t.dropped;
+                report.rows_carried += t.rows_carried;
+                *model = Box::new(DirichletTransitions::from_graph(
+                    t.graph,
+                    cfg.ci_level,
+                    cfg.mc_draws,
+                    cfg.seed ^ ((k as u64 + 1) * 0x9E37_79B9),
+                ));
+            }
+        }
         self.regions = regions;
         self.transitions = transitions;
         self.last_closed.clear();
-        self.seeded_region_events()
+        report.events = self.seeded_region_events();
+        report
+    }
+
+    /// Replaces only the encoder (an online adapter of the same snapshot, spec 36 §6.5): region
+    /// sets, transition posteriors and chain positions are kept. The adapter must carry the same
+    /// snapshot id and expert count; otherwise it is refused.
+    pub fn set_encoder(&mut self, encoder: Box<dyn EncoderFamily>) -> Result<(), String> {
+        if encoder.snapshot_id() != self.encoder.snapshot_id() {
+            return Err(format!(
+                "adapter is for snapshot {} but {} is serving",
+                encoder.snapshot_id(),
+                self.encoder.snapshot_id()
+            ));
+        }
+        if encoder.sizing().max_experts != self.encoder.sizing().max_experts {
+            return Err("adapter expert count differs from the serving encoder".into());
+        }
+        self.encoder = encoder;
+        Ok(())
     }
 
     pub fn timescale(&self) -> Timescale {
@@ -408,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn swapping_the_encoder_seeds_regions_from_the_map_and_restarts_the_chain() {
+    fn swapping_the_encoder_seeds_regions_and_transfers_the_kernel() {
         let cfg = PipelineConfig::default();
         let mut pl = TimescalePipeline::baseline(Timescale::Minute, &cfg);
         let all = bars(30, 4);
@@ -424,16 +511,24 @@ mod tests {
         assert!(pl.transition_rows() > 0);
         let stats = StatisticalEncoder::fit(Timescale::Minute, &all, &fa_encoders::FitConfig::default()).unwrap();
         let enc = StatisticalEncoder::with_stats(Timescale::Minute, "snap-x", stats);
-        let seed = fa_patterns::FittedRegion {
-            region_id: "snap-x-e0-r000".into(),
-            lineage_id: "1m-e0-r000".into(),
-            expert_index: 0,
-            centroid: vec![0.0; 8],
-            radius: 1.0,
-            mass: 1.0,
-            parent_region_id: Some("1m-e0-r000".into()),
-            score: 0.9,
-        };
+        // every live expert-0 region of the baseline is carried into the new snapshot (score 0.9)
+        let seeds: Vec<fa_patterns::FittedRegion> = pl.regions[0]
+            .regions()
+            .iter()
+            .enumerate()
+            .map(|(n, r)| fa_patterns::FittedRegion {
+                region_id: format!("snap-x-e0-r{n:03}"),
+                lineage_id: r.lineage_id.clone(),
+                expert_index: 0,
+                centroid: r.centroid.clone(),
+                radius: 1.0,
+                mass: 1.0,
+                parent_region_id: Some(r.id.clone()),
+                score: 0.9,
+            })
+            .collect();
+        let n_seeds = seeds.len();
+        let parents: Vec<String> = seeds.iter().filter_map(|r| r.parent_region_id.clone()).collect();
         let map = RegionMap {
             snapshot_id: "snap-x".into(),
             parent_snapshot_id: Some("stat-v1-1m".into()),
@@ -442,27 +537,93 @@ mod tests {
             carry_threshold: 0.5,
             experts: vec![fa_patterns::ExpertRegionMap {
                 expert_index: 0,
-                regions: vec![seed],
-                parent_regions: 1,
-                matched: 1,
+                regions: seeds,
+                parent_regions: n_seeds,
+                matched: n_seeds,
                 carried_mass: 1.0,
             }],
             note: None,
         };
-        let events = pl.swap_encoder(&cfg, Box::new(enc), Some(&map));
+        let old = pl.transitions[0].graph().unwrap().clone();
+        let old_live_mass: f64 = parents.iter().filter_map(|p| old.row(p)).flat_map(|r| r.counts.values()).sum::<f64>();
+        let old_rows = parents.iter().filter(|p| old.row(p).is_some()).count();
+        assert!(old_live_mass > 0.0 && old_rows > 0);
+        let report = pl.swap_encoder(&cfg, Box::new(enc), Some(&map));
+        let events = &report.events;
         assert_eq!(pl.snapshot_id(), "snap-x");
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), n_seeds);
         assert_eq!(events[0].region_id, "snap-x-e0-r000");
         assert_eq!(events[0].lineage_id, "1m-e0-r000");
         assert_eq!(events[0].space.as_ref().unwrap().snapshot_id, "snap-x");
-        assert_eq!(pl.live_regions(), 1);
-        assert_eq!(pl.transition_rows(), 0, "old posteriors dropped; nothing observed yet");
+        assert_eq!(pl.live_regions(), n_seeds);
+        // kernel transfer: every live row is carried with score (0.9) · carry_discount (0.5);
+        // successors that were retired before the swap have no destination and are dropped
+        assert_eq!(report.rows_carried, old_rows);
+        assert!(report.carried > 0.0 && report.carried <= old_live_mass * 0.45 + 1e-9, "{report:?}");
+        let g = pl.transitions[0].graph().unwrap();
+        let new_mass: f64 = g.regions().filter_map(|r| g.row(r)).flat_map(|r| r.counts.values()).sum();
+        assert!((new_mass - report.carried).abs() < 1e-9);
+        for from in g.regions() {
+            assert!(from.starts_with("snap-x-e0-"), "{from}");
+            let total: f64 = g.posterior_mean(from).iter().map(|x| x.1).sum();
+            assert!((total - 1.0).abs() < 1e-9);
+        }
+        assert_eq!(pl.transition_rows(), old_rows, "experts 1 and 2 have no map and restart from the prior");
+        assert!(pl.transitions[1].graph().unwrap().regions().count() == 0);
         let out =
             pl.step(&StepInput { instrument_id: "i", as_of_ms: 31 * 60_000, bars: &all, bar_closed: true }).unwrap();
         assert!(out.transitions.is_empty(), "chain position cleared: first closed bar observes nothing");
         let st = out.state.unwrap();
         assert_eq!(st.snapshot_id, "snap-x");
         assert!(st.experts.iter().all(|e| e.region_id.starts_with("snap-x-e")), "{:?}", st.experts);
+    }
+
+    #[test]
+    fn swap_without_a_map_restarts_the_posteriors() {
+        let cfg = PipelineConfig::default();
+        let mut pl = TimescalePipeline::baseline(Timescale::Minute, &cfg);
+        let all = bars(20, 9);
+        for end in 2..=all.len() {
+            pl.step(&StepInput {
+                instrument_id: "i",
+                as_of_ms: end as i64 * 60_000,
+                bars: &all[..end],
+                bar_closed: true,
+            })
+            .unwrap();
+        }
+        assert!(pl.transition_rows() > 0);
+        let stats = StatisticalEncoder::fit(Timescale::Minute, &all, &fa_encoders::FitConfig::default()).unwrap();
+        let report =
+            pl.swap_encoder(&cfg, Box::new(StatisticalEncoder::with_stats(Timescale::Minute, "snap-y", stats)), None);
+        assert!(report.events.is_empty() && report.carried == 0.0);
+        assert_eq!(pl.transition_rows(), 0);
+    }
+
+    #[test]
+    fn set_encoder_keeps_regions_and_refuses_other_snapshots() {
+        let cfg = PipelineConfig::default();
+        let mut pl = TimescalePipeline::baseline(Timescale::Minute, &cfg);
+        let all = bars(20, 3);
+        for end in 2..=all.len() {
+            pl.step(&StepInput {
+                instrument_id: "i",
+                as_of_ms: end as i64 * 60_000,
+                bars: &all[..end],
+                bar_closed: true,
+            })
+            .unwrap();
+        }
+        let (regions, rows) = (pl.live_regions(), pl.transition_rows());
+        let stats = StatisticalEncoder::fit(Timescale::Minute, &all, &fa_encoders::FitConfig::default()).unwrap();
+        let other = StatisticalEncoder::with_stats(Timescale::Minute, "snap-z", stats.clone());
+        assert!(pl.set_encoder(Box::new(other)).is_err());
+        let same = StatisticalEncoder::with_stats(Timescale::Minute, pl.snapshot_id().to_owned(), stats);
+        pl.set_encoder(Box::new(same)).unwrap();
+        assert_eq!((pl.live_regions(), pl.transition_rows()), (regions, rows));
+        let out =
+            pl.step(&StepInput { instrument_id: "i", as_of_ms: 21 * 60_000, bars: &all, bar_closed: true }).unwrap();
+        assert!(!out.transitions.is_empty(), "chain position kept across an adapter");
     }
 
     #[test]

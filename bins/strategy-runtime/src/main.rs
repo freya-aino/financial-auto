@@ -3,22 +3,28 @@
 //!
 //! Inputs: `md.trade.>` (prices, always), `latent.state.>` / `latent.region.>` /
 //! `latent.transition.>` (the latent graph from model-runtime) and `decoder.output.>`
-//! (evo-worker). Programs are evaluated through `fa_strategies::features::LiveContext`: graph
-//! and decoder primitives use the real data when the bus has it for the strategy's timescale
-//! and instrument, price-only fallbacks otherwise; the heartbeat reports how much was real
-//! (`primitives.graph|decoder|fallback`). The default population is the hand-written
-//! **baseline** set in `crates/fa-strategies/baselines.toml` (not evolved); pass
-//! `--strategies <file>` to run another one, or hot-reload with `ctl.strategy.reload`
-//! (`artifact_key` of a `strategies.<generation>.toml` in Garage, or a local `path`).
-//! `ctl.strategy.pause` / `resume` (`strategy_id`) flatten a strategy without unloading it.
+//! (evo-worker's `rnn_prior` / `retrieval`, model-runtime's `text.*` / `visual.*`). Programs are
+//! evaluated through `fa_strategies::features::LiveContext`: graph and decoder primitives use
+//! the real data when the bus has it for the strategy's timescale and instrument, price-only
+//! fallbacks otherwise; the heartbeat reports how much was real
+//! (`primitives.graph|decoder|fallback`). Retrieval analogs older than the in-memory history
+//! are priced from VictoriaMetrics between steps (`prefetch`). Spec 35 §8 failure modes
+//! (step budget, NaN outputs, starved primitives) are handled in `runtime`.
+//!
+//! Population: `--strategies` = a local file, `garage:fa-artifacts/strategies/<gen>.toml`,
+//! `latest` (newest object under `fa-artifacts/strategies/`) or nothing (the hand-written
+//! **baselines**, not evolved); any failure at start falls back to the baselines with a
+//! warning. Control: `ctl.strategy.reload|pause|resume|status`.
+mod prefetch;
 mod runtime;
+mod source;
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use bytes::Bytes;
 use clap::Parser;
-use fa_blob::{BlobStore, ObjectKey, S3BlobStore, buckets};
+use fa_blob::S3BlobStore;
 use fa_bus::{Bus, subjects};
 use fa_core::{InstrumentId, config::PlatformConfig, secrets::Secrets};
 use fa_proto::{
@@ -28,12 +34,14 @@ use fa_proto::{
         envelope::Payload,
     },
 };
-use fa_strategies::population::StrategyFile;
 use futures::StreamExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::runtime::Runtime;
+use crate::{
+    runtime::{Runtime, Settings},
+    source::PopulationSpec,
+};
 
 const SERVICE: &str = "strategy-runtime";
 
@@ -43,64 +51,110 @@ struct Args {
     /// Platform config (spec 60).
     #[arg(long, env = "FA_CONFIG", default_value = "config/platform.toml")]
     config: PathBuf,
-    /// Strategy population file (TOML). Defaults to the built-in baselines.
+    /// Population: a TOML file, `garage:fa-artifacts/strategies/<gen>.toml`, `latest` or
+    /// `baselines` (default). Falls back to the baselines with a warning.
     #[arg(long, env = "FA_STRATEGIES")]
-    strategies: Option<PathBuf>,
+    strategies: Option<String>,
     /// Scheduler resolution in milliseconds.
     #[arg(long, default_value_t = 250)]
     tick_ms: u64,
     #[arg(long, default_value_t = 2)]
     heartbeat_secs: u64,
     /// Decoder outputs older than this are ignored by the decoder primitives.
-    #[arg(long, default_value_t = 6 * 3600)]
+    #[arg(long, env = "FA_STRATEGY_DECODER_MAX_AGE_SECS", default_value_t = 6 * 3600)]
     decoder_max_age_secs: u64,
+    /// Trades kept in memory per instrument (bars, analog outcomes).
+    #[arg(long, env = "FA_STRATEGY_PRICE_HISTORY", default_value_t = 100_000)]
+    price_history: usize,
+    /// Per-strategy evaluation budget per step (spec 35 §8); slower steps are skipped.
+    #[arg(long, env = "FA_STRATEGY_STEP_BUDGET_MS", default_value_t = 50)]
+    step_budget_ms: u64,
+    /// Consecutive budget breaches before a strategy is auto-paused (N).
+    #[arg(long, env = "FA_STRATEGY_BREACH_LIMIT", default_value_t = 5)]
+    breach_limit: u32,
+    /// Consecutive steps with NaN/inf output before a strategy is auto-paused (N).
+    #[arg(long, env = "FA_STRATEGY_NAN_LIMIT", default_value_t = 5)]
+    nan_limit: u32,
+    /// Minutes a referenced primitive may answer only from the fallback before `starved=1` (M).
+    #[arg(long, env = "FA_STRATEGY_STARVED_AFTER_MINS", default_value_t = 10.0)]
+    starved_after_mins: f64,
+    /// Analog price cache entries.
+    #[arg(long, env = "FA_STRATEGY_ANALOG_CACHE", default_value_t = 4_096)]
+    analog_cache: usize,
+    /// Analogs fetched from VictoriaMetrics per prefetch round.
+    #[arg(long, default_value_t = 32)]
+    analog_prefetch_batch: usize,
+    /// Prefetch round interval.
+    #[arg(long, default_value_t = 500)]
+    analog_prefetch_ms: u64,
+    /// VictoriaMetrics base URL (defaults to `[victoriametrics] url` of the platform config).
+    #[arg(long, env = "FA_VM_URL")]
+    vm_url: Option<String>,
 }
 
-/// Loads a population from Garage (`artifact_key`) or a local file (`path`) and validates it.
-async fn load_population(
-    cfg: &PlatformConfig,
-    args: &std::collections::HashMap<String, String>,
-) -> anyhow::Result<(StrategyFile, String)> {
-    if let Some(path) = args.get("path").filter(|p| !p.is_empty()) {
-        let src = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
-        let file = StrategyFile::parse(&src).with_context(|| format!("parsing {path}"))?;
-        return Ok((file, path.clone()));
+impl Args {
+    fn settings(&self) -> Settings {
+        Settings {
+            price_history: self.price_history.max(2),
+            decoder_max_age_ms: (self.decoder_max_age_secs * 1000) as i64,
+            step_budget: Duration::from_millis(self.step_budget_ms.max(1)),
+            budget_breach_limit: self.breach_limit.max(1),
+            nan_breach_limit: self.nan_limit.max(1),
+            starved_after_ms: (self.starved_after_mins.max(0.0) * 60_000.0) as i64,
+            analog_cache_max: self.analog_cache.max(16),
+            ..Settings::default()
+        }
     }
-    let Some(key) = args.get("artifact_key").filter(|k| !k.is_empty()) else {
-        anyhow::bail!("invalid: reload needs `artifact_key` (Garage key under fa-artifacts/) or `path`");
-    };
-    let key = key.strip_prefix(&format!("{}/", buckets::ARTIFACTS)).unwrap_or(key).to_owned();
-    let secrets = Secrets::load().context("loading secrets")?;
-    let blob = S3BlobStore::from_config(cfg, &secrets).context("Garage credentials (config/secrets.toml [garage])")?;
-    let bytes = blob
-        .get(&ObjectKey { bucket: buckets::ARTIFACTS, key: key.clone() })
-        .await
-        .with_context(|| format!("not_found: fetching {}/{key}", buckets::ARTIFACTS))?;
-    let src = String::from_utf8(bytes).context("invalid: population is not UTF-8")?;
-    let file = StrategyFile::parse(&src).with_context(|| format!("invalid: parsing {key}"))?;
-    Ok((file, key))
+}
+
+/// Garage client, when credentials are configured.
+fn blob_store(cfg: &PlatformConfig) -> Option<S3BlobStore> {
+    let secrets = Secrets::load().map_err(|e| tracing::warn!(error = %e, "no secrets; Garage unavailable")).ok()?;
+    S3BlobStore::from_config(cfg, &secrets)
+        .map_err(|e| tracing::warn!(error = %e, "Garage credentials missing; Garage populations unavailable"))
+        .ok()
+}
+
+/// Population spec of a reload request: `path`, or `artifact_key` (a key or `latest`).
+fn reload_spec(args: &std::collections::HashMap<String, String>) -> anyhow::Result<PopulationSpec> {
+    if let Some(path) = args.get("path").filter(|p| !p.is_empty()) {
+        return Ok(PopulationSpec::Path(path.into()));
+    }
+    match args.get("artifact_key").map(|k| k.trim()).filter(|k| !k.is_empty()) {
+        Some("latest") => Ok(PopulationSpec::Latest),
+        Some(k) => Ok(PopulationSpec::parse(&format!("garage:{k}"))),
+        None => anyhow::bail!(
+            "invalid: reload needs `artifact_key` (Garage key under fa-artifacts/, or `latest`) or `path`"
+        ),
+    }
 }
 
 /// Handles one `ctl.strategy.<verb>` request.
-async fn handle_ctl(cfg: &PlatformConfig, rt: &Mutex<Runtime>, verb: &str, req: &CtlRequest) -> CtlReply {
+async fn handle_ctl(blob: Option<&S3BlobStore>, rt: &Mutex<Runtime>, verb: &str, req: &CtlRequest) -> CtlReply {
     let reply = |ok: bool, message: String| CtlReply { ok, message };
     match verb {
-        "reload" => match load_population(cfg, &req.args).await {
-            Ok((file, label)) => {
-                let mut r = rt.lock().await;
-                match r.replace_population(&file, &label) {
-                    Ok(ids) => {
-                        tracing::info!(population = %label, strategies = ?ids, "population reloaded");
-                        reply(true, format!("loaded {} strategies from {label}: {}", ids.len(), ids.join(",")))
+        "reload" => {
+            let loaded = match reload_spec(&req.args) {
+                Ok(spec) => source::load(&spec, blob).await,
+                Err(e) => Err(e),
+            };
+            match loaded {
+                Ok((file, label)) => {
+                    let mut r = rt.lock().await;
+                    match r.replace_population(&file, &label) {
+                        Ok(ids) => {
+                            tracing::info!(population = %label, strategies = ?ids, "population reloaded");
+                            reply(true, format!("loaded {} strategies from {label}: {}", ids.len(), ids.join(",")))
+                        }
+                        Err(e) => reply(false, format!("invalid: {e}")),
                     }
-                    Err(e) => reply(false, format!("invalid: {e}")),
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "reload failed");
+                    reply(false, format!("{e:#}"))
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "reload failed");
-                reply(false, format!("{e:#}"))
-            }
-        },
+        }
         "pause" | "resume" => {
             let Some(id) = req.args.get("strategy_id").filter(|s| !s.is_empty()) else {
                 return reply(false, "invalid: `strategy_id` required".into());
@@ -114,7 +168,8 @@ async fn handle_ctl(cfg: &PlatformConfig, rt: &Mutex<Runtime>, verb: &str, req: 
                 reply(false, format!("not_found: strategy `{id}`"))
             }
         }
-        other => reply(false, format!("invalid: unknown verb `{other}` (reload | pause | resume)")),
+        "status" => reply(true, rt.lock().await.status(now_ms()).to_string()),
+        other => reply(false, format!("invalid: unknown verb `{other}` (reload | pause | resume | status)")),
     }
 }
 
@@ -137,25 +192,26 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     fa_bus::metrics::serve_from_env("strategy-runtime", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config).context("loading platform config")?;
-    let file = match &args.strategies {
-        Some(p) => {
-            StrategyFile::parse(&std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)
-                .with_context(|| format!("parsing {}", p.display()))?
-        }
-        None => StrategyFile::baselines(),
-    };
-    let baselines = file.strategy.iter().filter(|s| s.is_baseline()).count();
-    let mut runtime = Runtime::new(&file)?;
-    runtime.decoder_max_age_ms = (args.decoder_max_age_secs * 1000) as i64;
-    if let Some(p) = &args.strategies {
-        runtime.population = p.display().to_string();
+    let blob = Arc::new(blob_store(&cfg));
+    let spec = PopulationSpec::parse(args.strategies.as_deref().unwrap_or("baselines"));
+    let (file, label, warning) = source::load_or_baselines(&spec, blob.as_ref().as_ref()).await;
+    if let Some(w) = &warning {
+        tracing::warn!("{w}");
     }
+    let baselines = file.strategy.iter().filter(|s| s.is_baseline()).count();
+    let settings = args.settings();
+    let mut runtime = Runtime::with_settings(&file, settings)?;
+    runtime.population = label.clone();
     let rt = Arc::new(Mutex::new(runtime));
+    let vm = fa_tsdb::Tsdb::new(args.vm_url.clone().unwrap_or_else(|| cfg.victoriametrics.url.clone()));
     let cfg = Arc::new(cfg);
     tracing::info!(
+        population = %label,
         strategies = ?rt.lock().await.strategy_ids(),
         baselines,
         instruments = if file.instruments.is_empty() { "all seen".to_owned() } else { file.instruments.join(",") },
+        ?settings,
+        vm = vm.base_url(),
         "strategy-runtime starting (baseline programs are hand-written, not evolved)"
     );
 
@@ -163,6 +219,7 @@ async fn main() -> anyhow::Result<()> {
     let instance_id = ulid::Ulid::generate().to_string();
     let published = Arc::new(Mutex::new(0u64));
 
+    let _ = &cfg;
     // heartbeat
     {
         let (bus, rt, published, instance_id) = (bus.clone(), rt.clone(), published.clone(), instance_id.clone());
@@ -170,40 +227,8 @@ async fn main() -> anyhow::Result<()> {
             let mut tick = tokio::time::interval(Duration::from_secs(args.heartbeat_secs));
             loop {
                 tick.tick().await;
-                let counters: BTreeMap<String, f64> = {
-                    let r = rt.lock().await;
-                    let src = r.sources();
-                    let mut c = BTreeMap::from([
-                        ("strategies".to_owned(), r.strategy_ids().len() as f64),
-                        ("paused".to_owned(), r.paused().count() as f64),
-                        ("reloads".to_owned(), r.reloads as f64),
-                        ("instruments".to_owned(), r.instruments() as f64),
-                        ("trades_seen".to_owned(), r.trades_seen as f64),
-                        ("latent_seen".to_owned(), r.latent_seen as f64),
-                        ("regions_seen".to_owned(), r.graph.seen.regions as f64),
-                        ("transitions_seen".to_owned(), r.graph.seen.transitions as f64),
-                        ("closes_seen".to_owned(), r.graph.seen.closes as f64),
-                        ("regions".to_owned(), r.graph.region_count() as f64),
-                        ("transition_rows".to_owned(), r.graph.row_count() as f64),
-                        ("decoder_outputs_seen".to_owned(), r.decoders.seen as f64),
-                        ("decoder_outputs".to_owned(), r.decoders.len() as f64),
-                        ("primitives.graph".to_owned(), src.graph as f64),
-                        ("primitives.decoder".to_owned(), src.decoder as f64),
-                        ("primitives.fallback".to_owned(), src.fallback as f64),
-                        ("signals_emitted".to_owned(), r.signals_emitted as f64),
-                        ("signals_published".to_owned(), *published.lock().await as f64),
-                    ]);
-                    for (id, st) in r.member_stats() {
-                        c.insert(format!("strategy.{id}.mean"), st.last_mean);
-                        c.insert(format!("strategy.{id}.std"), st.last_std);
-                        c.insert(format!("strategy.{id}.steps"), st.steps as f64);
-                        c.insert(format!("strategy.{id}.paused"), f64::from(u8::from(r.is_paused(id))));
-                        c.insert(format!("strategy.{id}.primitives.graph"), st.sources.graph as f64);
-                        c.insert(format!("strategy.{id}.primitives.decoder"), st.sources.decoder as f64);
-                        c.insert(format!("strategy.{id}.primitives.fallback"), st.sources.fallback as f64);
-                    }
-                    c
-                };
+                let mut counters = rt.lock().await.heartbeat_counters(now_ms());
+                counters.insert("signals_published".to_owned(), *published.lock().await as f64);
                 let hb = Heartbeat {
                     service: SERVICE.into(),
                     instance_id: instance_id.clone(),
@@ -272,9 +297,22 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-    // control: ctl.strategy.{reload,pause,resume} (request/reply, CtlRequest → CtlReply)
+    // analog price prefetch from VictoriaMetrics (between steps; D-063)
     {
-        let (bus, rt, cfg) = (bus.clone(), rt.clone(), cfg.clone());
+        let rt = rt.clone();
+        let (batch, every) =
+            (args.analog_prefetch_batch.max(1), Duration::from_millis(args.analog_prefetch_ms.max(50)));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            loop {
+                tick.tick().await;
+                prefetch::prefetch_once(&rt, &vm, batch, now_ms()).await;
+            }
+        });
+    }
+    // control: ctl.strategy.{reload,pause,resume,status} (request/reply, CtlRequest → CtlReply)
+    {
+        let (bus, rt, blob) = (bus.clone(), rt.clone(), blob.clone());
         let mut ctl = bus.subscribe_raw(subjects::ctl("strategy", "*")).await?;
         tokio::spawn(async move {
             while let Some(msg) = ctl.next().await {
@@ -287,7 +325,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
                 let verb = if req.verb.is_empty() { verb } else { req.verb.clone() };
-                let reply = handle_ctl(&cfg, &rt, &verb, &req).await;
+                let reply = handle_ctl(blob.as_ref().as_ref(), &rt, &verb, &req).await;
                 if let Some(to) = msg.reply
                     && let Err(e) = bus.client().publish(to, Bytes::from(reply.encode_to_vec())).await
                 {

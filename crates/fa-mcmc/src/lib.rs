@@ -122,6 +122,117 @@ impl MarkovGraph {
     }
 }
 
+/// One carried region of a kernel transfer (spec 33 §6.6): the new region `new_id` inherits
+/// from the old region `old_id` with match score `score` in `[0, 1]` (the Jaccard overlap of
+/// `fa_patterns::RegionMatch`). Several new regions may inherit from one old region (a split);
+/// several old regions may feed one new region (a merge).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegionCarry {
+    pub new_id: RegionKey,
+    pub old_id: RegionKey,
+    pub score: f64,
+}
+
+/// Result of [`MarkovGraph::transfer`].
+#[derive(Debug, Clone)]
+pub struct Transfer {
+    pub graph: MarkovGraph,
+    /// Observation mass (decayed counts) carried into the new rows.
+    pub carried: f64,
+    /// Observation mass of the old rows that had no destination (unmatched source or successor).
+    pub dropped: f64,
+    /// Rows of the new graph that received any carried mass.
+    pub rows_carried: usize,
+}
+
+impl MarkovGraph {
+    /// Kernel transfer across snapshots (spec 33 §6.6): initialises the rows of a new region
+    /// set from `old` through a region map instead of restarting the posteriors.
+    ///
+    /// Every `new_id` in `carries` (and in `new_support`) is registered as live support. For a
+    /// carried source row, the old counts are mapped successor by successor: a successor mass
+    /// `c` of old region `o` lands on each new region `n` carrying `o`, weighted by `n`'s share of
+    /// the scores of all new regions carrying `o` (a split distributes proportionally, a merge
+    /// sums), and the whole row is scaled by `score(source) · shrink` (`carry_discount`: the
+    /// transferred evidence is worth less than fresh observations). Old successors without a
+    /// destination contribute nothing (they fall back to the prior, like every unmatched new
+    /// region, whose row stays empty until observed). [`UNKNOWN`] mass is carried as is.
+    pub fn transfer(old: &MarkovGraph, carries: &[RegionCarry], new_support: &[RegionKey], shrink: f64) -> Transfer {
+        let shrink = shrink.clamp(0.0, 1.0);
+        let mut graph = MarkovGraph::new(old.prior, old.decay);
+        for id in new_support {
+            graph.register_region(id);
+        }
+        // old successor → [(new successor, share)]
+        let mut dest: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
+        for c in carries {
+            graph.register_region(&c.new_id);
+            if c.score > 0.0 {
+                dest.entry(c.old_id.as_str()).or_default().push((c.new_id.as_str(), c.score));
+            }
+        }
+        for v in dest.values_mut() {
+            let total: f64 = v.iter().map(|x| x.1).sum();
+            for x in v.iter_mut() {
+                x.1 /= total;
+            }
+        }
+        let mut carried = 0.0;
+        let mut dropped = 0.0;
+        let mut rows_carried = 0usize;
+        let mut sources_seen: BTreeSet<&str> = BTreeSet::new();
+        for c in carries {
+            let Some(row) = old.rows.get(&c.old_id) else {
+                continue;
+            };
+            sources_seen.insert(c.old_id.as_str());
+            let factor = c.score.clamp(0.0, 1.0) * shrink;
+            if factor <= 0.0 {
+                continue;
+            }
+            // A split source: each child gets the parent's row scaled by its own score share.
+            let share =
+                dest.get(c.old_id.as_str()).and_then(|v| v.iter().find(|x| x.0 == c.new_id)).map_or(0.0, |x| x.1);
+            let mut any = false;
+            for (to, count) in &row.counts {
+                let mass = count * factor * share;
+                if mass <= 0.0 {
+                    continue;
+                }
+                if to == UNKNOWN {
+                    *graph.rows.entry(c.new_id.clone()).or_default().counts.entry(UNKNOWN.to_owned()).or_insert(0.0) +=
+                        mass;
+                    carried += mass;
+                    any = true;
+                } else if let Some(targets) = dest.get(to.as_str()) {
+                    for (new_to, w) in targets {
+                        *graph
+                            .rows
+                            .entry(c.new_id.clone())
+                            .or_default()
+                            .counts
+                            .entry((*new_to).to_owned())
+                            .or_insert(0.0) += mass * w;
+                    }
+                    carried += mass;
+                    any = true;
+                } else {
+                    dropped += mass;
+                }
+            }
+            if any {
+                rows_carried += 1;
+            }
+        }
+        for (from, row) in &old.rows {
+            if !sources_seen.contains(from.as_str()) {
+                dropped += row.counts.values().sum::<f64>();
+            }
+        }
+        Transfer { graph, carried, dropped, rows_carried }
+    }
+}
+
 /// Dense view of the posterior-mean transition matrix: `index[i]` is the region of row/column
 /// `i`, `matrix[i][j]` the mean probability `index[i] → index[j]`. Regions that are only
 /// successors (never observed as sources, e.g. [`UNKNOWN`]) get an absorbing row.
@@ -533,6 +644,78 @@ mod tests {
         // Σα of the source row is 25 + 3 = 28; the recovered concentration should be in range.
         let s: f64 = dst.alpha("a").iter().map(|x| x.1).sum();
         assert!((15.0..=45.0).contains(&s), "recovered concentration {s}");
+    }
+
+    fn carry(new_id: &str, old_id: &str, score: f64) -> RegionCarry {
+        RegionCarry { new_id: new_id.into(), old_id: old_id.into(), score }
+    }
+
+    #[test]
+    fn transfer_carries_matched_rows_scaled_by_score_and_shrink() {
+        let old = graph(); // a→b ×8, a→c ×2, b→a ×1
+        let carries = [carry("A", "a", 1.0), carry("B", "b", 0.5)];
+        let t = MarkovGraph::transfer(&old, &carries, &["N".into()], 0.5);
+        // row A: a→b 8·1·0.5 = 4 on B; a→c dropped (c unmatched); row B: b→a 1·0.5·0.5 = 0.25 on A
+        let a = t.graph.row("A").unwrap();
+        assert!((a.counts["B"] - 4.0).abs() < 1e-12, "{a:?}");
+        assert!(!a.counts.contains_key("A") && !a.counts.contains_key("c"));
+        let b = t.graph.row("B").unwrap();
+        assert!((b.counts["A"] - 0.25).abs() < 1e-12);
+        assert!((t.carried - 4.25).abs() < 1e-12);
+        assert!((t.dropped - 1.0).abs() < 1e-12, "a→c mass is dropped: {}", t.dropped);
+        assert_eq!(t.rows_carried, 2);
+        // support: every new region + the extra unmatched one
+        assert_eq!(t.graph.support().cloned().collect::<Vec<_>>(), vec!["A", "B", "N"]);
+        // posterior rows still sum to one and keep the old ordering of successors
+        for from in ["A", "B"] {
+            let m: BTreeMap<_, _> = t.graph.posterior_mean(from).into_iter().collect();
+            assert!((m.values().sum::<f64>() - 1.0).abs() < 1e-12);
+            assert!(m.contains_key(UNKNOWN) && m.contains_key("N"));
+        }
+        let m: BTreeMap<_, _> = t.graph.posterior_mean("A").into_iter().collect();
+        // α: A=1, B=5, N=1, unknown=1 → B = 5/8
+        assert!((m["B"] - 5.0 / 8.0).abs() < 1e-12, "{m:?}");
+    }
+
+    #[test]
+    fn transfer_unmatched_regions_start_from_the_prior() {
+        let old = graph();
+        let t = MarkovGraph::transfer(&old, &[carry("X", "zzz", 0.9)], &["Y".into()], 1.0);
+        assert_eq!(t.carried, 0.0);
+        assert_eq!(t.rows_carried, 0);
+        assert!((t.dropped - 11.0).abs() < 1e-12, "all old mass dropped: {}", t.dropped);
+        // nothing observed: rows are empty until the first observation, support is the prior
+        assert!(t.graph.row("X").is_none());
+        let mut g = t.graph;
+        g.observe("X", "Y");
+        let m: BTreeMap<_, _> = g.posterior_mean("X").into_iter().collect();
+        // α: X=1, Y=2, unknown=1
+        assert!((m["Y"] - 0.5).abs() < 1e-12 && (m["X"] - 0.25).abs() < 1e-12, "{m:?}");
+    }
+
+    #[test]
+    fn transfer_splits_and_merges_successor_mass() {
+        let mut old = MarkovGraph::new(1.0, 1.0);
+        for _ in 0..6 {
+            old.observe("s", "t");
+        }
+        for _ in 0..2 {
+            old.observe("s", "u");
+        }
+        // t splits into T1 (score .6) and T2 (score .2); t and u... u merges into T2 as well
+        let carries = [carry("S", "s", 1.0), carry("T1", "t", 0.6), carry("T2", "t", 0.2), carry("T2", "u", 1.0)];
+        let t = MarkovGraph::transfer(&old, &carries, &[], 1.0);
+        let s = t.graph.row("S").unwrap();
+        // t's 6 counts split 0.75 / 0.25; u's 2 counts go whole to T2
+        assert!((s.counts["T1"] - 4.5).abs() < 1e-12, "{s:?}");
+        assert!((s.counts["T2"] - 1.5 - 2.0).abs() < 1e-12, "{s:?}");
+        assert!((t.carried - 8.0).abs() < 1e-12);
+        assert_eq!(t.dropped, 0.0);
+        // a zero-score or zero-shrink carry contributes nothing
+        let z = MarkovGraph::transfer(&old, &[carry("S", "s", 0.0), carry("T", "t", 1.0)], &[], 1.0);
+        assert_eq!(z.carried, 0.0);
+        let z = MarkovGraph::transfer(&old, &carries, &[], 0.0);
+        assert_eq!(z.carried, 0.0);
     }
 
     #[test]

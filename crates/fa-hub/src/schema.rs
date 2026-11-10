@@ -14,6 +14,9 @@ pub mod node {
     pub const ENTITY: &str = "Entity";
     pub const VENUE: &str = "Venue";
     pub const SNAPSHOT: &str = "Snapshot";
+    /// Online-adapter version of a snapshot (spec 36 §5 `AdapterState`): written by the
+    /// trainer's `adapter` job next to the Garage artifact.
+    pub const ADAPTER_STATE: &str = "AdapterState";
     pub const EXPERT_SPACE: &str = "ExpertSpace";
     pub const LATENT_REGION: &str = "LatentRegion";
     pub const WINDOW: &str = "Window";
@@ -34,6 +37,8 @@ pub mod edge {
     /// Snapshot lineage (spec 36 §5): parent snapshot → child snapshot, `op` = the job kind that
     /// produced the child (`pretrain | generation | adapter`).
     pub const SNAPSHOT_PARENT: &str = "SnapshotParent";
+    /// Snapshot → its adapter versions.
+    pub const HAS_ADAPTER: &str = "HasAdapter";
     pub const IN_SPACE: &str = "InSpace";
     pub const TRANSITION: &str = "Transition";
     pub const HIER: &str = "Hier";
@@ -72,6 +77,8 @@ pub fn static_indexes() -> Vec<IndexSpec> {
         I::node_equality(node::VENUE, "venue_id", true),
         I::node_equality(node::SNAPSHOT, "snapshot_id", true),
         I::node_equality(node::SNAPSHOT, "timescale", false),
+        I::node_equality(node::ADAPTER_STATE, "adapter_id", true),
+        I::node_equality(node::ADAPTER_STATE, "snapshot_id", false),
         I::node_equality(node::EXPERT_SPACE, "expert_space_id", true),
         I::node_equality(node::EXPERT_SPACE, "snapshot_id", false),
         I::node_equality(node::LATENT_REGION, "region_id", true),

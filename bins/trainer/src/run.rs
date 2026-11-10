@@ -22,6 +22,7 @@ use crate::{
     artifact::{self, Checkpoint, Stores},
     data::{self, BarHistory},
     fit::{Fit, FitSpec},
+    search::Candidate,
 };
 
 pub const PROTOCOL: &str = "train/v0";
@@ -78,17 +79,15 @@ pub struct AdapterSpec {
     pub window_hours: f64,
     #[serde(default)]
     pub instrument: Option<String>,
-    /// Mean |Δmean|/σ over features beyond which the adapter is frozen (spec 36 §6.5 guard).
-    #[serde(default = "default_max_drift")]
-    pub max_drift: f64,
+    /// Mean |Δmean|/σ over features beyond which the adapter is frozen (spec 36 §6.5 guard);
+    /// default: the snapshot's `manifest.params.adapter_guard.max_drift`, else 1.0.
+    #[serde(default)]
+    pub max_drift: Option<f64>,
     #[serde(default)]
     pub fit: FitConfig,
 }
 
 fn one_hour() -> f64 {
-    1.0
-}
-fn default_max_drift() -> f64 {
     1.0
 }
 
@@ -99,7 +98,7 @@ impl Default for AdapterSpec {
             timescale: None,
             window_hours: 1.0,
             instrument: None,
-            max_drift: default_max_drift(),
+            max_drift: None,
             fit: FitConfig::default(),
         }
     }
@@ -208,12 +207,21 @@ async fn fit_inner(kind: Kind, spec: FitSpec, svc: &Services<'_>, ctl: &Control)
         Some(c) => {
             tracing::info!(job = %ctl.job_id, phase = ?c.fit.phase, "resuming from checkpoint");
             resumed_from = Some(artifact::checkpoint_key(&ctl.job_id).key);
-            let h = data::load(svc.tsdb, ts, Some(&c.instrument), c.start_ms, c.end_ms).await?;
+            let h = data::load_set(svc.tsdb, ts, None, None, c.start_ms, c.end_ms, Some(&c.pins)).await?;
             (h, c.fit)
         }
         None => {
             let (start_ms, end_ms) = data::window(ts, spec.window_hours, now);
-            let h = data::load(svc.tsdb, ts, spec.instrument.as_deref(), start_ms, end_ms).await?;
+            let h = data::load_set(
+                svc.tsdb,
+                ts,
+                spec.instruments.as_ref(),
+                spec.instrument.as_deref(),
+                start_ms,
+                end_ms,
+                None,
+            )
+            .await?;
             let id = crate::fit::snapshot_id(ts, generation, now);
             let f = Fit::new(spec.clone(), id, generation, parent_id.clone(), &h, now);
             (h, f)
@@ -222,9 +230,14 @@ async fn fit_inner(kind: Kind, spec: FitSpec, svc: &Services<'_>, ctl: &Control)
     (ctl.progress)(
         fit.fraction(),
         format!(
-            "{} bars of {} at {ts}; {} windows, {} probes",
-            history.bars.len(),
-            history.instrument,
+            "{} bars of {} instrument(s) at {ts} ({}); {} windows, {} probes",
+            history.iter().map(|h| h.bars.len()).sum::<usize>(),
+            history.len(),
+            history
+                .iter()
+                .map(|h| format!("{}={}", &h.instrument[..h.instrument.len().min(8)], h.source.as_str()))
+                .collect::<Vec<_>>()
+                .join(","),
             fit.n_windows(),
             fit.probes.len()
         ),
@@ -269,16 +282,33 @@ async fn fit_inner(kind: Kind, spec: FitSpec, svc: &Services<'_>, ctl: &Control)
         tokio::task::yield_now().await;
     }
 
-    // 4. decoder feedback (generation only), 5. alignment + bundle, 6. persist
+    if let Some(o) = cancelled(ctl, kind, &fit, started) {
+        return Ok(o);
+    }
+    // 4. decoder feedback (generation only): the latest evolution statistics, the parent's
+    //    decoder skill and the hyper-parameter search scored by the in-process proxy.
     if kind == Kind::Generation {
-        fit.feedback = match svc.pg_url {
+        let stats = match svc.pg_url {
             Some(url) => crate::feedback::latest_generation_stats(url).await,
             None => None,
         };
+        fit.feedback = Some(json!({ "decoder_stats": stats }));
+        if fit.spec.search.candidates > 1 {
+            (ctl.progress)(0.8, format!("feedback search over {} candidates", fit.spec.search.candidates));
+            let anchor = parent_candidate(svc, parent_graph.as_ref(), &fit.spec).await;
+            let skill = crate::feedback::parent_skill(svc.pg_url, parent_id.as_deref()).await;
+            fit.apply_search(&history, &anchor, &skill)?;
+        }
+    }
+    if let Some(o) = cancelled(ctl, kind, &fit, started) {
+        return Ok(o);
     }
     (ctl.progress)(0.9, "regions and alignment".into());
     let parent = artifact::parent_assignment(hub, parent_graph.as_ref(), &history, &fit).await;
     let bundle = fit.finish(&history, &parent, chrono::Utc::now().to_rfc3339())?;
+    if let Some(o) = cancelled(ctl, kind, &fit, started) {
+        return Ok(o);
+    }
     let written = artifact::write_bundle(svc.stores, &bundle, parent_graph.as_ref(), kind.as_str()).await?;
     if let (Some(blob), Some(key)) = (&svc.stores.blob, &ckpt_key) {
         let _ =
@@ -302,6 +332,7 @@ async fn fit_inner(kind: Kind, spec: FitSpec, svc: &Services<'_>, ctl: &Control)
             "metrics": m.metrics,
             "probe_set": m.probe_set,
             "data": m.data,
+            "params": m.params,
             "region_map": {
                 "regions": bundle.region_map.n_regions(),
                 "matched": bundle.region_map.n_matched(),
@@ -320,7 +351,41 @@ async fn fit_inner(kind: Kind, spec: FitSpec, svc: &Services<'_>, ctl: &Control)
     })
 }
 
-async fn save(svc: &Services<'_>, ctl: &Control, kind: Kind, h: &BarHistory, fit: &Fit) -> Option<String> {
+/// A cancel that arrived after the statistics loop (search, regions, before persisting): the
+/// run stops without writing a snapshot. Preemption after the statistics phase is not honoured
+/// here (the remaining work is short and not checkpointed); it finishes.
+fn cancelled(ctl: &Control, kind: Kind, fit: &Fit, started: Instant) -> Option<Outcome> {
+    (ctl.stop.load(Ordering::Relaxed) == CANCEL).then(|| Outcome {
+        status: Status::Cancelled,
+        result: json!({
+            "protocol": PROTOCOL, "kind": kind.job_kind(), "snapshot_id": fit.snapshot_id,
+            "phase": fit.phase_name(), "reason": "cancelled", "elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+        checkpoint_ref: String::new(),
+        output_refs: vec![],
+        error: "cancelled".into(),
+        snapshot_id: Some(fit.snapshot_id.clone()),
+    })
+}
+
+/// The parent's search parameters (candidate 0 of the search): from its Garage manifest when it
+/// has one, else the spec defaults.
+async fn parent_candidate(svc: &Services<'_>, parent: Option<&fa_hub::SnapshotGraph>, spec: &FitSpec) -> Candidate {
+    let fallback = spec.default_candidate();
+    let (Some(blob), Some(g)) = (&svc.stores.blob, parent) else { return fallback };
+    if g.snapshot.garage_key.is_empty() {
+        return fallback;
+    }
+    match artifact::load_snapshot(blob, &g.snapshot.snapshot_id).await {
+        Ok((m, _, _)) => Candidate::from_manifest(&m, &fallback),
+        Err(e) => {
+            tracing::warn!(parent = %g.snapshot.snapshot_id, error = %e, "parent manifest unreadable; search anchors on defaults");
+            fallback
+        }
+    }
+}
+
+async fn save(svc: &Services<'_>, ctl: &Control, kind: Kind, h: &[BarHistory], fit: &Fit) -> Option<String> {
     let blob = svc.stores.blob.as_ref()?;
     if ctl.job_id.is_empty() {
         return None;
@@ -328,9 +393,9 @@ async fn save(svc: &Services<'_>, ctl: &Control, kind: Kind, h: &BarHistory, fit
     let ck = Checkpoint {
         job_id: ctl.job_id.clone(),
         kind: kind.job_kind(),
-        instrument: h.instrument.clone(),
-        start_ms: h.start_ms,
-        end_ms: h.end_ms,
+        pins: h.iter().map(|x| (x.instrument.clone(), x.source)).collect(),
+        start_ms: h.iter().map(|x| x.start_ms).min().unwrap_or_default(),
+        end_ms: h.iter().map(|x| x.end_ms).max().unwrap_or_default(),
         fit: fit.clone(),
         saved_ms: data::now_ms(),
     };
@@ -407,19 +472,30 @@ async fn adapter_inner(spec: AdapterSpec, svc: &Services<'_>, ctl: &Control) -> 
     };
     // Reference encoder: fitted statistics from Garage when the snapshot has an artifact.
     let has_artifact = snap.as_ref().is_some_and(|s| !s.garage_key.is_empty());
-    let (encoder, reference) = match (&svc.stores.blob, has_artifact) {
+    let (encoder, reference, guard) = match (&svc.stores.blob, has_artifact) {
         (Some(blob), true) => {
             let (m, w, _) = artifact::load_snapshot(blob, &snapshot_id).await?;
             let enc = StatisticalEncoder::from_manifest(&m, &w)?;
             let norm = enc.norm().cloned();
-            (enc, norm)
+            (enc, norm, m.adapter_guard())
         }
-        _ => (StatisticalEncoder::new(ts), None),
+        _ => (StatisticalEncoder::new(ts), None, fa_encoders::AdapterGuard::default()),
     };
+    let max_drift = spec.max_drift.unwrap_or(guard.max_drift);
     (ctl.progress)(0.1, format!("adapting {snapshot_id} on the last {:.2} h", spec.window_hours));
     let now = data::now_ms();
     let (start_ms, end_ms) = data::window(ts, spec.window_hours, now);
-    let history = data::load(svc.tsdb, ts, spec.instrument.as_deref(), start_ms, end_ms).await?;
+    let history = data::load_one(svc.tsdb, ts, spec.instrument.as_deref(), start_ms, end_ms, None).await?;
+    if ctl.stop.load(Ordering::Relaxed) == CANCEL {
+        return Ok(Outcome {
+            status: Status::Cancelled,
+            result: json!({ "protocol": PROTOCOL, "kind": "train.adapter", "snapshot_id": snapshot_id, "reason": "cancelled" }),
+            checkpoint_ref: String::new(),
+            output_refs: vec![],
+            error: "cancelled".into(),
+            snapshot_id: Some(snapshot_id),
+        });
+    }
     if ctl.stop.load(Ordering::Relaxed) == PREEMPT {
         return Ok(Outcome {
             status: Status::Preempted,
@@ -432,7 +508,7 @@ async fn adapter_inner(spec: AdapterSpec, svc: &Services<'_>, ctl: &Control) -> 
     }
     let stats = StatisticalEncoder::fit(ts, &history.bars, &spec.fit)?;
     let d = reference.as_ref().and_then(|r| drift(r, &stats));
-    let frozen = d.is_some_and(|d| d > spec.max_drift);
+    let frozen = d.is_some_and(|d| d > max_drift);
     // Occupancy under the snapshot's encoder over the window (how the adapter would move latents).
     let last_view = encoder.encode(&fa_encoders::EncoderInput::from_bars(history.end_ms, &history.bars))?;
     let artifact = json!({
@@ -441,12 +517,13 @@ async fn adapter_inner(spec: AdapterSpec, svc: &Services<'_>, ctl: &Control) -> 
         "timescale": ts,
         "ts_ms": now,
         "created_at": chrono::Utc::now().to_rfc3339(),
-        "window": { "start_ms": history.start_ms, "end_ms": history.end_ms, "instrument": history.instrument, "n_bars": history.bars.len() },
+        "window": { "start_ms": history.start_ms, "end_ms": history.end_ms, "instrument": history.instrument, "source": history.source.as_str(), "n_bars": history.bars.len() },
         "n_windows": stats.n_windows,
         "stats": stats,
         "reference": if reference.is_some() { "snapshot weights" } else { "baseline (no fitted statistics)" },
         "drift": d,
-        "max_drift": spec.max_drift,
+        "max_drift": max_drift,
+        "guard": guard,
         "frozen": frozen,
         "last_latent_rms": last_view.experts.iter().map(|e| (e.mean.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / e.mean.len().max(1) as f64).sqrt()).collect::<Vec<_>>(),
     });
@@ -463,13 +540,37 @@ async fn adapter_inner(spec: AdapterSpec, svc: &Services<'_>, ctl: &Control) -> 
         std::fs::write(&file, serde_json::to_vec_pretty(&artifact)?)?;
         persisted["local"] = json!(file.display().to_string());
     }
+    // AdapterState node next to the artifact (spec 36 §5).
+    let adapter_state = match svc.stores.hub.as_ref() {
+        Some(hub) => {
+            let row = fa_hub::NewAdapterState {
+                snapshot_id: snapshot_id.clone(),
+                timescale: ts.to_string(),
+                version: u64::try_from(now).unwrap_or_default(),
+                garage_key: if persisted["garage"] == json!(true) { key.key.clone() } else { String::new() },
+                drift: d,
+                max_drift,
+                frozen,
+                n_windows: stats.n_windows,
+                window_start_ms: history.start_ms,
+                window_end_ms: history.end_ms,
+            };
+            match artifact::write_adapter_state(hub, &row).await {
+                Ok(Some(a)) => json!({ "adapter_id": a.adapter_id, "helix_id": a.id }),
+                Ok(None) => json!({ "skipped": format!("snapshot {snapshot_id} not in Helix") }),
+                Err(e) => json!({ "error": e.to_string() }),
+            }
+        }
+        None => Value::Null,
+    };
     (ctl.progress)(1.0, format!("adapter {} drift={:?} frozen={frozen}", key.key, d));
     Ok(Outcome {
         status: Status::Ok,
         result: json!({
             "protocol": PROTOCOL, "kind": "train.adapter", "snapshot_id": snapshot_id, "timescale": ts,
             "artifact_key": key.key, "persisted": persisted, "n_bars": history.bars.len(),
-            "n_windows": stats.n_windows, "drift": d, "frozen": frozen, "max_drift": spec.max_drift,
+            "source": history.source.as_str(), "adapter_state": adapter_state,
+            "n_windows": stats.n_windows, "drift": d, "frozen": frozen, "max_drift": max_drift,
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }),
         checkpoint_ref: String::new(),
@@ -490,11 +591,11 @@ mod tests {
         assert_eq!(Kind::Pretrain.job_kind(), "train.pretrain");
         assert_eq!(Kind::Generation.gpu_class(), "generation_training");
         assert_eq!(Kind::Adapter.gpu_class(), "online_adapter");
-        let r = NormStats { n_windows: 10, mean: vec![vec![0.0, 1.0]], std: vec![vec![1.0, 0.0]] };
-        let n = NormStats { n_windows: 3, mean: vec![vec![0.5, 9.0]], std: vec![vec![1.0, 1.0]] };
+        let r = NormStats { n_windows: 10, mean: vec![vec![0.0, 1.0]], std: vec![vec![1.0, 0.0]], gain: vec![] };
+        let n = NormStats { n_windows: 3, mean: vec![vec![0.5, 9.0]], std: vec![vec![1.0, 1.0]], gain: vec![] };
         assert_eq!(drift(&r, &n), Some(0.5), "zero-variance features are skipped");
         let s: AdapterSpec = serde_json::from_str(r#"{"snapshot_id":"x"}"#).unwrap();
         assert_eq!(s.window_hours, 1.0);
-        assert_eq!(s.max_drift, 1.0);
+        assert_eq!(s.max_drift, None, "default comes from the snapshot's adapter guard");
     }
 }

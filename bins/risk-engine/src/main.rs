@@ -15,6 +15,11 @@
 //! startup and every intent, fill, halt/resume, lifecycle action, limit change (audit) and
 //! periodic position / strategy snapshot is persisted ([`persist`]); a reconciliation diff halts
 //! scope `broker`. Without Postgres the engine stays in memory and says so once.
+//!
+//! Reference data and FX (D-061): the instrument table (`fa_warehouse::venues`) is loaded at
+//! start, every `refdata_refresh_secs` and (debounced) on `ref.changed.>` / `ingest.unresolved.>`;
+//! the ECB daily reference rates are fetched every `fx.ecb_refresh_secs` into `ref.fx_rate` and
+//! the in-memory FX table reloaded; today's `ledger.payout_quota` is polled every 30 s.
 mod engine;
 mod persist;
 mod settings;
@@ -93,6 +98,10 @@ async fn publish_outs(bus: &Bus, store: &Store, engine: &Shared, outs: Vec<Out>)
                 Out::Audit { action, subject, payload } => {
                     p.audit(action, Some(subject), payload.clone()).await;
                 }
+                Out::Resume(h) => {
+                    p.audit("resume", Some(&h.scope), serde_json::json!({"reason": h.reason, "raised_by": SERVICE}))
+                        .await;
+                }
                 _ => {}
             }
         }
@@ -107,6 +116,10 @@ async fn publish_outs(bus: &Bus, store: &Store, engine: &Shared, outs: Vec<Out>)
             Out::Halt(h) => {
                 tracing::warn!(scope = %h.scope, reason = %h.reason, "raising halt");
                 bus.publish(subjects::risk_halt(&h.scope), h).await
+            }
+            Out::Resume(h) => {
+                tracing::info!(scope = %h.scope, reason = %h.reason, "clearing own halt");
+                bus.publish(subjects::risk_resume(&h.scope), h).await
             }
         };
         if let Err(e) = r {
@@ -168,7 +181,7 @@ async fn handle_ctl(verb: &str, req: &CtlRequest, engine: &Shared, store: &Store
                 (state, gate)
             };
             if let Some(p) = store {
-                p.strategy_state(&state, gate.as_ref()).await;
+                p.strategy_state(&state, None, gate.as_ref()).await;
                 p.audit_as(
                     &actor,
                     &format!("strategy.{}", action.as_str()),
@@ -182,27 +195,72 @@ async fn handle_ctl(verb: &str, req: &CtlRequest, engine: &Shared, store: &Store
         }
         "limits" => {
             let Some(set) = req.args.get("set") else {
-                return Ok(serde_json::to_value(engine.lock().await.limits()).unwrap_or_default());
+                let e = engine.lock().await;
+                let mut v = serde_json::to_value(e.limits()).unwrap_or_default();
+                v["allocator"] = e.allocator_spec().clone();
+                v["payout_reserve_eur"] = e.payout_reserve().into();
+                return Ok(v);
             };
-            let patch: serde_json::Value =
+            let mut patch: serde_json::Value =
                 serde_json::from_str(set).map_err(|e| format!("invalid: set is not JSON: {e}"))?;
-            let (before, after) = {
-                let mut e = engine.lock().await;
-                let before = e.limits().clone();
-                let after = e.set_limits(&patch)?;
-                (before, after)
-            };
-            if let Some(p) = store {
-                p.audit_as(
-                    &actor,
-                    "limits.tightened",
-                    Some("paper"),
-                    serde_json::json!({"set": patch, "before": before, "after": after}),
-                )
-                .await;
+            // `allocator` is not a limit: a runtime switch (evolved allocator genomes), allowed
+            // in both directions, audited and logged (D-061)
+            let alloc = patch.as_object_mut().and_then(|o| o.remove("allocator"));
+            let mut reply = serde_json::json!({});
+            if let Some(spec) = alloc {
+                let (before, after) = {
+                    let mut e = engine.lock().await;
+                    let before = e.allocator_spec().clone();
+                    (before, e.set_allocator(&spec)?)
+                };
+                if let Some(p) = store {
+                    p.audit_as(
+                        &actor,
+                        "allocator.changed",
+                        Some("paper"),
+                        serde_json::json!({"before": before, "after": after}),
+                    )
+                    .await;
+                }
+                tracing::warn!(%actor, %before, %after, "allocator switched at runtime");
+                reply["allocator"] = after;
             }
-            tracing::warn!(%actor, %patch, "limits tightened at runtime");
-            Ok(serde_json::to_value(&after).unwrap_or_default())
+            if patch.as_object().is_some_and(|o| !o.is_empty()) || !patch.is_object() {
+                let (before, after) = {
+                    let mut e = engine.lock().await;
+                    let before = e.limits().clone();
+                    let after = e.set_limits(&patch)?;
+                    (before, after)
+                };
+                // payout quota (spec 40 §6.5, spec 42 §6): the raised quota is also today's
+                // ledger.payout_quota row, which may only rise
+                if let (Some(p), Some(q)) = (store, patch.get("daily_payout_quota_eur").and_then(|v| v.as_f64())) {
+                    match p.raise_payout_quota(q).await {
+                        Ok(row) => {
+                            engine.lock().await.set_reserved_payout(p.payout_reserve_today().await.max(row.min(q)))
+                        }
+                        Err(e) => tracing::warn!(error = %e, "payout quota row not written"),
+                    }
+                }
+                if let Some(p) = store {
+                    p.audit_as(
+                        &actor,
+                        "limits.tightened",
+                        Some("paper"),
+                        serde_json::json!({"set": patch, "before": before, "after": after}),
+                    )
+                    .await;
+                }
+                tracing::warn!(%actor, %patch, "limits tightened at runtime");
+                let alloc = reply.get("allocator").cloned();
+                reply = serde_json::to_value(&after).unwrap_or_default();
+                if let Some(a) = alloc {
+                    reply["allocator"] = a;
+                }
+            } else if reply.get("allocator").is_none() {
+                return Err("invalid: `set` is empty".into());
+            }
+            Ok(reply)
         }
         "flatten" => {
             let ids = engine.lock().await.flatten_all(now);
@@ -246,6 +304,8 @@ async fn main() -> anyhow::Result<()> {
     );
     let limits = serde_json::to_value(&settings.limits).unwrap_or_default();
     let (snapshot_secs, reconcile_secs) = (settings.snapshot_secs, settings.reconcile_secs);
+    let fx_settings = settings.fx.clone();
+    let refdata_refresh_secs = settings.refdata_refresh_secs;
     let engine: Shared = Arc::new(Mutex::new(Engine::new(settings.clone())));
     let store: Store = if cfg.postgres.url.is_empty() {
         tracing::warn!("no [postgres] url configured: paper book is in memory only (resets on restart)");
@@ -260,10 +320,23 @@ async fn main() -> anyhow::Result<()> {
                     "paper book loaded from postgres"
                 );
                 let states = p.load_strategy_states().await;
-                tracing::info!(strategies = states.len(), "strategy lifecycle rows loaded");
+                let with_books = states.iter().filter(|(_, b)| b.is_some()).count();
+                tracing::info!(strategies = states.len(), with_books, "strategy lifecycle rows and sub-books loaded");
+                let refs = p.load_refdata().await;
+                let fx = p.load_fx(&fx_settings.source, fx_settings.history_days).await;
+                let reserve = p.payout_reserve_today().await;
                 let mut e = engine.lock().await;
                 e.seed_ledger(ledger);
                 e.seed_strategies(states);
+                if let Some(r) = refs {
+                    tracing::info!(instruments = r.len(), "reference data loaded");
+                    e.set_refdata(r);
+                }
+                if let Some(t) = fx {
+                    tracing::info!(rates = t.len(), currencies = ?t.currencies().collect::<Vec<_>>(), "fx table loaded");
+                    let _ = e.set_fx(t, now_ms());
+                }
+                e.set_reserved_payout(reserve);
                 drop(e);
                 p.audit("limits.loaded", Some(&settings.account), limits).await;
                 Some(Arc::new(p))
@@ -296,6 +369,9 @@ async fn main() -> anyhow::Result<()> {
                     );
                     c.insert("gross_exposure_eur".into(), e.gross_exposure_eur());
                     c.insert("halted".into(), if e.halted() { 1.0 } else { 0.0 });
+                    for (venue, eur) in e.exposure_by_venue() {
+                        c.insert(format!("exposure_eur.venue.{venue}"), eur);
+                    }
                     c
                 };
                 let hb = Heartbeat {
@@ -502,13 +578,13 @@ async fn main() -> anyhow::Result<()> {
             tick.tick().await; // skip the immediate first tick
             loop {
                 tick.tick().await;
-                let (ledger, states) = {
+                let (ledger, rows) = {
                     let e = engine_s.lock().await;
-                    (e.ledger().clone(), e.strategy_states())
+                    (e.ledger().clone(), e.strategy_rows())
                 };
                 p_s.snapshot(&ledger, "timer").await;
-                for s in &states {
-                    p_s.strategy_state(s, None).await;
+                for (s, book) in &rows {
+                    p_s.strategy_state(s, Some(book), None).await;
                 }
             }
         });
@@ -518,9 +594,81 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tick.tick().await;
                 let dirty = engine_d.lock().await.take_dirty_strategies();
-                for s in &dirty {
-                    p_d.strategy_state(s, None).await;
+                for (s, book) in &dirty {
+                    p_d.strategy_state(s, Some(book), None).await;
                 }
+            }
+        });
+        // reference data: periodic reload + debounced reload on ref.changed.> / ingest.unresolved.>
+        let refresh = Arc::new(tokio::sync::Notify::new());
+        for subject in ["ref.changed.>", "ingest.unresolved.>"] {
+            let mut sub = bus.subscribe_raw(subject.into()).await?;
+            let refresh = refresh.clone();
+            tokio::spawn(async move {
+                while let Some(m) = sub.next().await {
+                    tracing::debug!(subject = %m.subject, "reference data notice");
+                    refresh.notify_one();
+                }
+            });
+        }
+        let (engine_f, p_f, refresh_f) = (engine.clone(), p.clone(), refresh.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(refdata_refresh_secs.max(5)));
+            tick.tick().await;
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = refresh_f.notified() => tokio::time::sleep(Duration::from_secs(2)).await, // debounce bursts
+                }
+                if let Some(r) = p_f.load_refdata().await {
+                    tracing::debug!(instruments = r.len(), "reference data reloaded");
+                    engine_f.lock().await.set_refdata(r);
+                }
+            }
+        });
+        // ECB daily reference rates → ref.fx_rate → in-memory FX table (spec 12 §6, spec 42 §6)
+        let (engine_x, p_x, bus_x, fx_x) = (engine.clone(), p.clone(), bus.clone(), fx_settings.clone());
+        tokio::spawn(async move {
+            let http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .user_agent(concat!("financial-auto risk-engine/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .expect("http client");
+            let mut tick = tokio::time::interval(Duration::from_secs(fx_x.ecb_refresh_secs.max(60)));
+            loop {
+                tick.tick().await;
+                match p_x.refresh_ecb(&http).await {
+                    Ok((date, n, new)) => {
+                        tracing::info!(%date, currencies = n, new_rows = new, "ecb reference rates fetched");
+                        engine_x.lock().await.counters.insert("fx.ecb_fetches", 1.0);
+                        if new > 0 {
+                            p_x.audit(
+                                "fx.ecb_refresh",
+                                Some(fa_warehouse::fx::ECB_SOURCE),
+                                serde_json::json!({"date": date, "currencies": n, "new_rows": new}),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "ecb reference rates not fetched");
+                        *engine_x.lock().await.counters.entry("fx.ecb_errors").or_insert(0.0) += 1.0;
+                    }
+                }
+                if let Some(t) = p_x.load_fx(&fx_x.source, fx_x.history_days).await {
+                    let outs = engine_x.lock().await.set_fx(t, now_ms());
+                    publish_outs(&bus_x, &Some(p_x.clone()), &engine_x, outs).await;
+                }
+            }
+        });
+        // today's payout quota (spec 40 §6.5: deployable = equity − reserved quota)
+        let (engine_q, p_q) = (engine.clone(), p.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                let r = p_q.payout_reserve_today().await;
+                engine_q.lock().await.set_reserved_payout(r);
             }
         });
         let (engine_r, bus_r) = (engine.clone(), bus.clone());
@@ -551,11 +699,30 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // decision loop
+    // decision loop; SIGTERM / SIGINT flush the book snapshot and every strategy row + sub-book
+    // before exiting, so a clean stop (docker compose stop) loses no sub-book change (D-061)
     let mut tick = tokio::time::interval(Duration::from_millis(args.tick_ms.max(100)));
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
-        tick.tick().await;
-        let outs = engine.lock().await.tick(now_ms());
-        publish_outs(&bus, &store, &engine, outs).await;
+        tokio::select! {
+            _ = tick.tick() => {
+                let outs = engine.lock().await.tick(now_ms());
+                publish_outs(&bus, &store, &engine, outs).await;
+            }
+            _ = term.recv() => break,
+            _ = tokio::signal::ctrl_c() => break,
+        }
     }
+    if let Some(p) = &store {
+        let (ledger, rows) = {
+            let e = engine.lock().await;
+            (e.ledger().clone(), e.strategy_rows())
+        };
+        p.snapshot(&ledger, "shutdown").await;
+        for (s, book) in &rows {
+            p.strategy_state(s, Some(book), None).await;
+        }
+        tracing::info!(strategies = rows.len(), "shutdown flush: book snapshot and strategy sub-books written");
+    }
+    Ok(())
 }

@@ -61,6 +61,36 @@ N::Snapshot {
     garage_key: String,
     status: String, // candidate | active | retired
     created_at: Date DEFAULT NOW,
+    // Written by the trainer for the spec 36 §6.4 promotion checklist (control-api reads them
+    // when the Garage artifact is unavailable); absent on baseline rows.
+    carried_mass: F64,
+    manifest: String, // JSON `fa_encoders::SnapshotManifest`
+    // Set by control-api on promote: snapshot_id of the active snapshot this one replaced;
+    // rollback restores exactly that one (D-065).
+    previous_active: String,
+}
+
+// Online-adapter versions of a snapshot (spec 36 §5 / §6.5): one node per adapter artifact
+// (`fa-models/adapters/<snapshot>/<version>.json`), written by the trainer's `adapter` job.
+N::AdapterState {
+    UNIQUE INDEX adapter_id: String, // `<snapshot_id>@<version>`
+    INDEX snapshot_id: String,
+    timescale: String,
+    version: U64,    // unix ms of the adapter fit (monotonic per snapshot)
+    garage_key: String,
+    drift: F64,      // mean |Δmean|/σ vs the snapshot weights
+    max_drift: F64,  // guard threshold the job applied (manifest.params.adapter_guard)
+    frozen: Boolean, // drift > max_drift
+    n_windows: U64,
+    window_start: Date,
+    window_end: Date,
+    updated_at: Date DEFAULT NOW,
+}
+
+E::HasAdapter {
+    From: Snapshot,
+    To: AdapterState,
+    Properties: {}
 }
 
 N::ExpertSpace {

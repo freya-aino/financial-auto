@@ -38,14 +38,15 @@ func TestHalveUsesParetoRankOverObjectives(t *testing.T) {
 		cand("f", 0.20, 0.10, 4.0), // dominated by everyone
 	}
 	ranked := Rank(cands)
-	if got := ids(ranked); !reflect.DeepEqual(got[:3], []string{"a", "b", "c"}) || got[5] != "e" {
+	// a and b are both front extremes (+Inf crowding); the tie falls back to score, so b (0.60) leads.
+	if got := ids(ranked); !reflect.DeepEqual(got[:3], []string{"b", "a", "c"}) || got[5] != "e" {
 		t.Fatalf("rank = %v", got)
 	}
 	if ranked[3].ID != "d" && ranked[3].ID != "f" {
 		t.Fatalf("rank = %v", ids(ranked))
 	}
 	kept := Halve(cands, 2) // ceil(6/2) = 3
-	if got := ids(kept); !reflect.DeepEqual(got, []string{"a", "b", "c"}) {
+	if got := ids(kept); !reflect.DeepEqual(got, []string{"b", "a", "c"}) {
 		t.Fatalf("kept %v", got)
 	}
 	// Arrival order must not change the result.
@@ -100,5 +101,18 @@ func TestPlanStopsAtMaxBudget(t *testing.T) {
 	rungs := Plan(100, 2, 1000, 3000)
 	if len(rungs) != 2 || rungs[1].BudgetMs != 2000 {
 		t.Fatalf("rungs %v", rungs)
+	}
+}
+
+func TestRankBreaksCrowdingTiesByScore(t *testing.T) {
+	dirs := map[string]string{"a": "max", "b": "min"}
+	// Mutually non-dominated pair: both are extremes of the single front, so both have +Inf crowding.
+	cands := []Candidate{
+		{ID: "alpha", Score: 0.1, Objectives: map[string]float64{"a": 1, "b": 1}, Directions: dirs},
+		{ID: "zeta", Score: 0.9, Objectives: map[string]float64{"a": 2, "b": 2}, Directions: dirs},
+	}
+	got := Rank(cands)
+	if got[0].ID != "zeta" {
+		t.Fatalf("equal crowding must fall back to score, got order %v, %v", got[0].ID, got[1].ID)
 	}
 }

@@ -12,7 +12,7 @@ use fa_patterns::RegionMap;
 use serde::Serialize;
 
 use crate::{
-    data::{BarHistory, same_instrument},
+    data::{BarHistory, Source},
     fit::{Bundle, Fit, ParentAssignment},
 };
 
@@ -102,6 +102,9 @@ async fn mirror(
             status: "candidate".into(),
         })
         .await?;
+    // The promotion checklist (control-api) reads the manifest and carried mass from the node.
+    let manifest_json = String::from_utf8(m.to_json()?).unwrap_or_default();
+    hub.set_snapshot_manifest(snap.id, &manifest_json, bundle.region_map.carried_mass()).await?;
     let mut n_regions = 0;
     let mut n_edges = 0;
     for (k, regions) in bundle.regions.iter().enumerate() {
@@ -159,27 +162,31 @@ pub async fn parent_graph(hub: Option<&HubClient>, parent_id: Option<&str>) -> O
 }
 
 /// The parent's assignment of the probe windows, from its stored `LatentVec` observations
-/// (`kind = observation`, `ref_id = region_id`, `ts` = bar close) of the fitted instrument.
+/// (`kind = observation`, `ref_id = region_id`, `ts` = bar close) of the fitted instruments.
 pub async fn parent_assignment(
     hub: Option<&HubClient>,
     parent: Option<&SnapshotGraph>,
-    history: &BarHistory,
+    histories: &[BarHistory],
     fit: &Fit,
 ) -> ParentAssignment {
     let (Some(hub), Some(g)) = (hub, parent) else {
         return ParentAssignment::none("no parent snapshot in Helix: every region opens a new lineage");
     };
-    let probe_ends = fit.probe_ends_ms(history);
+    let keys = fit.probe_keys(histories);
+    let since = histories.iter().map(|h| h.start_ms).min().unwrap_or_default();
+    let tokens: std::collections::HashSet<String> =
+        histories.iter().map(|h| h.instrument.to_ascii_lowercase()).collect();
     let n_experts = fa_encoders::EXPERT_NAMES.len();
     let mut obs = Vec::new();
     for k in 0..n_experts {
         let space_id = format!("{}-e{k}", g.snapshot.snapshot_id);
-        let rows = match hub.space_latents(&space_id, Some("observation"), Some(history.start_ms), 20_000).await {
+        let rows = match hub.space_latents(&space_id, Some("observation"), Some(since), 50_000).await {
             Ok(r) => r,
             Err(e) => return ParentAssignment::none(format!("parent observations unreadable: {e}")),
         };
         for r in rows {
-            if !same_instrument(&history.instrument, &r.instrument_id) {
+            let token = r.instrument_id.replace('-', "").to_ascii_lowercase();
+            if !tokens.contains(&token) {
                 continue;
             }
             let Some(ts) = r.ts.as_deref().and_then(parse_rfc3339_ms) else { continue };
@@ -188,14 +195,15 @@ pub async fn parent_assignment(
                 .iter()
                 .find(|x| x.region_id == r.ref_id)
                 .map_or_else(|| r.ref_id.clone(), |x| x.lineage_id.clone());
-            obs.push((k as u32, r.ref_id, lineage, ts));
+            obs.push((k as u32, r.ref_id, lineage, token, ts));
         }
     }
-    let mut a = ParentAssignment::from_observations(&g.snapshot.snapshot_id, n_experts, &probe_ends, obs);
+    let mut a = ParentAssignment::from_observations(&g.snapshot.snapshot_id, n_experts, &keys, obs);
     if a.covered == 0 {
         a.note = Some(format!(
-            "parent {} has no stored observations for {} in the window: every region opens a new lineage",
-            g.snapshot.snapshot_id, history.instrument
+            "parent {} has no stored observations for the {} fitted instrument(s) in the window: every region opens a new lineage",
+            g.snapshot.snapshot_id,
+            histories.len()
         ));
     }
     a
@@ -242,17 +250,30 @@ pub async fn load_checkpoint(blob: &S3BlobStore, key: &str) -> anyhow::Result<Op
     }
 }
 
-/// Checkpoint payload: the fit state and the exact data window it was built on, so a resumed
-/// job reads the same bars.
+/// Checkpoint payload: the fit state and the exact data window and sources it was built on,
+/// so a resumed job reads the same bars.
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct Checkpoint {
     pub job_id: String,
     pub kind: String,
-    pub instrument: String,
+    /// `(instrument token, source)` per history, in fit order.
+    pub pins: Vec<(String, Source)>,
     pub start_ms: i64,
     pub end_ms: i64,
     pub fit: Fit,
     pub saved_ms: i64,
+}
+
+// ── adapters ────────────────────────────────────────────────────────────────
+
+/// Mirrors an adapter artifact as an `AdapterState` node linked from its snapshot. Returns
+/// `Ok(None)` when the snapshot is not in Helix (baseline without a row).
+pub async fn write_adapter_state(
+    hub: &HubClient,
+    a: &fa_hub::NewAdapterState,
+) -> anyhow::Result<Option<fa_hub::AdapterState>> {
+    let Some(snap) = hub.snapshot_by_id(&a.snapshot_id).await? else { return Ok(None) };
+    Ok(Some(hub.add_adapter_state(snap.id, a).await?))
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -357,4 +358,57 @@ func TestStrategyGenerationPromotesFinalFront(t *testing.T) {
 	if key, err := hook(&Generation{Kind: "evo.eval.decoder"}, gotFront); key != "" || err != nil {
 		t.Fatalf("decoder promote %q %v", key, err)
 	}
+}
+
+func TestAllocatorGenerationPromotesFinalFront(t *testing.T) {
+	var summaries []Summary
+	var store fakeStore
+	genomes := []string{
+		"alloc:name=risk_parity;cap=0.4;shrink=1;kelly=0.25;hl=240;pv=0.01;w_eq=0;w_rp=1;w_k=0",
+		"alloc:name=fractional_kelly;cap=0.5;shrink=1;kelly=0.1;hl=60;pv=0.00001;w_eq=0;w_rp=0;w_k=1",
+	}
+	g, _ := NewGenerationWith(GenerationConfig{Kind: AllocatorEvalKind, Eta: 2, MinBudgetMs: 100, MaxBudgetMs: 100, MaxGenerations: 1,
+		Genomes: genomes, OnSummary: func(s Summary) { summaries = append(summaries, s) }, Promote: PromoteFronts(&store, nil)})
+	s := &sink{}
+	_ = g.Start(s.pub)
+	for i, j := range s.jobs {
+		r := &fav1.JobResult{JobId: j.JobId, Status: fav1.JobResult_STATUS_OK, Result: []byte(fmt.Sprintf(`{"score":%d}`, i)),
+			Objectives: map[string]float64{"sharpe": float64(i), "turnover": float64(i)},
+			Directions: map[string]string{"sharpe": "max", "turnover": "min"}}
+		_, _ = g.OnResult(r, s.pub)
+	}
+	last := summaries[len(summaries)-1]
+	if last.ArtifactKey != "fa-artifacts/allocators/"+g.ID+".toml" || store.key != AllocatorsKey(g.ID) {
+		t.Fatalf("artifact %q stored %q", last.ArtifactKey, store.key)
+	}
+	body := string(store.body)
+	for _, want := range []string{"[active]", `name = "fractional_kelly"`, "[[allocator]]", "pv = 1e-05", "cap = 0.4",
+		`set={"allocator":{"name":"fractional_kelly","params":{`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q in\n%s", want, body)
+		}
+	}
+	if VaryKind(AllocatorEvalKind) != "evo.vary.allocator" {
+		t.Fatal("vary kind")
+	}
+	if sel, ok := ParseAllocatorGenome(genomes[0]); !ok || sel.Name != "risk_parity" || sel.Params["cap"] != 0.4 || len(sel.Params) != 8 {
+		t.Fatalf("parse %+v", sel)
+	}
+	if _, n := AllocatorsTOML("g", AllocatorEvalKind, []FrontMember{{Genome: "forecast:h=3"}}, time.Unix(0, 0)); n != 0 {
+		t.Fatal("non-allocator genome archived")
+	}
+	// the strategy hook name still archives strategies only through the shared dispatcher
+	if key, err := PromoteStrategies(nil, nil)(&Generation{Kind: "evo.eval.decoder"}, nil); key != "" || err != nil {
+		t.Fatalf("decoder promote %q %v", key, err)
+	}
+}
+
+type fakeStore struct {
+	key  string
+	body []byte
+}
+
+func (f *fakeStore) Put(_ context.Context, _, key string, body []byte, _ string) error {
+	f.key, f.body = key, body
+	return nil
 }

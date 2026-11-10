@@ -25,7 +25,6 @@ pub fn router(state: AppState, frontend: Option<PathBuf>) -> Router {
         .route("/api/health", get(health))
         .route("/api/services", get(services))
         .route("/api/config/timescales", get(timescales))
-        .route("/api/services/{name}/{action}", post(not_implemented))
         .route("/api/jobs", get(lr::jobs))
         .route("/api/jobs/{id}/cancel", post(lr::cancel_job))
         .route("/api/gpu", get(lr::gpu))

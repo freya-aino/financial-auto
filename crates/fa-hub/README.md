@@ -18,7 +18,10 @@ integration tests, see below). Supersedes the D-012 assumption of CLI-compiled
   `ensure_expert_space` (get-or-create), `upsert_region`, `mark_region_status`,
   `upsert_transition(s)` (edge keyed by `from_region_id, to_region_id, sampler_id`),
   `snapshot_graph`, `resolve_node`; business-id variants for evo-worker: `upsert_genome`,
-  `link_parent`, `add_fitness_record`.
+  `link_parent`, `add_fitness_record`. Trainer (spec 36): `set_snapshot_manifest` (manifest JSON +
+  `carried_mass` on the `Snapshot` node, read by control-api's promotion checklist),
+  `add_adapter_state` / `snapshot_adapters` / `latest_adapter` (`AdapterState` node,
+  `adapter_id = <snapshot_id>@<version>`, `HasAdapter` edge from the snapshot).
 - `catalog` – the **whitelist** of read-only named queries behind `POST /api/graph/query`
   (`NAMED_QUERIES`, `HubClient::run_named(name, params)`); business-id parameters, no raw trees.
 - `HubClient::{new, with_timeout, from_env, url_from_env_or, health, ready, diagnostics, batch,
@@ -155,6 +158,7 @@ Also available but unused: `GET /healthz`, `GET /readyz` (503 while indexes catc
 |---|---|
 | `bins/model-runtime` (`hub_sink`) | `Snapshot stat-v1-<ts>`, `ExpertSpace <snapshot>-e<k>`, `LatentRegion` (+ `status`), `Transition` (coalesced), `LatentVec kind=observation` for 1m and slower |
 | `bins/evo-worker` (pending; functions ready) | `Genome` via `upsert_genome`, `ParentOf` via `link_parent`, `FitnessRecord`+`Scored` via `add_fitness_record` |
+| `bins/trainer` | `Snapshot` candidates (+ `manifest`, `carried_mass`), `ExpertSpace`, `LatentRegion`, `SnapshotParent`, `RegionMatch`, `AdapterState` + `HasAdapter` |
 | `bins/control-api` (`graph_routes`) | reads only: `list_snapshots`, `snapshot_graph`, `resolve_node` + `neighborhood`, `genome_ancestry`, `run_named` |
 
 ## Tests
@@ -162,12 +166,13 @@ Also available but unused: `GET /healthz`, `GET /readyz` (503 while indexes catc
 cargo test -p fa-hub                                   # unit tests (JSON shapes, parsing, catalog validation)
 FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test live   # against `just up`'s helix
 
-Known flake: when the live suite runs concurrently with other Helix writers (a workspace-wide `cargo test` plus the compose `model-runtime`), `ensure_upsert_and_lifecycle_queries_are_idempotent` has once seen a transition count off by one; it passes reliably on its own and with `--test-threads=1`.
+Concurrent writers: `HubClient::batch` retries `409 transaction_conflict` (an aborted, uncommitted transaction) up to six times with a short backoff, so parallel writers and the parallel live suite do not fail spuriously.
 ```
 The live tests create `test-<nanos>-…` rows and drop them afterwards; the indexes created by
 `ensure_schema` and the `vec4` latent index remain. `live.rs` covers the typed queries, the
 idempotent `ensure_*`/`upsert_*` writers, lifecycle marks, `snapshot_graph`, `resolve_node`, the
-named-query catalog and the evo-worker business-id writers.
+named-query catalog, the evo-worker business-id writers and the `AdapterState` round trip
+(`adapter_state_round_trip_and_snapshot_manifest`).
 
 ## Governing specs
 - [20-storage](../../specs/20-storage.md) §5.2, [ADR 0002](../../specs/adr/0002-helixdb-hub.md), D-012, D-033, D-043, D-048

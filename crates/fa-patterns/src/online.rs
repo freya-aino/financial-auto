@@ -291,6 +291,18 @@ impl RegionDiscovery for LeaderClustering {
     }
 }
 
+impl LeaderClustering {
+    /// Discovers the region set of `points` and assigns every point: inside a region's radius
+    /// when possible, else to the nearest centroid (so a fit assigns every probe window).
+    /// Deterministic in point order; what the trainer's region fit and its hyper-parameter
+    /// search share.
+    pub fn fit_assign(&self, points: &[Vec<f32>]) -> (Vec<Vec<f32>>, Vec<Option<usize>>) {
+        let centroids = self.discover(points);
+        let assign = points.iter().map(|p| self.assign(&centroids, p).or_else(|| nearest(&centroids, p))).collect();
+        (centroids, assign)
+    }
+}
+
 pub fn distance(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt()
 }
@@ -404,5 +416,20 @@ mod tests {
         assert_eq!(r.region_id, "p-r001");
         assert!(r.is_novel(set.cfg()));
         assert_eq!(set.live_count(), 2);
+    }
+
+    #[test]
+    fn fit_assign_covers_every_point_deterministically() {
+        let disc = LeaderClustering { radius: 1.0, max_regions: 8 };
+        let pts: Vec<Vec<f32>> = (0..40).map(|i| vec![(i % 4) as f32 * 5.0, 0.0]).collect();
+        let (c, a) = disc.fit_assign(&pts);
+        assert_eq!(c.len(), 4);
+        assert!(a.iter().all(Option::is_some));
+        assert_eq!((c.clone(), a.clone()), disc.fit_assign(&pts));
+        let far = vec![vec![0.0, 0.0], vec![100.0, 0.0]];
+        let tight = LeaderClustering { radius: 0.1, max_regions: 1 };
+        let (c, a) = tight.fit_assign(&far);
+        assert_eq!(c.len(), 1);
+        assert_eq!(a, vec![Some(0), Some(0)], "outside every radius → nearest centroid");
     }
 }

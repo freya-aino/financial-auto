@@ -81,3 +81,29 @@ step_secs = 10
 # after two bars in a region, lean on that region's realised forward return; stand aside when the latent is novel
 signal = "(if_gt (novelty 0) 0.6 0 (if_gt (dwell (cur_region 0)) 2 (mul 400 (region_feature (cur_region 0) mean_fwd_return)) 0))"
 uncertainty = "(max (novelty 0) (sub 1 (path_value (sample_walk (cur_region 0) 3 64) up)))"
+
+# ---- text / visual decoder baselines (spec 35 §4.2 `text_score` / `visual_score`, D-063): read
+# model-runtime's `decoder.output.text.<topic>` / `decoder.output.visual.<kind>` scores in [-1, 1]
+# (instrument-specific output preferred over the market-wide `inst:*` one); 0 while nobody produces them.
+
+[[strategy]]
+id = "baseline-text-visual-1s"
+genome_id = "baseline"
+timescale = "1s"
+steps = 5
+lookback_bars = 32
+# agree-or-stand-aside: news sentiment times the future-chart direction, scaled so ±1 saturates tanh
+signal = "(mul 3 (mul (text_score news) (visual_score future)))"
+# uncertain when the news score is stale (score = freshness of the latest text.news output)
+uncertainty = "(sub 1 (score text.news))"
+
+[[strategy]]
+id = "baseline-narrative-chart-1m"
+genome_id = "baseline"
+timescale = "1m"
+steps = 3
+lookback_bars = 20
+step_secs = 10
+# narrative + summary consensus, gated by the chart decoder agreeing in sign
+signal = "(if_gt (mul (visual_score chart) (add (text_score narrative) (text_score summary))) 0 (mul 2 (add (text_score narrative) (text_score summary))) 0)"
+uncertainty = "(max (sub 1 (score text.summary)) (sub 1 (score visual.chart)))"

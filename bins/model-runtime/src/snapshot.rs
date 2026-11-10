@@ -11,19 +11,23 @@
 //!
 //! `ctl.model.reload` (request/reply, `CtlRequest{verb: "reload", args: timescale, snapshot_id?}`)
 //! resolves the named snapshot (default: the active one) and swaps it into the running pipeline
-//! ([`crate::pipeline::TimescalePipeline::swap_encoder`]); control-api's promote/rollback call
-//! it after changing the Helix status. The reply says what is now serving.
+//! ([`crate::pipeline::TimescalePipeline::swap_encoder`], with kernel transfer); control-api's
+//! promote/rollback call it after changing the Helix status. The reply says what is now serving.
+//! `ctl.model.shadow` (`timescale`, `snapshot_id` | `none`) resolves a candidate the same way and
+//! serves it alongside the active one ([`crate::shadow`]); `ctl.model.adapter` (`timescale`)
+//! applies the latest online-adapter artifact of the active snapshot ([`SnapshotLoader::adapter`]).
 
 use fa_blob::{BlobStore, S3BlobStore};
 use fa_core::{Secrets, Timescale, config::PlatformConfig};
 use fa_encoders::{
-    EncoderFamily, MANIFEST_FILE, REGION_MAP_FILE, STATISTICAL_FAMILY, SnapshotManifest, StatisticalEncoder,
+    EncoderFamily, MANIFEST_FILE, NormStats, REGION_MAP_FILE, STATISTICAL_FAMILY, SnapshotManifest, StatisticalEncoder,
     WEIGHTS_FILE,
 };
 use fa_hub::HubClient;
 use fa_patterns::RegionMap;
 use fa_proto::v1::{CtlReply, CtlRequest};
 use futures::StreamExt;
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::hub_sink::SnapshotDesc;
@@ -151,50 +155,208 @@ impl SnapshotLoader {
             note: None,
         })
     }
+
+    /// The online adapter of `snapshot_id` (spec 36 §6.5): `artifact_key` when given (from a
+    /// `jobs.result.train.adapter`), else the newest `fa-models/adapters/<snapshot>/<ms>.json`.
+    /// The artifact's re-fitted normalisation statistics replace the snapshot's (a trained
+    /// snapshot keeps its manifest params, e.g. `context_steps`). A `frozen` artifact (drift
+    /// beyond `max_drift`) is refused, as is one for another timescale.
+    pub async fn adapter(
+        &self,
+        ts: Timescale,
+        snapshot_id: &str,
+        artifact_key: Option<&str>,
+    ) -> anyhow::Result<LoadedAdapter> {
+        let Some(blob) = &self.blob else {
+            anyhow::bail!("adapters need Garage credentials");
+        };
+        let key = match artifact_key.filter(|k| !k.is_empty()) {
+            Some(k) => k.to_owned(),
+            None => {
+                let prefix = format!("adapters/{snapshot_id}/");
+                let listed = blob.list(fa_blob::buckets::MODELS, &prefix).await?;
+                listed
+                    .into_iter()
+                    .filter_map(|o| adapter_ms(&o.key).map(|ms| (ms, o.key)))
+                    .max()
+                    .map(|x| x.1)
+                    .ok_or_else(|| anyhow::anyhow!("no adapter artifact under fa-models/{prefix}"))?
+            }
+        };
+        let bytes = blob.get(&fa_blob::ObjectKey { bucket: fa_blob::buckets::MODELS, key: key.clone() }).await?;
+        let art = AdapterArtifact::from_json(&bytes)?;
+        if art.snapshot_id != snapshot_id {
+            anyhow::bail!("adapter {key} is for {} not {snapshot_id}", art.snapshot_id);
+        }
+        if art.timescale != ts {
+            anyhow::bail!("adapter {key} is for {} not {ts}", art.timescale);
+        }
+        if art.frozen {
+            anyhow::bail!("adapter {key} is frozen (drift {:?} > max {:?})", art.drift, art.max_drift);
+        }
+        let encoder: Box<dyn EncoderFamily> = match blob.get(&fa_blob::snapshot_file(snapshot_id, MANIFEST_FILE)).await
+        {
+            Ok(m) => {
+                Box::new(StatisticalEncoder::from_manifest(&SnapshotManifest::from_json(&m)?, &art.stats.to_bytes())?)
+            }
+            Err(fa_blob::BlobError::NotFound(..)) => {
+                Box::new(StatisticalEncoder::with_stats(ts, snapshot_id.to_owned(), art.stats.clone()))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        Ok(LoadedAdapter { encoder, key, ts_ms: art.ts_ms, drift: art.drift })
+    }
 }
 
-/// A `ctl.model.reload` request handed to the pipeline loop.
-pub struct ReloadRequest {
+/// An adapter ready to replace the serving encoder.
+pub struct LoadedAdapter {
+    pub encoder: Box<dyn EncoderFamily>,
+    pub key: String,
+    pub ts_ms: i64,
+    pub drift: Option<f64>,
+}
+
+/// The part of the trainer's `fa-models/adapters/<snapshot>/<ms>.json` the runtime needs
+/// (written by `bins/trainer` `run_adapter`, `protocol: train/v0`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdapterArtifact {
+    pub snapshot_id: String,
     pub timescale: Timescale,
-    pub snapshot_id: Option<String>,
+    pub ts_ms: i64,
+    pub stats: NormStats,
+    #[serde(default)]
+    pub drift: Option<f64>,
+    #[serde(default)]
+    pub max_drift: Option<f64>,
+    #[serde(default)]
+    pub frozen: bool,
+}
+
+impl AdapterArtifact {
+    pub fn from_json(b: &[u8]) -> anyhow::Result<Self> {
+        Ok(serde_json::from_slice(b)?)
+    }
+}
+
+/// `<ms>` of an `adapters/<snapshot>/<ms>.json` key.
+pub fn adapter_ms(key: &str) -> Option<i64> {
+    key.rsplit('/').next()?.strip_suffix(".json")?.parse().ok()
+}
+
+/// A `ctl.model.<verb>` request handed to the pipeline loop.
+pub struct CtlCommand {
+    pub timescale: Timescale,
+    pub verb: CtlVerb,
     pub reply: oneshot::Sender<CtlReply>,
 }
 
-/// Subscribes to `ctl.model.reload` and forwards decoded requests; answers the NATS reply
-/// subject with whatever the loop sends back (or an error for malformed requests).
-pub async fn run_reload_listener(bus: fa_bus::Bus, tx: mpsc::Sender<ReloadRequest>) {
-    let subject = fa_bus::subjects::ctl("model", "reload");
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CtlVerb {
+    /// Swap the active encoder (`snapshot_id`, default: the active Helix snapshot).
+    Reload { snapshot_id: Option<String> },
+    /// Serve a candidate in shadow (`None` = stop shadowing).
+    Shadow { snapshot_id: Option<String> },
+    /// Apply the latest online adapter of the active snapshot.
+    Adapter,
+}
+
+/// Parses verb + args; `Err` is the reply message for a malformed request.
+pub fn parse_ctl(verb: &str, req: &CtlRequest) -> Result<(Timescale, CtlVerb), String> {
+    let ts = match req.args.get("timescale").map(|s| s.parse::<Timescale>()) {
+        Some(Ok(t)) => t,
+        Some(Err(e)) => return Err(format!("bad timescale: {e}")),
+        None => return Err("missing arg `timescale`".into()),
+    };
+    let snapshot_id = req.args.get("snapshot_id").map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_owned);
+    let v = match verb {
+        "reload" => CtlVerb::Reload { snapshot_id },
+        "shadow" => CtlVerb::Shadow { snapshot_id: snapshot_id.filter(|s| !s.eq_ignore_ascii_case("none")) },
+        "adapter" => CtlVerb::Adapter,
+        other => return Err(format!("unknown verb `{other}` (reload | shadow | adapter)")),
+    };
+    Ok((ts, v))
+}
+
+/// Subscribes to `ctl.model.>` (`reload`, `shadow`, `adapter`) and forwards decoded requests;
+/// answers the NATS reply subject with whatever the loop sends back (or an error for malformed
+/// requests).
+pub async fn run_ctl_listener(bus: fa_bus::Bus, tx: mpsc::Sender<CtlCommand>) {
+    let subject = "ctl.model.>".to_owned();
     let Ok(mut sub) = bus.subscribe_raw(subject.clone()).await else {
-        tracing::error!(subject, "cannot subscribe to ctl.model.reload");
+        tracing::error!(subject, "cannot subscribe to ctl.model.>");
         return;
     };
-    tracing::info!(subject, "listening for snapshot reloads");
+    tracing::info!(subject, "listening for snapshot reload / shadow / adapter requests");
     while let Some(msg) = sub.next().await {
         let reply_to = msg.reply.clone();
+        let verb = msg.subject.as_str().strip_prefix("ctl.model.").unwrap_or_default().to_owned();
         let answer = match <CtlRequest as fa_proto::Message>::decode(msg.payload.as_ref()) {
-            Ok(req) => {
-                let ts = req.args.get("timescale").map(|s| s.parse::<Timescale>());
-                match ts {
-                    Some(Ok(timescale)) => {
-                        let (rtx, rrx) = oneshot::channel();
-                        let snapshot_id = req.args.get("snapshot_id").filter(|s| !s.is_empty()).cloned();
-                        if tx.send(ReloadRequest { timescale, snapshot_id, reply: rtx }).await.is_err() {
-                            CtlReply { ok: false, message: "pipeline loop gone".into() }
-                        } else {
-                            rrx.await.unwrap_or(CtlReply { ok: false, message: "reload dropped".into() })
-                        }
+            Ok(req) => match parse_ctl(&verb, &req) {
+                Ok((timescale, verb)) => {
+                    let (rtx, rrx) = oneshot::channel();
+                    if tx.send(CtlCommand { timescale, verb, reply: rtx }).await.is_err() {
+                        CtlReply { ok: false, message: "pipeline loop gone".into() }
+                    } else {
+                        rrx.await.unwrap_or(CtlReply { ok: false, message: "request dropped".into() })
                     }
-                    Some(Err(e)) => CtlReply { ok: false, message: format!("bad timescale: {e}") },
-                    None => CtlReply { ok: false, message: "missing arg `timescale`".into() },
                 }
-            }
+                Err(m) => CtlReply { ok: false, message: m },
+            },
             Err(e) => CtlReply { ok: false, message: format!("undecodable CtlRequest: {e}") },
         };
         if let Some(reply_to) = reply_to {
             let bytes = fa_proto::Message::encode_to_vec(&answer);
             if let Err(e) = bus.client().publish(reply_to, bytes.into()).await {
-                tracing::warn!(error = %e, "reload reply failed");
+                tracing::warn!(error = %e, "ctl reply failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctl_requests_parse() {
+        let req = |args: &[(&str, &str)]| CtlRequest {
+            verb: String::new(),
+            args: args.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+        };
+        assert_eq!(
+            parse_ctl("shadow", &req(&[("timescale", "1m"), ("snapshot_id", "stat-v1-1m-g0-1")])).unwrap(),
+            (Timescale::Minute, CtlVerb::Shadow { snapshot_id: Some("stat-v1-1m-g0-1".into()) })
+        );
+        assert_eq!(
+            parse_ctl("shadow", &req(&[("timescale", "1m"), ("snapshot_id", "none")])).unwrap().1,
+            CtlVerb::Shadow { snapshot_id: None }
+        );
+        assert_eq!(parse_ctl("shadow", &req(&[("timescale", "1h")])).unwrap().1, CtlVerb::Shadow { snapshot_id: None });
+        assert_eq!(parse_ctl("reload", &req(&[("timescale", "1d")])).unwrap().1, CtlVerb::Reload { snapshot_id: None });
+        assert_eq!(parse_ctl("adapter", &req(&[("timescale", "1m")])).unwrap().1, CtlVerb::Adapter);
+        assert!(parse_ctl("adapter", &req(&[])).unwrap_err().contains("timescale"));
+        assert!(parse_ctl("reload", &req(&[("timescale", "2m")])).unwrap_err().contains("bad timescale"));
+        assert!(parse_ctl("explode", &req(&[("timescale", "1m")])).unwrap_err().contains("unknown verb"));
+    }
+
+    #[test]
+    fn trainer_adapter_artifact_parses() {
+        // shape written by bins/trainer run_adapter (protocol train/v0)
+        let stats = NormStats { n_windows: 3, mean: vec![vec![0.0; 8]; 3], std: vec![vec![1.0; 8]; 3], gain: vec![] };
+        let json = serde_json::json!({
+            "protocol": "train/v0", "snapshot_id": "stat-v1-1m", "timescale": "1m", "ts_ms": 1_700_000_000_000i64,
+            "created_at": "2026-11-10T00:00:00Z",
+            "window": {"start_ms": 0, "end_ms": 1, "instrument": "x", "n_bars": 60},
+            "n_windows": 3, "stats": stats, "reference": "baseline (no fitted statistics)",
+            "drift": null, "max_drift": 1.0, "frozen": false, "last_latent_rms": [0.1, 0.2, 0.3]
+        });
+        let a = AdapterArtifact::from_json(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(
+            (a.snapshot_id.as_str(), a.timescale, a.ts_ms, a.frozen),
+            ("stat-v1-1m", Timescale::Minute, 1_700_000_000_000, false)
+        );
+        assert_eq!(a.stats, stats);
+        assert_eq!(adapter_ms("adapters/stat-v1-1m/1700000000000.json"), Some(1_700_000_000_000));
+        assert_eq!(adapter_ms("adapters/stat-v1-1m/notes.txt"), None);
     }
 }

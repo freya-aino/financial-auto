@@ -68,6 +68,27 @@ pub struct CashMovement {
     pub occurred_at: DateTime<Utc>,
 }
 
+/// Accounting details of a fill beyond [`Fill`] (spec 42 §5 `fill.ccy/fx_source/arrival_price`,
+/// D-051 `slippage_bps`); [`PgLedger::record_fill`] uses the defaults (EUR, source `fixed`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FillDetails {
+    /// Currency of `Fill.price`.
+    pub ccy: String,
+    /// Where `Fill.fx_to_eur` came from (`eur`, `ecb_daily`, `fixed`, `missing`, …).
+    pub fx_source: String,
+    /// Last trade when the intent was accepted (execution quality, spec 40 §6.4).
+    pub arrival_price: Option<f64>,
+    /// Signed slippage vs the arrival price in basis points (positive = paid).
+    pub slippage_bps: Option<f64>,
+}
+
+impl Default for FillDetails {
+    fn default() -> Self {
+        Self { ccy: fa_core::BASE_CURRENCY.into(), fx_source: "fixed".into(), arrival_price: None, slippage_bps: None }
+    }
+}
+
 /// A fill row joined with its intent, as read back for replay / P&L.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FillRow {
@@ -81,6 +102,14 @@ pub struct FillRow {
     pub fee_eur: f64,
     pub fx_rate_eur: f64,
     pub filled_at: DateTime<Utc>,
+    #[serde(default)]
+    pub ccy: String,
+    #[serde(default)]
+    pub fx_source: String,
+    #[serde(default)]
+    pub arrival_price: Option<f64>,
+    #[serde(default)]
+    pub slippage_bps: Option<f64>,
 }
 
 impl FillRow {
@@ -192,11 +221,24 @@ impl PgLedger {
 
     /// Persists a fill (plus its strategy attribution, split evenly). Returns `false` on replay.
     /// The intent must have been recorded first ([`PgError::UnknownIntent`] otherwise).
+    /// EUR-priced with FX source `fixed`; see [`Self::record_fill_with`] for the full details.
     pub async fn record_fill(
         &self,
         f: &Fill,
         filled_at: DateTime<Utc>,
         strategy_ids: &[String],
+    ) -> Result<bool, PgError> {
+        self.record_fill_with(f, filled_at, strategy_ids, &FillDetails::default()).await
+    }
+
+    /// [`Self::record_fill`] with the fill's currency, FX source, arrival price and slippage
+    /// (`ledger.fill.arrival_price` / `slippage_bps`, migration `20261110000060`).
+    pub async fn record_fill_with(
+        &self,
+        f: &Fill,
+        filled_at: DateTime<Utc>,
+        strategy_ids: &[String],
+        d: &FillDetails,
     ) -> Result<bool, PgError> {
         let mut tx = self.pool.begin().await?;
         let known: Option<(String,)> =
@@ -210,9 +252,10 @@ impl PgLedger {
         let fill_uuid = uuid_of(&f.fill_id);
         let inserted = sqlx::query(
             "INSERT INTO ledger.fill \
-             (id, client_order_id, venue_fill_id, qty, price, ccy, fee, fee_ccy, fx_rate_eur, fx_source, filled_at) \
-             VALUES ($1, $2, $3, $4::float8::numeric, $5::float8::numeric, 'EUR', $6::float8::numeric, 'EUR', \
-                     $7::float8::numeric, 'fixed', $8) \
+             (id, client_order_id, venue_fill_id, qty, price, ccy, fee, fee_ccy, fx_rate_eur, fx_source, filled_at, \
+              arrival_price, slippage_bps) \
+             VALUES ($1, $2, $3, $4::float8::numeric, $5::float8::numeric, $9, $6::float8::numeric, 'EUR', \
+                     $7::float8::numeric, $10, $8, $11::float8::numeric, $12::float8::numeric) \
              ON CONFLICT DO NOTHING",
         )
         .bind(fill_uuid)
@@ -223,6 +266,10 @@ impl PgLedger {
         .bind(f.fee_eur)
         .bind(f.fx_to_eur)
         .bind(filled_at)
+        .bind(if d.ccy.is_empty() { fa_core::BASE_CURRENCY } else { d.ccy.as_str() })
+        .bind(if d.fx_source.is_empty() { "fixed" } else { d.fx_source.as_str() })
+        .bind(d.arrival_price.filter(|v| v.is_finite()))
+        .bind(d.slippage_bps.filter(|v| v.is_finite()))
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -355,7 +402,8 @@ impl PgLedger {
         let rows = sqlx::query(
             "SELECT f.venue_fill_id, oi.idempotency_key AS intent_id, oi.book, oi.instrument_id, oi.side, \
              f.qty::float8 AS qty, f.price::float8 AS price, f.fee::float8 AS fee, \
-             f.fx_rate_eur::float8 AS fx, f.filled_at \
+             f.fx_rate_eur::float8 AS fx, f.filled_at, f.ccy, f.fx_source, \
+             f.arrival_price::float8 AS arrival_price, f.slippage_bps::float8 AS slippage_bps \
              FROM ledger.fill f \
              JOIN ledger.venue_order vo ON vo.client_order_id = f.client_order_id \
              JOIN ledger.order_intent oi ON oi.id = vo.intent_id \
@@ -385,7 +433,41 @@ impl PgLedger {
                 fee_eur: r.get("fee"),
                 fx_rate_eur: r.get("fx"),
                 filled_at: r.get("filled_at"),
+                ccy: r.get("ccy"),
+                fx_source: r.get("fx_source"),
+                arrival_price: r.get("arrival_price"),
+                slippage_bps: r.get("slippage_bps"),
             })
+            .collect())
+    }
+
+    /// Realised slippage per strategy over attributed fills in `[from, to)`: mean and count of
+    /// `slippage_bps` (fills without a recorded slippage are skipped).
+    pub async fn slippage_by_strategy(
+        &self,
+        book: &str,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Result<BTreeMap<Uuid, (f64, i64)>, PgError> {
+        let rows = sqlx::query(
+            "SELECT fa.strategy_id, avg(f.slippage_bps)::float8 AS mean, count(*) AS n \
+             FROM ledger.fill f \
+             JOIN ledger.fill_attribution fa ON fa.fill_id = f.id \
+             JOIN ledger.venue_order vo ON vo.client_order_id = f.client_order_id \
+             JOIN ledger.order_intent oi ON oi.id = vo.intent_id \
+             WHERE oi.book = $1 AND f.slippage_bps IS NOT NULL \
+               AND ($2::timestamptz IS NULL OR f.filled_at >= $2) \
+               AND ($3::timestamptz IS NULL OR f.filled_at < $3) \
+             GROUP BY fa.strategy_id",
+        )
+        .bind(book)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<Uuid, _>("strategy_id"), (r.get::<f64, _>("mean"), r.get::<i64, _>("n"))))
             .collect())
     }
 
@@ -596,8 +678,17 @@ mod tests {
         let f1 = fill(&format!("{i1}:f"), &i1, inst, 10.0, 100.0);
         assert!(pg.record_fill(&f1, t0, &["strat-a".into(), "strat-b".into()]).await.unwrap());
         assert!(!pg.record_fill(&f1, t0, &[]).await.unwrap(), "replayed fill ignored");
-        let f2 = fill(&format!("{i2}:f"), &i2, inst, -10.0, 110.0);
-        assert!(pg.record_fill(&f2, t0 + chrono::Duration::seconds(1), &[]).await.unwrap());
+        let mut f2 = fill(&format!("{i2}:f"), &i2, inst, -10.0, 110.0);
+        f2.fx_to_eur = 1.0;
+        let details = FillDetails {
+            ccy: "USD".into(),
+            fx_source: "ecb_daily".into(),
+            arrival_price: Some(109.5),
+            slippage_bps: Some(-4.2),
+        };
+        assert!(
+            pg.record_fill_with(&f2, t0 + chrono::Duration::seconds(1), &["strat-a".into()], &details).await.unwrap()
+        );
         let orphan = fill("orphan", "no-such-intent", inst, 1.0, 1.0);
         assert!(matches!(pg.record_fill(&orphan, t0, &[]).await, Err(PgError::UnknownIntent { .. })));
 
@@ -615,8 +706,14 @@ mod tests {
 
         // strategy filter goes through fill_attribution
         let a = pg.fills(&book, None, None, Some("strat-a")).await.unwrap();
-        assert_eq!(a.len(), 1);
+        assert_eq!(a.len(), 2);
         assert_eq!(a[0].fill_id, f1.fill_id);
+        assert_eq!((a[0].ccy.as_str(), a[0].fx_source.as_str(), a[0].slippage_bps), ("EUR", "fixed", None));
+        assert_eq!((a[1].ccy.as_str(), a[1].fx_source.as_str()), ("USD", "ecb_daily"));
+        assert_eq!((a[1].arrival_price, a[1].slippage_bps), (Some(109.5), Some(-4.2)));
+        let slip = pg.slippage_by_strategy(&book, None, None).await.unwrap();
+        assert_eq!(slip[&uuid_of("strat-a")], (-4.2, 1));
+        assert!(!slip.contains_key(&uuid_of("strat-b")), "no slippage recorded on strat-b's only fill");
         assert!(pg.fills(&book, None, None, Some("nobody")).await.unwrap().is_empty());
         assert_eq!(pg.fills(&book, Some(t0 + chrono::Duration::seconds(1)), None, None).await.unwrap().len(), 1);
 

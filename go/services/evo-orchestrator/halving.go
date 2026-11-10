@@ -77,7 +77,15 @@ func Rank(cands []Candidate) []Candidate {
 		for i := range idx {
 			idx[i] = i
 		}
-		sort.SliceStable(idx, func(a, b int) bool { return cd[idx[a]] > cd[idx[b]] })
+		// Crowding first; equal crowding (e.g. every member of a small front at +Inf) falls back to the
+		// scalar score, then to the id order of `ranked`, so a tie never silently favours alphabetical ids.
+		sort.SliceStable(idx, func(a, b int) bool {
+			ca, cb := cd[idx[a]], cd[idx[b]]
+			if ca != cb {
+				return ca > cb
+			}
+			return ranked[front[idx[a]]].Score > ranked[front[idx[b]]].Score
+		})
 		for _, i := range idx {
 			out = append(out, ranked[front[i]])
 		}

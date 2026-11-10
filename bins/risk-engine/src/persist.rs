@@ -1,6 +1,7 @@
-//! Postgres persistence for the paper book (spec 42): intents, fills, cash movements, position
-//! snapshots, reconciliation runs, strategy lifecycle rows (`ledger.strategy_state`, D-051) and
-//! the audit log. Everything here is best effort and idempotent: a failed write is logged and
+//! Postgres persistence for the paper book (spec 42): intents, fills (with currency, FX source,
+//! arrival price and slippage), cash movements, position snapshots, reconciliation runs,
+//! strategy lifecycle rows with their sub-books (`ledger.strategy_state`, D-051, D-061), the
+//! payout quota and the audit log; plus the reference-data, FX and ECB reads/writes (D-061). Everything here is best effort and idempotent: a failed write is logged and
 //! the in-memory engine carries on (the next reconciliation pass will surface the gap as a
 //! `diff`, which halts scope `broker`).
 use chrono::{DateTime, TimeZone, Utc};
@@ -13,7 +14,7 @@ use fa_risk::strategy::{Checklist, StrategyState, StrategyStatus};
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use crate::engine::BookedFill;
+use crate::engine::{BookedFill, SubBookRecord};
 
 pub const ACTOR: &str = "system:risk-engine";
 /// Cash differences below this are not reported by the reconciliation pass.
@@ -73,7 +74,7 @@ impl Persist {
 
     pub async fn fills(&self, fills: Vec<BookedFill>) {
         for b in fills {
-            if let Err(e) = self.pg.record_fill(&b.fill, at(b.at_ms), &b.strategy_ids).await {
+            if let Err(e) = self.pg.record_fill_with(&b.fill, at(b.at_ms), &b.strategy_ids, &b.details).await {
                 tracing::warn!(fill = %b.fill.fill_id, error = %e, "fill not persisted");
             }
         }
@@ -97,16 +98,18 @@ impl Persist {
         }
     }
 
-    /// Upserts one lifecycle row (`ledger.strategy_state`); `gate` is the last checklist.
-    pub async fn strategy_state(&self, s: &StrategyState, gate: Option<&Checklist>) {
+    /// Upserts one lifecycle row (`ledger.strategy_state`); `gate` is the last checklist, `book`
+    /// the strategy's sub-book (`book` JSONB, migration `20261110000060`; `None` keeps the stored one).
+    pub async fn strategy_state(&self, s: &StrategyState, book: Option<&SubBookRecord>, gate: Option<&Checklist>) {
         let r = sqlx::query(
             "INSERT INTO ledger.strategy_state (strategy_id, status, prev_status, since, first_seen, shadow_since, \
-             horizons_completed, sleeve_eur, pnl_eur, peak_pnl_eur, max_drawdown, gate, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now()) \
+             horizons_completed, sleeve_eur, pnl_eur, peak_pnl_eur, max_drawdown, gate, book, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now()) \
              ON CONFLICT (strategy_id) DO UPDATE SET status = EXCLUDED.status, prev_status = EXCLUDED.prev_status, \
              since = EXCLUDED.since, shadow_since = EXCLUDED.shadow_since, horizons_completed = EXCLUDED.horizons_completed, \
              sleeve_eur = EXCLUDED.sleeve_eur, pnl_eur = EXCLUDED.pnl_eur, peak_pnl_eur = EXCLUDED.peak_pnl_eur, \
-             max_drawdown = EXCLUDED.max_drawdown, gate = COALESCE(EXCLUDED.gate, ledger.strategy_state.gate), updated_at = now()",
+             max_drawdown = EXCLUDED.max_drawdown, gate = COALESCE(EXCLUDED.gate, ledger.strategy_state.gate), \
+             book = COALESCE(EXCLUDED.book, ledger.strategy_state.book), updated_at = now()",
         )
         .bind(&s.strategy_id)
         .bind(s.status.as_str())
@@ -120,6 +123,7 @@ impl Persist {
         .bind(s.peak_pnl_eur)
         .bind(s.max_drawdown)
         .bind(gate.and_then(|g| serde_json::to_value(g).ok()))
+        .bind(book.and_then(|b| serde_json::to_value(b).ok()))
         .execute(self.pg.pool())
         .await;
         if let Err(e) = r {
@@ -127,12 +131,12 @@ impl Persist {
         }
     }
 
-    /// Loads every persisted lifecycle row (startup seed).
-    pub async fn load_strategy_states(&self) -> Vec<StrategyState> {
+    /// Loads every persisted lifecycle row with its sub-book, if any (startup seed).
+    pub async fn load_strategy_states(&self) -> Vec<(StrategyState, Option<SubBookRecord>)> {
         let rows = match sqlx::query(
             "SELECT strategy_id, status, prev_status, since, first_seen, shadow_since, horizons_completed, \
              sleeve_eur::float8 AS sleeve_eur, pnl_eur::float8 AS pnl_eur, peak_pnl_eur::float8 AS peak_pnl_eur, \
-             max_drawdown::float8 AS max_drawdown FROM ledger.strategy_state",
+             max_drawdown::float8 AS max_drawdown, to_jsonb(s) -> 'book' AS book FROM ledger.strategy_state s",
         )
         .fetch_all(self.pg.pool())
         .await
@@ -146,7 +150,17 @@ impl Persist {
         rows.iter()
             .filter_map(|r| {
                 let status = StrategyStatus::parse(&r.get::<String, _>("status"))?;
-                Some(StrategyState {
+                let book = r
+                    .get::<Option<Value>, _>("book")
+                    .filter(|v| !v.is_null())
+                    .and_then(|v| match serde_json::from_value::<SubBookRecord>(v) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            tracing::warn!(strategy = %r.get::<String, _>("strategy_id"), error = %e, "sub-book not restored");
+                            None
+                        }
+                    });
+                let st = StrategyState {
                     strategy_id: r.get("strategy_id"),
                     status,
                     prev_status: r.get::<Option<String>, _>("prev_status").and_then(|s| StrategyStatus::parse(&s)),
@@ -159,9 +173,71 @@ impl Persist {
                     peak_pnl_eur: r.get("peak_pnl_eur"),
                     max_drawdown: r.get("max_drawdown"),
                     last_reason: String::new(),
-                })
+                };
+                Some((st, book))
             })
             .collect()
+    }
+
+    /// Instrument reference table (`fa_warehouse::venues`).
+    pub async fn load_refdata(&self) -> Option<fa_warehouse::venues::RefTable> {
+        match fa_warehouse::venues::load_instruments(self.pg.pool()).await {
+            Ok(v) => Some(fa_warehouse::venues::RefTable::from_refs(v)),
+            Err(e) => {
+                tracing::warn!(error = %e, "reference data not loaded");
+                None
+            }
+        }
+    }
+
+    /// FX as-of table of `source` covering the last `days` days.
+    pub async fn load_fx(&self, source: &str, days: u32) -> Option<fa_warehouse::fx::FxTable> {
+        let since = Utc::now() - chrono::Duration::days(i64::from(days));
+        match fa_warehouse::fx::load_recent(self.pg.pool(), source, since).await {
+            Ok(r) => Some(fa_warehouse::fx::FxTable::from_rates(r)),
+            Err(e) => {
+                tracing::warn!(error = %e, "fx rates not loaded");
+                None
+            }
+        }
+    }
+
+    /// Fetches the ECB daily reference rates and upserts them into `ref.fx_rate`
+    /// (`source = ecb_daily`, idempotent). Returns `(date, currencies, new rows)`.
+    pub async fn refresh_ecb(&self, http: &reqwest::Client) -> anyhow::Result<(chrono::NaiveDate, usize, usize)> {
+        let resp = http.get(fa_warehouse::fx::ECB_DAILY_URL).send().await?.error_for_status()?;
+        let body = resp.text().await?;
+        let daily = fa_warehouse::fx::parse_ecb_daily(&body)?;
+        let rates = daily.to_rates();
+        let n = fa_warehouse::fx::upsert_rates(self.pg.pool(), &rates).await?;
+        Ok((daily.date, rates.len(), n))
+    }
+
+    /// Today's reserved payout from `ledger.payout_quota` (spec 42 §6): the larger of
+    /// `quota − paid` and `reserved`, 0 without a row.
+    pub async fn payout_reserve_today(&self) -> f64 {
+        match self.pg.payout_quota(Utc::now().date_naive()).await {
+            Ok(Some(q)) => (q.quota_eur - q.paid_eur).max(q.reserved_eur).max(0.0),
+            Ok(None) => 0.0,
+            Err(e) => {
+                tracing::debug!(error = %e, "payout quota not read");
+                0.0
+            }
+        }
+    }
+
+    /// Raises today's quota to `quota_eur` (never lowers it: tighten-only, spec 40 §6.5).
+    pub async fn raise_payout_quota(&self, quota_eur: f64) -> anyhow::Result<f64> {
+        let day = Utc::now().date_naive();
+        let cur = self.pg.payout_quota(day).await?;
+        let q = fa_ledger::pg::PayoutQuota {
+            day,
+            quota_eur: cur.as_ref().map_or(quota_eur, |c| c.quota_eur.max(quota_eur)),
+            reserved_eur: cur.as_ref().map_or(0.0, |c| c.reserved_eur),
+            paid_eur: cur.as_ref().map_or(0.0, |c| c.paid_eur),
+        };
+        self.pg.upsert_payout_quota(&q).await?;
+        Ok(q.quota_eur)
     }
 
     /// Latest deflated Sharpe for a strategy (promotion gate item 2). Two sources, in order:
@@ -269,11 +345,12 @@ mod tests {
         s.horizons_completed = 3;
         s.observe_pnl(-120.0, 10_000.0);
         let gate = PromotionGate::default().check(&s, &GateEvidence::default(), 1_762_560_000_000 + 86_400_000);
-        p.strategy_state(&s, Some(&gate)).await;
+        p.strategy_state(&s, None, Some(&gate)).await;
         s.apply(fa_risk::strategy::StrategyAction::Pause, 1_762_560_100_000, None).unwrap();
-        p.strategy_state(&s, None).await; // gate NULL keeps the stored checklist
+        p.strategy_state(&s, None, None).await; // gate NULL keeps the stored checklist
         let rows = p.load_strategy_states().await;
-        let got = rows.iter().find(|r| r.strategy_id == id).expect("row loaded");
+        let (got, book) = rows.iter().find(|(r, _)| r.strategy_id == id).expect("row loaded");
+        assert!(book.is_none(), "no book written yet");
         assert_eq!((got.status, got.prev_status), (StrategyStatus::Paused, Some(StrategyStatus::Shadow)));
         assert_eq!(got.horizons_completed, 3);
         assert_eq!(got.since_ms, 1_762_560_100_000);
@@ -285,6 +362,19 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored_gate.unwrap()["green"], false);
+        // sub-book JSONB round trip (migration 20261110000060)
+        let inst = fa_core::InstrumentId::new();
+        let rec: SubBookRecord = serde_json::from_value(json!({
+            "v": 1, "kind": "active", "cash_eur": -4900.5, "last_value_eur": 99.5, "fees_eur": 0.5,
+            "positions": {inst.to_string(): {"quantity": 50.0, "avg_cost_eur": 100.0, "realised_eur": 1.25}},
+            "slippage_sum_bps": 12.0, "slippage_n": 3, "history": [[1_762_560_000_000i64, 0.0], [1_762_563_600_000i64, -120.0]],
+        }))
+        .unwrap();
+        p.strategy_state(&s, Some(&rec), None).await;
+        p.strategy_state(&s, None, None).await; // NULL book keeps the stored one
+        let rows = p.load_strategy_states().await;
+        let (_, book) = rows.iter().find(|(r, _)| r.strategy_id == id).expect("row loaded");
+        assert_eq!(book.as_ref(), Some(&rec), "sub-book restored verbatim");
         assert_eq!(p.deflated_sharpe(&[&id]).await, None, "no validation row → unknown");
         assert_eq!(p.deflated_sharpe(&[]).await, None);
         // generation_stats path (migration 20261110000030, validation workstream): the DSR of the

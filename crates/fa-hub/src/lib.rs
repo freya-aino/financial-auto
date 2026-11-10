@@ -31,6 +31,11 @@ pub const DEFAULT_URL: &str = "http://127.0.0.1:6969";
 /// Environment variable overriding the base URL (also gates the live integration tests).
 pub const URL_ENV: &str = "FA_HELIX_URL";
 
+/// Server error code of an aborted, uncommitted transaction (safe to retry).
+pub const TRANSACTION_CONFLICT: &str = "transaction_conflict";
+/// Attempts [`HubClient::batch`] makes when the server reports [`TRANSACTION_CONFLICT`].
+pub const CONFLICT_ATTEMPTS: u32 = 6;
+
 #[derive(Debug, thiserror::Error)]
 pub enum HubError {
     #[error("http: {0}")]
@@ -250,7 +255,30 @@ impl HubClient {
     }
 
     /// `POST /v2/query` with a full batch.
+    ///
+    /// A `409 transaction_conflict` means the server aborted the transaction (nothing was
+    /// committed), so it is retried here for every caller, up to [`CONFLICT_ATTEMPTS`] times with
+    /// a short exponential backoff. Concurrent writers (model-runtime's sink, evo-worker lineage,
+    /// the trainer, parallel tests) otherwise surface it as a spurious failure. Other errors,
+    /// including other `retryable` ones, are returned as they are; see [`Self::batch_retrying`].
     pub async fn batch(&self, batch: &Batch) -> Result<Response> {
+        let mut delay = Duration::from_millis(20);
+        let mut attempt = 1;
+        loop {
+            match self.batch_once(batch).await {
+                Err(HubError::Server { ref code, .. })
+                    if code == TRANSACTION_CONFLICT && attempt < CONFLICT_ATTEMPTS =>
+                {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_millis(500));
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn batch_once(&self, batch: &Batch) -> Result<Response> {
         let resp = self.http.post(self.query_url()).json(&batch.to_json()).send().await?;
         let status = resp.status().as_u16();
         let body = resp.text().await?;
