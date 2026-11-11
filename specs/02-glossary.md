@@ -34,7 +34,7 @@ Terms are binding across the specs. If a spec uses a term differently, the spec 
 | **Online adapter** | A small LoRA-like module updated on the live stream on top of a frozen snapshot (rank-8 LoRA for the neural families, D-073). |
 | **Strategy** | A GP program or neural policy that emits a distribution over target exposure for its asset set and horizon. |
 | **Meta-allocator** | Pluggable layer that turns strategy exposure distributions into capital allocation, with cross-strategy netting. |
-| **Hard limit** | A non-evolvable risk constraint enforced before every order ([40](40-execution-and-risk.md)). |
+| **Hard limit** | A non-evolvable risk constraint enforced before every order ([40](../bins/risk-engine/README.md#execution-and-risk-lasting-content-of-the-retired-spec-40)). |
 | **Payout quota** | Capital reserved daily for withdrawals; deployable capital = equity − quota. |
 | **Locked holdout** | A time period never used for selection, used only for promotion gates. |
 | **Shadow (paper shadow)** | Running a candidate on live data with simulated fills before promotion. |

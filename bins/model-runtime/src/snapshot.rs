@@ -235,6 +235,24 @@ impl SnapshotLoader {
     }
 }
 
+impl SnapshotLoader {
+    /// The snapshot Helix records as the shadow of `ts` (`status = shadow`; the newest
+    /// generation when several), restored after a restart (spec 36 §6.4).
+    pub async fn shadow_snapshot(&self, ts: Timescale) -> anyhow::Result<Option<String>> {
+        let Some(hub) = &self.hub else { return Ok(None) };
+        let rows = hub.list_snapshots().await?;
+        Ok(pick_shadow(&rows, ts))
+    }
+}
+
+/// The newest `shadow` row of `ts`.
+pub fn pick_shadow(rows: &[fa_hub::Snapshot], ts: Timescale) -> Option<String> {
+    rows.iter()
+        .filter(|r| r.status == "shadow" && r.timescale == ts.as_str())
+        .max_by(|a, b| a.generation.cmp(&b.generation).then(a.created_at.cmp(&b.created_at)))
+        .map(|r| r.snapshot_id.clone())
+}
+
 /// The active snapshot of `ts` whatever its encoder family (control-api keeps at most one
 /// `active` row per timescale across families: promotion retires the replaced one).
 pub async fn active_any_family(hub: &HubClient, ts: Timescale) -> anyhow::Result<Option<fa_hub::Snapshot>> {
@@ -447,5 +465,32 @@ mod tests {
         assert_eq!(adapter_ms("adapters/x/1.lora.safetensors"), None, "the LoRA weights are not an artifact");
         assert_eq!(adapter_ms("adapters/stat-v1-1m/1700000000000.json"), Some(1_700_000_000_000));
         assert_eq!(adapter_ms("adapters/stat-v1-1m/notes.txt"), None);
+    }
+
+    #[test]
+    fn persisted_shadow_is_the_newest_shadow_row_of_the_timescale() {
+        let row = |id: &str, ts: &str, status: &str, generation: u32| fa_hub::Snapshot {
+            id: 1,
+            snapshot_id: id.into(),
+            timescale: ts.into(),
+            encoder_family: "jepa_vae".into(),
+            generation,
+            garage_key: String::new(),
+            status: status.into(),
+            created_at: None,
+            carried_mass: None,
+            manifest: None,
+            previous_active: None,
+        };
+        let rows = vec![
+            row("a", "1m", "active", 3),
+            row("b", "1m", "shadow", 1),
+            row("c", "1m", "shadow", 2),
+            row("d", "1s", "shadow", 9),
+            row("e", "1m", "candidate", 7),
+        ];
+        assert_eq!(pick_shadow(&rows, Timescale::Minute).as_deref(), Some("c"));
+        assert_eq!(pick_shadow(&rows, Timescale::Second).as_deref(), Some("d"));
+        assert_eq!(pick_shadow(&rows, Timescale::Hour), None);
     }
 }

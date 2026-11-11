@@ -50,7 +50,7 @@ pub struct PlanConfig {
 impl Default for PlanConfig {
     fn default() -> Self {
         Self {
-            adapter_every: Some(Duration::from_secs(3600)),
+            adapter_every: Some(Duration::from_secs(900)),
             generation_every: None,
             generation_window_hours: 6.0,
             generation_instruments: "all".into(),
@@ -85,7 +85,7 @@ pub fn planned_hours(timescale: &str, hours: f64) -> f64 {
 pub fn jobs_for(kind: Kind, active: &[fa_hub::Snapshot], cfg: &PlanConfig) -> Vec<Planned> {
     active
         .iter()
-        .filter(|s| s.encoder_family == STATISTICAL_FAMILY && s.status == "active")
+        .filter(|s| s.status == "active")
         .map(|s| {
             let spec = match kind {
                 Kind::Adapter => serde_json::json!({
@@ -93,6 +93,7 @@ pub fn jobs_for(kind: Kind, active: &[fa_hub::Snapshot], cfg: &PlanConfig) -> Ve
                 }),
                 _ => serde_json::json!({
                     "timescale": s.timescale, "parent_snapshot_id": s.snapshot_id,
+                    "family": (s.encoder_family != STATISTICAL_FAMILY).then(|| s.encoder_family.clone()),
                     "window_hours": planned_hours(&s.timescale, cfg.generation_window_hours),
                     "instruments": if cfg.generation_instruments == "all" { serde_json::json!("all") }
                         else { serde_json::json!(cfg.generation_instruments.split(',').map(str::trim).collect::<Vec<_>>()) },
@@ -123,14 +124,10 @@ impl Planned {
     }
 }
 
-/// Active statistical snapshots of every timescale (Helix).
+/// Active snapshots (every family) of every timescale (Helix).
 pub async fn active_snapshots(hub: &fa_hub::HubClient) -> anyhow::Result<Vec<fa_hub::Snapshot>> {
-    let mut rows: Vec<fa_hub::Snapshot> = hub
-        .list_snapshots()
-        .await?
-        .into_iter()
-        .filter(|s| s.status == "active" && s.encoder_family == STATISTICAL_FAMILY)
-        .collect();
+    let mut rows: Vec<fa_hub::Snapshot> =
+        hub.list_snapshots().await?.into_iter().filter(|s| s.status == "active").collect();
     rows.sort_by(|a, b| a.timescale.cmp(&b.timescale).then(a.snapshot_id.cmp(&b.snapshot_id)));
     Ok(rows)
 }
@@ -219,7 +216,11 @@ mod tests {
         ];
         let cfg = PlanConfig::default();
         let a = jobs_for(Kind::Adapter, &active, &cfg);
-        assert_eq!(a.iter().map(|p| p.snapshot_id.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            a.iter().map(|p| p.snapshot_id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "d"],
+            "neural snapshots adapt too"
+        );
         assert_eq!((a[0].gpu_class, a[0].priority), ("online_adapter", 1));
         assert_eq!(a[0].spec["snapshot_id"], "a");
         assert_eq!(a[0].spec["window_hours"], 1.0, "1m: 1 h holds 60 bars");
@@ -230,6 +231,8 @@ mod tests {
         assert_eq!((g[0].gpu_class, g[0].priority), ("generation_training", 3));
         assert_eq!(g[0].spec["parent_snapshot_id"], "a");
         assert_eq!(g[0].spec["instruments"], "all");
+        assert!(g[0].spec["family"].is_null());
+        assert_eq!(g[2].spec["family"], "fsq_hybrid", "a neural generation keeps its family");
         let job = g[0].to_job();
         assert_eq!(job.kind, "train.generation");
         assert_eq!(job.snapshot_id, "a");

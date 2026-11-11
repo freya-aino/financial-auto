@@ -74,7 +74,7 @@ See [20](20-storage.md) and [21](21-bus-and-contracts.md).
 - **Live path** (per timescale): event → feature windows → encoder snapshot + online adapter → expert views → region assignment → MCMC kernel update → decoders → strategies → exposure distributions → allocator → risk → order intent → broker-gateway.
 - **Learning path:** trainer runs generations (gen 0 self-supervised, then decoder feedback) and publishes snapshots. evo-orchestrator schedules decoder/strategy candidates on evo-workers within a GPU-hour budget.
 - **Replay path:** the backtest drives the *same* live path from the Garage archive and VM ([41](41-backtest-and-validation.md)).
-- **GPU arbitration:** priority queue, live inference > online adapters > evolution eval > generation training, held by the arbiter in `evo-orchestrator` (`ctl.gpu.*`, D-006) ([60](60-ops.md)).
+- **GPU arbitration:** priority queue, live inference > online adapters > evolution eval > generation training, held by the arbiter in `evo-orchestrator` (`ctl.gpu.*`, D-006) ([60, retired](../docker/README.md#reference-spec-60-ops-retired-2026-11-11)).
 
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
@@ -82,8 +82,8 @@ See [20](20-storage.md) and [21](21-bus-and-contracts.md).
 | `runtime.timescales_per_process` | all | may split per timescale for latency |
 
 ## 8. Failure modes
-- Bus down → every producer buffers locally up to a bound, then halts; risk halts trading ([40](40-execution-and-risk.md)).
-- A store is unavailable → the services that depend on it degrade or halt as specified per service in [60](60-ops.md).
+- Bus down → every producer buffers locally up to a bound, then halts; risk halts trading ([40](../bins/risk-engine/README.md#execution-and-risk-lasting-content-of-the-retired-spec-40)).
+- A store is unavailable → the services that depend on it degrade or halt as specified per service in [60, retired](../docker/README.md#reference-spec-60-ops-retired-2026-11-11).
 
 ## 9. Acceptance criteria
 - Every process in the table above exists as a directory with a README that links back here.

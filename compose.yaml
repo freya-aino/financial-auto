@@ -12,6 +12,7 @@ x-rust-defaults:
     FA_SECRETS: /app/config/secrets.toml
     FA_METRICS_BIND: 0.0.0.0:9100 # GET /metrics, scraped by victoriametrics; host ports 91xx below (D-056)
     RUST_LOG: info
+    FA_LOG_FORMAT: ${FA_LOG_FORMAT:-text} # json → one JSON object per line (spec 60 §4); set in .env for the whole stack
   volumes: &secrets-volume
     - ./config/secrets.toml:/app/config/secrets.toml:ro # git-ignored; create with docker/garage-init.sh (D-045)
 
@@ -75,7 +76,7 @@ services:
     image: victoriametrics/victoria-metrics:v1.155.0
     command:
       - "-storageDataPath=/storage"
-      - "-retentionPeriod=100y" # effectively unlimited; per-timescale retention (spec 20 §6.5) is not enforced yet
+      - "-retentionPeriod=100y" # global ceiling; per-timescale retention is the fa_tsdb::retention job (spec 20 §6.5)
       - "-httpListenAddr=:8428"
       - "-promscrape.config=/etc/vm-scrape.yaml" # scrapes every service's /metrics (spec 60 §4, D-056)
       - "-promscrape.config.strictParse=false"
@@ -262,8 +263,12 @@ services:
     profiles: ["app"]
     image: financial-auto/rust:dev
     command: ["model-runtime"]
-    environment: *rust-env
-    volumes: *secrets-volume
+    environment:
+      <<: *rust-env
+      FA_HUB_LOG_DIR: /var/lib/fa/hub-log # Helix observation log, replayed on reconnect (spec 30 §8, spec 33 §8)
+    volumes:
+      - ./config/secrets.toml:/app/config/secrets.toml:ro
+      - model-runtime-hub-log:/var/lib/fa/hub-log
     ports:
       - "127.0.0.1:9102:9100" # metrics
     depends_on: *core-deps
@@ -363,11 +368,17 @@ services:
     # Keyless live sources + the synthetic heartbeat (D-050); add lemon/oanda once keys are in config/secrets.toml.
     command: ["-nats", "nats://nats:4222", "-catalog", "/app/config/sources.yaml", "-connectors", "heartbeat,yahoo,hackernews,google_news,frankfurter,ecb,gdelt,sec_edgar,kraken",
               "-tsdb-url", "http://victoriametrics:8428", "-postgres", "postgres://fa:fa@postgres:5432/fa", "-garage", "http://garage:3900"]
-    volumes: *secrets-volume
+    volumes:
+      - ./config/secrets.toml:/app/config/secrets.toml:ro # git-ignored; create with docker/garage-init.sh (D-045)
+      # catalog.reload_on_change (spec 11 §7): the ingestor polls this file every 30 s (FA_CATALOG_WATCH).
+      # A single-file bind mount follows the inode: edit in place, or run ctl.ingest.reload after replacing it.
+      - ./config/sources.yaml:/app/config/sources.yaml:ro
     environment:
       FA_SECRETS: /app/config/secrets.toml
       FA_METRICS_BIND: 0.0.0.0:9100
+      FA_LOG_FORMAT: ${FA_LOG_FORMAT:-text}
       FA_ARCHIVE_SPOOL: /tmp/fa-raw-spool # raw-archive spool while Garage is down (spec 10 §8)
+      FA_NATS_SPOOL: /tmp/fa-nats-spool # envelope disk buffer while NATS is down (spec 10 §8)
     ports:
       - "127.0.0.1:9105:9100" # metrics
     depends_on:
@@ -396,6 +407,7 @@ services:
     environment:
       FA_SECRETS: /app/config/secrets.toml
       FA_METRICS_BIND: 0.0.0.0:9100
+      FA_LOG_FORMAT: ${FA_LOG_FORMAT:-text}
       FA_COSTS: /app/config/costs.yaml # go/services/broker-gateway/costs.yaml, baked into the image
       FA_STATE_DIR: /var/lib/fa # → costs.calibrated.yaml (+ .report.json)
     ports:
@@ -421,6 +433,7 @@ services:
       FA_SECRETS: /app/config/secrets.toml
       FA_GARAGE_URL: http://garage:3900 # strategy promotion artifacts (D-052)
       FA_METRICS_BIND: 0.0.0.0:9100
+      FA_LOG_FORMAT: ${FA_LOG_FORMAT:-text}
     volumes: *secrets-volume
     ports:
       - "127.0.0.1:9107:9100" # metrics
@@ -464,3 +477,4 @@ volumes:
   garage-meta:
   garage-data:
   broker-gateway-state: # broker-gateway calibrated cost model
+  model-runtime-hub-log: # model-runtime's Helix observation log (deferred writes during an outage)

@@ -87,6 +87,9 @@ type PaperEngine struct {
 	seenOrder []string
 	// Bumped on every change of persisted state (state.go).
 	rev uint64
+	// CarryPeriod is the funding / borrow charging period (carry.go; 0 disables carry).
+	CarryPeriod time.Duration
+	carry       *carryState
 }
 
 func NewPaperEngine(costs *CostModel) *PaperEngine {
@@ -97,6 +100,7 @@ func NewPaperEngine(costs *CostModel) *PaperEngine {
 		markets: map[string]*market{}, seen: map[string]bool{}, resting: map[string]*resting{},
 		working: map[string]*working{}, profiles: map[string][]float64{}, positions: map[string]float64{},
 		now: time.Now, Costs: costs, VolumeWindow: time.Hour, SigmaDecay: 0.97,
+		CarryPeriod: time.Hour, carry: newCarryState(),
 	}
 }
 

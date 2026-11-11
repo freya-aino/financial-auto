@@ -32,6 +32,8 @@ type RefWatcher struct {
 	Counters   *bus.Counters
 	Log        func(msg string, args ...any)
 	Timeout    time.Duration // for the status reload, default 5 s
+	// Overrides re-applies stored rate-limit/config overrides (Reloader.ApplyStoredOverrides); nil = none.
+	Overrides func(context.Context) ([]string, error)
 }
 
 // Handle processes one notice by subject.
@@ -66,12 +68,21 @@ func (w *RefWatcher) Handle(subject string) {
 	if changed := w.Catalog.ApplyStatuses(st); len(changed) > 0 {
 		w.log("catalog statuses reloaded from postgres", "subject", subject, "sources", changed)
 	}
+	if w.Overrides != nil {
+		if applied, err := w.Overrides(ctx); err != nil {
+			w.count("catalog.reload_errors")
+			w.log("catalog overrides reload", "subject", subject, "err", err)
+		} else if len(applied) > 0 {
+			w.log("catalog overrides applied from postgres", "subject", subject, "sources", applied)
+		}
+	}
 }
 
 // Subscribe attaches the watcher to `ref.changed.>` and `catalog.changed.>`.
 func (w *RefWatcher) Subscribe(nc *nats.Conn) error {
 	for _, subj := range []string{bus.RefChanged(">"), bus.CatalogChanged(">")} {
-		if _, err := nc.Subscribe(subj, func(m *nats.Msg) { w.Handle(m.Subject) }); err != nil {
+		// Handled off the NATS dispatcher: an override may restart a connector.
+		if _, err := nc.Subscribe(subj, func(m *nats.Msg) { go w.Handle(m.Subject) }); err != nil {
 			return err
 		}
 	}

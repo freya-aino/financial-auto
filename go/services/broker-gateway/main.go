@@ -6,7 +6,8 @@
 // (`costs.yaml`, `-costs` / `FA_COSTS`); `order.cancel.<account>` (`OrderCancel`; a legacy
 // `OrderIntent` payload decodes identically by intent id) cancels a resting limit order or the
 // remainder of a working algo order (algo.go). Live fills recalibrate the impact coefficient
-// (calib.go) and the report goes out on `exec.costs.calibrated`.
+// (calib.go) and the report goes out on `exec.costs.calibrated`. Open positions accrue the
+// schedule's funding / borrow carry, charged per period on `exec.carry.<account>` (carry.go).
 //
 // Restart safety and fail-closed (state.go, spec 40 §8): working algo orders, resting limits,
 // recently seen intent ids and per-account positions persist in `$FA_STATE_DIR/orders.json`;
@@ -20,7 +21,6 @@ import (
 	"errors"
 	"flag"
 	"io/fs"
-	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -56,8 +56,9 @@ func main() {
 	metricsBind := flag.String("metrics", bus.MetricsBindDefault(service), "Prometheus GET /metrics bind (FA_METRICS_BIND; off disables)")
 	statePath := flag.String("orders-state", envOr("FA_ORDERS_STATE", defaultStatePath()), "working/resting orders + positions persisted across restarts (empty: in memory only)")
 	riskTimeout := flag.Duration("risk-heartbeat-timeout", 15*time.Second, "fail-closed: reject risk-increasing intents while the risk-engine heartbeat is older than this (0 disables)")
+	carryPeriod := flag.Duration("carry-period", time.Hour, "funding / borrow charging period on open paper positions, published on exec.carry.<account> (0 disables)")
 	flag.Parse()
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("svc", service)
+	log := bus.NewLogger(service) // FA_LOG_FORMAT=json|text (spec 60 §4)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -97,6 +98,7 @@ func main() {
 
 	engine := NewPaperEngine(costs)
 	engine.Counters = counters
+	engine.CarryPeriod = *carryPeriod
 	guard := &RiskGuard{Timeout: *riskTimeout}
 	engine.Guard = guard
 	var store *StateStore
@@ -200,6 +202,13 @@ func main() {
 				return
 			case <-t.C:
 				publish(engine.Tick())
+				for _, ch := range engine.TickCarry() {
+					if b, err := json.Marshal(ch); err == nil {
+						if err := pub.NC.Publish(CarrySubjectPrefix+ch.Account, b); err != nil {
+							counters.Add("carry.publish_errors", 1)
+						}
+					}
+				}
 				age := guard.Age(time.Now())
 				if age > 1e9 {
 					age = -1 // never seen

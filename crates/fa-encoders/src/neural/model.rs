@@ -27,6 +27,8 @@
 //! Both add the spec 32 terms (per-expert next-step loss, D-008 residual decorrelation, router
 //! load balancing, KL) and the mixture next-step loss that trains the router.
 
+use std::collections::BTreeMap;
+
 use candle_core::{D, Device, Result, Tensor};
 use fa_expert_space::{
     moe::{MoeConfig, MoeExpertSpace},
@@ -185,12 +187,72 @@ pub struct NeuralConfig {
     /// `constrained` solver: block-coordinate sweeps (0 = the solver default).
     #[serde(default)]
     pub head_solver_sweeps: usize,
+    /// Ridge of the exact head solvers, relative to the mean Gram diagonal (0 = the solver
+    /// default 1e-3); larger = stronger shrinkage of the heads / disagreement directions.
+    #[serde(default)]
+    pub head_solver_ridge: f64,
     pub lr: f64,
     pub weight_decay: f64,
     pub batch: usize,
     pub steps: usize,
     pub min_window: usize,
     pub val_fraction: f64,
+    /// Spec 31 §6.4: learned asset embeddings + cross-asset attention before the router
+    /// ([`super::assets`]). Off by default.
+    #[serde(default)]
+    pub asset_attn: bool,
+    /// Bars of a candidate asset's token.
+    #[serde(default = "default_asset_ctx")]
+    pub asset_ctx: usize,
+    /// Assets per cross-attention candidate set (spec 31 §7 `asset_set_size`).
+    #[serde(default = "default_asset_set_size")]
+    pub asset_set_size: usize,
+    /// Weight of the attention-entropy penalty (spec 31 §7 `asset_attn_sparsity`).
+    #[serde(default = "default_asset_sparsity")]
+    pub asset_attn_sparsity: f64,
+    /// Instruments with an embedding row (set by the trainer from the training set).
+    #[serde(default)]
+    pub asset_vocab: Vec<String>,
+    /// Per vocabulary entry, its candidate peers (empty = every other entry).
+    #[serde(default)]
+    pub asset_candidates: Vec<Vec<usize>>,
+    /// Candidates whose latest bar is older than this are masked (trainer: 3 steps).
+    #[serde(default = "default_asset_max_age")]
+    pub asset_max_age_ms: i64,
+    /// Spec 32 §6.3.1 generalisation fix: share of the training windows (the latest of each
+    /// series, after an embargo) reserved for the decorrelation term. The D-008 penalty is then
+    /// computed on a minibatch of these held-out windows while the prediction losses use the
+    /// rest, so the experts must disagree in a way that holds on windows the heads were not fit
+    /// on. 0 = the penalty reads the training minibatch.
+    #[serde(default)]
+    pub decor_holdout: f64,
+    /// Expert split (spec 32 §6.1): after pruning, an expert whose routed residual variance
+    /// exceeds this multiple of the experts' mean and whose latent is bimodal is cloned into a
+    /// free slot and trained `split_steps` more steps. 0 = off.
+    #[serde(default)]
+    pub split_resid_ratio: f64,
+    #[serde(default = "default_split_steps")]
+    pub split_steps: usize,
+}
+
+fn default_asset_ctx() -> usize {
+    4
+}
+
+fn default_asset_set_size() -> usize {
+    32
+}
+
+fn default_asset_sparsity() -> f64 {
+    1e-3
+}
+
+fn default_asset_max_age() -> i64 {
+    i64::MAX
+}
+
+fn default_split_steps() -> usize {
+    100
 }
 
 fn default_top_dim() -> usize {
@@ -222,9 +284,11 @@ fn default_gated_pred() -> f64 {
 }
 
 impl NeuralConfig {
-    /// `head_solver` selects the exact constrained solver ([`super::heads`]).
+    /// `head_solver` selects one of the exact solvers of [`super::heads`]: `constrained` (the
+    /// KKT solve on the training residuals) or `disagree` (planted disagreement from latent
+    /// second moments, [`super::heads::disagree`]).
     pub fn constrained_heads(&self) -> bool {
-        self.head_solver == "constrained"
+        self.head_solver == "constrained" || self.head_solver == "disagree"
     }
 
     /// Whether a fit refits the next-step heads after training: the constrained solver always
@@ -269,13 +333,53 @@ impl NeuralConfig {
             head_solver: String::new(),
             head_solver_corr: 0.0,
             head_solver_sweeps: 0,
+            head_solver_ridge: 0.0,
             lr: 3e-3,
             weight_decay: 1e-4,
             batch: 64,
             steps: 600,
             min_window: 16,
             val_fraction: 0.15,
+            asset_attn: false,
+            asset_ctx: default_asset_ctx(),
+            asset_set_size: default_asset_set_size(),
+            asset_attn_sparsity: default_asset_sparsity(),
+            asset_vocab: Vec::new(),
+            asset_candidates: Vec::new(),
+            asset_max_age_ms: default_asset_max_age(),
+            decor_holdout: 0.0,
+            split_resid_ratio: 0.0,
+            split_steps: default_split_steps(),
         }
+    }
+
+    /// The per-timescale capacity ladder (spec 31 §6.1 / §7, scaled to the CPU host): context,
+    /// width, depth, expert width and expert capacity grow from seconds (XS) to days (L) and
+    /// shrink again for weeks (M, little history). Jobs override any of them as genes.
+    ///
+    /// | ts | context | d_model | layers | expert_dim | K_max | relative |
+    /// |---|---|---|---|---|---|---|
+    /// | 1s | 64 | 24 | 3 | 6 | 4 | XS |
+    /// | 1m | 64 | 32 | 4 | 8 | 4 | S |
+    /// | 1h | 48 | 48 | 4 | 8 | 6 | M |
+    /// | 1d | 32 | 64 | 5 | 12 | 8 | L |
+    /// | 1w | 32 | 48 | 4 | 8 | 6 | M |
+    pub fn for_timescale(family: NeuralFamily, ts: fa_core::Timescale) -> Self {
+        use fa_core::Timescale as T;
+        let (context, d, layers, ed, k) = match ts {
+            T::Second => (64, 24, 3, 6, 4),
+            T::Minute => (64, 32, 4, 8, 4),
+            T::Hour => (48, 48, 4, 8, 6),
+            T::Day => (32, 64, 5, 12, 8),
+            T::Week => (32, 48, 4, 8, 6),
+        };
+        let mut c = Self::new(family);
+        c.context_steps = context;
+        c.d_model = d;
+        c.layers = layers;
+        c.moe.expert_dim = ed;
+        c.moe.max_experts = k;
+        c
     }
 
     /// The ahead-steps a window needs after its end (target bar / JEPA target window).
@@ -379,6 +483,10 @@ pub struct NeuralModel {
     pub ps: ParamStore,
     pub moe: MoeExpertSpace,
     pub norm: InputNorm,
+    /// Predictive standard deviation of each expert's next-step head per target (expert id →
+    /// `[T]`, normalised units), calibrated on the training windows after the fit (spec 32 §6.4
+    /// calibration; `ExpertView.next_step.log_var`). Empty for snapshots written before it.
+    pub pred_sd: BTreeMap<usize, Vec<f32>>,
 }
 
 /// One batch, already normalised.
@@ -392,6 +500,10 @@ pub struct Batch {
     pub recon: Option<Tensor>,
     /// Window `jepa_horizon` steps ahead `[B, L, F]` (jepa_vae).
     pub future: Option<Tensor>,
+    /// Cross-asset context of the rows (`asset_attn`).
+    pub asset: Option<super::assets::AssetBatch>,
+    /// Cross-asset context of the future windows (`latent_diffusion` with `asset_attn`).
+    pub future_asset: Option<super::assets::AssetBatch>,
     /// `(series, end)` of every row (the window is `bars[..end]`), for feedback decoders that
     /// need the row's own context.
     pub windows: Vec<(usize, usize)>,
@@ -412,6 +524,8 @@ pub struct Forward {
     pub out: fa_expert_space::moe::MoeOutput,
     /// `hier_vae_flow` only.
     pub top: Option<Top>,
+    /// Cross-asset attention `[B, 1 + M]` (column 0 = the null token), `asset_attn` only.
+    pub asset_attn: Option<Tensor>,
 }
 
 impl NeuralModel {
@@ -439,7 +553,10 @@ impl NeuralModel {
         if cfg.family == NeuralFamily::LatentDiffusion {
             super::prior::init_diffusion(&mut ps, cfg.moe.max_experts * cfg.moe.expert_dim, cfg.prior_hidden)?;
         }
-        Ok(Self { cfg, ps, moe, norm })
+        if cfg.asset_attn {
+            super::assets::init(&mut ps, &cfg)?;
+        }
+        Ok(Self { cfg, ps, moe, norm, pred_sd: BTreeMap::new() })
     }
 
     pub fn device(&self) -> &Device {
@@ -459,7 +576,36 @@ impl NeuralModel {
         noise: Option<&Tensor>,
         top_eps: Option<&Tensor>,
     ) -> Result<Forward> {
+        self.forward_ctx(w, x, None, noise, top_eps)
+    }
+
+    /// [`Self::forward_w`] with the cross-asset context of the rows (`asset_attn` genomes; without
+    /// a context every row reads only its own embedding — the unknown row — and the null token).
+    pub fn forward_ctx(
+        &self,
+        w: &dyn Weights,
+        x: &Tensor,
+        asset: Option<&super::assets::AssetBatch>,
+        noise: Option<&Tensor>,
+        top_eps: Option<&Tensor>,
+    ) -> Result<Forward> {
         let h = backbone_forward(w, &self.cfg, x)?;
+        let (h, asset_attn) = if self.cfg.asset_attn {
+            let empty;
+            let a = match asset {
+                Some(a) => a,
+                None => {
+                    let rows: Vec<super::assets::AssetRow<'_>> =
+                        (0..h.dim(0)?).map(|_| (String::new(), Box::new(|_: &str| None) as Box<_>)).collect();
+                    empty = super::assets::build(&self.cfg, &rows, h.device())?;
+                    &empty
+                }
+            };
+            let (h2, at) = super::assets::forward(w, &h, a)?;
+            (h2, Some(at))
+        } else {
+            (h, None)
+        };
         let (h_moe, top) = if self.cfg.family == NeuralFamily::HierVaeFlow {
             let td = self.cfg.top_dim;
             let o = lin(w, "hvf.top", &h)?;
@@ -476,7 +622,7 @@ impl NeuralModel {
             (h.clone(), None)
         };
         let out = self.moe.forward_w(w, &h_moe, noise)?;
-        Ok(Forward { h, out, top })
+        Ok(Forward { h, out, top, asset_attn })
     }
 
     /// Gated self-supervised head: `Σ_k p_k · mu_k H_k (+ z_top H_top) + b`.

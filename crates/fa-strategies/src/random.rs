@@ -1,15 +1,20 @@
 //! Typed random program generation (spec 35 §4.2, §6.3): grow-method trees over the GP DSL
 //! with depth and node limits and ephemeral random constants (ERCs).
 //!
-//! Every expression node is `Num`-typed; the typing lives in the literal arguments of the
-//! primitives — `Dur` steps (`k`), `Prob` levels (`q`), expert indices, region features and
-//! family / topic words — which the generator draws from their own domains so every program it
-//! produces parses back through `sexpr` unchanged. Generation is deterministic in the `Rng`.
+//! Expression nodes are `Num`- or `Bool`-typed (strongly-typed GP): `Bool` subtrees (`gt`, `lt`,
+//! `and`, `or`, `not`) are only grown as the condition of `(if p a b)`; the rest of the typing
+//! lives in the literal arguments of the primitives — `Dur` steps (`k`), `Prob` levels (`q`) and
+//! sources (`prob_gt`), expert indices, region features and family / topic words — which the
+//! generator draws from their own domains so every program it produces parses back through
+//! `sexpr` unchanged. Generation is deterministic in the `Rng`.
 
 use fa_core::{Timescale, rng::Rng};
 use serde::{Deserialize, Serialize};
 
-use crate::{DecoderOp, Expr, GraphOp, PathFn, PortfolioOp, RegionFeature, RegionRef, SetRef, genome::StrategyGenome};
+use crate::{
+    CmpOp, DecoderOp, Expr, GraphOp, PathFn, PortfolioOp, ProbSrc, RegionFeature, RegionRef, SetRef,
+    genome::StrategyGenome,
+};
 
 /// Limits and literal domains for generation and mutation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,6 +38,11 @@ pub struct RandomSpec {
     /// Include the spec 35 §4.2 graph/decoder primitives (`p_trans`, `fc_quantile`, …) in
     /// addition to the D-040 subset.
     pub extended: bool,
+    /// Region literals `(region e k)` with ordinals `0..region_literals` may appear (in
+    /// `p_trans` targets and `dwell`) — only for genomes bound to a snapshot (spec 35 §6.5);
+    /// 0 = never (unbound genomes).
+    #[serde(default)]
+    pub region_literals: u32,
     /// Horizon (bars) range for random genomes.
     pub steps_range: (u32, u32),
     pub lookback_range: (usize, usize),
@@ -52,6 +62,7 @@ impl Default for RandomSpec {
             text_topics: vec!["news".into()],
             visual_kinds: vec!["future".into()],
             extended: true,
+            region_literals: 0,
             steps_range: (1, 10),
             lookback_range: (8, 64),
         }
@@ -95,10 +106,16 @@ fn feature(rng: &mut Rng) -> RegionFeature {
     [RegionFeature::Mass, RegionFeature::MeanFwdReturn, RegionFeature::Vol][rng.below(3)]
 }
 
+/// A region literal of expert `e` with probability 0.3 when the spec allows literals.
+fn literal(rng: &mut Rng, spec: &RandomSpec, e: u32) -> Option<RegionRef> {
+    (spec.region_literals > 0 && rng.uniform() < 0.3)
+        .then(|| RegionRef::Lit(e, rng.below(spec.region_literals as usize) as u32))
+}
+
 /// A random terminal (leaf) node.
 pub fn random_terminal(rng: &mut Rng, spec: &RandomSpec) -> Expr {
     let base = 10;
-    let ext = if spec.extended { 12 } else { 0 };
+    let ext = if spec.extended { 14 } else { 0 };
     let cur = RegionRef::Cur(0);
     match rng.below(base + ext) {
         0 | 1 => Expr::Const(erc(rng, spec)),
@@ -122,11 +139,12 @@ pub fn random_terminal(rng: &mut Rng, spec: &RandomSpec) -> Expr {
         // spec 35 §4.2 graph primitives
         10 => {
             let e = rng.below(spec.experts.max(1) as usize) as u32;
-            Expr::Graph(GraphOp::PTrans(cur, RegionRef::Cur(e), k(rng, spec)))
+            let to = literal(rng, spec, e).unwrap_or(RegionRef::Cur(e));
+            Expr::Graph(GraphOp::PTrans(cur, to, k(rng, spec)))
         }
         11 => Expr::Graph(GraphOp::PToSet(cur, SetRef::Neighbors(cur, k(rng, spec)), k(rng, spec))),
         12 => Expr::Graph(GraphOp::HittingTime(cur, SetRef::Neighbors(cur, k(rng, spec)))),
-        13 => Expr::Graph(GraphOp::Dwell(cur)),
+        13 => Expr::Graph(GraphOp::Dwell(literal(rng, spec, 0).unwrap_or(cur))),
         14 => Expr::Graph(GraphOp::Novelty(rng.below(spec.experts.max(1) as usize) as u32)),
         15 => Expr::Graph(GraphOp::RegionFeature(cur, feature(rng))),
         16 => {
@@ -139,6 +157,8 @@ pub fn random_terminal(rng: &mut Rng, spec: &RandomSpec) -> Expr {
         18 => Expr::Decoder(DecoderOp::FcDist(k(rng, spec))),
         19 => Expr::Decoder(DecoderOp::AnalogOutcome(k(rng, spec))),
         20 => Expr::Decoder(DecoderOp::AnalogAge),
+        21 => Expr::Portfolio(PortfolioOp::ExposureGross),
+        22 => Expr::Portfolio(PortfolioOp::Drawdown),
         _ => {
             if rng.uniform() < 0.5 {
                 match pick(rng, &spec.text_topics) {
@@ -189,10 +209,62 @@ pub fn random_function(rng: &mut Rng, kids: Vec<Expr>) -> Expr {
     }
 }
 
+/// A random binary arithmetic node (`add sub mul div min max`).
+pub fn binary_num(rng: &mut Rng, a: Box<Expr>, b: Box<Expr>) -> Expr {
+    match rng.below(6) {
+        0 => Expr::Add(a, b),
+        1 => Expr::Sub(a, b),
+        2 => Expr::Mul(a, b),
+        3 => Expr::Div(a, b),
+        4 => Expr::Min(a, b),
+        _ => Expr::Max(a, b),
+    }
+}
+
+/// A random `Bool` tree of depth `≤ depth` (≥ 2: a comparison of two `Num` subtrees; deeper
+/// trees combine comparisons with `and` / `or` / `not`).
+pub fn random_bool(rng: &mut Rng, depth: usize, spec: &RandomSpec) -> Expr {
+    let depth = depth.max(2);
+    if depth > 2 && rng.uniform() < 0.25 {
+        return match rng.below(3) {
+            0 => Expr::And(Box::new(random_bool(rng, depth - 1, spec)), Box::new(random_bool(rng, depth - 1, spec))),
+            1 => Expr::Or(Box::new(random_bool(rng, depth - 1, spec)), Box::new(random_bool(rng, depth - 1, spec))),
+            _ => Expr::Not(Box::new(random_bool(rng, depth - 1, spec))),
+        };
+    }
+    let op = if rng.uniform() < 0.5 { CmpOp::Gt } else { CmpOp::Lt };
+    let a = grow(rng, depth - 1, spec);
+    // half the time against a constant threshold: `(gt stay_prob 0.6)`
+    let b = if rng.uniform() < 0.5 { Expr::Const(round_sig(rng.uniform(), 2)) } else { grow(rng, depth - 1, spec) };
+    Expr::Cmp(op, Box::new(a), Box::new(b))
+}
+
 /// Grow-method tree of depth `≤ depth`.
 pub fn grow(rng: &mut Rng, depth: usize, spec: &RandomSpec) -> Expr {
     if depth == 0 || rng.uniform() < spec.terminal_prob {
         return random_terminal(rng, spec);
+    }
+    if spec.extended {
+        // spec 35 §4.2 combinators: clip, if (Bool condition), prob_gt
+        match rng.below(20) {
+            0 if depth >= 2 => {
+                let lo = Expr::Const(-round_sig(rng.uniform().max(0.01), 2));
+                let hi = Expr::Const(round_sig(rng.uniform().max(0.01), 2));
+                return Expr::Clip(Box::new(grow(rng, depth - 1, spec)), Box::new(lo), Box::new(hi));
+            }
+            1 if depth >= 3 => {
+                let c = random_bool(rng, depth - 1, spec);
+                return Expr::If(Box::new(c), Box::new(grow(rng, depth - 1, spec)), Box::new(grow(rng, depth - 1, spec)));
+            }
+            2 => {
+                let kk = k(rng, spec);
+                let src = if rng.uniform() < 0.5 { ProbSrc::Fc(kk) } else { ProbSrc::Analog(kk) };
+                // threshold: 0 (direction) or a small return
+                let x = if rng.uniform() < 0.5 { 0.0 } else { round_sig((rng.uniform() - 0.5) * 0.004, 2) };
+                return Expr::ProbGt(src, Box::new(Expr::Const(x)));
+            }
+            _ => {}
+        }
     }
     let arity = random_arity(rng);
     let kids: Vec<Expr> = (0..arity).map(|_| grow(rng, depth - 1, spec)).collect();
@@ -226,7 +298,38 @@ pub fn random_genome(rng: &mut Rng, timescale: Timescale, spec: &RandomSpec) -> 
         parents: Vec::new(),
         generation: 0,
         snapshot: None,
+        assets: Vec::new(),
+        policy: None,
     }
+}
+
+/// A random neural-policy genome at `timescale` (immigrant of the neural pool, spec 35 §6.3):
+/// each observation feature on with probability 1/2 (at least 3), expert 0's latents (4 dims)
+/// with probability 1/2, one hidden layer of 4–16 units (two layers with probability 0.2),
+/// `tanh` (70 %) or `relu`.
+pub fn random_neural_genome(rng: &mut Rng, timescale: Timescale, spec: &RandomSpec) -> StrategyGenome {
+    use crate::neural::{Act, FEATURES, PolicyNet};
+    let (s0, s1) = (spec.steps_range.0.max(1), spec.steps_range.1.max(spec.steps_range.0.max(1)));
+    let (l0, l1) = (spec.lookback_range.0.max(2), spec.lookback_range.1.max(spec.lookback_range.0.max(2)));
+    let mut mask = 0u32;
+    for i in 0..FEATURES.len() {
+        if rng.uniform() < 0.5 {
+            mask |= 1 << i;
+        }
+    }
+    while mask.count_ones() < 3 {
+        mask |= 1 << rng.below(FEATURES.len());
+    }
+    let (experts, dims) = if rng.uniform() < 0.5 { (1u32, 4usize) } else { (0, 0) };
+    let mut hidden = vec![4 + rng.below(13)];
+    if rng.uniform() < 0.2 {
+        hidden.push(4 + rng.below(9));
+    }
+    let act = if rng.uniform() < 0.7 { Act::Tanh } else { Act::Relu };
+    let net = PolicyNet::random(rng, mask, experts, dims, hidden, act);
+    let steps = s0 + rng.below((s1 - s0 + 1) as usize) as u32;
+    let lookback = l0 + rng.below(l1 - l0 + 1);
+    StrategyGenome::neural(timescale, steps, lookback, net)
 }
 
 /// `n` random genomes (deterministic in `seed`).
@@ -286,13 +389,41 @@ mod tests {
             "(score",
             "(quantile",
             "(path_up",
+            "exposure_gross",
+            "drawdown",
         ] {
             assert!(texts.iter().any(|t| t.contains(needle)), "{needle} never generated");
+        }
+        // the §4.2 combinators appear in grown programs
+        let grown: Vec<String> = (0..600).map(|_| random_expr(&mut rng, 5, &spec).to_string()).collect();
+        for needle in ["(clip ", "(if ", "(prob_gt (fc_dist", "(prob_gt (analog_outcome", "(gt ", "(lt "] {
+            assert!(grown.iter().any(|t| t.contains(needle)), "{needle} never grown");
         }
         let legacy = RandomSpec { extended: false, ..RandomSpec::default() };
         for _ in 0..500 {
             let t = random_terminal(&mut rng, &legacy).to_string();
             assert!(!t.contains("p_trans") && !t.contains("fc_"), "{t}");
+        }
+    }
+
+    #[test]
+    fn literals_only_when_bound_and_neural_immigrants_are_valid() {
+        let mut rng = Rng::seed(4);
+        let free = RandomSpec::default();
+        assert!((0..3000).all(|_| !random_terminal(&mut rng, &free).to_string().contains("(region ")));
+        let bound = RandomSpec { region_literals: 6, ..RandomSpec::default() };
+        let lits: Vec<String> =
+            (0..3000).map(|_| random_terminal(&mut rng, &bound).to_string()).filter(|t| t.contains("(region ")).collect();
+        assert!(!lits.is_empty());
+        for t in &lits {
+            assert_eq!(sexpr::parse(t).unwrap().to_string(), *t);
+        }
+        for _ in 0..50 {
+            let g = random_neural_genome(&mut rng, Timescale::Minute, &RandomSpec::default());
+            let net = g.policy.as_ref().unwrap();
+            net.validate().unwrap();
+            assert!(net.n_features() >= 3 && g.id().starts_with("nn-"));
+            assert_eq!(StrategyGenome::parse(&g.to_string()).unwrap().id(), g.id());
         }
     }
 

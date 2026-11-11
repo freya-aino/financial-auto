@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+<channel>
+<title>Example Markets</title>
+<language>en-gb</language>
+<item><title>Rates hold &amp; markets rally</title><link>https://example.com/a?utm_source=x</link><guid>a-1</guid><pubDate>Tue, 10 Nov 2026 14:00:00 GMT</pubDate></item>
+<item><title>Second</title><link>https://example.com/b</link><dc:date>2026-11-10T15:00:00Z</dc:date></item>
+<item><title>No key</title></item>
+</channel>
+</rss>

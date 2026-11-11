@@ -29,6 +29,9 @@ max_age_hours = 72          # rate older than this at the event time → `stale`
 halt_on_stale = false       # true: reduce-only halt scope `fx` while any used currency is stale (spec 42 §8); false: warning only
 source = "ecb_daily"        # fx.accounting_source
 history_days = 60           # rates loaded into memory at start (older fills use the earliest known rate, flagged stale)
+block_stale_ccy = true      # a stale currency is reduce-only (its instruments' targets and foreign orders); others trade on (spec 42 §8)
+intraday = true             # trades of EUR FX pairs in ref data (Yahoo EURUSD=X) are intraday rates → table + ref.fx_rate (source = feed id)
+intraday_max_dev = 0.05     # intraday rate dropped when > 5 % off the latest daily rate (bad tick)
 
 # Strategy lifecycle (spec 40 §3, §6.6; D-051). A strategy first seen on signal.exposure.<id> gets
 # `new_strategy_status`: "active" allocates paper capital at once (baseline behaviour), "shadow"
@@ -73,8 +76,8 @@ auto_lock = true
 check_secs = 300
 timescales = ["1s", "1m"]   # the baselines' and evolution's timescales; candidates add theirs on demand
 min_bars = 300
-relock_after_days = 0       # 0 = never re-lock automatically (spec 41 Q5 open)
-[holdout.length_secs]       # holdout.length.<ts>: placeholders scaled to the history the stack has
+relock_after_days = 7       # spec 41 Q5: a new full-length segment once the latest ended max(7 d, its length) ago (0 = never)
+[holdout.length_secs]       # holdout.length.<ts> (spec 41 Q1): >= 300 bars and >= 100 non-overlapping horizons of the timescale's strategies
 "1s" = 7200
 "1m" = 43200
 "1h" = 7776000
@@ -98,7 +101,7 @@ jump_confirm = 3            # … until this many trades confirm the new level
 [limits]
 max_drawdown = 0.10         # risk.portfolio_max_drawdown → kill switch, manual re-arm
 strategy_max_drawdown = 0.05 # risk.strategy_max_drawdown: attributed P&L drawdown vs sleeve → pause + flatten that strategy
-max_daily_loss = 0.02       # risk.daily_loss_limit → reduce-only for the rest of the UTC day
+max_daily_loss = 0.02       # risk.daily_loss_limit → reduce-only until the losing day ends (UTC for 24/7 venues, the exchange day per calendar; spec 40 §10 Q4)
 max_position_frac = 0.05    # risk.max_position_pct per instrument
 # provisional_position_frac = 0.025 # per instrument whose ref.instrument.status is `provisional` (D-050); default = max_position_frac × 0.5, never above it
 max_class_frac = 0.40       # risk.max_class_pct: gross per asset class / deployable
@@ -197,3 +200,14 @@ amount_eur = 0.0
 pct = 0.0
 rollover = false
 max_equity_frac = 0.05
+
+# Risk-chain history (spec 40 §5): allocation snapshots and netted targets (raw / capped / gated,
+# decision) in ledger.allocation_snapshot / ledger.portfolio_target, kept on change (an order, a
+# weight move > 1e-4, a gated target move > min_order_eur) and at least every snapshot_secs,
+# pruned after retention_days; ledger.promotion_review gets every promote attempt and every change
+# of a shadow strategy's gate outcome (hourly while unchanged).
+[history]
+enabled = true
+snapshot_secs = 60
+retention_days = 30
+review_unchanged_secs = 3600

@@ -5,5 +5,5 @@ Synthetic connector that proves the ingestion path end to end (D-018). It emits 
 **Status:** implemented. It isn't a catalog source, so the ingestor runs it as a built-in.
 
 ## Governing specs
-- [10-ingestion](../../../specs/10-ingestion.md)
+- [Ingestion reference (ex spec 10)](../../services/ingestor/README.md#ingestion-reference)
 - [21-bus-and-contracts](../../../specs/21-bus-and-contracts.md)

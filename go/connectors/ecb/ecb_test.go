@@ -248,3 +248,36 @@ func TestInitRejectsBadQuery(t *testing.T) {
 		t.Fatal("want error")
 	}
 }
+
+func TestSDMXAdapterServesAnotherCatalogID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/rest/data/HICP/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write(fixture(t, "hicp_history.json"))
+	}))
+	defer srv.Close()
+	c, err := connector.NewFor("oecd", Adapter)
+	if err != nil || c.ID() != "oecd" {
+		t.Fatalf("adapter %v %v", c, err)
+	}
+	src := catalog.Source{ID: "oecd", Adapter: Adapter, Config: &catalog.Params{Queries: []string{"HICP/M.U2.N.000000.4D0.ANR"}, Extra: map[string]string{"base_url": srv.URL + "/rest/data/"}}}
+	if err := c.Init(context.Background(), connector.SourceConfig{Source: src}, connector.Deps{Clock: fixedClock{now}}); err != nil {
+		t.Fatal(err)
+	}
+	raws, err := c.(connector.Poller).Poll(context.Background(), connector.PollRequest{})
+	if err != nil || len(raws) != 1 || raws[0].SourceID != "oecd" {
+		t.Fatalf("poll %v %d", err, len(raws))
+	}
+	envs, _, err := c.(connector.Normalizer).Normalize(raws[0])
+	if err != nil || len(envs) == 0 || envs[0].SourceId != "oecd" {
+		t.Fatalf("normalize %v %d", err, len(envs))
+	}
+	for _, bad := range []*catalog.Params{{Queries: []string{"HICP/M"}}, {Extra: map[string]string{"base_url": "http://x"}}} {
+		c2, _ := connector.NewFor("oecd", Adapter)
+		if err := c2.Init(context.Background(), connector.SourceConfig{Source: catalog.Source{ID: "oecd", Config: bad}}, connector.Deps{}); err == nil {
+			t.Fatalf("%+v: want Init error", bad)
+		}
+	}
+}

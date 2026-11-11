@@ -76,6 +76,9 @@ pub struct Settings {
     pub model_drift: ModelDriftSettings,
     /// Daily payout quota rule (spec 42 §10 Q1, `fa_ledger::payout`); default reserves nothing.
     pub payout: fa_ledger::payout::PayoutRule,
+    /// Risk-chain history (`ledger.allocation_snapshot` / `portfolio_target` / `promotion_review`,
+    /// spec 40 §5).
+    pub history: crate::engine::history::HistorySettings,
 }
 
 /// `[model_drift]`: the risk-engine raises `model:<snapshot>` when a served snapshot's region
@@ -131,6 +134,7 @@ impl Default for Settings {
             rebalance: RebalanceConfig::default(),
             model_drift: ModelDriftSettings::default(),
             payout: fa_ledger::payout::PayoutRule::default(),
+            history: crate::engine::history::HistorySettings::default(),
         }
     }
 }
@@ -207,6 +211,14 @@ pub struct FxSettings {
     pub source: String,
     /// Days of history loaded into the in-memory as-of table at start.
     pub history_days: u32,
+    /// Block risk-increasing orders in a currency whose rate is stale (spec 42 §8): targets and
+    /// foreign orders on instruments quoted in it are reduce-only; other currencies trade on.
+    pub block_stale_ccy: bool,
+    /// Intraday EUR rates from the trades of EUR FX pairs in reference data (Yahoo `EURUSD=X`;
+    /// spec 42 §6 `fx.intraday_source`), written to `ref.fx_rate` under the feed's source id.
+    pub intraday: bool,
+    /// An intraday rate deviating more than this from the latest daily rate is dropped (bad tick).
+    pub intraday_max_dev: f64,
 }
 
 impl Default for FxSettings {
@@ -217,6 +229,9 @@ impl Default for FxSettings {
             halt_on_stale: false,
             source: fa_warehouse::fx::ECB_SOURCE.into(),
             history_days: 60,
+            block_stale_ccy: true,
+            intraday: true,
+            intraday_max_dev: 0.05,
         }
     }
 }
@@ -333,7 +348,7 @@ mod tests {
         assert_eq!(s.holdout.timescales(), vec![Timescale::Second, Timescale::Minute]);
         assert_eq!(s.holdout.policy(Timescale::Second).length_ms, 2 * 3_600_000);
         assert_eq!(s.holdout.policy(Timescale::Minute).embargo_ms, 3_600_000);
-        assert_eq!(s.holdout.policy(Timescale::Second).relock_after_ms, None);
+        assert_eq!(s.holdout.policy(Timescale::Second).relock_after_ms, Some(fa_backtest::holdout::RELOCK_AFTER_MS));
         assert_eq!((s.feed.stale_freeze_bars, s.feed.stale_flatten_secs, s.feed.jump_max), (3.0, 0.0, 0.15));
         assert!(matches!(Settings::parse("[holdout]\ntimescales = ['5s']"), Err(SettingsError::Timescale(_))));
         assert!(Settings::parse("allocator = 'thompson_rp'").is_ok());

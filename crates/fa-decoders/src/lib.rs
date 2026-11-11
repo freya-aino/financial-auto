@@ -20,6 +20,7 @@ pub mod decoder;
 pub mod genome;
 pub mod neural;
 pub mod render;
+pub mod summary;
 pub mod text_baseline;
 pub mod visual_baseline;
 

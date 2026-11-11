@@ -12,4 +12,4 @@ healthcheck: { test: ["CMD", "healthprobe", "http://127.0.0.1:9100/metrics"] }
 `main_test.go`: 2xx passes; a 503 among several URLs, a timeout and a refused connection fail.
 
 ## Governing specs
-- [60-ops](../../../specs/60-ops.md)
+- [Ops reference (ex spec 60)](../../../docker/README.md#reference-spec-60-ops-retired-2026-11-11)

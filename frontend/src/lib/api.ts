@@ -1,4 +1,6 @@
 // Typed client for control-api (spec 50). Paths are relative; vite proxies them in dev.
+import type { ContainerSummary, ServiceAction, Supervisor } from './services';
+import type { PretradeResult } from './ticket';
 
 export interface ServiceStatus {
 	service: string;
@@ -6,6 +8,8 @@ export interface ServiceStatus {
 	version: string;
 	last_seen: string;
 	counters: Record<string, number>;
+	/** Compose container of the service (D-060), null without a Docker socket. */
+	container?: ContainerSummary | null;
 }
 
 /** `ingest.health.<source>` frame as overlaid by `GET /api/sources` (D-054). */
@@ -201,7 +205,18 @@ export async function getJson<T>(path: string): Promise<T> {
 
 export const api = {
 	health: () => getJson<Health>('/api/health'),
-	services: () => getJson<{ services: ServiceStatus[]; nats_connected: boolean }>('/api/services'),
+	services: () => getJson<{ services: ServiceStatus[]; nats_connected: boolean; supervisor?: Supervisor }>('/api/services'),
+	/** Container inspect (state, exit code, restarts, health) of a compose service (D-060). */
+	serviceContainer: (name: string) =>
+		getJson<{ service: string; replicas: number; name: string; id: string; image: string; state: string; running: boolean; exit_code: number | null; restart_count: number; health: string | null; finished_at: string | null }>(
+			`/api/services/${encodeURIComponent(name)}/container`
+		),
+	/** `docker start|stop|restart` of a compose service (D-060); confirm first. */
+	serviceAction: (name: string, action: ServiceAction, body: Record<string, unknown> = {}) =>
+		postJson<{ ok: boolean; service: string; action: string; state: string; noop: boolean; audited: boolean; containers: { name: string; state: string }[] }>(
+			`/api/services/${encodeURIComponent(name)}/${action}`,
+			body
+		),
 	sources: () => getJson<{ version: number; sources: Source[] }>('/api/sources'),
 	/** `ctl.ingest.*` start/stop. The ingestor has no handler yet, so control-api answers 501 (shown to the operator). */
 	ingest: (source: string, action: 'start' | 'stop') => postJson<{ ok: boolean }>(`/api/ingest/${source}/${action}`),
@@ -900,6 +915,8 @@ export const live = {
 	signals: () => getJson<{ signals: SignalView[] }>('/api/trading/signals'),
 	halt: (reason: string) => postJson<{ ok: boolean }>('/api/trading/halt', { reason }),
 	resume: () => postJson<{ ok: boolean }>('/api/trading/resume'),
+	/** Dry-run pre-trade risk check of a manual order (pending control-api route, see ticket.ts). */
+	pretrade: (body: Record<string, unknown>) => postJson<PretradeResult>('/api/trading/pretrade', body),
 	paperOrder: (body: { instrument_id: string; side: 'buy' | 'sell'; quantity: number; limit_price?: number }) =>
 		postJson<{ ok: boolean; intent_id: string }>('/api/trading/paper-order', { ...body, mode: 'paper' })
 };

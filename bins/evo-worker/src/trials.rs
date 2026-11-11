@@ -84,6 +84,18 @@ impl TrialStore {
         }
     }
 
+    /// Appends an `audit.log` row (spec 42 §6, append-only) as `system:evo-worker`.
+    pub async fn audit(&self, action: &str, subject: Option<&str>, payload: &Value) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT INTO audit.log (actor, action, subject, payload) VALUES ($1, $2, $3, $4)")
+            .bind(crate::holdout::AUDIT_ACTOR)
+            .bind(action)
+            .bind(subject)
+            .bind(payload)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+    }
+
     /// `validation.*` tables exist (control-api applies migrations on start).
     pub async fn ready(&self) -> bool {
         sqlx::query("select 1 from validation.trial limit 0").execute(&self.pool).await.is_ok()
@@ -136,6 +148,44 @@ impl TrialStore {
                 returns: r.get::<Option<Vec<f64>>, _>("returns").unwrap_or_default(),
             })
             .collect())
+    }
+
+    /// Block returns of the generation's current elite set for the diversification objective
+    /// (spec 35 §6.2): the best `k` other candidates of `kind` by deflated Sharpe whose trial
+    /// window overlaps `[start, end]` by ≥ 90 % (so their blocks are time-aligned), one row per
+    /// candidate (its newest such trial).
+    pub async fn elite_returns(
+        &self,
+        generation: &str,
+        kind: &str,
+        exclude_candidate: &str,
+        window: (i64, i64),
+        k: usize,
+    ) -> Result<Vec<Vec<f64>>, sqlx::Error> {
+        let len_s = ((window.1 - window.0).max(1) as f64) / 1000.0;
+        let rows = sqlx::query(
+            "select distinct on (candidate) candidate, returns, \
+                    coalesce((objectives->>'deflated_sharpe')::float8, 0) as dsr \
+             from validation.trial \
+             where generation = $1 and kind = $2 and candidate <> $3 and returns is not null \
+               and extract(epoch from (least(window_end, $5) - greatest(window_start, $4))) >= 0.9 * $6 \
+             order by candidate, created_at desc",
+        )
+        .bind(generation)
+        .bind(kind)
+        .bind(exclude_candidate)
+        .bind(ts(window.0))
+        .bind(ts(window.1))
+        .bind(len_s)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut v: Vec<(f64, Vec<f64>)> = rows
+            .iter()
+            .map(|r| (r.get::<f64, _>("dsr"), r.get::<Option<Vec<f64>>, _>("returns").unwrap_or_default()))
+            .filter(|(_, r)| !r.is_empty())
+            .collect();
+        v.sort_by(|a, b| b.0.total_cmp(&a.0));
+        Ok(v.into_iter().take(k).map(|x| x.1).collect())
     }
 
     /// `(n_trials, sharpe variance)` of the generation so far: the deflated-Sharpe inputs of

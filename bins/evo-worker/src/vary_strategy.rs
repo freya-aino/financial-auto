@@ -1,18 +1,41 @@
 //! `evo.vary.strategy` (spec 35 §6.3): children of a strategy generation's elites through the
-//! shared `fa_evolution::vary::vary_with` loop with `fa_strategies::ops` operators (subtree
-//! crossover, point / subtree / hoist mutation, constant jitter, spec-gene mutation), plus
-//! random immigrants (`immigrant_frac`, spec 34 §6.2 step 1).
+//! shared `fa_evolution::vary::vary_with` loop, in **two breeding pools** that share the
+//! orchestrator's one selection front:
+//!
+//! - **GP** (`fa_strategies::ops`): typed subtree crossover, point / subtree / hoist mutation,
+//!   constant jitter, spec-gene mutation;
+//! - **neural** (`fa_strategies::neural`): arithmetic crossover between nets of the same
+//!   topology, Gaussian weight perturbation (ES), topology mutation, input-mask flips,
+//!   spec-gene mutation, and an **SGD fine-tune** (candle, [`crate::neural_policy`]) of a share
+//!   (`sgd_prob`, 0.3) of the neural children on a training window before the selection window.
+//!
+//! No crossover between the pools. Each pool gets `n_children × share` children, the share
+//! being its parents' share clamped to `[min_share_per_repr, 1 − min_share_per_repr]`
+//! (default 0.3), so selection can never drive a representation extinct: a pool without
+//! parents is refilled with random immigrants of its representation. Each pool also gets its
+//! `immigrant_frac` of random immigrants.
+//!
+//! Every child may also get an **asset-set mutation** (`asset_mutation_prob`, 0.15; add /
+//! remove / swap with the MCMC cross-asset pair proposals of its timescale as the distribution,
+//! `fa_strategies::assets`), and children are **stamped with the generation's encoder
+//! snapshot** (`Job.snapshot_id`) unless already bound — so region literals and latent inputs of
+//! evolved strategies refer to a known snapshot (spec 35 §6.5) and bound GP immigrants may
+//! carry region literals.
 //!
 //! `Job.spec` has the same shape as `evo.vary.decoder` (`parents` best first with their
 //! objectives, `n_children`, `seed`, `generation`, optional `budget`, operator overrides
-//! `sigma`, `crossover_prob`, `immigrant_frac`, `max_depth`, `max_nodes`). Parents are genome
-//! text forms; children are returned as canonical text forms, de-duplicated by id against the
-//! parents and each other. Lineage (`upsert_genome`, `link_parent`, `add_fitness_record` for
-//! the parents' objectives) goes to Helix best effort.
+//! `sigma`, `crossover_prob`, `immigrant_frac`, `max_depth`, `max_nodes`,
+//! `min_share_per_repr`, `asset_mutation_prob`, `sgd_prob`). Parents are genome text forms;
+//! children are returned as canonical text forms, de-duplicated by id against the parents and
+//! each other. Lineage (`upsert_genome`, `link_parent`, `add_fitness_record` for the parents'
+//! objectives) goes to Helix best effort.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::{Mutex, OnceLock},
+};
 
-use fa_core::rng::Rng;
+use fa_core::{Timescale, rng::Rng};
 use fa_evolution::{
     plan_halving,
     vary::{Child, Evolvable, Operators, vary_with},
@@ -22,18 +45,25 @@ use fa_hub::{
     queries::{NewFitness, NewGenome},
 };
 use fa_strategies::{
-    genome::StrategyGenome,
+    assets::{AssetProposals, mutate_assets},
+    genome::{Representation, StrategyGenome},
     ops::{OpSpec, crossover_genome, mutate_genome},
-    random::{RandomSpec, random_genome},
+    random::{RandomSpec, random_genome, random_neural_genome},
 };
 use serde_json::{Value, json};
 
 use crate::vary::{Lineage, MAX_CHILDREN, VaryRequest};
 
 pub const KIND: &str = "evo.vary.strategy";
-pub const PROTOCOL: &str = "evo.vary.strategy/v0";
+pub const PROTOCOL: &str = "evo.vary.strategy/v1";
 /// Share of children that are random immigrants (spec 34 §6.2 `immigrant_frac`).
 pub const DEFAULT_IMMIGRANT_FRAC: f64 = 0.1;
+/// Population share floor per representation (spec 35 §7 `min_share_per_repr`).
+pub const DEFAULT_MIN_SHARE: f64 = 0.3;
+pub const DEFAULT_ASSET_MUTATION_PROB: f64 = 0.15;
+pub const DEFAULT_SGD_PROB: f64 = 0.3;
+/// Region-literal ordinals random GP programs of snapshot-bound genomes may use.
+pub const LITERAL_ORDINALS: u32 = 8;
 
 /// `StrategyGenome` in the shared loop: family = timescale (no crossover across timescales).
 #[derive(Clone, Debug, PartialEq)]
@@ -64,6 +94,66 @@ impl Operators<Evo> for GpOps {
     }
 }
 
+/// Neural-pool operators (`fa_strategies::neural`).
+pub struct NnOps {
+    pub sigma: f64,
+    pub random: RandomSpec,
+    /// Expert spaces addressable by input-mask flips.
+    pub experts: u32,
+}
+
+impl Operators<Evo> for NnOps {
+    fn crossover(&self, a: &Evo, b: &Evo, rng: &mut Rng) -> Evo {
+        let mut c = a.0.clone();
+        if let (Some(x), Some(y)) = (&a.0.policy, &b.0.policy) {
+            c.policy = Some(x.crossover(y, rng));
+        }
+        c.parents = vec![a.0.id(), b.0.id()];
+        c.generation = a.0.generation.max(b.0.generation) + 1;
+        Evo(c)
+    }
+    fn mutate(&self, g: &Evo, rng: &mut Rng) -> (Evo, &'static str) {
+        let mut c = g.0.clone();
+        c.parents = vec![g.0.id()];
+        c.generation = g.0.generation + 1;
+        let Some(net) = &g.0.policy else { return (Evo(c), "mutation") };
+        let u = rng.uniform();
+        let op = if u < 0.5 {
+            c.policy = Some(net.perturb(rng, self.sigma));
+            "es_perturb"
+        } else if u < 0.7 {
+            c.policy = Some(net.mutate_topology(rng));
+            "topology"
+        } else if u < 0.85 {
+            c.policy = Some(net.mutate_inputs(rng, self.experts));
+            "input_mask"
+        } else {
+            let (lo, hi) = self.random.steps_range;
+            if rng.uniform() < 0.5 {
+                let f = 1.0 + self.sigma * rng.normal();
+                let steps = ((f64::from(g.0.steps) * f).round() as u32).clamp(lo.max(1), hi.max(1));
+                c.steps = if steps == g.0.steps { g.0.steps.saturating_add(1).min(hi.max(1)) } else { steps };
+            } else {
+                let (l0, l1) = self.random.lookback_range;
+                let f = 1.0 + self.sigma * rng.normal();
+                let lb = ((g.0.lookback_bars as f64 * f).round() as usize).clamp(l0.max(2), l1.max(2));
+                c.lookback_bars = if lb == g.0.lookback_bars { g.0.lookback_bars + 1 } else { lb };
+            }
+            "spec_gene"
+        };
+        (Evo(c), op)
+    }
+}
+
+/// Inputs of a variation step that come from the bus / the job rather than the spec.
+#[derive(Debug, Clone, Default)]
+pub struct VaryContext {
+    /// Encoder snapshot of the generation (`Job.snapshot_id`); children are bound to it.
+    pub snapshot: Option<String>,
+    /// Cross-asset pair proposals per timescale (`latent.crossprior.<ts>`).
+    pub proposals: std::collections::BTreeMap<Timescale, AssetProposals>,
+}
+
 #[derive(Debug)]
 pub struct Outcome {
     pub parents: Vec<StrategyGenome>,
@@ -71,10 +161,43 @@ pub struct Outcome {
     pub lineage: Vec<Lineage>,
     pub immigrants: usize,
     pub plan: Option<Value>,
+    /// Children per representation (`gp`, `neural`).
+    pub pools: Value,
+    /// Indices into `children` of neural children to fine-tune by SGD before they are returned.
+    pub fine_tune: Vec<usize>,
+    pub asset_mutations: usize,
+}
+
+/// Interns operator names (a small bounded set of combinations) for `Lineage.op`.
+pub fn intern(op: &str) -> &'static str {
+    static NAMES: OnceLock<Mutex<BTreeSet<&'static str>>> = OnceLock::new();
+    let mut set = NAMES.get_or_init(|| Mutex::new(BTreeSet::new())).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = set.get(op) {
+        return s;
+    }
+    let s: &'static str = Box::leak(op.to_owned().into_boxed_str());
+    set.insert(s);
+    s
+}
+
+/// Child counts per pool: `(n_gp, n_neural)` (module docs).
+pub fn pool_sizes(n_children: usize, n_gp_parents: usize, n_nn_parents: usize, min_share: f64) -> (usize, usize) {
+    let total = n_gp_parents + n_nn_parents;
+    let min_share = min_share.clamp(0.0, 0.5);
+    let share_nn = if total == 0 { 0.5 } else { n_nn_parents as f64 / total as f64 };
+    let share_nn = share_nn.clamp(min_share, 1.0 - min_share);
+    let n_nn = ((n_children as f64) * share_nn).round() as usize;
+    (n_children - n_nn.min(n_children), n_nn.min(n_children))
+}
+
+/// Pure variation step without bus context (no snapshot binding, no asset proposals).
+#[cfg(test)]
+pub fn produce(req: &VaryRequest) -> Result<Outcome, String> {
+    produce_with(req, &VaryContext::default())
 }
 
 /// Pure variation step. Errors on unparsable parents or an empty parent set.
-pub fn produce(req: &VaryRequest) -> Result<Outcome, String> {
+pub fn produce_with(req: &VaryRequest, ctx: &VaryContext) -> Result<Outcome, String> {
     if req.parents.is_empty() {
         return Err("no parents".into());
     }
@@ -102,95 +225,147 @@ pub fn produce(req: &VaryRequest) -> Result<Outcome, String> {
     if let Some(n) = req.max_nodes {
         random.max_nodes = n.max(1);
     }
-    let ops = OpSpec { sigma: req.sigma.unwrap_or(OpSpec::default().sigma), ..OpSpec::default() };
+    if ctx.snapshot.is_some() {
+        random.region_literals = LITERAL_ORDINALS;
+    }
+    let sigma = req.sigma.unwrap_or(OpSpec::default().sigma);
+    let ops = OpSpec { sigma, ..OpSpec::default() };
     let crossover_prob = req.crossover_prob.unwrap_or(0.5);
     let immigrant_frac = req.immigrant_frac.unwrap_or(DEFAULT_IMMIGRANT_FRAC).clamp(0.0, 1.0);
-    let n_immigrants = ((n_children as f64) * immigrant_frac).round() as usize;
-    let n_bred = n_children.saturating_sub(n_immigrants);
+    let min_share = req.min_share_per_repr.unwrap_or(DEFAULT_MIN_SHARE);
+    let p_assets = req.asset_mutation_prob.unwrap_or(DEFAULT_ASSET_MUTATION_PROB).clamp(0.0, 1.0);
+    let p_sgd = req.sgd_prob.unwrap_or(DEFAULT_SGD_PROB).clamp(0.0, 1.0);
+    // immigrants at the parents' (most common) timescale
+    let timescale = {
+        let mut counts: std::collections::BTreeMap<Timescale, usize> = std::collections::BTreeMap::new();
+        for p in &parents {
+            *counts.entry(p.timescale).or_default() += 1;
+        }
+        counts.into_iter().max_by_key(|(t, n)| (*n, std::cmp::Reverse(*t))).map_or(parents[0].timescale, |x| x.0)
+    };
 
-    let gp = GpOps { random: random.clone(), ops };
-    let evo_parents: Vec<Evo> = parents
-        .iter()
-        .cloned()
-        .map(|mut g| {
-            g.generation = req.generation.saturating_sub(1);
-            Evo(g)
-        })
-        .collect();
     let mut seen: BTreeSet<String> = parents.iter().map(StrategyGenome::id).collect();
-    let mut children = Vec::with_capacity(n_children);
+    let mut children: Vec<StrategyGenome> = Vec::with_capacity(n_children);
     let mut lineage = Vec::with_capacity(n_children);
-    // Over-produce in rounds so duplicates (a mutation collapsing onto a parent) are replaced.
-    let mut round = 0u64;
-    while children.len() < n_bred && round < 8 {
-        let want = (n_bred - children.len()) * 2;
-        let batch: Vec<Child<Evo>> =
-            vary_with(&evo_parents, want, req.seed.wrapping_add(round.wrapping_mul(0x9E37_79B9)), crossover_prob, &gp);
-        for c in batch {
-            if children.len() >= n_bred {
-                break;
-            }
-            let key = c.genome.0.id();
-            if !seen.insert(key.clone()) {
-                continue;
-            }
-            let mut g = c.genome.0;
-            g.generation = req.generation; // crossover + mutation each bumped it; children belong to this loop
-            lineage.push(Lineage {
-                child: g.to_string(),
-                parents: c.parents.clone(),
-                op: leak(&c.op),
-                parents_as_sent: Vec::new(),
-            });
-            children.push(g);
-        }
-        round += 1;
-    }
-    // Immigrants: random programs at the parents' (most common) timescale.
-    let timescale = parents[0].timescale;
-    let mut rng = Rng::seed(req.seed ^ 0x5EED_1A11);
     let mut immigrants = 0usize;
-    let mut tries = 0;
-    while immigrants < n_immigrants && tries < n_immigrants * 8 + 8 {
-        tries += 1;
-        let mut g = random_genome(&mut rng, timescale, &random);
+    let mut asset_mutations = 0usize;
+    let mut fine_tune = Vec::new();
+    let mut rng = Rng::seed(req.seed ^ 0x5EED_1A11);
+    let gp_parents: Vec<&StrategyGenome> =
+        parents.iter().filter(|p| p.representation() == Representation::Gp).collect();
+    let nn_parents: Vec<&StrategyGenome> =
+        parents.iter().filter(|p| p.representation() == Representation::Neural).collect();
+    let (n_gp, n_nn) = pool_sizes(n_children, gp_parents.len(), nn_parents.len(), min_share);
+    let mut pools = json!({});
+
+    // Finishes a child: snapshot binding, optional asset-set mutation, dedup; returns whether kept.
+    let mut admit = |mut g: StrategyGenome,
+                     parents_of: Vec<String>,
+                     op: String,
+                     rng: &mut Rng,
+                     children: &mut Vec<StrategyGenome>,
+                     lineage: &mut Vec<Lineage>|
+     -> bool {
         g.generation = req.generation;
-        let key = g.id();
-        if !seen.insert(key) {
-            continue;
+        if g.snapshot.is_none() {
+            g.snapshot.clone_from(&ctx.snapshot);
         }
-        lineage.push(Lineage {
-            child: g.to_string(),
-            parents: Vec::new(),
-            op: "immigrant",
-            parents_as_sent: Vec::new(),
-        });
+        let mut op = op;
+        let mut mutated = false;
+        if let Some(props) = ctx.proposals.get(&g.timescale)
+            && !props.is_empty()
+            && rng.uniform() < p_assets
+        {
+            let k = mutate_assets(&mut g, rng, props);
+            if k != fa_strategies::assets::AssetOp::None {
+                op = format!("{op}+{}", k.as_str());
+                mutated = true;
+            }
+        }
+        if !seen.insert(g.id()) {
+            return false;
+        }
+        asset_mutations += usize::from(mutated);
+        lineage.push(Lineage { child: g.to_string(), parents: parents_of, op: intern(&op), parents_as_sent: Vec::new() });
         children.push(g);
-        immigrants += 1;
+        true
+    };
+
+    for (repr, n_pool, pool_parents) in
+        [(Representation::Gp, n_gp, &gp_parents), (Representation::Neural, n_nn, &nn_parents)]
+    {
+        let first = children.len();
+        let n_imm = if pool_parents.is_empty() { n_pool } else { ((n_pool as f64) * immigrant_frac).round() as usize };
+        let n_bred = n_pool.saturating_sub(n_imm);
+        let evo_parents: Vec<Evo> = pool_parents
+            .iter()
+            .map(|g| {
+                let mut g = (*g).clone();
+                g.generation = req.generation.saturating_sub(1);
+                Evo(g)
+            })
+            .collect();
+        let gp = GpOps { random: random.clone(), ops };
+        let nn = NnOps { sigma, random: random.clone(), experts: 2 };
+        // Over-produce in rounds so duplicates (a mutation collapsing onto a parent) are replaced.
+        let mut round = 0u64;
+        let salt = if repr == Representation::Neural { 0xA5A5_0000 } else { 0 };
+        while !evo_parents.is_empty() && children.len() - first < n_bred && round < 8 {
+            let want = (n_bred - (children.len() - first)) * 2;
+            let seed = req.seed.wrapping_add(salt).wrapping_add(round.wrapping_mul(0x9E37_79B9));
+            let batch: Vec<Child<Evo>> = match repr {
+                Representation::Gp => vary_with(&evo_parents, want, seed, crossover_prob, &gp),
+                Representation::Neural => vary_with(&evo_parents, want, seed, crossover_prob, &nn),
+            };
+            for c in batch {
+                if children.len() - first >= n_bred {
+                    break;
+                }
+                admit(c.genome.0, c.parents.clone(), c.op.clone(), &mut rng, &mut children, &mut lineage);
+            }
+            round += 1;
+        }
+        let mut made = 0usize;
+        let mut tries = 0;
+        let want_imm = n_pool - (children.len() - first);
+        while made < want_imm && tries < want_imm * 8 + 8 {
+            tries += 1;
+            let g = match repr {
+                Representation::Gp => random_genome(&mut rng, timescale, &random),
+                Representation::Neural => random_neural_genome(&mut rng, timescale, &random),
+            };
+            if admit(g, Vec::new(), "immigrant".into(), &mut rng, &mut children, &mut lineage) {
+                made += 1;
+            }
+        }
+        immigrants += made;
+        if repr == Representation::Neural {
+            for i in first..children.len() {
+                if rng.uniform() < p_sgd {
+                    fine_tune.push(i);
+                }
+            }
+        }
+        pools[repr.as_str()] = json!({"parents": pool_parents.len(), "children": children.len() - first,
+                                      "quota": n_pool, "immigrants": made});
     }
-    Ok(Outcome { parents, children, lineage, immigrants, plan })
+    Ok(Outcome { parents, children, lineage, immigrants, plan, pools, fine_tune, asset_mutations })
 }
 
-/// Operator names are a small fixed set; intern them as `&'static str` for `Lineage`.
-fn leak(op: &str) -> &'static str {
-    const KNOWN: [&str; 12] = [
-        "point_mutation",
-        "subtree_mutation",
-        "hoist_mutation",
-        "constant_jitter",
-        "spec_gene",
-        "crossover+point_mutation",
-        "crossover+subtree_mutation",
-        "crossover+hoist_mutation",
-        "crossover+constant_jitter",
-        "crossover+spec_gene",
-        "immigrant",
-        "mutation",
-    ];
-    KNOWN.iter().find(|k| **k == op).copied().unwrap_or("variation")
+/// Replaces child `i` by its fine-tuned version (new id, `+sgd` appended to the operator);
+/// `false` when the tuned genome collides with another genome (the untuned child is kept).
+pub fn replace_tuned(out: &mut Outcome, i: usize, tuned: StrategyGenome) -> bool {
+    let id = tuned.id();
+    if out.children.iter().chain(&out.parents).any(|g| g.id() == id) {
+        return false;
+    }
+    out.lineage[i].child = tuned.to_string();
+    out.lineage[i].op = intern(&format!("{}+sgd", out.lineage[i].op));
+    out.children[i] = tuned;
+    true
 }
 
-/// Best-effort Helix lineage write (kind `strategy`, family `gp`).
+/// Best-effort Helix lineage write (kind `strategy`, family `gp` | `neural`).
 pub async fn persist(hub: Option<&HubClient>, req: &VaryRequest, out: &Outcome) -> Value {
     let Some(hub) = hub else { return json!({"persisted": false, "reason": "no helix client"}) };
     let (mut genomes, mut edges, mut fitness) = (0usize, 0usize, 0usize);
@@ -203,7 +378,7 @@ pub async fn persist(hub: Option<&HubClient>, req: &VaryRequest, out: &Outcome) 
     let new_genome = |g: &StrategyGenome| NewGenome {
         genome_id: g.id(),
         kind: "strategy".into(),
-        family: "gp".into(),
+        family: g.representation().as_str().into(),
         params: g.to_string(),
     };
     for (p, spec) in out.parents.iter().zip(&req.parents) {
@@ -251,6 +426,8 @@ pub fn payload(req: &VaryRequest, out: &Outcome, helix: Value, worker_id: &str, 
         "n_parents": out.parents.len(),
         "n_children": out.children.len(),
         "immigrants": out.immigrants,
+        "pools": out.pools,
+        "asset_mutations": out.asset_mutations,
         "requested_children": req.n_children,
         "generation": req.generation,
         "seed": req.seed,
@@ -286,7 +463,7 @@ mod tests {
     #[test]
     fn children_are_valid_distinct_deterministic_and_include_immigrants() {
         let parents = random_population(3, 4, fa_core::Timescale::Second, &RandomSpec::default());
-        let r = req(&parents, 10, 11, "");
+        let r = req(&parents, 10, 11, r#"{"min_share_per_repr": 0}"#);
         let a = produce(&r).unwrap();
         let b = produce(&r).unwrap();
         assert_eq!(a.children, b.children, "deterministic in seed");
@@ -313,7 +490,7 @@ mod tests {
             produce(&req(&parents, 3, 1, "")).unwrap().children,
             produce(&req(&parents, 3, 2, "")).unwrap().children
         );
-        let no_imm = produce(&req(&parents, 10, 11, r#"{"immigrant_frac": 0}"#)).unwrap();
+        let no_imm = produce(&req(&parents, 10, 11, r#"{"immigrant_frac": 0, "min_share_per_repr": 0}"#)).unwrap();
         assert_eq!(no_imm.immigrants, 0);
         let p = payload(&r, &a, json!({"persisted": false}), "w", 3);
         assert_eq!(p["children"].as_array().unwrap().len(), 10);
@@ -324,8 +501,12 @@ mod tests {
     fn budget_sizes_population_and_errors_are_clear() {
         let parents = random_population(5, 2, fa_core::Timescale::Minute, &RandomSpec::default());
         // plan_halving(3_600_000, 10_000, 3, 4) → 90 initial candidates; 2 parents → 88 children
-        let r =
-            req(&parents, 0, 5, r#"{"budget":{"total_gpu_ms":3600000,"min_budget_gpu_ms":10000,"eta":3,"rungs":4}}"#);
+        let r = req(
+            &parents,
+            0,
+            5,
+            r#"{"budget":{"total_gpu_ms":3600000,"min_budget_gpu_ms":10000,"eta":3,"rungs":4},"min_share_per_repr":0}"#,
+        );
         let out = produce(&r).unwrap();
         assert_eq!(out.children.len(), 88);
         assert_eq!(out.plan.as_ref().unwrap()["initial_candidates"], 90);
@@ -334,5 +515,75 @@ mod tests {
         assert!(produce(&empty).is_err());
         let bad: VaryRequest = serde_json::from_str(r#"{"parents":["forecast:h=3"],"n_children":1}"#).unwrap();
         assert!(produce(&bad).unwrap_err().contains("parent"));
+    }
+
+    #[test]
+    fn breeding_pools_keep_both_representations_alive() {
+        use fa_strategies::random::random_neural_genome;
+        let gp = random_population(3, 6, fa_core::Timescale::Second, &RandomSpec::default());
+        // GP-only parents: the neural pool is refilled with immigrants at the share floor
+        let out = produce(&req(&gp, 20, 4, "")).unwrap();
+        let nn: Vec<&StrategyGenome> =
+            out.children.iter().filter(|c| c.representation() == Representation::Neural).collect();
+        assert_eq!(nn.len(), 6, "0.3 × 20: {}", out.pools);
+        assert!(out.lineage.iter().filter(|l| l.child.contains("policy")).all(|l| l.op == "immigrant"));
+        assert_eq!(pool_sizes(20, 6, 0, 0.3), (14, 6));
+        assert_eq!(pool_sizes(20, 1, 9, 0.3), (6, 14), "the share follows the parents within the floor");
+        assert_eq!(pool_sizes(20, 5, 5, 0.3), (10, 10));
+        // mixed parents: neural children are bred from neural parents only (no cross-pool crossover)
+        let mut rng = Rng::seed(8);
+        let mut mixed = gp.clone();
+        for _ in 0..4 {
+            mixed.push(random_neural_genome(&mut rng, fa_core::Timescale::Second, &RandomSpec::default()));
+        }
+        let nn_ids: BTreeSet<String> =
+            mixed.iter().filter(|g| g.representation() == Representation::Neural).map(StrategyGenome::id).collect();
+        let gp_ids: BTreeSet<String> =
+            mixed.iter().filter(|g| g.representation() == Representation::Gp).map(StrategyGenome::id).collect();
+        let out = produce(&req(&mixed, 30, 9, "")).unwrap();
+        let mut neural_ops = BTreeSet::new();
+        for (c, l) in out.children.iter().zip(&out.lineage) {
+            let pool = if c.representation() == Representation::Neural { &nn_ids } else { &gp_ids };
+            assert!(l.parents.iter().all(|p| pool.contains(p)), "{} from {:?}", l.op, l.parents);
+            if c.representation() == Representation::Neural {
+                neural_ops.insert(l.op.split('+').next_back().unwrap_or("").to_owned());
+                c.policy.as_ref().unwrap().validate().unwrap();
+            }
+        }
+        assert!(neural_ops.len() >= 3, "{neural_ops:?}");
+        assert!(!out.fine_tune.is_empty() && out.fine_tune.iter().all(|i| out.children[*i].policy.is_some()));
+        // a tuned replacement updates the child and its lineage
+        let mut out2 = produce(&req(&mixed, 30, 9, "")).unwrap();
+        let i = out2.fine_tune[0];
+        let mut tuned = out2.children[i].clone();
+        tuned.policy = Some(tuned.policy.unwrap().perturb(&mut rng, 0.5));
+        assert!(replace_tuned(&mut out2, i, tuned.clone()));
+        assert!(out2.lineage[i].op.ends_with("+sgd") && out2.lineage[i].child == tuned.to_string());
+    }
+
+    #[test]
+    fn children_are_stamped_with_the_snapshot_and_asset_sets_mutate() {
+        let gp = random_population(5, 6, fa_core::Timescale::Minute, &RandomSpec::default());
+        let mut props = std::collections::BTreeMap::new();
+        props.insert(
+            fa_core::Timescale::Minute,
+            AssetProposals { pairs: vec![("a".into(), "b".into(), 3.0), ("b".into(), "c".into(), 1.0)], universe: vec![] },
+        );
+        let ctx = VaryContext { snapshot: Some("stat-v2-1m".into()), proposals: props };
+        let r = req(&gp, 40, 3, r#"{"asset_mutation_prob": 0.5}"#);
+        let out = produce_with(&r, &ctx).unwrap();
+        assert!(out.children.iter().all(|c| c.snapshot.as_deref() == Some("stat-v2-1m")), "every child bound");
+        assert!(out.asset_mutations > 5, "{}", out.asset_mutations);
+        let with_assets: Vec<&StrategyGenome> = out.children.iter().filter(|c| !c.assets.is_empty()).collect();
+        assert_eq!(with_assets.len(), out.asset_mutations);
+        assert!(out.lineage.iter().any(|l| l.op.contains("+asset_pair")));
+        for c in &out.children {
+            assert_eq!(StrategyGenome::parse(&c.to_string()).unwrap().id(), c.id());
+        }
+        // bound genomes keep their binding (a remap, not a vary, rebinds)
+        let mut bound = gp.clone();
+        bound[0].snapshot = Some("old".into());
+        let out = produce_with(&req(&bound[..1], 3, 1, r#"{"immigrant_frac": 0, "min_share_per_repr": 0}"#), &ctx).unwrap();
+        assert!(out.children.iter().all(|c| c.snapshot.as_deref() == Some("old")));
     }
 }

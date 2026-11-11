@@ -56,6 +56,7 @@ fn event(p: &Persist, b: &BookedFill) -> FillEvent {
         fill: b.fill.clone(),
         filled_at: at(b.at_ms),
         strategy_ids: b.strategy_ids.clone(),
+        strategy_weights: b.strategy_weights.clone(),
         details: b.details.clone(),
         book: Some(p.book().to_owned()),
         venue: Some(PAPER_VENUE),
@@ -182,6 +183,7 @@ pub async fn resolve_unknown(p: &Persist, engine: &Shared, events: Vec<OrderEven
             filled_at: at(ev.event_time.as_ref().map_or(now, |t| t.seconds * 1000 + i64::from(t.nanos) / 1_000_000)),
             fill,
             strategy_ids: Vec::new(),
+            strategy_weights: Vec::new(),
             details: FillDetails {
                 ccy: String::new(),
                 fx_source: "unknown".into(),

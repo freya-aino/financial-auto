@@ -278,3 +278,51 @@ func TestClassifyKrakenSymbols(t *testing.T) {
 		t.Errorf("kraken without hint: %+v", got)
 	}
 }
+
+func TestLiveOverridesAndStatusNote(t *testing.T) {
+	s := liveStore(t)
+	ctx := context.Background()
+	cat, err := catalog.Load("../../../config/sources.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncCatalog(ctx, cat); err != nil {
+		t.Fatal(err)
+	}
+	const id = "dukascopy" // planned, no connector: safe to edit on a shared database
+	t.Cleanup(func() {
+		_ = s.SetOverride(context.Background(), id, catalog.Override{}, true)
+		_ = s.SetStatusNote(context.Background(), id, "planned", "")
+	})
+	o := catalog.Override{RateLimit: &catalog.RateLimit{PerSecond: 0.25, Burst: 1}}
+	if err := s.SetOverride(ctx, id, o, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetOverride(ctx, id, catalog.Override{Config: &catalog.Params{Symbols: []string{"EURUSD"}, Timeframe: "1m"}}, false); err != nil {
+		t.Fatal(err)
+	}
+	ov, err := s.Overrides(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := ov[id]
+	if got.RateLimit == nil || got.RateLimit.PerSecond != 0.25 || got.Config == nil || got.Config.Symbols[0] != "EURUSD" {
+		t.Fatalf("override %+v", got)
+	}
+	if err := s.SetOverride(ctx, id, catalog.Override{}, true); err != nil {
+		t.Fatal(err)
+	}
+	if ov, _ := s.Overrides(ctx); !ov[id].IsZero() {
+		t.Fatalf("cleared override still there: %+v", ov[id])
+	}
+	if err := s.SetStatusNote(ctx, id, "disabled", "auto-disabled: test"); err != nil {
+		t.Fatal(err)
+	}
+	var st, note string
+	if err := s.Pool.QueryRow(ctx, `select status, status_note from catalog.source where id = $1`, id).Scan(&st, &note); err != nil || st != "disabled" || note != "auto-disabled: test" {
+		t.Fatalf("status %q note %q %v", st, note, err)
+	}
+	if err := s.SetOverride(ctx, "no_such_source", o, false); err == nil {
+		t.Fatal("unknown source must fail")
+	}
+}

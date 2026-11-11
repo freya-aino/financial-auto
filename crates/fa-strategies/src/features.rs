@@ -148,6 +148,43 @@ pub struct VirtualBook {
     pub steps_in_trade: u32,
 }
 
+/// Strategy-level book state behind `exposure_gross` / `drawdown` (spec 35 §4.2): the same for
+/// every asset of one step.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PortfolioSummary {
+    /// Σ |exposure| over the strategy's asset set (fraction of its sleeve).
+    pub exposure_gross: f64,
+    /// Drawdown of the strategy's virtual equity from its peak (sleeve-return units, ≥ 0).
+    pub drawdown: f64,
+}
+
+/// A strategy's virtual equity in sleeve-return units: `Σ_t Σ_i exposure_i · r_i,t` (the
+/// runtime's and the replay's `drawdown` source).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StrategyEquity {
+    pub equity: f64,
+    pub peak: f64,
+}
+
+impl StrategyEquity {
+    /// Adds one step's return (non-finite returns are ignored).
+    pub fn add(&mut self, ret: f64) {
+        if ret.is_finite() {
+            self.equity += ret;
+            self.peak = self.peak.max(self.equity);
+        }
+    }
+
+    pub fn drawdown(&self) -> f64 {
+        (self.peak - self.equity).max(0.0)
+    }
+
+    /// Summary for a step whose books are `books` (exposures in [-1, 1]).
+    pub fn summary<'a>(&self, books: impl IntoIterator<Item = &'a VirtualBook>) -> PortfolioSummary {
+        PortfolioSummary { exposure_gross: books.into_iter().map(|b| b.exposure.abs()).sum(), drawdown: self.drawdown() }
+    }
+}
+
 /// Price-only observation for one instrument at one step (see module docs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FallbackContext {
@@ -157,6 +194,7 @@ pub struct FallbackContext {
     std: f64,
     latent: Option<LatentInfo>,
     book: VirtualBook,
+    portfolio: PortfolioSummary,
 }
 
 impl FallbackContext {
@@ -167,7 +205,22 @@ impl FallbackContext {
         let mean = if n > 0.0 { returns.iter().sum::<f64>() / n } else { 0.0 };
         let std =
             if n > 1.0 { (returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt() } else { 0.0 };
-        Self { returns, mean, std, latent, book }
+        Self { returns, mean, std, latent, book, portfolio: PortfolioSummary::default() }
+    }
+
+    /// Sets the strategy-level book (`exposure_gross`, `drawdown`).
+    pub fn with_portfolio(mut self, portfolio: PortfolioSummary) -> Self {
+        self.portfolio = portfolio;
+        self
+    }
+
+    /// Log returns of the lookback window, oldest first.
+    pub fn returns(&self) -> &[f64] {
+        &self.returns
+    }
+
+    pub fn book(&self) -> VirtualBook {
+        self.book
     }
 
     pub fn n_returns(&self) -> usize {
@@ -283,6 +336,14 @@ impl StrategyContext for FallbackContext {
 
     fn time_in_trade(&self) -> f64 {
         f64::from(self.book.steps_in_trade)
+    }
+
+    fn exposure_gross(&self) -> f64 {
+        self.portfolio.exposure_gross.max(self.book.exposure.abs())
+    }
+
+    fn drawdown(&self) -> f64 {
+        self.portfolio.drawdown.max(0.0)
     }
 }
 
@@ -709,6 +770,11 @@ impl StrategyContext for LiveContext<'_> {
         self.pick("visual_score", real, Source::Decoder, || 0.0)
     }
 
+    fn latent(&self, expert: u32) -> Option<Vec<f32>> {
+        let real = self.graph_q(|g| g.latent(self.inst, expert));
+        self.pick("latent", real.map(Some), Source::Graph, || None)
+    }
+
     fn position(&self) -> f64 {
         self.fallback.position()
     }
@@ -719,6 +785,14 @@ impl StrategyContext for LiveContext<'_> {
 
     fn time_in_trade(&self) -> f64 {
         self.fallback.time_in_trade()
+    }
+
+    fn exposure_gross(&self) -> f64 {
+        self.fallback.exposure_gross()
+    }
+
+    fn drawdown(&self) -> f64 {
+        self.fallback.drawdown()
     }
 }
 

@@ -52,7 +52,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -85,7 +84,7 @@ func main() {
 	mcmcPairs := flag.Int("mcmc-pairs", envInt("FA_EVO_MCMC_PAIRS", 4), "default cross-asset pair genomes per decoder loop from latent.crossprior.* (0 disables)")
 	metricsBind := flag.String("metrics", bus.MetricsBindDefault(service), "Prometheus GET /metrics bind (FA_METRICS_BIND; off disables)")
 	flag.Parse()
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("svc", service)
+	log := bus.NewLogger(service) // FA_LOG_FORMAT=json|text (spec 60 §4)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -194,6 +193,14 @@ func main() {
 		if s.ArtifactKey != "" {
 			counters.Add("promotions.artifacts", 1)
 		}
+		// loop-end decoder fronts → Helix ParetoFront (spec 34 §5, lineage.go)
+		if j := FrontJob(s); j != nil {
+			if err := publishJob(bus.Jobs(j.Kind), j.JobId, j); err != nil {
+				log.Warn("front job", "err", err)
+			} else {
+				counters.Add("fronts.jobs", 1)
+			}
+		}
 		log.Info("generation.summary", "id", s.GenerationID, "gen", s.Generation, "rung", s.Rung, "final", s.Final, "state", s.State,
 			"candidates", s.Candidates, "front", len(s.ParetoFront), "fronts", s.FrontSizes, "survivors", s.Survivors, "artifact", s.ArtifactKey)
 	}
@@ -214,6 +221,12 @@ func main() {
 				reply.Message = err.Error()
 			} else {
 				reply.Ok, reply.Message = true, msg
+			}
+			// trace id from control-api (spec 60 §6.5); GPU lease traffic only at debug
+			if _, l := bus.Consumed(context.Background(), log, m); strings.HasPrefix(subject, "ctl.gpu.") {
+				l.Debug("ctl", "subject", subject, "ok", reply.Ok, "message", reply.Message)
+			} else {
+				l.Info("ctl", "subject", subject, "ok", reply.Ok, "message", reply.Message)
 			}
 			if b, err := proto.Marshal(reply); err == nil && m.Reply != "" {
 				_ = m.Respond(b)
@@ -403,6 +416,37 @@ func main() {
 		log.Info("generation stopped", "id", g.ID, "cancelled", len(cancelled))
 		return fmt.Sprintf("stopped %s (%d job(s) cancelled)", g.ID, len(cancelled)), nil
 	})
+
+	// Elite decoder re-evaluation (spec 34 §8, lineage.go): on demand, and after a snapshot swap.
+	handle(bus.Ctl("evo", "reeval"), func(r *fav1.CtlRequest) (string, error) {
+		j := ReevalArgs(r.Args)
+		counters.Add("reeval.jobs", 1)
+		return j.JobId, publishJob(bus.Jobs(j.Kind), j.JobId, j)
+	})
+	snapshots := NewSnapshotWatch()
+	if delay := ReevalDelay(); delay > 0 {
+		if _, err := pub.NC.Subscribe("latent.lifecycle.>", func(m *nats.Msg) {
+			var ev fav1.RegionLifecycleEvent
+			if proto.Unmarshal(m.Data, &ev) != nil || ev.Space == nil {
+				return
+			}
+			ts, snap := ev.Space.Timescale, ev.Space.SnapshotId
+			if !snapshots.Observe(ts, snap) {
+				return
+			}
+			log.Info("snapshot swap: elite decoders re-evaluated after the delay", "timescale", ts, "snapshot", snap, "delay", delay)
+			time.AfterFunc(delay, func() {
+				j := ReevalJob(snap, ts, 0, int(delay.Hours()+0.5), false)
+				if err := publishJob(bus.Jobs(j.Kind), j.JobId, j); err != nil {
+					log.Warn("reeval job", "err", err)
+					return
+				}
+				counters.Add("reeval.jobs", 1)
+			})
+		}); err != nil {
+			log.Warn("subscribe latent.lifecycle", "err", err)
+		}
+	}
 
 	if _, err := pub.NC.Subscribe(bus.AllJobResults, func(m *nats.Msg) {
 		var res fav1.JobResult

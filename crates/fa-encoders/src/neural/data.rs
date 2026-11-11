@@ -133,12 +133,23 @@ pub struct Series {
     pub instrument: String,
     pub bars: Vec<MarketBar>,
     pub feats: Vec<[f32; N_FEATURES]>,
+    /// End time (ms) of every bar, ascending; empty when unknown (no cross-asset context).
+    pub ends_ms: Vec<i64>,
 }
 
 impl Series {
     pub fn new(instrument: impl Into<String>, bars: Vec<MarketBar>) -> Self {
         let feats = bar_features(&bars);
-        Self { instrument: instrument.into(), bars, feats }
+        Self { instrument: instrument.into(), bars, feats, ends_ms: Vec::new() }
+    }
+
+    /// A series with bar end times (needed by the cross-asset context, spec 31 §6.4).
+    pub fn with_times(instrument: impl Into<String>, bars: Vec<MarketBar>, ends_ms: Vec<i64>) -> Self {
+        let mut s = Self::new(instrument, bars);
+        if ends_ms.len() == s.bars.len() {
+            s.ends_ms = ends_ms;
+        }
+        s
     }
 }
 

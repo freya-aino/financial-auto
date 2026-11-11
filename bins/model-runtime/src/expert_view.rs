@@ -50,7 +50,12 @@ pub fn build(
             next_step: extras.and_then(|x| x.next_step.get(pos)).map(|p| PredictiveDist {
                 targets: extras.map(|x| x.targets.clone()).unwrap_or_default(),
                 mean: p.clone(),
-                log_var: Vec::new(),
+                // calibrated Gaussian spread of the expert's next step (spec 32 §6.4)
+                log_var: extras
+                    .and_then(|x| x.next_step_logvar.as_ref())
+                    .and_then(|l| l.get(pos))
+                    .cloned()
+                    .unwrap_or_default(),
             }),
             codes: extras.and_then(|x| x.codes.as_ref()).and_then(|c| c.get(pos)).map(|c| vec![*c]).unwrap_or_default(),
         })
@@ -71,6 +76,8 @@ pub fn build(
         encoder_family: family.to_owned(),
         prior_score: prior.unwrap_or(0.0),
         has_prior_score: prior.is_some(),
+        // spec 31 §6.4: the window's cross-asset attention (asset_attn encoders)
+        asset_attn: extras.and_then(|x| x.asset_attn.as_ref()).map(|a| a.iter().cloned().collect()).unwrap_or_default(),
     }
 }
 
@@ -181,13 +188,50 @@ impl LiveHealth {
 }
 
 /// Live health per timescale.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ExpertPublisher {
     pub cfg: HealthCfg,
     live: BTreeMap<Timescale, LiveHealth>,
+    /// VictoriaMetrics for the spec 32 §5 series of each live health report
+    /// (`fa_expert_resid_corr{tf, expert="i_j", src="live"}`, `fa_expert_usage`, …).
+    pub vm: Option<fa_tsdb::Tsdb>,
+}
+
+impl std::fmt::Debug for ExpertPublisher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExpertPublisher")
+            .field("cfg", &self.cfg)
+            .field("live", &self.live)
+            .field("vm", &self.vm.is_some())
+            .finish()
+    }
+}
+
+/// The spec 32 §5 VictoriaMetrics samples of a health report.
+pub fn vm_samples(h: &ExpertHealth, as_of_ms: i64) -> Vec<fa_tsdb::Sample> {
+    let k = h.expert_ids.len();
+    let report = fa_expert_space::health::HealthReport {
+        resid_corr: (0..k)
+            .map(|i| h.resid_corr.get(i * k..(i + 1) * k).map(<[f64]>::to_vec).unwrap_or_default())
+            .collect(),
+        usage: h.usage.clone(),
+        skill: h.skill.clone(),
+        k_eff: h.k_eff,
+        ..Default::default()
+    };
+    report
+        .vm_series(&h.timescale, &h.source, &h.expert_ids)
+        .into_iter()
+        .map(|(m, labels, v)| labels.into_iter().fold(fa_tsdb::Sample::new(m, v, as_of_ms), |s, (k, l)| s.label(k, l)))
+        .collect()
 }
 
 impl ExpertPublisher {
+    /// A publisher that also writes each live health report as VictoriaMetrics series.
+    pub fn with_vm(vm: fa_tsdb::Tsdb) -> Self {
+        Self { vm: Some(vm), ..Default::default() }
+    }
+
     /// The view of a step and, on closed bars, a due health report.
     #[allow(clippy::too_many_arguments)]
     pub fn step(
@@ -209,6 +253,15 @@ impl ExpertPublisher {
             }
             _ => None,
         };
+        if let (Some(h), Some(vm)) = (&health, &self.vm) {
+            let samples = vm_samples(h, as_of_ms);
+            let vm = vm.clone();
+            tokio::spawn(async move {
+                if let Err(e) = vm.write(&samples).await {
+                    tracing::debug!(error = %e, "expert health series not written");
+                }
+            });
+        }
         (view, health)
     }
 }
@@ -303,6 +356,7 @@ mod tests {
             prior_score: Some(1.5),
             realised_prev: None,
             probs: vec![0.7, 0.3],
+            ..Default::default()
         };
         let v = build(Timescale::Minute, "tok", "hier_vae_flow", &st, Some(&mem), Some(&x));
         assert_eq!(v.experts.len(), 2);
@@ -310,6 +364,16 @@ mod tests {
         assert_eq!(v.experts[1].region.as_ref().unwrap().weights[0].region_id, "r1");
         assert!(v.experts[0].region.is_none());
         assert_eq!(v.experts[1].next_step.as_ref().unwrap().mean, vec![-0.1, 0.0, 0.1]);
+        // calibrated spread and cross-asset attention travel when the encoder supplies them
+        let x2 = ExpertExtras {
+            next_step_logvar: Some(vec![vec![-1.0; 3], vec![-2.0; 3]]),
+            asset_attn: Some(vec![("peer".into(), 0.25)]),
+            ..x.clone()
+        };
+        let v2 = build(Timescale::Minute, "tok", "hier_vae_flow", &st, Some(&mem), Some(&x2));
+        assert_eq!(v2.experts[1].next_step.as_ref().unwrap().log_var, vec![-2.0; 3]);
+        assert_eq!(v2.asset_attn.get("peer"), Some(&0.25));
+        assert!(v.asset_attn.is_empty() && v.experts[1].next_step.as_ref().unwrap().log_var.is_empty());
         assert_eq!(v.experts[1].codes, vec![9]);
         assert_eq!(v.mcmc_state.as_ref().unwrap().region_ids, vec!["r0", "r1"]);
         assert!(v.has_prior_score && v.prior_score == 1.5);
@@ -345,6 +409,7 @@ mod tests {
                 prior_score: None,
                 realised_prev: Some(ys[i as usize].clone()),
                 probs: vec![0.5, 0.5],
+                ..Default::default()
             };
             let (_, h) = p.step(
                 Timescale::Minute,
@@ -363,6 +428,10 @@ mod tests {
                 assert!(h.skill[1] < h.skill[0]);
                 assert!(h.k_eff > 1.0 && h.k_eff <= 2.0);
                 assert!(gauges(&h).iter().any(|(k, _)| k == "expert.1m.k_eff"));
+                // spec 32 §5 series: one pair, two usages, two skills, K_eff
+                let vm = vm_samples(&h, 1);
+                assert_eq!(vm.len(), 6);
+                assert!(vm.iter().all(|s| s.validate().is_ok() && s.labels["src"] == "live"));
                 return;
             }
         }

@@ -15,4 +15,4 @@ GDELT DOC 2.0 article search (text), catalog id `gdelt`. No key.
 `gdelt_test.go` on `testdata/artlist_stock_market.json` (live answer, 3 articles), `bad_query.txt`, `ratelimit.txt`, `empty.json`: poll URL, mapping, dedup, cursor/restart, deterministic payloads, error bodies, backfill windows and depth clamp, URL normalization.
 
 ## Governing specs
-- [10-ingestion](../../../specs/10-ingestion.md), [11-source-catalog](../../../specs/11-source-catalog.md)
+- [Ingestion reference (ex spec 10)](../../services/ingestor/README.md#ingestion-reference), [Source catalog reference (ex spec 11)](../../pkg/catalog/README.md#source-catalog-reference)

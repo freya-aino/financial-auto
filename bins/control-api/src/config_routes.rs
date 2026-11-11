@@ -206,25 +206,10 @@ async fn put_section(
     .into_response()
 }
 
-/// Writes an `audit.log` row (`actor = 'ui'`) when Postgres is attached; returns whether it did.
-/// Same insert as `ledger_routes` uses (control-api has no `fa-warehouse` dependency).
+/// Writes an `audit.log` row (`actor = 'ui'`) when Postgres is attached; returns whether it did
+/// (through `crate::audit::record`, which also notes the action for the request audit).
 pub async fn audit(s: &AppState, action: &str, subject: &str, payload: Value) -> bool {
-    let Some(pool) = s.pg.get() else {
-        return false;
-    };
-    match sqlx::query("INSERT INTO audit.log (actor, action, subject, payload) VALUES ('ui', $1, $2, $3)")
-        .bind(action)
-        .bind(subject)
-        .bind(payload)
-        .execute(pool)
-        .await
-    {
-        Ok(_) => true,
-        Err(e) => {
-            tracing::warn!(action, error = %e, "audit row not written");
-            false
-        }
-    }
+    crate::audit::record(s, action, Some(subject), payload).await
 }
 
 #[cfg(test)]

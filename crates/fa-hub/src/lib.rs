@@ -32,6 +32,7 @@ pub mod asof;
 pub mod ast;
 pub mod buffer;
 pub mod catalog;
+pub mod evolution;
 pub mod experts;
 pub mod meta;
 pub mod queries;
@@ -57,7 +58,7 @@ pub use meta::{SCHEMA_VERSION, SchemaMarker};
 pub use queries::*;
 pub use reference::{InstrumentReference, RefEntity, RefExposure, RefInstrument, RefListing, RefSyncReport, RefVenue};
 pub use regions::{
-    LineageLink, NewCrossPrior, NewDescent, NewHierEdge, NewKernelModel, NewRegionSet, RegionLineage, RegionSetRow,
+    LineageLink, NewCrossPrior, NewDescent, NewHierEdge, NewKernelModel, NewRegionEpisode, NewRegionSet, RegionLineage, RegionSetRow,
     RegionStatsUpdate,
 };
 pub use retention::{PruneReport, RetentionPolicy};

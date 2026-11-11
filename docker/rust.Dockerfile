@@ -10,6 +10,8 @@ COPY crates crates
 COPY bins bins
 COPY proto proto
 COPY migrations migrations
+# Build provenance for trainer run manifests (bins/trainer/build.rs): `--build-arg FA_GIT_COMMIT=$(git rev-parse HEAD)`.
+ARG FA_GIT_COMMIT=
 RUN --mount=type=cache,id=fa-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=fa-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=fa-cargo-target,target=/src/target \
@@ -29,7 +31,8 @@ FROM debian:trixie-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --home /app fa
+    && useradd --system --uid 10001 --home /app fa \
+    && mkdir -p /var/lib/fa/hub-log && chown -R fa /var/lib/fa # model-runtime's Helix observation log volume
 WORKDIR /app
 COPY --from=builder /out/ /usr/local/bin/
 COPY config/platform.toml config/platform.docker.toml config/sources.yaml config/

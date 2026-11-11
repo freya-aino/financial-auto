@@ -21,7 +21,7 @@ use std::{collections::HashMap, time::Instant};
 use fa_core::rng::Rng;
 
 pub use crate::rich::KernelCtx;
-use crate::{MarkovGraph, ProbSummary, RegionKey, UNKNOWN, refit::RefitOutcome};
+use crate::{MarkovGraph, ProbSummary, PruneReport, RegionKey, UNKNOWN, refit::RefitOutcome};
 
 pub trait KernelSampler: Send + Sync {
     /// Stable id (`conjugate`, `smc`), the `sampler_id` of published rows.
@@ -67,6 +67,11 @@ pub trait KernelSampler: Send + Sync {
         None
     }
     fn import_state(&mut self, _v: &serde_json::Value) {}
+    /// Support-based pruning of the evidence (spec 33 §8, [`MarkovGraph::prune`]); samplers with
+    /// per-row state drop it for removed rows and rebuild it for changed ones.
+    fn prune(&mut self, min_edge: f64) -> PruneReport {
+        self.graph_mut().prune(min_edge)
+    }
 }
 
 /// Closed-form Dirichlet–multinomial sampler (spec 33 `ConjugateExact`).
@@ -197,6 +202,14 @@ impl KernelSampler for SmcParticle {
         self.graph.retire_region(id);
         self.graph.drop_centroid(id);
         self.rows.remove(id);
+    }
+    fn prune(&mut self, min_edge: f64) -> PruneReport {
+        let rep = self.graph.prune(min_edge);
+        // particles of removed / shrunk rows are regenerated from the posterior on next use
+        for k in rep.rows.iter().chain(&rep.changed) {
+            self.rows.remove(k);
+        }
+        rep
     }
 
     fn observe(&mut self, from: &str, to: &str) {

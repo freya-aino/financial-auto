@@ -51,7 +51,9 @@ func ReplayNormalize(norm connector.Normalizer, items []archive.ReplayItem) ([]*
 			continue
 		}
 		backfill := it.Raw.TransportMeta[connector.MetaBackfill] == "1"
+		gapFill := it.Raw.TransportMeta[connector.MetaGapFill] == "1"
 		for _, e := range envs {
+			e.GapFilled = e.GapFilled || gapFill
 			Finalize(e, it.Ref, true, backfill)
 			out = append(out, e)
 		}
@@ -108,7 +110,7 @@ func (r *Replayer) Replay(ctx context.Context, args map[string]string) (*ReplayR
 	if mode != "verify" && mode != "publish" {
 		return nil, fmt.Errorf("%w: mode must be verify or publish", ErrInvalid)
 	}
-	c, err := connector.New(source)
+	c, err := connector.NewFor(source, src.Adapter)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrNotFound, err)
 	}

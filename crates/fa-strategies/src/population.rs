@@ -3,7 +3,11 @@
 use fa_core::{Horizon, Timescale};
 use serde::{Deserialize, Serialize};
 
-use crate::{GpStrategy, sexpr};
+use crate::{
+    GpStrategy, Strategy,
+    neural::{NetError, NeuralStrategy, PolicyNet},
+    sexpr,
+};
 
 /// Genome id that marks a hand-written, non-evolved program.
 pub const BASELINE_GENOME: &str = "baseline";
@@ -29,7 +33,8 @@ pub struct StrategyDef {
     /// Decision cadence in seconds; defaults to one bar of `timescale`.
     #[serde(default)]
     pub step_secs: Option<u64>,
-    /// GP program for the exposure mean (S-expression).
+    /// GP program for the exposure mean (S-expression); unused by a neural policy.
+    #[serde(default = "default_signal")]
     pub signal: String,
     /// GP program for the exposure uncertainty (S-expression).
     #[serde(default = "default_uncertainty")]
@@ -39,6 +44,17 @@ pub struct StrategyDef {
     /// timescale changes; unbound literals resolve against whatever snapshot is live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<String>,
+    /// Asset set (instrument UUIDs) the strategy trades (spec 35 §3, §6.3); empty = every
+    /// instrument it sees.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets: Vec<String>,
+    /// Neural policy (`neural::PolicyNet` text form, spec 35 §4.3); `None` = the GP programs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+}
+
+fn default_signal() -> String {
+    "0".into()
 }
 
 fn default_genome() -> String {
@@ -67,6 +83,8 @@ pub struct StrategyFile {
 pub enum PopulationError {
     #[error("strategy `{id}` {field}: {source}")]
     Program { id: String, field: &'static str, source: sexpr::ParseError },
+    #[error("strategy `{id}` policy: {source}")]
+    Policy { id: String, source: NetError },
     #[error("duplicate strategy id `{0}`")]
     Duplicate(String),
     #[error("parsing strategy file: {0}")]
@@ -86,6 +104,39 @@ impl StrategyDef {
         self.genome_id == BASELINE_GENOME
     }
 
+    /// Representation of the definition.
+    pub fn is_neural(&self) -> bool {
+        self.policy.is_some()
+    }
+
+    /// Whether `instrument` (UUID text) is in the asset set (an empty set holds everything).
+    pub fn trades(&self, instrument: &str) -> bool {
+        self.assets.is_empty() || self.assets.iter().any(|a| a == instrument)
+    }
+
+    /// The neural policy of a neural definition.
+    pub fn policy_net(&self) -> Result<Option<PolicyNet>, PopulationError> {
+        self.policy
+            .as_deref()
+            .map(|p| PolicyNet::parse(p).map_err(|source| PopulationError::Policy { id: self.id.clone(), source }))
+            .transpose()
+    }
+
+    /// The runnable strategy: a [`NeuralStrategy`] for a neural definition, else the GP programs.
+    pub fn build_dyn(&self) -> Result<Box<dyn Strategy>, PopulationError> {
+        Ok(match self.policy_net()? {
+            Some(net) => Box::new(NeuralStrategy {
+                id: self.id.clone(),
+                genome_id: self.genome_id.clone(),
+                horizon: self.horizon(),
+                net,
+                recorder: None,
+            }),
+            None => Box::new(self.build()?),
+        })
+    }
+
+    /// The GP programs (a neural definition has the placeholder program `0`).
     pub fn build(&self) -> Result<GpStrategy, PopulationError> {
         let prog = |field: &'static str, src: &str| {
             sexpr::parse(src).map_err(|source| PopulationError::Program { id: self.id.clone(), field, source })
@@ -110,6 +161,7 @@ impl StrategyFile {
         }
         for s in &f.strategy {
             s.build()?;
+            s.policy_net()?;
         }
         Ok(f)
     }

@@ -99,8 +99,8 @@ fn latent_shift(model: &NeuralModel, lora: &LoraSet, ds: &Dataset, idx: &[(usize
     let (mut shift, mut spread, mut n) = (0.0f64, 0.0f64, 0usize);
     for chunk in idx.chunks(256) {
         let b = tr.batch(ds, chunk)?;
-        let base = model.forward_w(&model.ps, &b.x, None, None)?.out.mu.to_vec3::<f32>()?;
-        let ad = model.forward_w(&view, &b.x, None, None)?.out.mu.to_vec3::<f32>()?;
+        let base = model.forward_ctx(&model.ps, &b.x, b.asset.as_ref(), None, None)?.out.mu.to_vec3::<f32>()?;
+        let ad = model.forward_ctx(&view, &b.x, b.asset.as_ref(), None, None)?.out.mu.to_vec3::<f32>()?;
         let k = base.first().map_or(0, Vec::len);
         let d = base.first().and_then(|r| r.first()).map_or(0, Vec::len);
         let mut centre = vec![vec![0.0f64; d]; k];
@@ -135,12 +135,32 @@ pub fn train_lora(
     seed: u64,
     dev: &Device,
 ) -> Result<(LoraSet, LoraReport)> {
+    train_lora_from(model, ds, cfg, seed, dev, None)
+}
+
+/// [`train_lora`] continuing from a previous adapter of the same snapshot (spec 36 §6.5
+/// continuous adapters: each job resumes the factors of the last served, non-frozen adapter
+/// instead of restarting from the identity, so successive jobs form one continuing optimisation
+/// on a sliding replay window). `init` is used only when its targets and rank match; the
+/// guards still measure the total `ΔW` against the frozen snapshot weights.
+pub fn train_lora_from(
+    model: &NeuralModel,
+    ds: &Dataset,
+    cfg: &LoraConfig,
+    seed: u64,
+    dev: &Device,
+    init: Option<&LoraSet>,
+) -> Result<(LoraSet, LoraReport)> {
     let windows: Vec<(usize, usize)> = ds.train.iter().chain(&ds.val).copied().collect();
     if windows.is_empty() {
         candle_core::bail!("no adapter windows");
     }
     let targets = lora_targets(model);
-    let lora = LoraSet::new(&model.ps, &targets, cfg.rank, cfg.alpha, seed, dev)?;
+    let mut lora = LoraSet::new(&model.ps, &targets, cfg.rank, cfg.alpha, seed, dev)?;
+    if let Some(prev) = init.filter(|p| p.rank == lora.rank && p.targets == lora.targets) {
+        let vals: std::collections::HashMap<String, candle_core::Tensor> = prev.ps.snapshot()?.into_iter().collect();
+        lora.ps.load(&vals)?;
+    }
     let tr = ssl_only(model);
     let eval_idx: Vec<(usize, usize)> = {
         let step = (windows.len() / 512).max(1);
@@ -178,4 +198,53 @@ pub fn merged(model: &NeuralModel, lora: &LoraSet) -> Result<NeuralModel> {
     ps.insert_all(&model.ps.snapshot()?.into_iter().collect(), "")?;
     lora.merge_into(&mut ps)?;
     Ok(NeuralModel { ps, ..model.clone() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        MarketBar,
+        neural::{InputNorm, NeuralConfig, NeuralFamily, Series},
+    };
+
+    /// Continuous adapters: a job resumes the previous factors instead of the identity.
+    #[test]
+    fn lora_warm_start_resumes_previous_factors() {
+        let dev = Device::Cpu;
+        let mut rng = Rng::seed(4);
+        let mut p = 100.0;
+        let bars: Vec<MarketBar> = (0..120)
+            .map(|_| {
+                let o = p;
+                p *= 1.0 + 0.003 * rng.normal();
+                MarketBar {
+                    open: o,
+                    high: o.max(p) * 1.001,
+                    low: o.min(p) * 0.999,
+                    close: p,
+                    volume: 100.0,
+                    trade_count: 5,
+                }
+            })
+            .collect();
+        let cfg = NeuralConfig {
+            context_steps: 12,
+            d_model: 8,
+            layers: 2,
+            moe: fa_expert_space::moe::MoeConfig { max_experts: 2, expert_dim: 3, ..Default::default() },
+            ..NeuralConfig::new(NeuralFamily::JepaVae)
+        };
+        let ds = Dataset::build(vec![Series::new("x", bars)], 8, cfg.horizon(), 0.0);
+        let model = NeuralModel::new(cfg, InputNorm::fit(&ds), 1, &dev).unwrap();
+        let lc = LoraConfig { steps: 5, lr: 1e-2, ..Default::default() };
+        let (first, rep) = train_lora(&model, &ds, &lc, 9, &dev).unwrap();
+        assert!(rep.delta_norm > 0.0);
+        let still = LoraConfig { steps: 0, ..lc.clone() };
+        let (resumed, rep2) = train_lora_from(&model, &ds, &still, 10, &dev, Some(&first)).unwrap();
+        assert!((rep2.delta_norm - rep.delta_norm).abs() < 1e-9, "{} vs {}", rep2.delta_norm, rep.delta_norm);
+        let (fresh, rep3) = train_lora_from(&model, &ds, &still, 10, &dev, None).unwrap();
+        assert_eq!(rep3.delta_norm, 0.0);
+        assert_eq!(resumed.targets, fresh.targets);
+    }
 }

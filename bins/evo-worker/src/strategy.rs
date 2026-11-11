@@ -1,4 +1,5 @@
-//! `evo.eval.strategy` (spec 35 §6.1–6.2, spec 41 §4): replay one GP strategy genome through
+//! `evo.eval.strategy` (spec 35 §6.1–6.2, spec 41 §4): replay one strategy genome (GP program
+//! or neural policy, restricted to its asset set when it has one) through
 //! `fa_backtest::replay` over VictoriaMetrics bars at the strategy's timescale, net of the
 //! shared cost model, with the **recorded latent graph and decoder outputs** of the window
 //! ([`crate::recorded`], D-053 feeds replayed point-in-time), and report the objective set.
@@ -14,8 +15,8 @@
 //! Result payload (protocol `evo.eval.strategy/v0`):
 //! ```json
 //! {"protocol":"evo.eval.strategy/v0","score":<deflated_sharpe>,
-//!  "objectives":{"deflated_sharpe","sharpe","max_drawdown","turnover","cost_sensitivity","compute_cost","calibration","cost_share","psr","n_trades","n_obs","sources.graph","sources.decoder","sources.fallback"},
-//!  "directions":{"deflated_sharpe":"max","sharpe":"max","max_drawdown":"min","turnover":"min","cost_sensitivity":"min","compute_cost":"min"},
+//!  "objectives":{"deflated_sharpe","sharpe","max_drawdown","cvar","turnover","cost_sensitivity","calibration","compute_cost","cost_share","psr","n_trades","n_obs","sources.graph","sources.decoder","sources.fallback","diversification","diversification_refs"},
+//!  "directions":{"deflated_sharpe":"max","sharpe":"max","max_drawdown":"min","cvar":"min","turnover":"min","cost_sensitivity":"min","calibration":"max","compute_cost":"min","diversification":"min"},
 //!  "genome":{"text":"{ id = … }","id":"gp-…","timescale":"1s","steps":5,"lookback_bars":32,"signal":"…","uncertainty":"…"},
 //!  "replay":{"purpose":"selection","window_start_ms":…,"window_end_ms":…,"cost_model":"costs.yaml","capital":…,"n_trials":…,"trial_sharpe_var":…,
 //!            "instruments":[…],"n_steps":…,"n_obs":…,"n_trades":…,"gross_pnl":…,"total_cost":…,"net_pnl":…,"stop":"complete",
@@ -147,6 +148,7 @@ pub fn replay_json(rspec: &ReplaySpec, report: &EvalReport, n_holdouts: usize, r
         "stop": report.stop, "holdouts": n_holdouts, "registry": registry,
         "snapshot": report.latents.snapshot.declared, "sources": report.sources, "latents": report.latents,
         "trade_rule": rspec.trade_rule, "rebalance": report.rebalance,
+        "coverage": report.coverage, "latency": report.latency,
     })
 }
 
@@ -229,6 +231,9 @@ impl Worker {
             }
             Ok(Err(e @ (ReplayError::HoldoutIntersect { .. } | ReplayError::SnapshotMismatch { .. }))) => {
                 tracing::warn!(job = %job.job_id, error = %e, "replay rejected");
+                if matches!(e, ReplayError::HoldoutIntersect { .. }) {
+                    crate::holdout::audit_access(self.trials.as_ref(), job, &def.id, rspec, &e.to_string()).await;
+                }
                 return Err(Box::new(self.failed(job, format!("rejected: {e}"), elapsed_ms)));
             }
             Ok(Err(e)) => return Err(Box::new(self.failed(job, format!("replay: {e}"), elapsed_ms))),
@@ -331,9 +336,11 @@ impl Worker {
         let rspec = ReplaySpec {
             window_ms: (loaded.source.window_start_ms, loaded.source.window_end_ms),
             purpose: spec.purpose,
-            instruments: Vec::new(),
+            // asset-set gene (spec 35 §6.3): an empty set trades every series
+            instruments: genome.assets.clone(),
             timescale: genome.timescale,
-            snapshot: job.snapshot_id.clone(),
+            // a genome bound to a snapshot is scored on that snapshot's recorded latents
+            snapshot: genome.snapshot.clone().unwrap_or_else(|| job.snapshot_id.clone()),
             cost_model: self.cost.id.clone(),
             seed: job.seed,
             capital: CAPITAL,
@@ -345,6 +352,7 @@ impl Worker {
         };
         if let Err(e) = replay::check_holdout(&rspec, &holdouts) {
             tracing::warn!(job = %job.job_id, error = %e, "selection replay rejected (holdout)");
+            crate::holdout::audit_access(self.trials.as_ref(), job, &def.id, &rspec, &e.to_string()).await;
             return self.failed(job, format!("rejected: {e}"), started.elapsed().as_millis() as u64);
         }
 
@@ -357,8 +365,25 @@ impl Worker {
         };
         let report = &run.report;
 
-        // 5. registry + stats, Helix, Garage, result
-        let objectives = objectives_json(report);
+        // 5. diversification against the generation's current elites (spec 35 §6.2), then
+        // registry + stats, Helix, Garage, result
+        let mut objectives = objectives_json(report);
+        let diversification = match &self.trials {
+            Some(t) if !job.parent_job_id.is_empty() => {
+                let blocks = fa_backtest::validation::block_sums(&report.returns, fa_backtest::validation::N_BLOCKS);
+                let elites = t
+                    .elite_returns(&job.parent_job_id, KIND, &genome.to_string(), rspec.window_ms, ELITE_REFERENCE)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::debug!(error = %e, "elite returns unavailable");
+                        Vec::new()
+                    });
+                (fa_backtest::validation::diversification(&blocks, &elites), elites.len())
+            }
+            _ => (None, 0),
+        };
+        objectives.insert("diversification".into(), json!(diversification.0.unwrap_or(0.0)));
+        objectives.insert("diversification_refs".into(), json!(diversification.1));
         let generation_stats = trials::register(
             self.trials.as_ref(),
             &TrialRow {
@@ -395,7 +420,9 @@ impl Worker {
             "directions": directions_json(),
             "genome": {"text": genome.to_string(), "id": def.id, "timescale": def.timescale, "steps": def.steps,
                        "lookback_bars": def.lookback_bars, "signal": def.signal, "uncertainty": def.uncertainty,
-                       "nodes": genome.size()},
+                       "nodes": genome.size(), "representation": genome.representation(),
+                       "topology": genome.policy.as_ref().map(fa_strategies::neural::PolicyNet::topology),
+                       "assets": genome.assets, "snapshot": genome.snapshot},
             "replay": replay_json(&rspec, report, n_holdouts, self.trials.is_some()),
             "latents": self.recorded.json(&run.latents),
             "data": data_block,
@@ -406,6 +433,7 @@ impl Worker {
             "report_ref": {"planned": format!("{}/{}", report_key.bucket, report_key.key), "persisted": self.blob.is_some()},
             "worker_id": self.worker_id,
         });
+        payload["directions"]["diversification"] = json!("min");
         // The stored document carries the curves; the bus payload does not.
         let mut stored = payload.clone();
         stored["equity"] = json!(report.equity);
@@ -416,11 +444,17 @@ impl Worker {
         }
         tracing::info!(job = %job.job_id, strategy = %def.id, sharpe = report.sharpe, dsr = report.deflated_sharpe,
             trades = report.n_trades, steps = report.n_steps, sources = ?report.sources, "strategy evaluated");
-        Outcome { result: ok_result(&self.worker_id, job, &payload, report, run.elapsed_ms), outputs: Vec::new() }
+        let mut result = ok_result(&self.worker_id, job, &payload, report, run.elapsed_ms);
+        result.objectives.insert("diversification".into(), diversification.0.unwrap_or(0.0));
+        result.directions.insert("diversification".into(), "min".into());
+        Outcome { result, outputs: Vec::new() }
     }
 }
 
-/// Best-effort Helix write: the strategy as a `Genome` node (kind `strategy`, family `gp`,
+/// Elite trials the diversification objective correlates a candidate with.
+pub const ELITE_REFERENCE: usize = 8;
+
+/// Best-effort Helix write: the strategy as a `Genome` node (kind `strategy`, family `gp` | `neural`,
 /// params = text form) plus a `FitnessRecord` with the objectives (spec 35 §6.4 elites are a
 /// subset of these; the vary job re-scores the parents).
 pub async fn persist_helix(
@@ -430,8 +464,12 @@ pub async fn persist_helix(
     objectives: &serde_json::Map<String, Value>,
 ) -> Value {
     let Some(hub) = hub else { return json!({"persisted": false, "reason": "no helix client"}) };
-    let g =
-        NewGenome { genome_id: genome.id(), kind: "strategy".into(), family: "gp".into(), params: genome.to_string() };
+    let g = NewGenome {
+        genome_id: genome.id(),
+        kind: "strategy".into(),
+        family: genome.representation().as_str().into(),
+        params: genome.to_string(),
+    };
     if let Err(e) = hub.upsert_genome(&g).await {
         return json!({"persisted": false, "reason": e.to_string()});
     }

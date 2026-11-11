@@ -1,6 +1,6 @@
 //! Strategy lifecycle and limit routes (spec 50 §4.7, spec 40 §4.4; D-051):
 //! `GET /api/trading/strategies`, `POST /api/trading/strategies/{id}/{pause|resume|flatten|promote|shadow}`,
-//! `GET|PUT /api/trading/limits`, `POST /api/trading/flatten`. Commands are request/reply to the
+//! `GET|PUT /api/trading/limits`, `POST /api/trading/flatten`, `POST /api/trading/pretrade`. Commands are request/reply to the
 //! risk-engine (`ctl.risk.strategy|limits|flatten`, `CtlRequest` → `CtlReply` whose message is
 //! JSON); `CtlReply{ok:false}` is mapped by prefix (`not_found:` 404, `conflict:` 409,
 //! `invalid:` 400, anything else — e.g. `loosen:` from a PUT that would loosen a limit — 422).
@@ -44,6 +44,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/trading/strategies/{id}/{action}", post(strategy_action))
         .route("/api/trading/limits", get(limits_get).put(limits_put))
         .route("/api/trading/flatten", post(flatten))
+        .route("/api/trading/pretrade", post(pretrade))
         .with_state(state)
 }
 
@@ -76,7 +77,8 @@ async fn ctl(s: &AppState, verb: &str, args: Vec<(&str, String)>) -> Result<CtlR
         verb: verb.into(),
         args: args.into_iter().map(|(k, v)| (k.to_owned(), v)).chain([("actor".to_owned(), "ui".to_owned())]).collect(),
     };
-    let fut = client.request(subject.clone(), Bytes::from(req.encode_to_vec()));
+    let headers = fa_bus::trace::headers(&fa_bus::trace::outgoing()); // trace id of the HTTP request
+    let fut = client.request_with_headers(subject.clone(), headers, Bytes::from(req.encode_to_vec()));
     match tokio::time::timeout(CTL_TIMEOUT, fut).await {
         Ok(Ok(msg)) => CtlReply::decode(msg.payload.as_ref())
             .map_err(|e| CtlError::Gateway(format!("bad reply on {subject}: {e}"))),
@@ -235,6 +237,68 @@ pub async fn limits_put(State(s): State<AppState>, Json(body): Json<Value>) -> R
 pub async fn flatten(State(s): State<AppState>) -> Response {
     match ctl(&s, "flatten", Vec::new()).await {
         Ok(r) => reply_response(r, |v| v),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Pre-trade check body (spec 51 pre-submit risk check).
+#[derive(Debug, serde::Deserialize)]
+pub struct PretradeBody {
+    pub instrument_id: String,
+    pub side: String,
+    pub quantity: f64,
+    pub limit_price: Option<f64>,
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+/// `ctl.risk.pretrade` arguments: every body field as a string (`limit_price` only when given,
+/// `mode` defaults to `paper`); `ctl` adds `actor = ui`.
+pub fn pretrade_args(b: &PretradeBody) -> Result<Vec<(&'static str, String)>, String> {
+    if b.instrument_id.trim().is_empty() {
+        return Err("instrument_id is required".into());
+    }
+    if !matches!(b.side.to_ascii_lowercase().as_str(), "buy" | "sell") {
+        return Err(format!("side must be buy or sell, got {:?}", b.side));
+    }
+    if !(b.quantity.is_finite() && b.quantity > 0.0) {
+        return Err("quantity must be a positive number".into());
+    }
+    let mut args = vec![
+        ("instrument_id", b.instrument_id.trim().to_owned()),
+        ("side", b.side.to_ascii_lowercase()),
+        ("quantity", b.quantity.to_string()),
+        ("mode", b.mode.clone().filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "paper".into())),
+    ];
+    if let Some(p) = b.limit_price {
+        args.push(("limit_price", p.to_string()));
+    }
+    Ok(args)
+}
+
+/// `POST /api/trading/pretrade`: dry-run risk check of a would-be order, nothing published.
+/// Request/reply on `ctl.risk.pretrade` (`CtlRequest{verb: "pretrade", args: instrument_id, side,
+/// quantity, limit_price?, mode, actor}`); the risk-engine answers `CtlReply{ok: true, message:
+/// "{\"ok\": bool, \"reasons\": [..]}"}` and that JSON is returned verbatim (a refused order is a
+/// 200 with `ok: false`). 400 bad body, 503 without NATS, 502 when nothing answers (no
+/// responder), 504 after 5 s. Not audited per request (a read, see `crate::audit`).
+pub async fn pretrade(State(s): State<AppState>, Json(b): Json<PretradeBody>) -> Response {
+    let args = match pretrade_args(&b) {
+        Ok(a) => a,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    match ctl(&s, "pretrade", args).await {
+        Ok(r) => {
+            let v = message_json(&r.message);
+            if v.get("ok").is_some_and(Value::is_boolean) {
+                Json(json!({ "ok": v["ok"], "reasons": v.get("reasons").cloned().unwrap_or_else(|| json!([])) }))
+                    .into_response()
+            } else if r.ok {
+                err(StatusCode::BAD_GATEWAY, format!("unexpected pretrade reply: {}", r.message))
+            } else {
+                err(reply_status(&r.message), r.message)
+            }
+        }
         Err(e) => e.into_response(),
     }
 }

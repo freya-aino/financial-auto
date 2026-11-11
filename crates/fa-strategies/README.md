@@ -2,10 +2,10 @@
 
 Strategy population: GP programs and neural policies producing exposure distributions.
 
-**Status:** partial (the GP side implements the spec 35 §4.2 graph / decoder primitives, D-063, but not `exposure_gross`, `drawdown`, `clip`, `Bool` comparisons or `prob_gt`; neural policies and asset-set genes are pending) — GP DSL AST + interpreter, `GpStrategy`, `Strategy`/`NeuralPolicy` traits, proto conversion; S-expression program syntax (`sexpr`) with the typed spec 35 §4.2 graph/decoder primitives; `strategies.toml` population files and the hand-written **baseline** set (`baselines.toml`, not evolved); the live observation `features::LiveContext` (real latent graph + decoder outputs with price-only fallbacks and per-source counters); the point-in-time latent graph `graph::LatentGraph` over `fa_mcmc::MarkovGraph`; the decoder-output cache `decoders::DecoderOutputs`; the **strategy genome** (`genome`), **typed random program generation** (`random`) and the **GP variation operators** (`ops`) used by `evo-worker` for `evo.vary.strategy`; snapshot-bound **region literals** and their remapping through region lineage on an encoder swap (`remap`, spec 35 §6.5) (all tested). Neural policies are pending (`NeuralPolicy` is a trait without an implementation).
+**Status:** implements spec 35 §4.2–§4.3 / §6.3 / §6.5 for both representations — GP DSL AST + interpreter (the full §4.2 set: graph / decoder / portfolio primitives incl. `exposure_gross` / `drawdown`, `clip`, `Bool` comparisons with `if`, `prob_gt`), `GpStrategy`; **neural policies** (`neural::PolicyNet` MLP, `NeuralStrategy`, text form with exact weights, ES / topology / input-mask variation; candle SGD fine-tune behind feature `train`); S-expression syntax (`sexpr`); `strategies.toml` population files (GP or `policy` entries, `assets`) and the hand-written **baseline** set; the live observation `features::LiveContext` (real latent graph + decoder outputs + latent means with price-only fallbacks and per-source counters, strategy-level `PortfolioSummary`); the point-in-time latent graph `graph::LatentGraph` (states per snapshot, parallel snapshots readable with `at_snapshot`); the decoder-output cache; the **strategy genome** (representation, asset set, snapshot binding), typed random programs (region literals for bound genomes) and neural immigrants (`random`), the typed GP operators (`ops`), **asset-set mutation** over MCMC pair proposals (`assets`), region-literal remapping (`remap`); `op_cost`, the representation-independent compute unit of the `compute_cost` objective (all tested).
 
 ## DSL (`sexpr`)
-Grammar `atom | (op arg...)`; operators `add sub mul div neg tanh min max if_gt`.
+Grammar `atom | (op arg...)`; operators `add sub mul div neg tanh min max if_gt clip if`; `Bool` forms `gt lt and or not` (only as an `if` condition; a program must be `Num`); `(prob_gt (fc_dist k)|(analog_outcome k) x)`.
 
 | Type | Forms |
 |---|---|
@@ -14,7 +14,7 @@ Grammar `atom | (op arg...)`; operators `add sub mul div neg tanh min max if_gt`
 | `[Path]` | `(sample_walk r k n)` |
 | `Num` (graph, spec 33) | `stay_prob`, `(path_up k)`, `region_entropy`, `(p_trans a b k)`, `(p_to_set r S k)`, `(hitting_time r S)`, `(dwell r)`, `(novelty expert)`, `(region_feature r mass\|mean_fwd_return\|vol)`, `(path_value (sample_walk r k n) up\|mass\|mean_fwd_return\|vol)` |
 | `Num` (decoders, spec 34) | `(quantile q)`, `analog_forecast`, `(score family)`, `(fc_quantile q k)`, `(fc_dist k)`, `(analog_outcome k)`, `analog_age`, `(text_score topic)`, `(visual_score kind)` |
-| `Num` (portfolio) | `position`, `unrealised_pnl`, `time_in_trade` |
+| `Num` (portfolio) | `position`, `unrealised_pnl`, `time_in_trade`, `exposure_gross`, `drawdown` |
 
 Typed forms are only valid as arguments (`(add (cur_region 0) 1)` is a `ParseError::Type`); arities are checked. The asset of the decoder primitives is the instrument being evaluated. `(score family)` takes dotted family names (`(score text.news)`); `(text_score topic)` / `(visual_score kind)` take a bare word. `Display` round-trips (`parse(&e.to_string()) == e`).
 
@@ -52,8 +52,14 @@ Hand-written, `genome_id = "baseline"`: momentum / reversion / path skew / quant
 ## Region remapping (`remap`)
 `LineageBook` collects model-runtime's snapshot-swap lineage (`RegionLifecycleEvent` on `latent.lifecycle.<ts>`, `reason = snapshot`: ancestors `carry|split|merge|partial` with probe overlap; unmatched parents die). `remap_def` rewrites a bound strategy's literals into the new snapshot: a `carry` successor, else the successor with the largest overlap; no descendant or no observed lineage → unmappable (`RemapReport`). strategy-runtime swaps a fully mapped strategy in place and suspends an unmappable one; the risk-engine pipeline sends a remapped active strategy back to shadow. Random generation does not emit literals.
 
+## Neural policies (`neural`)
+`PolicyNet`: per-asset shared-weight MLP over a masked subset of 20 observation features (`FEATURES`: the GP primitives, scaled to ~[-1, 1]) and the first `latent_dims` (≤ 8) latent-mean dims of masked experts; 1–3 hidden layers (2–64, `tanh`/`relu`); `mean = tanh(o₀)`, `std = min(1, softplus(o₁))`. Text form `mlp:f=<hex>;e=<hex>;l=<n>;h=16x8;a=tanh;w=<base64 f32 LE>` (exact round trip; genome id `nn-<hash>`). Variation: `perturb` (ES), `mutate_topology` (widen with zero out-weights / narrow / insert identity layer / drop layer by composition), `mutate_inputs` (switch a feature or an expert's latents on with zero weights, or off), `crossover` (per-layer blend, same topology only). `train::fine_tune` (feature `train`, candle CPU): maximises `mean[ln(1 + L·m·r) − c·|Δm|] − w_s·mean(s − ŝ)²`, AdamW, newest 25 % held out, best held-out weights kept; `candle_forward` is pinned to the plain forward by a test. `flops()` / `op_cost` give `compute_cost` in one unit for both representations.
+
+## Asset sets (`assets`)
+`StrategyGenome::assets` (sorted instrument UUIDs; empty = every instrument) is part of the phenotype id. `mutate_assets` over `AssetProposals` (from `fa.v1.CrossAssetPriors`): unrestricted → a proposed pair ∝ score; add a partner ∝ pair support; remove the least-supported member (the last one → unrestricted); swap a member for a partner; at most `MAX_ASSETS` (8).
+
 ## Owns
 GP DSL interpreter, live observation, latent graph query surface, decoder cache, strategy genome + random generation + variation operators, region-literal remapping, `Strategy` / `NeuralPolicy` traits.
 
 ## Governing specs
-- [35-strategies](../../specs/35-strategies.md), [33-mcmc-graph](../../specs/33-mcmc-graph.md) §4.2, [34-decoder-population](../../specs/34-decoder-population.md)
+- [35-strategies](../../specs/35-strategies.md), [fa-mcmc](../fa-mcmc/README.md#graph-model-lasting-content-of-the-retired-spec-33) (retired spec 33 §4.2), [fa-decoders](../fa-decoders/README.md#decoder-population-lasting-content-of-the-retired-spec-34) (retired spec 34)

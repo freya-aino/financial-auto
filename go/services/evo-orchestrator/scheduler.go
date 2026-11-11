@@ -101,7 +101,8 @@ type Summary struct {
 	Type         string          `json:"type"` // "generation.summary"
 	GenerationID string          `json:"generation_id"`
 	Kind         string          `json:"kind"`
-	Generation   int             `json:"generation"` // 0-based loop index
+	SnapshotID   string          `json:"snapshot_id,omitempty"` // encoder snapshot the evaluations read
+	Generation   int             `json:"generation"`            // 0-based loop index
 	MaxGens      int             `json:"max_generations"`
 	Rung         int             `json:"rung"`
 	Rungs        int             `json:"rungs"`
@@ -482,17 +483,9 @@ func (g *Generation) OnResult(r *fav1.JobResult, pub PublishJob) (bool, error) {
 		all = append(all, c)
 	}
 	keep := max(1, (g.popSize+g.eta-1)/g.eta)
-	ranked := Rank(all)
-	g.elites = g.elites[:0]
-	for _, c := range ranked {
-		if len(g.elites) >= keep {
-			break
-		}
-		if c.Score == math.Inf(-1) && !c.hasObjectives() {
-			continue // never carry a failed genome over
-		}
-		g.elites = append(g.elites, c)
-	}
+	// NSGA-II (≤ 3 objectives) / NSGA-III (≥ 4) survivor selection, best first; a failed
+	// genome is never carried over (spec 34 §6.2 step 6)
+	g.elites = append(g.elites[:0], SelectElites(all, keep)...)
 	g.final = append([]Candidate(nil), g.elites...)
 	for _, e := range g.elites {
 		s.Survivors = append(s.Survivors, e.ID)
@@ -610,7 +603,7 @@ func (g *Generation) summaryLocked(final bool) Summary {
 	}
 	keys, fronts, unranked := Pareto(cands)
 	s := Summary{
-		Type: "generation.summary", GenerationID: g.ID, Kind: g.Kind, Generation: g.genIndex, MaxGens: g.cfg.MaxGenerations,
+		Type: "generation.summary", GenerationID: g.ID, Kind: g.Kind, SnapshotID: g.SnapshotID, Generation: g.genIndex, MaxGens: g.cfg.MaxGenerations,
 		Rung: g.rung, Rungs: len(g.rungs), Final: final, Candidates: len(cands), Unranked: unranked, Keys: keys,
 		Fronts: fronts, Validation: g.validation, State: g.stateLocked(), At: time.Now(), ElapsedMs: time.Since(g.loopStart).Milliseconds(),
 	}

@@ -80,7 +80,7 @@ impl IntoResponse for NotImpl {
         let section = spec_section(&path);
         (
             StatusCode::NOT_IMPLEMENTED,
-            Json(json!({"error": "not_implemented", "path": path, "spec": format!("specs/50-control-api.md §{section}")})),
+            Json(json!({"error": "not_implemented", "path": path, "spec": format!("bins/control-api/README.md (ex spec 50 §{section})")})),
         )
             .into_response()
     }
@@ -213,10 +213,10 @@ mod tests {
     async fn unimplemented_routes_return_501_with_spec_pointer() {
         let (s, v) = get_json("/api/audit").await;
         assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(v["spec"], "specs/50-control-api.md §4.7");
+        assert_eq!(v["spec"], "bins/control-api/README.md (ex spec 50 §4.7)");
         let (s, v) = get_json("/api/trading/pnl").await;
         assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(v["spec"], "specs/50-control-api.md §4.7");
+        assert_eq!(v["spec"], "bins/control-api/README.md (ex spec 50 §4.7)");
     }
 
     async fn post_json(uri: &str, body: Value) -> (StatusCode, Value) {

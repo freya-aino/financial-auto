@@ -10,9 +10,24 @@ Key helpers in use: `snapshot_file`/`snapshot_prefix`, `adapter_state`, `job_sta
 FA_GARAGE_TEST=1 cargo test -p fa-blob --test garage
 ```
 
+## Genome-weight GC (`gc` module, spec 20 §6.5)
+Collects the weights of non-elite decoder genomes once they are N generations old. **Only** `fa-models/decoders/<generation>/*.safetensors` bundles are eligible (`gc::is_weight_key`); cards (`*.card.json`, the lineage/fitness record), snapshots, adapters (LoRA weights belong to their snapshot), `fa-ckpt`, eval reports and live sets are never touched, and `execute` re-checks every key before deleting.
+
+- Generations are the `<generation>` segment (evo generation job id or `adhoc`), ordered by their newest object's `last_modified`; the newest `keep_generations` (default **5**) are kept whole.
+- Protected regardless of age: keys in `Protection` — serving / shadow / pinned decoders (`GET /api/decoders/serving`) and every bundle referenced by a snapshot manifest (`gc::snapshot_refs`, the D-009 feedback set) plus an optional keep file; the **card elites** (`gc::card_elites`: per `(output_family, step_ms)` the top `elite_per_family` = **8** cards by `score` among `score > 0`); anything younger than `min_age` (**7 d**) or undated.
+- A bundle without a card is unloadable (bundles are discovered through cards) and is collected like any non-elite.
+- `gc::plan(listing, policy, protection, elites, now)` is pure; `gc::execute(store, plan, dry_run)` deletes (or counts) the planned bundles and reports failures without stopping.
+
+```sh
+cargo run -p fa-blob --example genome_gc                   # dry run against the compose Garage (default)
+cargo run -p fa-blob --example genome_gc -- --list         # + one line per decision
+cargo run -p fa-blob --example genome_gc -- --apply        # delete; refused if GET /api/decoders/serving fails
+# --keep-generations N --elite-per-family K --min-age-days D --control-api URL|none --keep-file PATH --no-serving-check
+```
+
 ## Owns
 Content-addressed blob keys and snapshot layout.
 
 ## Governing specs
 - [20-storage](../../specs/20-storage.md)
-- [36-training-lifecycle](../../specs/36-training-lifecycle.md)
+- [trainer README](../../bins/trainer/README.md#training-lifecycle-lasting-content-of-the-retired-spec-36) (retired spec 36)

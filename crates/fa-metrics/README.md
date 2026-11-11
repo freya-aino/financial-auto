@@ -16,4 +16,4 @@ Dependency-free Prometheus text exporter shared by every Rust service (spec 60 �
 Re-exported as `fa_bus::metrics` so services need no extra dependency.
 
 ## Governing specs
-- [60-ops](../../specs/60-ops.md) §4, §6.5
+- [Ops reference (ex spec 60)](../../docker/README.md#reference-spec-60-ops-retired-2026-11-11) §4, §6.5

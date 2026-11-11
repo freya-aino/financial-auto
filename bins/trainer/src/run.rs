@@ -34,6 +34,8 @@ pub enum Kind {
     Pretrain,
     Generation,
     Adapter,
+    /// A whole encoder generation through the [`crate::generation`] state machine.
+    Cycle,
 }
 
 impl Kind {
@@ -42,6 +44,7 @@ impl Kind {
             Self::Pretrain => "pretrain",
             Self::Generation => "generation",
             Self::Adapter => "adapter",
+            Self::Cycle => "cycle",
         }
     }
 
@@ -55,6 +58,7 @@ impl Kind {
             "pretrain" => Some(Self::Pretrain),
             "generation" => Some(Self::Generation),
             "adapter" => Some(Self::Adapter),
+            "cycle" => Some(Self::Cycle),
             _ => None,
         }
     }
@@ -167,17 +171,37 @@ impl Outcome {
 }
 
 /// Shared services of a run.
+#[derive(Clone, Copy)]
 pub struct Services<'a> {
     pub stores: &'a Stores,
     pub tsdb: &'a Tsdb,
     pub pg_url: Option<&'a str>,
+    /// Frozen bars that replace the VictoriaMetrics read (generation cycles freeze their data
+    /// once, bootstrap / reproduction runs bring their own); holdouts are still excluded.
+    pub frozen: Option<&'a [BarHistory]>,
+    /// Where the data loading of the current run records what it read ([`crate::holdout`]).
+    pub audit: Option<&'a crate::holdout::AuditSlot>,
 }
 
+impl<'a> Services<'a> {
+    pub fn new(stores: &'a Stores, tsdb: &'a Tsdb, pg_url: Option<&'a str>) -> Self {
+        Self { stores, tsdb, pg_url, frozen: None, audit: None }
+    }
+}
+
+/// Runs a fit and writes its run manifest ([`crate::run_manifest`], spec 36 §6.6).
 pub async fn run_fit(kind: Kind, spec: FitSpec, svc: &Services<'_>, ctl: &Control) -> Outcome {
-    match fit_inner(kind, spec, svc, ctl).await {
+    let slot = crate::holdout::AuditSlot::default();
+    let audited = Services { audit: Some(svc.audit.unwrap_or(&slot)), ..*svc };
+    let mut out = match fit_inner(kind, spec.clone(), &audited, ctl).await {
         Ok(o) => o,
         Err(e) => Outcome::failed(e, kind),
+    };
+    if out.status == Status::Ok {
+        let audit = audited.audit.and_then(|a| a.lock().ok().and_then(|g| g.clone()));
+        crate::run_manifest::attach(&mut out, kind, &spec, audit, &audited, ctl).await;
     }
+    out
 }
 
 async fn fit_inner(kind: Kind, spec: FitSpec, svc: &Services<'_>, ctl: &Control) -> anyhow::Result<Outcome> {
@@ -219,19 +243,20 @@ async fn fit_inner(kind: Kind, spec: FitSpec, svc: &Services<'_>, ctl: &Control)
         Some(c) => {
             tracing::info!(job = %ctl.job_id, phase = ?c.fit.phase, "resuming from checkpoint");
             resumed_from = Some(artifact::checkpoint_key(&ctl.job_id).key);
-            let h = data::load_set(svc.tsdb, ts, None, None, c.start_ms, c.end_ms, Some(&c.pins)).await?;
+            let h = crate::holdout::load_fit_set(svc, ts, None, None, c.start_ms, c.end_ms, Some(&c.pins), 1).await?;
             (h, c.fit)
         }
         None => {
-            let (start_ms, end_ms) = data::window(ts, spec.window_hours, now);
-            let h = data::load_set(
-                svc.tsdb,
+            let (start_ms, end_ms) = crate::holdout::fit_window(&spec, now);
+            let h = crate::holdout::load_fit_set(
+                svc,
                 ts,
                 spec.instruments.as_ref(),
                 spec.instrument.as_deref(),
                 start_ms,
                 end_ms,
                 None,
+                1,
             )
             .await?;
             let id = crate::fit::snapshot_id(ts, generation, now);
@@ -500,7 +525,7 @@ async fn adapter_inner(spec: AdapterSpec, svc: &Services<'_>, ctl: &Control) -> 
     (ctl.progress)(0.1, format!("adapting {snapshot_id} on the last {:.2} h", spec.window_hours));
     let now = data::now_ms();
     let (start_ms, end_ms) = data::window(ts, spec.window_hours, now);
-    let history = data::load_one(svc.tsdb, ts, spec.instrument.as_deref(), start_ms, end_ms, None).await?;
+    let history = crate::holdout::load_adapter_window(svc, ts, spec.instrument.as_deref(), start_ms, end_ms, 1).await?;
     if ctl.stop.load(Ordering::Relaxed) == CANCEL {
         return Ok(Outcome {
             status: Status::Cancelled,

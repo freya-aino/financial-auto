@@ -46,3 +46,60 @@ func Registered() []string {
 	sort.Strings(ids)
 	return ids
 }
+
+// AdapterFactory creates a generic connector serving the catalog entry `id`
+// (spec 11 §6.3: rss, sdmx).
+type AdapterFactory func(id string) Connector
+
+var adapters = map[string]AdapterFactory{}
+
+// RegisterAdapter adds a generic adapter; packages call it from init(). Panics on duplicates.
+func RegisterAdapter(name string, f AdapterFactory) {
+	regMu.Lock()
+	defer regMu.Unlock()
+	if _, dup := adapters[name]; dup {
+		panic(fmt.Sprintf("adapter %q registered twice", name))
+	}
+	adapters[name] = f
+}
+
+// NewFor instantiates the connector for a catalog entry: the one registered
+// under its id, else its `adapter:` bound to the id.
+func NewFor(id, adapter string) (Connector, error) {
+	if c, err := New(id); err == nil {
+		return c, nil
+	}
+	if adapter == "" {
+		return nil, fmt.Errorf("connector %q not registered", id)
+	}
+	regMu.RLock()
+	f, ok := adapters[adapter]
+	regMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("connector %q not registered and adapter %q unknown", id, adapter)
+	}
+	return f(id), nil
+}
+
+// HasConnector reports whether id has a registered connector or names a known adapter.
+func HasConnector(id, adapter string) bool {
+	regMu.RLock()
+	defer regMu.RUnlock()
+	if _, ok := registry[id]; ok {
+		return true
+	}
+	_, ok := adapters[adapter]
+	return adapter != "" && ok
+}
+
+// Adapters lists registered adapter names in sorted order.
+func Adapters() []string {
+	regMu.RLock()
+	defer regMu.RUnlock()
+	out := make([]string, 0, len(adapters))
+	for n := range adapters {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}

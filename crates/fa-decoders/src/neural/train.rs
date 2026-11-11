@@ -49,6 +49,9 @@ impl Default for TrainOptions {
 pub struct TrainReport {
     pub train_rows: usize,
     pub val_rows: usize,
+    /// Training rows dropped because their target overlaps the validation tail's.
+    #[serde(default)]
+    pub purged_rows: usize,
     pub steps: usize,
     /// Step whose weights were kept (best validation loss; 0 = the initial weights).
     #[serde(default)]
@@ -168,7 +171,17 @@ pub fn train(
         })
         .collect();
     let n_val = (rows.len() / 10).max(8);
-    let n_train = rows.len() - n_val;
+    let n_split = rows.len() - n_val;
+    // Purge (López de Prado): training rows whose target reaches into the first validation
+    // row's target window are dropped, so overlapping text / chart windows cannot make the
+    // held-out tail look better than out-of-sample data (early stopping relies on it).
+    let step_ms = series.iter().map(|s| s.step_ms).find(|s| *s > 0).unwrap_or(1000);
+    let val_label_start = rows[n_split].t_ms - label_lookback_ms(g, step_ms);
+    let n_train = match rows[..n_split].iter().rposition(|r| r.end_ms <= val_label_start) {
+        Some(i) if i + 1 >= 32 => i + 1,
+        _ => n_split,
+    };
+    let purged_rows = n_split - n_train;
 
     // 2. target statistics (reconstruction baseline, sentiment normalisation)
     let tw = lay.target;
@@ -178,7 +191,7 @@ pub fn train(
             *m += y / n_train as f32;
         }
     }
-    let sentiment = if g.family.uses_text() {
+    let sentiment = if g.family.uses_text() && g.family.embeds() {
         let dir = data::sentiment_direction(g.nn.tdim);
         let ds: Vec<f64> =
             rows[..n_train].iter().map(|r| r.y.iter().zip(&dir).map(|(a, b)| f64::from(a * b)).sum()).collect();
@@ -196,6 +209,9 @@ pub fn train(
     let network = Net::new(vb, lay, &g.nn)?;
     let seed = g.nn.seed ^ crate::genome::stable_hash(g.family.as_str());
     net::seeded_init(&varmap, seed)?;
+    if g.family.residual_init() {
+        residual_init(&varmap, g, &target_mean)?;
+    }
     let warm_started = match &opts.warm_start {
         Some(bytes) => warm_start(&varmap, bytes, &dev)?,
         None => 0,
@@ -203,7 +219,6 @@ pub fn train(
     let mut opt =
         AdamW::new(varmap.all_vars(), ParamsAdamW { lr: g.nn.lr, weight_decay: g.nn.wd, ..Default::default() })?;
 
-    let step_ms = series.iter().map(|s| s.step_ms).find(|s| *s > 0).unwrap_or(1000);
     let gap_ms = (g.min_gap.max(g.horizon) as i64) * step_ms;
     let ctx_loss = LossCtx { g, lay, rows: &rows, gap_ms, dev: &dev };
     let eval_idx: Vec<usize> = (0..n_train).step_by(n_train.div_ceil(512).max(1)).collect();
@@ -215,7 +230,7 @@ pub fn train(
     let mut steps = 0usize;
     let mut interrupted = false;
     // Early stopping on the held-out tail: the weights with the best validation loss win.
-    let val_idx: Vec<usize> = (n_train..rows.len()).collect();
+    let val_idx: Vec<usize> = (n_split..rows.len()).collect();
     let total_steps = opts.steps.unwrap_or(g.nn.steps).max(1);
     let check_every = (total_steps / 10).clamp(10, 200);
     let mut best = (ctx_loss.mean_loss(&network, &val_idx)?, 0usize, snapshot(&varmap)?);
@@ -249,6 +264,7 @@ pub fn train(
     let report = TrainReport {
         train_rows: n_train,
         val_rows: n_val,
+        purged_rows,
         steps,
         best_step,
         train_loss,
@@ -279,6 +295,7 @@ pub fn train(
         score: 0.0,
         job_id: String::new(),
         generation: String::new(),
+        transfer: Vec::new(),
     };
     // Rebuild the network on the detached tensors so the decoder holds no optimiser graph.
     let map: HashMap<String, Tensor> = params.iter().cloned().collect();
@@ -296,6 +313,42 @@ pub fn train(
         eval_from_ms: Some(cutoff),
         cache: Mutex::new(HashMap::new()),
     })
+}
+
+/// How far before its step a row's target window starts (the purge span).
+fn label_lookback_ms(g: &DecoderGenome, step_ms: i64) -> i64 {
+    let lb = g.lookback as i64 * step_ms;
+    let tw = data::text_window_ms(g);
+    match g.family {
+        BaselineFamily::NnChart => lb,
+        BaselineFamily::NnSummary => lb.max(tw),
+        BaselineFamily::NnNews | BaselineFamily::NnFrame => tw,
+        _ => 0,
+    }
+}
+
+/// Starts the decoder at its reconstruction baseline: output weights 0, output bias = the
+/// training-mean target in output space (log-probabilities per raster column / summary slot,
+/// the mean embedding for `1 − cos` families). SGD then learns a residual, weight decay shrinks
+/// it back towards the baseline, and early stopping keeps the baseline when nothing beats it on
+/// the held-out tail (live text/chart decoders scored below the training mean when they started
+/// from a random output, D-085).
+fn residual_init(varmap: &VarMap, g: &DecoderGenome, target_mean: &[f32]) -> Result<(), NeuralError> {
+    let data = varmap.data().lock().map_err(|e| NeuralError::Bundle(e.to_string()))?;
+    let (Some(w), Some(b)) = (data.get("net.out.weight"), data.get("net.out.bias")) else {
+        return Ok(());
+    };
+    if b.elem_count() != target_mean.len() {
+        return Ok(());
+    }
+    let bias: Vec<f32> = if g.family.embeds() {
+        target_mean.to_vec()
+    } else {
+        target_mean.iter().map(|p| p.max(1e-4).ln()).collect()
+    };
+    w.set(&w.zeros_like()?)?;
+    b.set(&Tensor::from_vec(bias, target_mean.len(), b.device())?)?;
+    Ok(())
 }
 
 fn snapshot(varmap: &VarMap) -> Result<Vec<(String, Tensor)>, NeuralError> {
@@ -364,7 +417,14 @@ impl LossCtx<'_> {
             BaselineFamily::NnChart | BaselineFamily::NnFuture => {
                 net::raster_ce(&net::raster_logp(&out, g.nn.res)?, &self.ys(idx)?, g.nn.res)?
             }
-            BaselineFamily::NnNews | BaselineFamily::NnNarrative => net::cosine_loss(&out, &self.ys(idx)?)?,
+            BaselineFamily::NnNews | BaselineFamily::NnNarrative | BaselineFamily::NnFrame => {
+                net::cosine_loss(&out, &self.ys(idx)?)?
+            }
+            BaselineFamily::NnSummary => net::slots_ce(
+                &net::slots_logp(&out, &crate::summary::slot_sizes())?,
+                &self.ys(idx)?,
+                crate::summary::SLOTS.len(),
+            )?,
             BaselineFamily::NnRetrieval => {
                 let cand: Vec<usize> = match pool {
                     Some((rng, n)) => (0..(4 * idx.len()).min(n)).map(|_| rng.below(n)).collect(),

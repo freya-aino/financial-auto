@@ -87,11 +87,18 @@ struct ExpertObs {
     region_id: String,
     /// Mean posterior std of the latent (`exp(log_var / 2)`).
     uncertainty: f64,
+    /// First [`LATENT_DIMS_KEPT`] dims of the latent mean (neural policy input, spec 35 §4.3).
+    mean: Vec<f32>,
 }
+
+/// Latent mean dimensions kept per state (the neural policy reads at most this many).
+pub const LATENT_DIMS_KEPT: usize = crate::neural::MAX_LATENT_DIMS;
 
 #[derive(Debug, Clone, PartialEq)]
 struct StateObs {
     as_of_ms: i64,
+    /// Encoder snapshot that produced the state (`""` = unknown / in-process baseline).
+    snapshot: String,
     experts: Vec<ExpertObs>,
 }
 
@@ -132,6 +139,26 @@ impl LatentGraph {
     /// Ingests a `LatentState` (all experts). States are kept per `(timescale, instrument)` in
     /// event-time order; out-of-order states are dropped.
     pub fn on_state(&mut self, st: &LatentState) -> bool {
+        self.ingest_state(st, true)
+    }
+
+    /// Ingests a state of a snapshot served **in parallel** (model-runtime's
+    /// `latent.shadow.<ts>.<inst>`, spec 35 §6.5): kept next to the live states and readable
+    /// through [`Self::at_snapshot`], but it never changes which snapshot the timescale serves.
+    pub fn on_parallel_state(&mut self, st: &LatentState) -> bool {
+        self.ingest_state(st, false)
+    }
+
+    /// Event time of the newest state of `snapshot` on `ts` (any instrument).
+    pub fn last_state_ms(&self, ts: Timescale, snapshot: &str) -> Option<i64> {
+        self.states
+            .iter()
+            .filter(|((t, _), _)| *t == ts)
+            .filter_map(|(_, h)| h.iter().rev().find(|o| o.snapshot == snapshot).map(|o| o.as_of_ms))
+            .max()
+    }
+
+    fn ingest_state(&mut self, st: &LatentState, live: bool) -> bool {
         let (Ok(ts), Some(inst)) = (st.timescale.parse::<Timescale>(), parse_inst(&st.instrument_id)) else {
             return false;
         };
@@ -152,10 +179,11 @@ impl LatentGraph {
                 } else {
                     e.log_var.iter().map(|lv| (f64::from(*lv) / 2.0).exp()).sum::<f64>() / e.log_var.len() as f64
                 },
+                mean: e.mean.iter().take(LATENT_DIMS_KEPT).copied().collect(),
             })
             .collect();
-        hist.push_back(StateObs { as_of_ms, experts });
-        if !st.snapshot_id.is_empty() && self.snapshots.get(&ts) != Some(&st.snapshot_id) {
+        hist.push_back(StateObs { as_of_ms, snapshot: st.snapshot_id.clone(), experts });
+        if live && !st.snapshot_id.is_empty() && self.snapshots.get(&ts) != Some(&st.snapshot_id) {
             self.snapshots.insert(ts, st.snapshot_id.clone());
         }
         while hist.len() > MAX_STATES_PER_INSTRUMENT {
@@ -252,10 +280,20 @@ impl LatentGraph {
             return;
         }
         let ret = (close / prev_close).ln();
-        let Some(obs) = self.state_at(ts, inst, prev_ms) else {
+        // the newest state of every snapshot served at the time (region ids are per snapshot)
+        let Some(hist) = self.states.get(&(ts, inst)) else { return };
+        let mut snaps: Vec<&str> = Vec::new();
+        let mut regions: Vec<(u32, String)> = Vec::new();
+        for obs in hist.iter().rev().filter(|o| o.as_of_ms <= prev_ms).take(8) {
+            if snaps.contains(&obs.snapshot.as_str()) {
+                continue;
+            }
+            snaps.push(&obs.snapshot);
+            regions.extend(obs.experts.iter().map(|e| (e.expert, e.region_id.clone())));
+        }
+        if regions.is_empty() {
             return;
-        };
-        let regions: Vec<(u32, String)> = obs.experts.iter().map(|e| (e.expert, e.region_id.clone())).collect();
+        }
         for (expert, region) in regions {
             let sp = self.spaces.entry((ts, expert)).or_default();
             let q = sp.returns.entry(region).or_default();
@@ -267,8 +305,8 @@ impl LatentGraph {
         self.seen.closes += 1;
     }
 
-    fn state_at(&self, ts: Timescale, inst: InstrumentId, at_ms: i64) -> Option<&StateObs> {
-        self.states.get(&(ts, inst))?.iter().rev().find(|s| s.as_of_ms <= at_ms)
+    fn state_at(&self, ts: Timescale, inst: InstrumentId, at_ms: i64, snap: Option<&str>) -> Option<&StateObs> {
+        self.states.get(&(ts, inst))?.iter().rev().find(|s| s.as_of_ms <= at_ms && snap_ok(s, snap))
     }
 
     /// Timescales with any graph data.
@@ -293,12 +331,27 @@ impl LatentGraph {
 
     /// Point-in-time view at `at_ms` for one timescale.
     pub fn at(&self, ts: Timescale, at_ms: i64) -> GraphAt<'_> {
-        GraphAt { g: self, ts, at_ms, spaces: RefCell::new(BTreeMap::new()) }
+        GraphAt { g: self, ts, at_ms, spaces: RefCell::new(BTreeMap::new()), snap: self.snapshots.get(&ts).cloned() }
+    }
+
+    /// Point-in-time view reading the states of `snapshot` (spec 35 §6.5 parallel serving: a
+    /// strategy bound to the previous snapshot keeps reading its latents while model-runtime
+    /// still serves it). Kernel rows and regions are shared (ids are per snapshot).
+    pub fn at_snapshot(&self, ts: Timescale, snapshot: &str, at_ms: i64) -> GraphAt<'_> {
+        GraphAt { g: self, ts, at_ms, spaces: RefCell::new(BTreeMap::new()), snap: Some(snapshot.to_owned()) }
     }
 
     /// Encoder snapshot of the newest `LatentState` of `ts`.
     pub fn snapshot(&self, ts: Timescale) -> Option<&str> {
         self.snapshots.get(&ts).map(String::as_str)
+    }
+}
+
+/// Whether a state belongs to the view's snapshot (states without a snapshot id always do).
+fn snap_ok(s: &StateObs, snap: Option<&str>) -> bool {
+    match snap {
+        Some(want) => s.snapshot.is_empty() || s.snapshot == want,
+        None => true,
     }
 }
 
@@ -346,6 +399,8 @@ pub struct GraphAt<'a> {
     ts: Timescale,
     at_ms: i64,
     spaces: RefCell<BTreeMap<u32, SpaceView>>,
+    /// Snapshot whose states the view reads (the timescale's live one for [`LatentGraph::at`]).
+    snap: Option<String>,
 }
 
 impl GraphAt<'_> {
@@ -429,9 +484,15 @@ impl GraphAt<'_> {
 
     /// Latest state of `inst` as of the view time: `(as_of_ms, region, uncertainty)` for `expert`.
     pub fn current(&self, inst: InstrumentId, expert: u32) -> Option<(i64, String, f64)> {
-        let obs = self.g.state_at(self.ts, inst, self.at_ms)?;
+        let obs = self.g.state_at(self.ts, inst, self.at_ms, self.snap.as_deref())?;
         let e = obs.experts.iter().find(|e| e.expert == expert)?;
         Some((obs.as_of_ms, e.region_id.clone(), e.uncertainty))
+    }
+
+    /// Latent mean (first [`LATENT_DIMS_KEPT`] dims) of `inst` in `expert` as of the view time.
+    pub fn latent(&self, inst: InstrumentId, expert: u32) -> Option<Vec<f32>> {
+        let obs = self.g.state_at(self.ts, inst, self.at_ms, self.snap.as_deref())?;
+        obs.experts.iter().find(|e| e.expert == expert).map(|e| e.mean.clone())
     }
 
     /// `cur_region(expert)`.
@@ -443,7 +504,8 @@ impl GraphAt<'_> {
     /// `None` without a state). Measured in event time, so preview states do not inflate it.
     pub fn dwell(&self, inst: InstrumentId, expert: u32) -> Option<f64> {
         let hist = self.g.states.get(&(self.ts, inst))?;
-        let mut it = hist.iter().rev().filter(|s| s.as_of_ms <= self.at_ms);
+        let snap = self.snap.as_deref();
+        let mut it = hist.iter().rev().filter(|s| s.as_of_ms <= self.at_ms && snap_ok(s, snap));
         let latest = it.next()?;
         let region = &latest.experts.iter().find(|e| e.expert == expert)?.region_id;
         let mut entered = latest.as_of_ms;
@@ -463,7 +525,7 @@ impl GraphAt<'_> {
             .states
             .iter()
             .filter(|((t, _), _)| *t == self.ts)
-            .filter_map(|(_, h)| h.iter().rev().find(|s| s.as_of_ms <= self.at_ms))
+            .filter_map(|(_, h)| h.iter().rev().find(|s| s.as_of_ms <= self.at_ms && snap_ok(s, self.snap.as_deref())))
             .filter(|s| s.experts.iter().any(|e| e.expert == expert && e.region_id == region))
             .count()
     }
@@ -482,7 +544,7 @@ impl GraphAt<'_> {
 
     /// Encoder snapshot currently served on this timescale (newest `LatentState`).
     pub fn snapshot(&self) -> Option<&str> {
-        self.g.snapshots.get(&self.ts).map(String::as_str)
+        self.snap.as_deref().or_else(|| self.g.snapshots.get(&self.ts).map(String::as_str))
     }
 
     /// Resolves the literal `(region expert ordinal)` to a region id of this timescale: the live
@@ -662,6 +724,35 @@ pub(crate) mod tests {
             g.on_state(&state(inst, 1_000 + t * 1_000, &["a", "x"]));
         }
         g
+    }
+
+    #[test]
+    fn a_snapshot_served_in_parallel_is_readable_without_becoming_live() {
+        let inst = InstrumentId::new();
+        let mut g = LatentGraph::new();
+        let mut old = state(inst, 1_000, &["old-e0-r001"]);
+        old.snapshot_id = "old".into();
+        g.on_state(&old);
+        let mut new = state(inst, 2_000, &["new-e0-r004"]);
+        new.snapshot_id = "new".into();
+        new.experts[0].mean = vec![0.5, -0.5];
+        g.on_state(&new);
+        // the old snapshot keeps being served in parallel (model-runtime shadow)
+        for t in [2_000, 3_000] {
+            let mut st = state(inst, t, &["old-e0-r001"]);
+            st.snapshot_id = "old".into();
+            assert!(g.on_parallel_state(&st));
+        }
+        assert_eq!(g.snapshot(Timescale::Second), Some("new"), "parallel states never change the live snapshot");
+        let live = g.at(Timescale::Second, 3_500);
+        assert_eq!(live.cur_region(inst, 0).as_deref(), Some("new-e0-r004"));
+        assert_eq!(live.latent(inst, 0), Some(vec![0.5, -0.5]));
+        let prev = g.at_snapshot(Timescale::Second, "old", 3_500);
+        assert_eq!(prev.cur_region(inst, 0).as_deref(), Some("old-e0-r001"));
+        assert_eq!(prev.snapshot(), Some("old"));
+        assert_eq!(prev.dwell(inst, 0), Some(2.0), "dwell counts the old snapshot's own states");
+        assert_eq!(g.last_state_ms(Timescale::Second, "old"), Some(3_000));
+        assert_eq!(g.last_state_ms(Timescale::Second, "new"), Some(2_000));
     }
 
     #[test]

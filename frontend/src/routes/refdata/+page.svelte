@@ -8,6 +8,7 @@
 	import ViewHeader from '../../lib/ViewHeader.svelte';
 	import { api, num, short, type Instrument } from '../../lib/api';
 	import { consoleApi, errText, type CorporateAction, type SessionRow, type Venue } from '../../lib/console';
+	import { IDENTIFIER_SCHEMES, contractSpecBody, identifierBody, operatorApi } from '../../lib/operator';
 
 	// as-of resolve
 	let rVenue = $state('');
@@ -51,6 +52,46 @@
 	let caOk = $state(true);
 	let sc = $state({ venue: '', old_symbol: '', new_symbol: '', effective: '' });
 	let scMsg = $state('');
+
+	// identifier / contract-spec overrides (spec 12 §4 manual CRUD)
+	let idf = $state({ scheme: 'isin', value: '', valid_from: '' });
+	let cs = $state<Record<string, string>>({ venue: '', tick_size: '', lot_size: '', min_notional: '', multiplier: '', max_leverage: '', settlement_ccy: '', shortable: '', fee_schedule_ref: '', expiry: '', valid_from: '' });
+	let ovMsg = $state('');
+	let ovOk = $state(true);
+
+	async function override(question: string, call: () => Promise<unknown>, done: string) {
+		if (!confirm(question)) return;
+		try {
+			const r = await call();
+			ovMsg = `${done}: ${JSON.stringify(r)}`;
+			ovOk = true;
+			await loadInstrument();
+		} catch (e) {
+			ovMsg = `${done} failed: ${errText(e)}`;
+			ovOk = false;
+		}
+	}
+
+	function addIdentifier() {
+		const b = identifierBody(instId, idf.scheme, idf.value, idf.valid_from);
+		if ('error' in b) return ((ovMsg = b.error), (ovOk = false));
+		void override(
+			`Add identifier ${b.body.scheme}:${b.body.value} to instrument ${b.body.instrument_id}${b.body.valid_from ? ` from ${b.body.valid_from}` : ''}?\n\n409 if it belongs to another instrument. Audited, announced on ref.changed.identifier.`,
+			() => operatorApi.addIdentifier(b.body),
+			'identifier added'
+		);
+	}
+
+	function addContractSpec() {
+		const b = contractSpecBody({ ...cs, instrument_id: instId });
+		if ('error' in b) return ((ovMsg = b.error), (ovOk = false));
+		const fields = Object.entries(b.body).filter(([k]) => k !== 'instrument_id' && k !== 'venue').map(([k, v]) => `${k}=${v}`).join(', ');
+		void override(
+			`Write a new contract-spec version for ${b.body.instrument_id} on ${b.body.venue}: ${fields || 'all fields empty (NULL)'}?\n\nThe version open at valid_from (default now) is closed there; empty fields become NULL. Risk-engine caps and the short check read this. Audited, announced on ref.changed.contract_spec.`,
+			() => operatorApi.addContractSpec(b.body),
+			'contract spec written'
+		);
+	}
 
 	const KINDS = ['split', 'reverse_split', 'stock_dividend', 'cash_dividend', 'spinoff', 'merger', 'symbol_change'];
 	const iso = (v: string) => (v ? (v.length === 10 ? v : new Date(v).toISOString()) : undefined);
@@ -354,6 +395,36 @@
 			<label>effective <input type="date" bind:value={sc.effective} /></label>
 			<button type="submit" disabled={!sc.venue || !sc.old_symbol || !sc.new_symbol}>apply…</button>
 			{#if scMsg}<span class="mono dim small">{scMsg}</span>{/if}
+		</form>
+	</section>
+
+	<section class="panel wide">
+		<div class="panel-head"><h2>Overrides <span class="dim">{instId ? `for ${short(instId, 12)}` : '(load an instrument above first)'}</span></h2><span class="dim">POST /api/refdata/identifiers · /api/refdata/contract-specs</span></div>
+		{#if ovMsg}<p class="badge" class:ok={ovOk} class:danger={!ovOk}>{ovMsg}</p>{/if}
+		<h3 class="sub">Identifier</h3>
+		<form class="row" onsubmit={(e) => (e.preventDefault(), addIdentifier())}>
+			<label>scheme <input list="id-schemes" bind:value={idf.scheme} size="10" /></label>
+			<datalist id="id-schemes">{#each IDENTIFIER_SCHEMES as s}<option value={s}></option>{/each}</datalist>
+			<label>value <input class="mono" bind:value={idf.value} size="16" /></label>
+			<label>valid from <input type="datetime-local" bind:value={idf.valid_from} /></label>
+			<button type="submit" disabled={!instId || !idf.value}>add…</button>
+		</form>
+		<h3 class="sub">Contract spec (new version)</h3>
+		<form class="row" onsubmit={(e) => (e.preventDefault(), addContractSpec())}>
+			<label>venue <input bind:value={cs.venue} size="6" /></label>
+			<label>tick <input bind:value={cs.tick_size} size="7" /></label>
+			<label>lot <input bind:value={cs.lot_size} size="7" /></label>
+			<label>min notional <input bind:value={cs.min_notional} size="7" /></label>
+			<label>multiplier <input bind:value={cs.multiplier} size="5" /></label>
+			<label>max leverage <input bind:value={cs.max_leverage} size="5" /></label>
+			<label>settle ccy <input bind:value={cs.settlement_ccy} size="4" /></label>
+			<label>shortable
+				<select bind:value={cs.shortable}><option value="">unknown</option><option value="true">yes</option><option value="false">no</option></select>
+			</label>
+			<label>fee schedule <input bind:value={cs.fee_schedule_ref} size="10" /></label>
+			<label>expiry <input type="datetime-local" bind:value={cs.expiry} /></label>
+			<label>valid from <input type="datetime-local" bind:value={cs.valid_from} /></label>
+			<button type="submit" disabled={!instId || !cs.venue}>write…</button>
 		</form>
 	</section>
 </div>

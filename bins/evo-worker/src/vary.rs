@@ -118,6 +118,15 @@ pub struct VaryRequest {
     pub max_depth: Option<usize>,
     #[serde(default)]
     pub max_nodes: Option<usize>,
+    /// Strategy breeding pools (spec 35 §6.3): population share floor per representation
+    /// (`min_share_per_repr`, default 0.3), probability of an asset-set mutation per child
+    /// (default 0.15) and of an SGD fine-tune per neural child (default 0.3).
+    #[serde(default)]
+    pub min_share_per_repr: Option<f64>,
+    #[serde(default)]
+    pub asset_mutation_prob: Option<f64>,
+    #[serde(default)]
+    pub sgd_prob: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -168,7 +168,7 @@ func (b *Backfiller) resolveBackfiller(source string) (catalog.Source, error) {
 	if err != nil {
 		return src, err
 	}
-	c, err := connector.New(source)
+	c, err := connector.NewFor(source, src.Adapter)
 	if err != nil {
 		return src, fmt.Errorf("%w: %v", ErrNotFound, err)
 	}
@@ -178,9 +178,11 @@ func (b *Backfiller) resolveBackfiller(source string) (catalog.Source, error) {
 	return src, nil
 }
 
-// Run pulls jobs until ctx is done. One job at a time: backfill shares the
-// source's rate limiter with the live connector, so parallel jobs would only
-// starve each other (spec 10 §6.4 low-priority lane, approximated).
+// Run pulls jobs until ctx is done, one job per lane: Run is started once per
+// backfill lane (-backfill-lanes, default 2). Every job's requests go through
+// its source's low-priority backfill lane (connector.LaneLimiter), which
+// yields to the live connector and is capped at a share of the catalog rate,
+// so parallel jobs never starve live polling (spec 10 §6.4).
 func (b *Backfiller) Run(ctx context.Context) {
 	for ctx.Err() == nil {
 		batch, err := b.Consumer.Fetch(1, jetstream.FetchMaxWait(5*time.Second))
@@ -259,18 +261,13 @@ func (b *Backfiller) execute(ctx context.Context, log *slog.Logger, job *fav1.Jo
 	if err != nil {
 		return nil, err
 	}
-	src, err := b.resolveBackfiller(spec.Source)
-	if err != nil {
+	if _, err := b.resolveBackfiller(spec.Source); err != nil {
 		return nil, err
 	}
-	c, _ := connector.New(spec.Source)
-	cfg := connector.SourceConfig{Source: src}
-	if b.Sup.Secrets != nil {
-		cfg.Secrets = b.Sup.Secrets(spec.Source)
-	}
-	deps := b.Sup.deps(src)
-	if err := c.Init(ctx, cfg, deps); err != nil {
-		return nil, fmt.Errorf("init %s: %w", spec.Source, err)
+	// Low-priority lane (spec 10 §6.4): the job's requests yield to the live connector's.
+	c, src, deps, err := b.Sup.Instance(ctx, spec.Source, true)
+	if err != nil {
+		return nil, err
 	}
 	norm, ok := c.(connector.Normalizer)
 	if !ok {

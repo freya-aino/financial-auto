@@ -13,4 +13,4 @@ First-wave connector: OANDA v20 (pricing stream → quotes, candles → bars).
 `oanda_test.go`: secrets precedence and env hosts, stream parsing + reconnect/401 stop, quote mapping, unresolved instrument, chunked candle backfill (incomplete candle skipped), API error surfacing.
 
 ## Governing specs
-- [10-ingestion](../../../specs/10-ingestion.md), [11-source-catalog](../../../specs/11-source-catalog.md)
+- [Ingestion reference (ex spec 10)](../../services/ingestor/README.md#ingestion-reference), [Source catalog reference (ex spec 11)](../../pkg/catalog/README.md#source-catalog-reference)

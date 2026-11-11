@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let (status, v) = get_json(app, "/api/trading/strategies").await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(v["spec"], "specs/50-control-api.md §4.7");
+        assert_eq!(v["spec"], "bins/control-api/README.md (ex spec 50 §4.7)");
     }
 
     /// Needs `DATABASE_URL` (compose Postgres with migrations applied).

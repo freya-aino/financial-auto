@@ -8,13 +8,17 @@
 //! planner and holdout-aware selection windows (spec 41 §6.4), and [`knowledge`], the per-source
 //! knowledge delays every event-time replay applies (spec 41 §6.2), and [`venue`], the paper
 //! venue state ported from the broker-gateway so recorded live fills replay identically, and
-//! [`trade_rule`], the live risk-engine's rebalance rule both fitness replays trade with.
+//! [`trade_rule`], the live risk-engine's rebalance rule both fitness replays trade with, and
+//! [`coverage`] (missing-data cut) and [`latency`] (per-venue order latency) of the strategy
+//! replay.
 
 pub mod allocator_replay;
 pub mod cost;
+pub mod coverage;
 pub mod eval;
 pub mod holdout;
 pub mod knowledge;
+pub mod latency;
 pub mod latents;
 pub mod replay;
 pub mod stats;
@@ -60,6 +64,9 @@ pub enum ReplayError {
     HoldoutIntersect { timescale: String, holdout_start_ms: i64, holdout_end_ms: i64 },
     #[error("no bars in the replay window")]
     NoData,
+    /// Too much of the window is missing (spec 41 §8, [`coverage`]): no fitness.
+    #[error("insufficient data coverage: window {window:.2}, best instrument {best_instrument:.2} < min {min:.2}")]
+    Coverage { window: f64, best_instrument: f64, min: f64 },
     /// Recorded latents of another encoder snapshot than the one the replay declares (spec 41 §4
     /// `ReplaySpec.snapshot`); only `Diagnostic` replays may mix snapshots.
     #[error("latents of snapshot(s) `{found}` mixed into a replay declared on `{declared}`")]

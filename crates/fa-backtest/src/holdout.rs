@@ -38,8 +38,11 @@ pub struct HoldoutPolicy {
     pub embargo_ms: i64,
     /// Minimum bars of the timescale the segment must contain on its best-covered instrument.
     pub min_bars: usize,
-    /// Re-lock (a new segment after the latest one) once the latest holdout ended this long ago;
-    /// `None` = never (spec 41 Q5 is open; a re-lock invalidates gate results on the old one).
+    /// Re-lock (a new, full-length segment after the latest one) once the latest holdout ended
+    /// `max(this, length_ms)` ago; `None` = never. Spec 41 Q5 decision: weekly
+    /// ([`RELOCK_AFTER_MS`], `risk.toml [holdout] relock_after_days = 7`), so the 1 s / 1 m
+    /// holdouts stay within a week of the present and each one serves a bounded number of
+    /// pipeline rounds; slow timescales re-lock once a full holdout length has passed.
     pub relock_after_ms: Option<i64>,
 }
 
@@ -82,7 +85,9 @@ pub fn plan_lock(ts: Timescale, policy: &HoldoutPolicy, now_ms: i64, existing: &
     match latest {
         None => LockPlan::Lock { start_ms: end - length, end_ms: end, relock: false, embargo_ms },
         Some(h) => match policy.relock_after_ms {
-            Some(age) if now_ms - h.end_ms >= age => {
+            // Q5: due once the latest holdout ended `max(relock_after, length)` ago, so the new
+            // segment is a full-length one that never overlaps the old
+            Some(age) if now_ms - h.end_ms >= age.max(length) => {
                 // the new segment never overlaps the old one
                 let start = (end - length).max(h.end_ms);
                 if end - start < bar {
@@ -95,6 +100,9 @@ pub fn plan_lock(ts: Timescale, policy: &HoldoutPolicy, now_ms: i64, existing: &
         },
     }
 }
+
+/// Re-lock age of the Q5 decision: one week.
+pub const RELOCK_AFTER_MS: i64 = 7 * 86_400_000;
 
 /// Floor of every embargo: one minute.
 pub const MIN_EMBARGO_MS: i64 = 60_000;
@@ -178,11 +186,13 @@ mod tests {
             plan_lock(Timescale::Second, &p, 124 * H, &old),
             LockPlan::Lock { start_ms: 122 * H, end_ms: 124 * H, relock: true, embargo_ms: 0 }
         );
-        // length longer than the time since the old end → starts exactly at the old end
+        // a re-lock waits until a full-length segment fits after the old end (Q5: disjoint,
+        // full-size holdouts), then starts no earlier than the old end
         let p = HoldoutPolicy { length_ms: 48 * H, ..p };
+        assert!(matches!(plan_lock(Timescale::Second, &p, 124 * H, &old), LockPlan::Locked(_)));
         assert_eq!(
-            plan_lock(Timescale::Second, &p, 124 * H, &old),
-            LockPlan::Lock { start_ms: 100 * H, end_ms: 124 * H, relock: true, embargo_ms: 0 }
+            plan_lock(Timescale::Second, &p, 148 * H + 1, &old),
+            LockPlan::Lock { start_ms: 100 * H, end_ms: 148 * H, relock: true, embargo_ms: 0 }
         );
     }
 

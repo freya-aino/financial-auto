@@ -204,6 +204,19 @@ QUERY crossPriors(timescale: String) =>
     c <- N<CrossPrior>({timescale: timescale})::ORDER<Desc>(_::{score})
     RETURN c
 
+// upsertRegionEpisodes (batched): by episode_id; pruneRegionEpisodes drops those with t_exit < cutoff.
+QUERY upsertRegionEpisodes(episode_id: String, region_id: String, expert_space_id: String, timescale: String, instrument_id: String, t_enter: Date, t_exit: Date, bars: U32, max_weight: F64, mean_weight: F64) =>
+    e <- AddN<RegionEpisode>({episode_id: episode_id, region_id: region_id, expert_space_id: expert_space_id, timescale: timescale, instrument_id: instrument_id, t_enter: t_enter, t_exit: t_exit, bars: bars, max_weight: max_weight, mean_weight: mean_weight})
+    RETURN e
+
+QUERY regionEpisodes(region_id: String) =>
+    e <- N<RegionEpisode>({region_id: region_id})::ORDER<Desc>(_::{t_exit})
+    RETURN e
+
+QUERY pruneRegionEpisodes(timescale: String, cutoff: Date) =>
+    N<RegionEpisode>({timescale: timescale})::WHERE(_::{t_exit}::LT(cutoff))::DROP
+    RETURN "ok"
+
 // ── Latent vectors (centroids, observations, retrieval windows) ─────────
 QUERY addLatent(vector: [F64], expert_space_id: String, kind: String, ref_id: String, instrument_id: String, uncertainty: F64) =>
     v <- AddV<LatentVec>(vector, {expert_space_id: expert_space_id, kind: kind, ref_id: ref_id, instrument_id: instrument_id, uncertainty: uncertainty})

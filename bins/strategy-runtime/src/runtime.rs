@@ -26,9 +26,9 @@ use std::{
 use fa_core::{InstrumentId, Timescale};
 use fa_proto::v1::{DecoderOutput, LatentState, RegionEvent, RegionLifecycleEvent, TransitionUpdate};
 use fa_strategies::{
-    AssetExposure, ExposureDistribution, GpStrategy, Strategy, StrategyContext,
+    AssetExposure, ExposureDistribution, Strategy, StrategyContext,
     decoders::{AnalogRequest, DEFAULT_MAX_AGE_MS, DecoderOutputs, PriceLookup},
-    features::{FallbackContext, LatentInfo, LiveContext, PriceSeries, Sources, VirtualBook},
+    features::{FallbackContext, LatentInfo, LiveContext, PriceSeries, Sources, StrategyEquity, VirtualBook},
     graph::LatentGraph,
     population::{PopulationError, StrategyDef, StrategyFile},
     remap::{LineageBook, RemapReport, remap_def},
@@ -145,7 +145,16 @@ pub struct MemberStats {
 
 struct Member {
     def: StrategyDef,
-    strategy: GpStrategy,
+    strategy: Box<dyn Strategy>,
+    /// Asset-set gene (spec 35 §6.3); empty = every tracked instrument.
+    assets: BTreeSet<InstrumentId>,
+    /// Virtual equity behind `drawdown` (spec 35 §4.2).
+    equity: StrategyEquity,
+    /// Bound snapshot served in parallel while the timescale serves another one (spec 35 §6.5):
+    /// the strategy keeps reading it until it is no longer published.
+    parallel: Option<String>,
+    /// The remapped replacement evaluated next to it on the live snapshot (shadow only).
+    twin: Option<Twin>,
     next_step_ms: i64,
     books: BTreeMap<InstrumentId, VirtualBook>,
     last_price: BTreeMap<InstrumentId, f64>,
@@ -160,7 +169,11 @@ impl Member {
     fn new(def: &StrategyDef) -> Result<Self, PopulationError> {
         Ok(Self {
             def: def.clone(),
-            strategy: def.build()?,
+            strategy: def.build_dyn()?,
+            assets: def.assets.iter().filter_map(|a| Uuid::parse_str(a).ok().map(InstrumentId)).collect(),
+            equity: StrategyEquity::default(),
+            parallel: None,
+            twin: None,
             next_step_ms: 0,
             books: BTreeMap::new(),
             last_price: BTreeMap::new(),
@@ -175,6 +188,33 @@ impl Member {
         self.fallback_since.iter().filter(|(_, since)| now_ms - **since > after_ms).map(|(p, _)| *p).collect()
     }
 }
+
+/// The remapped replacement of a strategy whose bound snapshot is still served in parallel
+/// (spec 35 §6.5): evaluated on the live snapshot every step of the original, published on
+/// `signal.shadow.<strategy_id>` (never traded), and compared with the original.
+struct Twin {
+    def: StrategyDef,
+    strategy: Box<dyn Strategy>,
+    books: BTreeMap<InstrumentId, VirtualBook>,
+    steps: u64,
+    /// Σ |mean_twin − mean_original| and steps whose mean signs agree.
+    abs_diff: f64,
+    sign_agree: u64,
+    since_ms: i64,
+}
+
+impl Twin {
+    fn stats(&self) -> serde_json::Value {
+        let n = self.steps.max(1) as f64;
+        serde_json::json!({"snapshot": self.def.snapshot, "steps": self.steps, "since_ms": self.since_ms,
+            "mean_abs_diff": self.abs_diff / n, "sign_agreement": self.sign_agree as f64 / n,
+            "signal": self.def.signal})
+    }
+}
+
+/// Newest state of a parallel snapshot older than this many bars (at least 2 min) ends the
+/// parallel serving: the strategy is remapped onto the live snapshot.
+pub const PARALLEL_STALE_BARS: i64 = 5;
 
 #[derive(Debug, Clone, PartialEq)]
 struct Latent {
@@ -329,6 +369,8 @@ pub struct Runtime {
     /// Last closed bar bucket fed to the graph per (timescale, instrument).
     last_bucket: BTreeMap<(Timescale, InstrumentId), i64>,
     pub graph: LatentGraph,
+    /// Shadow distributions of remapped replacements (`signal.shadow.<id>`), drained by the caller.
+    shadow_out: Vec<ExposureDistribution>,
     pub decoders: DecoderOutputs,
     pub analogs: AnalogCache,
     paused: BTreeMap<String, PauseReason>,
@@ -381,6 +423,7 @@ impl Runtime {
             latent: BTreeMap::new(),
             last_bucket: BTreeMap::new(),
             graph: LatentGraph::new(),
+            shadow_out: Vec::new(),
             decoders: DecoderOutputs::new(),
             analogs: AnalogCache::default(),
             paused: BTreeMap::new(),
@@ -538,6 +581,19 @@ impl Runtime {
             .insert((ts, inst), Latent { info: LatentInfo { region_id: e.region_id.clone(), uncertainty, dwell } });
     }
 
+    /// `latent.shadow.<ts>.<inst>`: a snapshot model-runtime serves in parallel (spec 35 §6.5).
+    pub fn on_parallel_latent(&mut self, state: &LatentState) {
+        let Ok(uuid) = Uuid::parse_str(&state.instrument_id) else { return };
+        if self.tracks(InstrumentId(uuid)) {
+            self.graph.on_parallel_state(state);
+        }
+    }
+
+    /// Shadow distributions of the remapped replacements produced since the last call.
+    pub fn take_shadow_signals(&mut self) -> Vec<ExposureDistribution> {
+        std::mem::take(&mut self.shadow_out)
+    }
+
     pub fn on_region(&mut self, ev: &RegionEvent, now_ms: i64) {
         self.graph.on_region(ev, now_ms);
     }
@@ -559,8 +615,49 @@ impl Runtime {
                 if matches!(self.paused.get(&m.def.id), Some(PauseReason::Snapshot { .. })) {
                     self.paused.remove(&m.def.id);
                 }
+                m.parallel = None;
+                m.twin = None;
                 continue;
             }
+            // Parallel serving (spec 35 §6.5): while model-runtime still publishes the bound
+            // snapshot (`latent.shadow.<ts>.*`, e.g. `ctl.model.shadow` of the previous
+            // snapshot after a swap) the strategy keeps reading it, and its remapped replacement
+            // runs next to it on the live snapshot in shadow (`signal.shadow.<id>`).
+            let bar_ms = m.def.timescale.duration().as_millis() as i64;
+            let fresh_ms = (PARALLEL_STALE_BARS * bar_ms).max(120_000);
+            // served in parallel = its states keep pace with the live snapshot's (within one bar)
+            // and are recent; the last states before a plain swap are older than the new ones
+            let live_last = self.graph.last_state_ms(m.def.timescale, &live).unwrap_or(i64::MIN);
+            if self
+                .graph
+                .last_state_ms(m.def.timescale, &bound)
+                .is_some_and(|t| now_ms - t <= fresh_ms && t >= live_last.saturating_sub(bar_ms))
+            {
+                if m.parallel.as_deref() != Some(bound.as_str()) {
+                    tracing::info!(strategy = %m.def.id, %bound, %live, "bound snapshot served in parallel: strategy stays on it");
+                }
+                m.parallel = Some(bound.clone());
+                if matches!(self.paused.get(&m.def.id), Some(PauseReason::Snapshot { .. })) {
+                    self.paused.remove(&m.def.id);
+                }
+                if m.twin.as_ref().is_none_or(|t| t.def.snapshot.as_deref() != Some(live.as_str())) {
+                    m.twin = remap_def(&m.def, &live, &self.lineage).0.and_then(|d| {
+                        let strategy = d.build_dyn().ok()?;
+                        Some(Twin {
+                            def: d,
+                            strategy,
+                            books: BTreeMap::new(),
+                            steps: 0,
+                            abs_diff: 0.0,
+                            sign_agree: 0,
+                            since_ms: now_ms,
+                        })
+                    });
+                }
+                continue;
+            }
+            m.parallel = None;
+            m.twin = None;
             let prev = self.remaps.get(&m.def.id);
             if prev.is_some_and(|p| {
                 !p.ok && p.from == bound && p.to == live && p.lineage_events == self.lineage.events
@@ -573,7 +670,7 @@ impl Runtime {
                 Some(p) if p.from == bound && p.to == live && p.ok == ok => p.at_ms,
                 _ => now_ms,
             };
-            match def.map(|d| d.build().map(|s| (d, s))) {
+            match def.map(|d| d.build_dyn().map(|s| (d, s))) {
                 Some(Ok((d, strategy))) => {
                     tracing::warn!(strategy = %m.def.id, from = %bound, to = %live, signal = %d.signal, "strategy remapped onto the new snapshot");
                     m.def = d;
@@ -674,6 +771,7 @@ impl Runtime {
         let mut wanted: Vec<AnalogKey> = Vec::new();
         let (mut unresolved, mut resolved_tsdb, mut resolved_memory) = (0u64, 0u64, 0u64);
         let mut new_pauses: Vec<(String, PauseReason)> = Vec::new();
+        let mut shadow: Vec<ExposureDistribution> = Vec::new();
         for m in &mut self.members {
             if now_ms < m.next_step_ms {
                 continue;
@@ -683,9 +781,12 @@ impl Runtime {
             let pause = self.paused.get(&m.def.id);
 
             // auto-paused: not evaluated, flat with full uncertainty
+            // asset-set gene (spec 35 §6.3)
+            let traded: Vec<InstrumentId> =
+                instruments.iter().copied().filter(|i| m.assets.is_empty() || m.assets.contains(i)).collect();
             if pause.is_some_and(PauseReason::is_auto) {
                 let exposures: Vec<AssetExposure> =
-                    instruments.iter().map(|i| AssetExposure { instrument: *i, mean: 0.0, stddev: 1.0 }).collect();
+                    traded.iter().map(|i| AssetExposure { instrument: *i, mean: 0.0, stddev: 1.0 }).collect();
                 for e in &exposures {
                     m.books.insert(e.instrument, VirtualBook::default());
                 }
@@ -703,13 +804,20 @@ impl Runtime {
             }
 
             let ts = m.def.timescale;
-            let view = graph.at(ts, now_ms);
-            let lookups: Vec<(InstrumentId, LayeredPrices<'_>)> = instruments
+            // a bound strategy whose snapshot is served in parallel reads that snapshot's states
+            let view = match &m.parallel {
+                Some(snap) => graph.at_snapshot(ts, snap, now_ms),
+                None => graph.at(ts, now_ms),
+            };
+            let lookups: Vec<(InstrumentId, LayeredPrices<'_>)> = traded
                 .iter()
                 .filter_map(|i| Some((*i, LayeredPrices { series: prices.get(i)?, fetched: analogs.points.get(i) })))
                 .collect();
             let mut new_prices: Vec<(InstrumentId, f64)> = Vec::new();
-            let contexts: Vec<(InstrumentId, LiveContext<'_>)> = lookups
+            // closes and marked books first: the strategy-level book (`exposure_gross`,
+            // `drawdown`) is the same for every asset of the step
+            let mut step_ret = 0.0;
+            let marked: Vec<(InstrumentId, &LayeredPrices<'_>, Vec<f64>, VirtualBook)> = lookups
                 .iter()
                 .filter_map(|(inst, lookup)| {
                     let closes = lookup.series.closes(ts, m.def.lookback_bars + 1);
@@ -718,17 +826,29 @@ impl Runtime {
                     if let Some(prev) = m.last_price.get(inst)
                         && *prev > 0.0
                     {
-                        book.unrealised += book.exposure * (price / prev).ln();
+                        let r = book.exposure * (price / prev).ln();
+                        book.unrealised += r;
+                        step_ret += r;
                     }
                     new_prices.push((*inst, price));
+                    Some((*inst, lookup, closes, book))
+                })
+                .collect();
+            let mut equity = m.equity;
+            equity.add(step_ret);
+            let portfolio = equity.summary(marked.iter().map(|x| &x.3));
+            let contexts: Vec<(InstrumentId, LiveContext<'_>)> = marked
+                .iter()
+                .map(|(inst, lookup, closes, book)| {
                     let info = latent.get(&(ts, *inst)).map(|l| l.info.clone());
-                    let ctx = LiveContext::new(FallbackContext::new(&closes, info, book), *inst, m.def.steps)
+                    let fb = FallbackContext::new(closes, info, *book).with_portfolio(portfolio);
+                    let c = LiveContext::new(fb, *inst, m.def.steps)
                         .with_graph(&view)
                         .with_snapshot(m.def.snapshot.as_deref())
                         .with_bar(ts)
                         .with_decoders(decoders.at(*inst, now_ms, settings.decoder_max_age_ms))
-                        .with_prices(lookup as &dyn PriceLookup);
-                    Some((*inst, ctx))
+                        .with_prices(*lookup as &dyn PriceLookup);
+                    (*inst, c)
                 })
                 .collect();
 
@@ -804,6 +924,7 @@ impl Runtime {
             for (inst, p) in new_prices {
                 m.last_price.insert(inst, p);
             }
+            m.equity = equity;
             if nan_insts > 0 {
                 m.stats.nan_steps += 1;
                 m.stats.nan_outputs += nan_insts;
@@ -839,6 +960,39 @@ impl Runtime {
             let n = exposures.len().max(1) as f64;
             m.stats.last_mean = exposures.iter().map(|e| e.mean).sum::<f64>() / n;
             m.stats.last_std = exposures.iter().map(|e| e.stddev).sum::<f64>() / n;
+            // the remapped replacement on the live snapshot (shadow, spec 35 §6.5)
+            if let Some(tw) = &mut m.twin {
+                let live_view = graph.at(ts, now_ms);
+                let twin_ctx: Vec<(InstrumentId, LiveContext<'_>)> = marked
+                    .iter()
+                    .map(|(inst, lookup, closes, _)| {
+                        let book = tw.books.get(inst).copied().unwrap_or_default();
+                        let info = latent.get(&(ts, *inst)).map(|l| l.info.clone());
+                        let c = LiveContext::new(FallbackContext::new(closes, info, book).with_portfolio(portfolio), *inst, tw.def.steps)
+                            .with_graph(&live_view)
+                            .with_snapshot(tw.def.snapshot.as_deref())
+                            .with_bar(ts)
+                            .with_decoders(decoders.at(*inst, now_ms, settings.decoder_max_age_ms))
+                            .with_prices(*lookup as &dyn PriceLookup);
+                        (*inst, c)
+                    })
+                    .collect();
+                let assets: Vec<(InstrumentId, &dyn StrategyContext)> =
+                    twin_ctx.iter().map(|(i, c)| (*i, c as &dyn StrategyContext)).collect();
+                let mut d = tw.strategy.step(now_ms, &assets);
+                fa_strategies::take_non_finite();
+                for e in &mut d.exposures {
+                    sanitize(e);
+                    tw.books.insert(e.instrument, VirtualBook { exposure: e.mean, ..Default::default() });
+                }
+                let tm = d.exposures.iter().map(|e| e.mean).sum::<f64>() / d.exposures.len().max(1) as f64;
+                tw.steps += 1;
+                tw.abs_diff += (tm - m.stats.last_mean).abs();
+                tw.sign_agree += u64::from(tm.signum() == m.stats.last_mean.signum());
+                d.strategy_id = m.def.id.clone();
+                d.genome_id = tw.def.genome_id.clone();
+                shadow.push(d);
+            }
             self.signals_emitted += 1;
             out.push(ExposureDistribution {
                 strategy_id: m.def.id.clone(),
@@ -848,6 +1002,7 @@ impl Runtime {
                 exposures,
             });
         }
+        self.shadow_out.extend(shadow);
         self.analog_unresolved += unresolved;
         self.analog_resolved_tsdb += resolved_tsdb;
         self.analog_resolved_memory += resolved_memory;
@@ -880,6 +1035,9 @@ impl Runtime {
             ("lineage.events".to_owned(), self.lineage.events as f64),
             ("lineage.snapshots".to_owned(), self.lineage.snapshots() as f64),
             ("snapshot.remapped".to_owned(), self.remaps.values().filter(|r| r.ok).count() as f64),
+            ("snapshot.parallel".to_owned(), self.members.iter().filter(|m| m.parallel.is_some()).count() as f64),
+            ("snapshot.twins".to_owned(), self.members.iter().filter(|m| m.twin.is_some()).count() as f64),
+            ("strategies.neural".to_owned(), self.members.iter().filter(|m| m.def.is_neural()).count() as f64),
             (
                 "snapshot.suspended".to_owned(),
                 self.paused.values().filter(|r| matches!(r, PauseReason::Snapshot { .. })).count() as f64,
@@ -973,7 +1131,12 @@ impl Runtime {
                             "from": r.from, "to": r.to, "ok": r.ok, "at_ms": r.at_ms, "report": r.report,
                         })),
                         "remapped_ms": self.remaps.get(&m.def.id).filter(|r| r.ok).map(|r| r.at_ms),
+                        "parallel": m.parallel,
+                        "twin": m.twin.as_ref().map(Twin::stats),
                     },
+                    "representation": if m.def.is_neural() { "neural" } else { "gp" },
+                    "assets": m.def.assets,
+                    "drawdown": m.equity.drawdown(),
                     "starved": !starved.is_empty(),
                     "starved_primitives": starved,
                     "stats": {
@@ -1239,6 +1402,81 @@ mod tests {
     }
 
     #[test]
+    fn neural_policies_run_live_on_their_asset_set() {
+        use fa_strategies::{
+            genome::StrategyGenome,
+            neural::{ALL_FEATURES, Act, PolicyNet},
+        };
+        let (a, b) = (InstrumentId::new(), InstrumentId::new());
+        let net = PolicyNet::random(&mut fa_core::rng::Rng::seed(2), ALL_FEATURES, 0, 0, vec![6], Act::Tanh)
+            .perturb(&mut fa_core::rng::Rng::seed(3), 2.0);
+        let mut g = StrategyGenome::neural(Timescale::Second, 2, 8, net);
+        g.set_assets([a.to_string()]);
+        let text = StrategyGenome::population_toml(&[g.clone()], "test");
+        let file = StrategyFile::parse(&text).unwrap();
+        let mut rt = Runtime::new(&file).unwrap();
+        for i in 0..30 {
+            rt.on_trade(a, i * 1_000, 100.0 + (i as f64 * 0.4).sin());
+            rt.on_trade(b, i * 1_000, 50.0 + (i as f64 * 0.3).cos());
+        }
+        let d = rt.tick(30_000);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].strategy_id, g.id());
+        assert_eq!(d[0].exposures.len(), 1, "only the asset set is traded");
+        assert_eq!(d[0].exposures[0].instrument, a);
+        let e = d[0].exposures[0];
+        assert!(e.mean.abs() <= 1.0 && (0.0..=1.0).contains(&e.stddev));
+        let st = rt.status(30_000);
+        assert_eq!(st["strategies"][0]["representation"], "neural");
+        assert_eq!(rt.heartbeat_counters(30_000)["strategies.neural"], 1.0);
+    }
+
+    #[test]
+    fn a_snapshot_served_in_parallel_keeps_the_strategy_and_shadows_its_replacement() {
+        let file = StrategyFile::parse(
+            "[[strategy]]\nid='gp-lit'\ngenome_id='gp-lit'\ntimescale='1s'\nsnapshot='s1'\n\
+             signal='(mul 3 (sub 0.5 (dwell (region 0 2))))'\n",
+        )
+        .unwrap();
+        let mut rt = Runtime::new(&file).unwrap();
+        let inst = InstrumentId::new();
+        for i in 0..40 {
+            rt.on_trade(inst, i * 1_000, 100.0 + i as f64 * 0.1);
+        }
+        rt.on_region(&created("s1", "s1-e0-r002"), 0);
+        rt.on_latent(&state_of("s1", inst, 19_000, "s1-e0-r002"));
+        rt.tick(20_000);
+        // swap to s2, while model-runtime keeps serving s1 in parallel (latent.shadow)
+        rt.on_lifecycle(&carried("s2", "s2-e0-r007", "s1-e0-r002"));
+        rt.on_region(&created("s2", "s2-e0-r007"), 20_500);
+        rt.on_latent(&state_of("s2", inst, 21_000, "s2-e0-r007"));
+        rt.on_parallel_latent(&state_of("s1", inst, 21_000, "s1-e0-r002"));
+        let d = rt.tick(22_000);
+        let m = rt.members.iter().find(|m| m.def.id == "gp-lit").unwrap();
+        assert_eq!(m.def.snapshot.as_deref(), Some("s1"), "not remapped while s1 is served");
+        assert_eq!(m.parallel.as_deref(), Some("s1"));
+        assert_eq!(m.twin.as_ref().unwrap().def.signal, "(mul 3 (sub 0.5 (dwell (region 0 7))))");
+        assert!(rt.remap_of("gp-lit").is_none());
+        assert_eq!(d.len(), 1, "the original trades");
+        let sh = rt.take_shadow_signals();
+        assert_eq!(sh.len(), 1, "the replacement is shadowed");
+        assert_eq!(sh[0].strategy_id, "gp-lit");
+        assert_eq!(rt.heartbeat_counters(22_000)["snapshot.twins"], 1.0);
+        let st = rt.status(22_000);
+        assert_eq!(st["strategies"][0]["snapshot"]["twin"]["steps"], 1);
+        // s1 stops: after the staleness window the strategy is remapped onto s2 as before
+        rt.on_latent(&state_of("s2", inst, 200_000, "s2-e0-r007"));
+        for i in 40..60 {
+            rt.on_trade(inst, 200_000 + i * 10, 104.0);
+        }
+        rt.tick(201_000);
+        let m = rt.members.iter().find(|m| m.def.id == "gp-lit").unwrap();
+        assert_eq!(m.def.snapshot.as_deref(), Some("s2"));
+        assert!(m.parallel.is_none() && m.twin.is_none());
+        assert!(rt.remap_of("gp-lit").unwrap().ok);
+    }
+
+    #[test]
     fn snapshot_change_remaps_literals_or_suspends() {
         let file = StrategyFile::parse(
             "[[strategy]]\nid='gp-lit'\ngenome_id='gp-lit'\ntimescale='1s'\nsnapshot='s1'\n\
@@ -1320,7 +1558,7 @@ mod tests {
         assert_eq!(rt.paused().count(), 0, "paused id that left the population is forgotten");
         let kept = rt.members.iter().find(|m| m.def.id == "baseline-momentum-1s").unwrap();
         assert_eq!(kept.books[&inst], before, "surviving id keeps its virtual book");
-        assert_eq!(kept.strategy.genome_id, "gen-3-abc");
+        assert_eq!(kept.strategy.genome_id(), "gen-3-abc");
         let dists = rt.tick(41_000);
         assert_eq!(dists.len(), 2);
         assert_eq!(dists[0].genome_id, "gen-3-abc");

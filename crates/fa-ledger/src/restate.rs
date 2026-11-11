@@ -3,7 +3,7 @@
 //! Fills booked before their instrument's quote currency was known carry `ccy = 'EUR'` at rate
 //! 1 (`fx_source` `eur` / `fixed`) although their prices are in the quote currency. A
 //! restatement re-labels them with the instrument's quote currency and the EUR rate valid at
-//! the fill time (latest `ref.fx_rate.ts ≤ filled_at`, `ecb_daily` preferred), leaving
+//! the fill time (latest `ref.fx_rate.ts ≤ filled_at` of the accounting source `ecb_daily`), leaving
 //! quantity, price and the (EUR) fee untouched.
 //!
 //! It is a dry run unless explicitly applied: [`PgLedger::plan_fx_restatement`] reads the
@@ -141,8 +141,8 @@ impl PgLedger {
              JOIN ledger.venue_order vo ON vo.client_order_id = f.client_order_id \
              JOIN ledger.order_intent oi ON oi.id = vo.intent_id \
              LEFT JOIN LATERAL (SELECT x.rate_to_eur, x.source_id, x.ts FROM ref.fx_rate x \
-                                WHERE x.ccy = $4 AND x.ts <= f.filled_at \
-                                ORDER BY x.ts DESC, (x.source_id = 'ecb_daily') DESC LIMIT 1) r ON true \
+                                WHERE x.ccy = $4 AND x.ts <= f.filled_at AND x.source_id = $5 \
+                                ORDER BY x.ts DESC LIMIT 1) r ON true \
              WHERE oi.book = $1 AND oi.instrument_id = $2 AND upper(f.ccy) = $3 \
              ORDER BY f.filled_at, f.id",
         )
@@ -150,6 +150,7 @@ impl PgLedger {
         .bind(req.instrument.0)
         .bind(&from_ccy)
         .bind(&ccy)
+        .bind(crate::pg_accounting::ACCOUNTING_FX_SOURCE)
         .fetch_all(self.pool())
         .await?;
         let mut fills = Vec::new();
@@ -456,5 +457,30 @@ mod tests {
 
     fn dec(x: f64) -> Decimal {
         money::dec(x)
+    }
+
+    /// FX source policy: the ledger's reads use the ECB daily rate even when a newer intraday
+    /// row (risk-engine `[fx] intraday`, source `yahoo`) exists. Test-scoped currency, removed after.
+    #[tokio::test]
+    async fn ledger_fx_reads_use_the_accounting_source_only() {
+        let Some(pg) = ledger().await else { return };
+        let ccy = format!("Q{}", &uuid::Uuid::now_v7().simple().to_string()[24..26]).to_uppercase();
+        let d1 = chrono::DateTime::parse_from_rfc3339("2099-03-01T00:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        for (ts, rate, src) in [(d1, "0.5", "ecb_daily"), (d1 + chrono::Duration::hours(1), "0.6", "yahoo")] {
+            sqlx::query("INSERT INTO ref.fx_rate (ccy, ts, rate_to_eur, source_id) VALUES ($1, $2, $3::numeric, $4)")
+                .bind(&ccy)
+                .bind(ts)
+                .bind(rate)
+                .bind(src)
+                .execute(pg.pool())
+                .await
+                .unwrap();
+        }
+        let at = d1 + chrono::Duration::hours(2);
+        let r = pg.rate_to_eur(&ccy, at).await;
+        let m = pg.fx_rates_at(std::slice::from_ref(&ccy), at).await;
+        sqlx::query("DELETE FROM ref.fx_rate WHERE ccy = $1").bind(&ccy).execute(pg.pool()).await.unwrap();
+        assert_eq!(r.unwrap(), Some((dec(0.5), "ecb_daily".to_owned())), "intraday row ignored");
+        assert_eq!(m.unwrap().get(&ccy).copied(), Some(dec(0.5)));
     }
 }

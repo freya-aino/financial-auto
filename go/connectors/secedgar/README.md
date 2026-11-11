@@ -16,4 +16,4 @@ SEC EDGAR filings via the submissions API, catalog id `sec_edgar`. No key; a dec
 `facts_test.go` on `testdata/companyfacts_aapl.json` (live, trimmed to 10 whitelisted + 2 other facts): mapping, periods, vintages, whitelist, cadence, cursor/restart, subject, determinism. `secedgar_test.go` on `testdata/submissions_aapl.json` (live, trimmed to 5 filings) and `testdata/submissions_aapl_001.json` (older page, trimmed to 3): mapping, document URLs, dedup, cursor/restart, first-run lookback, User-Agent handling (403), deterministic payloads, backfill range incl. older pages, estimated times, CIK parsing.
 
 ## Governing specs
-- [10-ingestion](../../../specs/10-ingestion.md), [11-source-catalog](../../../specs/11-source-catalog.md), [20-storage](../../../specs/20-storage.md) (filings metadata in `wh`)
+- [Ingestion reference (ex spec 10)](../../services/ingestor/README.md#ingestion-reference), [Source catalog reference (ex spec 11)](../../pkg/catalog/README.md#source-catalog-reference), [20-storage](../../../specs/20-storage.md) (filings metadata in `wh`)

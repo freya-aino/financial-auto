@@ -22,6 +22,8 @@
 //! * `GET /api/trading/lots?book=&at=`, `GET /api/trading/pnl/breakdown?book=&from=&to=`
 //! * `GET /api/trading/orphans?status=`, `POST /api/trading/orphans/{id}/resolve` (`OrphanAction`)
 //! * `POST /api/trading/payouts` `{book?, day, amount_eur}`
+//! * `GET /api/trading/tax/realised?book=&year=&method=fifo|lifo|average&year_start=MM-DD&format=json|csv`
+//!   (`fa_ledger::tax`: realised gains per tax year and instrument, EUR at the booking rates)
 //!
 //! Everything answers 503 without Postgres.
 use axum::{
@@ -66,6 +68,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/trading/orphans/{id}/resolve", post(resolve_orphan))
         .route("/api/trading/payouts", post(payout))
         .route("/api/trading/restatements/fx", post(restate_fx))
+        .route("/api/trading/tax/realised", get(tax_realised))
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -110,7 +113,7 @@ macro_rules! ts_or_return {
 
 /// Audit + `ref.changed.<entity>` notice; failures are logged, never fatal.
 async fn announce(s: &AppState, pool: &PgPool, entity: &str, ids: Vec<String>, change: &str, payload: Value) {
-    if let Err(e) = fa_warehouse::audit::append(pool, ACTOR, &format!("ref.{entity}.{change}"), ids.first().map(String::as_str), payload).await {
+    if let Err(e) = crate::audit::append(pool, ACTOR, &format!("ref.{entity}.{change}"), ids.first().map(String::as_str), payload).await {
         tracing::warn!(error = %e, "audit append failed");
     }
     if let Some(nats) = &s.nats {
@@ -396,7 +399,7 @@ async fn payout(State(s): State<AppState>, Json(b): Json<PayoutBody>) -> Respons
     let bk = b.book.clone().unwrap_or_else(|| "paper".into());
     match PgLedger::from_pool(pool.clone()).record_payout(&bk, b.day, b.amount_eur).await {
         Ok(created) => {
-            if let Err(e) = fa_warehouse::audit::append(&pool, ACTOR, "ledger.payout", Some(&bk), json!(b)).await {
+            if let Err(e) = crate::audit::append(&pool, ACTOR, "ledger.payout", Some(&bk), json!(b)).await {
                 tracing::warn!(error = %e, "audit append failed");
             }
             Json(json!({ "ok": true, "created": created })).into_response()
@@ -442,7 +445,10 @@ async fn restate_fx(State(s): State<AppState>, Json(b): Json<RestateBody>) -> Re
             return err(StatusCode::BAD_REQUEST, "apply needs a reason");
         };
         match l.apply_fx_restatement(&plan, ACTOR, reason).await {
-            Ok(a) => Some(a),
+            Ok(a) => {
+                crate::audit::note("ledger.restatement"); // written by fa-ledger in the same transaction
+                Some(a)
+            }
             Err(fa_ledger::pg::PgError::Invalid(m)) => return err(StatusCode::CONFLICT, m),
             Err(e) => return db_err(e),
         }
@@ -458,6 +464,39 @@ async fn restate_fx(State(s): State<AppState>, Json(b): Json<RestateBody>) -> Re
     plan.fills.truncate(b.fills.unwrap_or(20));
     Json(json!({ "dry_run": applied.is_none(), "fills_total": total, "plan": plan, "applied": applied }))
         .into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TaxQuery {
+    book: Option<String>,
+    year: Option<i32>,
+    method: Option<String>,
+    year_start: Option<String>,
+    format: Option<String>,
+}
+
+/// `GET /api/trading/tax/realised` (spec 42 §10 Q2): the jurisdiction-neutral realised-gains
+/// report (`fa_ledger::tax`); read-only. `method` defaults to `fifo`, `year_start` to `01-01`.
+async fn tax_realised(State(s): State<AppState>, Query(q): Query<TaxQuery>) -> Response {
+    let pool = pool_or_return!(s);
+    let method = match q.method.as_deref().map(str::parse::<fa_ledger::tax::TaxLotMethod>).transpose() {
+        Ok(m) => m.unwrap_or_default(),
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    let year_start = match q.year_start.as_deref().map(str::parse::<fa_ledger::tax::TaxYearStart>).transpose() {
+        Ok(y) => y.unwrap_or_default(),
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    let opts = fa_ledger::tax::TaxReportOptions { method, year_start, year: q.year };
+    let b = q.book.clone().filter(|b| !b.trim().is_empty()).unwrap_or_else(|| "paper".into());
+    let l = PgLedger::from_pool(pool).with_stored_settlement().await;
+    match l.realised_gains(&b, &opts).await {
+        Ok(r) if q.format.as_deref() == Some("csv") => {
+            ([(header::CONTENT_TYPE, "text/csv; charset=utf-8")], r.to_csv()).into_response()
+        }
+        Ok(r) => Json(r).into_response(),
+        Err(e) => db_err(e),
+    }
 }
 
 #[cfg(test)]

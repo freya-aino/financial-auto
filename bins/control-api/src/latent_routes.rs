@@ -8,6 +8,10 @@
 //! | `POST /api/latent/snapshots/{id}/promote\|rollback` | `promote` first evaluates the spec 36 §6.4 checklist ([`promotion_checklist`]: manifest carried mass, shadow serving minutes, shadow region agreement) and answers 409 with it unless every item passes or the body says `{"force": true}`; then `HubClient::set_snapshot_status` and `ctl.model.reload` (`timescale`, `snapshot_id` = the new active) so model-runtime hot-swaps the encoder |
 //! | `POST\|DELETE /api/latent/snapshots/{id}/shadow`, `POST …/shadow/stop` | `ctl.model.shadow {timescale, snapshot_id \| "none"}`: model-runtime serves the candidate next to the active snapshot (`latent.shadow.<ts>.<inst>`, heartbeat gauges `shadow.<ts>.*`) |
 //! | `GET /api/latent/snapshots/{id}` | Helix row + manifest (Helix mirror, else Garage) + the promotion checklist + latest `AdapterState` |
+//! | `GET /api/generations` | encoder generation records (spec 36 §4.1 state machine, `validation.encoder_generation`), newest first; `?timescale=&limit=` |
+//! | `POST /api/generations` | enqueues a `train.cycle` job (`CycleSpec` body, at least `{timescale}`); 202 with `generation_id` |
+//! | `GET /api/generations/{id}` | the full generation record (phase events, frozen data window, candidates, Pareto selection, artefacts, validation) + `data_window` rows |
+//! | `POST /api/generations/{id}/abort` | marks a running generation `aborting` and cancels its job (`ctl.train.cancel`) |
 //! | `WS /ws/latent?snapshot=&instruments=` | `LatentState` changes from `live`, latest value per instrument, ≤ `runtime.ws.latent_hz` |
 use std::{
     collections::HashMap,
@@ -40,7 +44,7 @@ use crate::{
 };
 
 pub const DEFAULT_POINTS: usize = 2000;
-pub const MAX_POINTS: usize = 20_000;
+pub const MAX_POINTS: usize = 50_000;
 const CACHE_TTL: Duration = Duration::from_secs(30);
 
 pub fn router() -> Router<AppState> {
@@ -51,6 +55,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/latent/snapshots/{id}/shadow", post(shadow_start).delete(shadow_stop))
         .route("/api/latent/snapshots/{id}/shadow/stop", post(shadow_stop))
         .route("/api/latent/snapshots/{id}/{action}", post(snapshot_action))
+        .route("/api/generations", get(generations_list).post(generation_start))
+        .route("/api/generations/{id}", get(generation_detail))
+        .route("/api/generations/{id}/abort", post(generation_abort))
         .route("/ws/latent", get(ws_latent))
 }
 
@@ -179,7 +186,7 @@ pub struct ProjectionQuery {
     pub expert: Option<String>,
     /// `<n>m|h|d`, RFC 3339 or `all` (default) — lower bound on `ts`.
     pub range: Option<String>,
-    /// Points fetched (newest first); default 2000, max 20 000.
+    /// Points fetched (newest first); default 2000, max 50 000.
     pub n: Option<usize>,
     /// 2 or 3 (default 2).
     pub dims: Option<usize>,
@@ -563,7 +570,65 @@ async fn checklist_for(
             c.passed = c.checks.iter().all(|x| x.ok);
         }
     }
+    // Item 5 from the elite re-evaluations (`evo.reeval.decoder` → `meta.transfer[]` on the
+    // cards): authoritative over the trainer's frozen-feedback estimate when it exists.
+    if let Some(cards) = elite_cards(s).await
+        && let Some(chk) = card_transfer_check(&cards, &row.snapshot_id)
+    {
+        c.checks.retain(|x| x.name != "elite_transfer");
+        c.checks.push(chk);
+        c.passed = c.checks.iter().all(|x| x.ok);
+    }
     (c, manifest, source)
+}
+
+/// Elite decoder cards in Garage (`fa-models/decoders/**.card.json`); `None` without Garage.
+async fn elite_cards(s: &AppState) -> Option<Vec<fa_decoders::neural::feedback::EliteCard>> {
+    use fa_blob::BlobStore;
+    use fa_decoders::neural::feedback::{CARD_SUFFIX, EliteCard, PREFIX};
+    let secrets = fa_core::Secrets::load().ok()?;
+    let blob = fa_blob::S3BlobStore::from_config(&s.cfg, &secrets).ok()?;
+    let listed = blob.list(fa_blob::buckets::MODELS, PREFIX).await.ok()?;
+    let mut cards = Vec::new();
+    for o in listed.iter().filter(|o| o.key.ends_with(CARD_SUFFIX)) {
+        let key = fa_blob::ObjectKey { bucket: fa_blob::buckets::MODELS, key: o.key.clone() };
+        if let Ok(b) = blob.get(&key).await
+            && let Ok(c) = serde_json::from_slice::<EliteCard>(&b)
+        {
+            cards.push(c);
+        }
+    }
+    Some(cards)
+}
+
+/// Elites per output family re-evaluated for item 5 (as the trainer's feedback selection).
+const TRANSFER_ELITES_PER_FAMILY: usize = 4;
+
+/// Spec 36 §6.4 item 5 from the cards ([`fa_decoders::neural::feedback::transfer_check`]): every
+/// elite re-evaluated on `snapshot_id` keeps ≥ `1 − FA_PROMOTE_TRANSFER_TOL` (0.10) of its skill.
+/// `None` when no elite was re-evaluated on this snapshot (the manifest estimate or
+/// `not_evaluated` stays).
+pub fn card_transfer_check(cards: &[fa_decoders::neural::feedback::EliteCard], snapshot_id: &str) -> Option<Check> {
+    let tol = std::env::var("FA_PROMOTE_TRANSFER_TOL")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.10);
+    let t = fa_decoders::neural::feedback::transfer_check(cards, TRANSFER_ELITES_PER_FAMILY, snapshot_id, tol);
+    (t.evaluated > 0).then(|| Check {
+        name: "elite_transfer",
+        ok: t.passed == t.evaluated,
+        value: Some(1.0 - t.worst_ratio),
+        threshold: Some(tol),
+        detail: format!(
+            "re-evaluated elites (evo.reeval.decoder): {}/{} of {} kept ≥ {:.0} % of their skill on this snapshot (worst ratio {:.3})",
+            t.passed,
+            t.evaluated,
+            t.elites,
+            (1.0 - tol) * 100.0,
+            t.worst_ratio
+        ),
+    })
 }
 
 /// Spec 36 §6.4 items 1 (`ssl_regression`: next-step skill not worse than the parent by more than
@@ -637,14 +702,104 @@ pub fn manifest_health_checks(manifest: &Value) -> Vec<Check> {
             });
         }
     }
+    out.extend(manifest_transfer_checks(manifest));
     out
+}
+
+/// Spec 36 §6.4 items 4 (`mcmc_ece`: the region kernel's prequential ECE on the probe grid is
+/// not worse than the parent's on the same probes by more than `FA_PROMOTE_ECE_TOL`, 0.02) and 5
+/// (`elite_transfer`: the frozen feedback decoders lose at most `FA_PROMOTE_TRANSFER_TOL`, 10 %,
+/// when re-evaluated on the candidate's latents instead of the parent's), from the metrics the
+/// trainer writes (`bins/trainer/src/promotion.rs`). Without a parent to compare against, item 4
+/// is an `n/a` pass carrying the candidate's own ECE and item 5 an `n/a` pass; with a parent but
+/// no measurement the item yields no check and stays `not_evaluated`.
+pub fn manifest_transfer_checks(manifest: &Value) -> Vec<Check> {
+    let env = |k: &str, d: f64| {
+        std::env::var(k).ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite()).unwrap_or(d)
+    };
+    let metric = |k: &str| manifest["metrics"][k].as_f64();
+    let parent = manifest["parent_snapshot_id"].as_str().unwrap_or("");
+    let mut out = Vec::new();
+    // spec 31 §8: a candidate with collapsed experts (posterior / codebook collapse) is unfit
+    if let Some(c) = metric("collapsed") {
+        out.push(Check {
+            name: "expert_collapse",
+            ok: c <= 0.0,
+            value: Some(c),
+            threshold: Some(0.0),
+            detail: "manifest.metrics.collapsed: experts whose KL / code usage collapsed (spec 31 §8)".into(),
+        });
+    }
+    let ece_tol = env("FA_PROMOTE_ECE_TOL", 0.02);
+    match (metric("mcmc_ece_regression"), metric("mcmc_ece")) {
+        (Some(r), _) => out.push(Check {
+            name: "mcmc_ece",
+            ok: r <= ece_tol,
+            value: Some(r),
+            threshold: Some(ece_tol),
+            detail: format!(
+                "candidate ECE {:.4} − parent ECE {:.4} on {} shared probe transitions (prequential, Dirichlet kernel)",
+                metric("mcmc_ece_shared").unwrap_or(f64::NAN),
+                metric("parent_mcmc_ece").unwrap_or(f64::NAN),
+                metric("mcmc_ece_shared_n").unwrap_or(0.0)
+            ),
+        }),
+        (None, Some(e)) if parent.is_empty() => out.push(Check {
+            name: "mcmc_ece",
+            ok: true,
+            value: Some(e),
+            threshold: Some(ece_tol),
+            detail: format!("no parent snapshot: nothing to regress against (n/a; candidate ECE {e:.4})"),
+        }),
+        _ => {}
+    }
+    let tol = env("FA_PROMOTE_TRANSFER_TOL", 0.10);
+    let source = manifest["feedback"]["source"].as_str().unwrap_or("none");
+    match metric("elite_transfer") {
+        Some(t) => out.push(Check {
+            name: "elite_transfer",
+            ok: t <= tol,
+            value: Some(t),
+            threshold: Some(tol),
+            detail: format!(
+                "relative loss increase of {} frozen {source} decoder set(s): parent latents {:.4} → candidate {:.4}",
+                metric("elite_transfer_n").unwrap_or(0.0),
+                metric("elite_loss_parent").unwrap_or(f64::NAN),
+                metric("elite_loss_candidate").unwrap_or(f64::NAN)
+            ),
+        }),
+        None if parent.is_empty() && metric("mcmc_ece").is_some() => out.push(Check {
+            name: "elite_transfer",
+            ok: true,
+            value: None,
+            threshold: Some(tol),
+            detail: "no parent snapshot: no elites to transfer (n/a)".into(),
+        }),
+        None => {}
+    }
+    out
+}
+
+/// The [`NOT_EVALUATED`] items the checklist does not report as checks.
+pub fn not_evaluated_for(checklist: &Checklist) -> Vec<&'static str> {
+    let has = |n: &str| checklist.checks.iter().any(|c| c.name == n);
+    NOT_EVALUATED
+        .iter()
+        .copied()
+        .filter(|item| {
+            !(item.starts_with("1 ") && has("ssl_regression"))
+                && !(item.starts_with("2 ") && has("expert_k_eff"))
+                && !(item.starts_with("4 ") && has("mcmc_ece"))
+                && !(item.starts_with("5 ") && has("elite_transfer"))
+        })
+        .collect()
 }
 
 const NOT_EVALUATED: [&str; 4] = [
     "1 ssl_regression (statistical family / statistical parent: no SSL loss; neural snapshots add the check)",
     "2 expert_space_health (statistical family; neural snapshots add expert_k_eff / expert_resid_corr / expert_min_skill)",
-    "4 mcmc_ece (no ECE producer yet)",
-    "5 elite_transfer (elites not re-evaluated on candidates yet)",
+    "4 mcmc_ece (the manifest carries no mcmc_ece metric: snapshot fitted before the producer, or no region transitions)",
+    "5 elite_transfer (no frozen feedback decoder reads both the parent's and the candidate's latents)",
 ];
 
 /// Promote body: `{"force": bool, "note": string, "representation_break": bool}`, all optional.
@@ -683,15 +838,7 @@ async fn snapshot_detail(State(s): State<AppState>, Path(id): Path<String>) -> R
     if let Some(o) = snapshot.as_object_mut() {
         o.remove("manifest");
     }
-    // items reported as checks are no longer "not evaluated"
-    let has = |n: &str| checklist.checks.iter().any(|c| c.name == n);
-    let not_evaluated: Vec<&str> = NOT_EVALUATED
-        .iter()
-        .copied()
-        .filter(|item| {
-            !(item.starts_with("1 ") && has("ssl_regression")) && !(item.starts_with("2 ") && has("expert_k_eff"))
-        })
-        .collect();
+    let not_evaluated = not_evaluated_for(&checklist);
     Json(json!({
         "snapshot": snapshot,
         "manifest": manifest,
@@ -832,7 +979,7 @@ async fn snapshot_action(
                     "failing": failing,
                     "checklist": checklist,
                     "manifest_source": source,
-                    "not_evaluated": NOT_EVALUATED,
+                    "not_evaluated": not_evaluated_for(&checklist),
                     "audited": audited,
                 })),
             )
@@ -894,6 +1041,36 @@ async fn snapshot_action(
         args.push(("snapshot_id", id));
     }
     let reload = ctl_model(&s, "reload", &args, Duration::from_secs(30)).await;
+    // A reply with ok=false is model-runtime refusing the snapshot (e.g. a collapsed region
+    // map): it keeps serving the old one, so the Helix statuses go back to what they were.
+    // Transport failures (no NATS, timeout) leave the change in place, as before.
+    if reload["ok"] == false && reload.get("error").is_none() {
+        let mut reverted = Vec::new();
+        for (hid, sid, _) in &changes {
+            let Some(old) = snaps.iter().find(|o| o.id == *hid).map(|o| o.status.clone()) else { continue };
+            match s.hub.set_snapshot_status(*hid, &old).await {
+                Ok(row) => reverted.push(json!({ "snapshot_id": sid, "status": row.status })),
+                Err(e) => reverted.push(json!({ "snapshot_id": sid, "status": null, "error": e.to_string() })),
+            }
+        }
+        let audited = audit(
+            &s,
+            &format!("latent.snapshot.{action}.reload_refused"),
+            &id,
+            json!({ "attempted": applied, "reverted": reverted, "reload": reload, "gate": gate }),
+        )
+        .await;
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "reload_refused",
+                "detail": format!("model-runtime refused the reload: {}; Helix statuses restored", reload["detail"].as_str().unwrap_or("")),
+                "snapshot_id": id, "action": action, "attempted": applied, "reverted": reverted,
+                "reload": reload, "audited": audited,
+            })),
+        )
+            .into_response();
+    }
     let audited = audit(
         &s,
         &format!("latent.snapshot.{action}"),
@@ -901,11 +1078,216 @@ async fn snapshot_action(
         json!({ "changes": applied, "reload": reload, "gate": gate }),
     )
     .await;
+    let lifecycle = lifecycle_snapshot_event(&s, &id, &target.timescale, &action, &applied).await;
     Json(json!({
         "ok": true, "snapshot_id": id, "action": action, "changes": applied, "reload": reload,
-        "gate": gate, "audited": audited,
+        "gate": gate, "audited": audited, "lifecycle": lifecycle,
     }))
     .into_response()
+}
+
+/// Spec 36 §4.3: `lifecycle.snapshot` (core NATS, JSON) after a promote / rollback, and the
+/// encoder generation that selected the snapshot follows it (`promoted`, or back to
+/// `rolled_back`) in `validation.encoder_generation`.
+async fn lifecycle_snapshot_event(s: &AppState, id: &str, ts: &str, action: &str, changes: &[Value]) -> Value {
+    let ev = json!({ "snapshot_id": id, "timescale": ts, "action": action, "changes": changes, "at": Utc::now().to_rfc3339() });
+    let published = match s.nats.as_ref().filter(|_| s.nats_connected()) {
+        Some(c) => c.publish(LIFECYCLE_SNAPSHOT, serde_json::to_vec(&ev).unwrap_or_default().into()).await.is_ok(),
+        None => false,
+    };
+    let mut generation = Value::Null;
+    if let Some(pool) = s.pg.get() {
+        let (phase, status) = if action == "promote" { ("promoted", "promoted") } else { ("rejected", "rolled_back") };
+        let r = sqlx::query_scalar::<_, String>(
+            "update validation.encoder_generation set phase = $2, status = $3, updated_at = now(),              record = jsonb_set(jsonb_set(record, '{phase}', to_jsonb($2::text)), '{status}', to_jsonb($3::text))              where selected_snapshot = $1 and status in ('awaiting_promotion', 'promoted') returning generation_id",
+        )
+        .bind(id)
+        .bind(phase)
+        .bind(status)
+        .fetch_all(pool)
+        .await;
+        generation = match r {
+            Ok(ids) => json!(ids),
+            Err(e) => json!({ "error": e.to_string() }),
+        };
+    }
+    json!({ "subject": LIFECYCLE_SNAPSHOT, "published": published, "generations": generation })
+}
+
+/// NATS subject of snapshot lifecycle events (spec 36 §4.3).
+pub const LIFECYCLE_SNAPSHOT: &str = "lifecycle.snapshot";
+
+// ------------------------------------------------------- encoder generations
+
+/// `GET /api/generations?timescale=&limit=`: encoder generation records, newest first.
+async fn generations_list(State(s): State<AppState>, Query(q): Query<GenerationsQuery>) -> Response {
+    let Some(pool) = s.pg.get() else { return pg_unavailable() };
+    let rows = sqlx::query_as::<_, (String, String, String, String, String, Option<String>, Option<String>, String, String)>(
+        "select generation_id, timescale, kind, phase, status, job_id, selected_snapshot,          to_char(started_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),          to_char(updated_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')          from validation.encoder_generation where ($1::text is null or timescale = $1) order by started_at desc limit $2",
+    )
+    .bind(q.timescale.as_deref())
+    .bind(q.limit.unwrap_or(50).clamp(1, 500))
+    .fetch_all(pool)
+    .await;
+    match rows {
+        Ok(rows) => Json(json!({ "generations": rows.into_iter().map(|r| json!({
+            "generation_id": r.0, "timescale": r.1, "kind": r.2, "phase": r.3, "status": r.4, "job_id": r.5,
+            "selected_snapshot": r.6, "started_at": r.7, "updated_at": r.8,
+        })).collect::<Vec<_>>() }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "postgres", "detail": e.to_string() })))
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct GenerationsQuery {
+    pub timescale: Option<String>,
+    pub limit: Option<i64>,
+}
+
+fn pg_unavailable() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "postgres_unavailable" }))).into_response()
+}
+
+/// `GET /api/generations/{id}`: the full record (phase events, data window, candidates, Pareto
+/// selection, artefacts, validation) and its `validation.data_window` rows.
+async fn generation_detail(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some(pool) = s.pg.get() else { return pg_unavailable() };
+    let rec =
+        sqlx::query_scalar::<_, Value>("select record from validation.encoder_generation where generation_id = $1")
+            .bind(&id)
+            .fetch_optional(pool)
+            .await;
+    match rec {
+        Ok(Some(mut r)) => {
+            let status: Option<(String, String)> =
+                sqlx::query_as("select phase, status from validation.encoder_generation where generation_id = $1")
+                    .bind(&id)
+                    .fetch_optional(pool)
+                    .await
+                    .ok()
+                    .flatten();
+            if let Some((phase, st)) = status {
+                r["phase"] = json!(phase);
+                r["status"] = json!(st);
+            }
+            let windows = sqlx::query_as::<_, (String, f64, f64, Option<Value>)>(
+                "select kind, extract(epoch from start_at) * 1000, extract(epoch from end_at) * 1000, detail                  from validation.data_window where generation_id = $1 order by start_at",
+            )
+            .bind(&id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            r["data_windows"] = json!(
+                windows
+                    .into_iter()
+                    .map(|w| json!({ "kind": w.0, "start_ms": w.1 as i64, "end_ms": w.2 as i64, "detail": w.3 }))
+                    .collect::<Vec<_>>()
+            );
+            Json(r).into_response()
+        }
+        Ok(None) => not_found("Generation", &id),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "postgres", "detail": e.to_string() })))
+            .into_response(),
+    }
+}
+
+/// `POST /api/generations`: enqueues a `train.cycle` job (body = the trainer's `CycleSpec`:
+/// `{timescale, kind?: "cycle"|"bootstrap", families?, window_hours?, instruments?, seed?, neural?,
+/// parent_snapshot_id?}`); the trainer runs the spec 36 §4.1 state machine and never promotes.
+async fn generation_start(State(s): State<AppState>, body: Bytes) -> Response {
+    let mut spec: Value = match serde_json::from_slice(&body) {
+        Ok(v @ Value::Object(_)) => v,
+        _ => return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "error": "bad_request", "detail": "body must be a JSON object with at least {\"timescale\"}" }),
+            ),
+        )
+            .into_response(),
+    };
+    let Some(ts) = spec["timescale"].as_str().and_then(|t| t.parse::<fa_core::Timescale>().ok()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "bad_request", "detail": "unknown or missing timescale" })),
+        )
+            .into_response();
+    };
+    let job_id = fa_core::JobId::new().0.to_string();
+    let generation_id =
+        format!("gen-{ts}-{}-{}", spec["kind"].as_str().unwrap_or("cycle"), job_id.to_ascii_lowercase());
+    spec["generation_id"] = json!(generation_id);
+    let job = fa_proto::v1::Job {
+        job_id: job_id.clone(),
+        kind: "train.cycle".into(),
+        priority: 3,
+        spec: serde_json::to_vec(&spec).unwrap_or_default(),
+        ..Default::default()
+    };
+    let Some(client) = s.nats.as_ref().filter(|_| s.nats_connected()) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "nats_unavailable" }))).into_response();
+    };
+    let js = fa_bus::async_nats::jetstream::new(client.clone());
+    let subject = fa_bus::subjects::jobs("train.cycle");
+    match js.publish(subject.clone(), job.encode_to_vec().into()).await {
+        Ok(ack) => {
+            if let Err(e) = ack.await {
+                return (StatusCode::BAD_GATEWAY, Json(json!({ "error": "enqueue_failed", "detail": e.to_string() })))
+                    .into_response();
+            }
+        }
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, Json(json!({ "error": "enqueue_failed", "detail": e.to_string() })))
+                .into_response();
+        }
+    }
+    let audited = audit(&s, "latent.generation.start", &generation_id, json!({ "job_id": job_id, "spec": spec })).await;
+    (StatusCode::ACCEPTED, Json(json!({ "ok": true, "generation_id": generation_id, "job_id": job_id, "subject": subject, "audited": audited }))).into_response()
+}
+
+/// `POST /api/generations/{id}/abort`: marks the generation `aborting` (the trainer stops between
+/// phases / candidates) and cancels its job (`ctl.train.cancel`).
+async fn generation_abort(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some(pool) = s.pg.get() else { return pg_unavailable() };
+    let row = sqlx::query_as::<_, (String, Option<String>)>(
+        "update validation.encoder_generation set status = 'aborting', updated_at = now()          where generation_id = $1 and status = 'running' returning status, job_id",
+    )
+    .bind(&id)
+    .fetch_optional(pool)
+    .await;
+    let job = match row {
+        Ok(Some((_, job))) => job,
+        Ok(None) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "conflict", "detail": "unknown generation or not running" })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "postgres", "detail": e.to_string() })))
+                .into_response();
+        }
+    };
+    let mut cancel = Value::Null;
+    if let (Some(job), Some(client)) = (job.filter(|j| !j.is_empty()), s.nats.as_ref().filter(|_| s.nats_connected())) {
+        let req =
+            CtlRequest { verb: "cancel".into(), args: [("job_id".to_owned(), job.clone())].into_iter().collect() };
+        cancel = match tokio::time::timeout(
+            Duration::from_secs(5),
+            client.request(fa_bus::subjects::ctl("train", "cancel"), req.encode_to_vec().into()),
+        )
+        .await
+        {
+            Ok(Ok(m)) => CtlReply::decode(m.payload.as_ref())
+                .map_or(json!({ "ok": false }), |r| json!({ "ok": r.ok, "detail": r.message })),
+            _ => json!({ "ok": false, "detail": "no trainer answered ctl.train.cancel" }),
+        };
+    }
+    let audited = audit(&s, "latent.generation.abort", &id, json!({ "cancel": cancel })).await;
+    Json(json!({ "ok": true, "generation_id": id, "status": "aborting", "cancel": cancel, "audited": audited }))
+        .into_response()
 }
 
 /// The snapshot a `rollback` of `target` re-activates: the one `target` replaced on promotion
@@ -1358,5 +1740,45 @@ mod tests {
         let c = manifest_health_checks(&first);
         let ssl = c.iter().find(|x| x.name == "ssl_regression").expect("ssl_regression present");
         assert!(ssl.ok && ssl.value.is_none() && ssl.detail.contains("stat-v1-1m"), "{ssl:?}");
+    }
+
+    /// Spec 36 §6.4 items 4 and 5 become checks when the trainer measured them.
+    #[test]
+    fn card_transfer_needs_a_reevaluation_on_the_snapshot() {
+        // no card re-evaluated on this snapshot: no card-based item 5 (manifest / not_evaluated stay)
+        assert!(card_transfer_check(&[], "jepa-v1-1m-g1-1").is_none());
+    }
+
+    #[test]
+    fn ece_and_elite_transfer_checks() {
+        let by = |c: &[Check], n: &str| c.iter().find(|x| x.name == n).cloned();
+        // gen 0: n/a passes carrying the candidate's own ECE
+        let g0 = json!({ "metrics": { "mcmc_ece": 0.04, "k_eff": 1.5 } });
+        let c = manifest_transfer_checks(&g0);
+        assert!(by(&c, "mcmc_ece").unwrap().ok && by(&c, "mcmc_ece").unwrap().value == Some(0.04));
+        assert!(by(&c, "elite_transfer").unwrap().ok);
+        // a child: ECE regression and elite transfer are compared with the tolerances
+        let child = json!({ "parent_snapshot_id": "p", "feedback": { "source": "elite_decoders" }, "metrics": {
+            "mcmc_ece": 0.05, "mcmc_ece_shared": 0.08, "parent_mcmc_ece": 0.03, "mcmc_ece_regression": 0.05,
+            "elite_transfer": 0.04, "elite_transfer_n": 2.0, "elite_loss_parent": 1.0, "elite_loss_candidate": 1.04
+        }});
+        let c = manifest_transfer_checks(&child);
+        assert!(!by(&c, "mcmc_ece").unwrap().ok, "0.05 > 0.02 tolerance");
+        let t = by(&c, "elite_transfer").unwrap();
+        assert!(t.ok && t.detail.contains("elite_decoders"), "{t:?}");
+        // a child without measurements stays not evaluated
+        let bare = json!({ "parent_snapshot_id": "p", "metrics": { "k_eff": 2.0 } });
+        assert!(manifest_transfer_checks(&bare).is_empty());
+        let collapsed = json!({ "parent_snapshot_id": "p", "metrics": { "collapsed": 1.0 } });
+        assert!(!by(&manifest_transfer_checks(&collapsed), "expert_collapse").unwrap().ok);
+        let checklist = Checklist {
+            snapshot_id: "x".into(),
+            timescale: "1m".into(),
+            passed: false,
+            checks: manifest_transfer_checks(&child),
+            thresholds: PromotionThresholds::default(),
+        };
+        let ne = not_evaluated_for(&checklist);
+        assert!(ne.iter().all(|i| !i.starts_with("4 ") && !i.starts_with("5 ")), "{ne:?}");
     }
 }

@@ -58,6 +58,13 @@ pub async fn write_bundle(
     op: &str,
 ) -> anyhow::Result<Written> {
     let mut w = Written::default();
+    // build provenance in every snapshot manifest (spec 36 §6.6; the full run manifest is
+    // written next to it by `run_manifest::attach`)
+    let mut owned = bundle.clone();
+    if let Some(o) = owned.manifest.params.as_object_mut() {
+        o.insert("build".into(), crate::run_manifest::build_info());
+    }
+    let bundle = &owned;
     let files = files(bundle)?;
     let id = &bundle.manifest.snapshot_id;
     if let Some(dir) = &stores.out_dir {

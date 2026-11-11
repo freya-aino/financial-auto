@@ -148,6 +148,9 @@ const (
 	MetaTf       = "tf"       // bar timeframe
 	MetaBackfill = "backfill" // "1" when produced by Backfill (no live de-dup)
 	MetaURL      = "url"      // request URL, for the raw archive
+	// MetaGapFill is "1" on payloads re-fetched to fill a stream/poll gap
+	// (spec 10 §6.3); the pipeline sets Envelope.gap_filled.
+	MetaGapFill = "gap_fill"
 )
 
 // RateLimiter blocks until a request may proceed.

@@ -129,11 +129,29 @@ pub async fn start_generation(State(s): State<AppState>, Json(body): Json<StartG
         return err(StatusCode::BAD_REQUEST, "kind and at least one genome are required");
     };
     let req = CtlRequest { verb: "start".into(), args: args.into_iter().map(|(k, v)| (k.to_owned(), v)).collect() };
-    match ctl_request(&s, subjects::ctl("evo", "start"), &req).await {
+    let result = ctl_request(&s, subjects::ctl("evo", "start"), &req).await;
+    let subject = match &result {
+        Ok(r) if r.ok => r.message.clone(),
+        _ => req.args.get("kind").cloned().unwrap_or_default(),
+    };
+    audit_ctl(&s, "evolution.generation.start", &subject, json!({ "args": req.args }), &result).await;
+    match result {
         Ok(r) if r.ok => Json(json!({ "ok": true, "generation_id": r.message })).into_response(),
         Ok(r) => err(StatusCode::UNPROCESSABLE_ENTITY, r.message),
         Err(e) => e.into_response(),
     }
+}
+
+/// Audits an operator command forwarded on `ctl.*` (spec 50 §3) with its outcome: `ok`, the
+/// service's refusal, or the transport error (no NATS / no reply) — so the attempt is on record
+/// even when the owning service is down.
+async fn audit_ctl(s: &AppState, action: &str, subject: &str, mut payload: serde_json::Value, r: &Result<CtlReply, ApiError>) {
+    let outcome = match r {
+        Ok(r) => json!({ "ok": r.ok, "message": r.message }),
+        Err(ApiError(status, m)) => json!({ "ok": false, "status": status.as_u16(), "error": m }),
+    };
+    payload["outcome"] = outcome;
+    crate::audit::record(s, action, Some(subject), payload).await;
 }
 
 /// `ctl.evo.start` arguments of a start body (`None` without a kind or a genome).
@@ -173,7 +191,9 @@ async fn ctl_request(s: &AppState, subject: String, req: &CtlRequest) -> Result<
     let Some(client) = s.nats.as_ref().filter(|_| s.nats_connected()) else {
         return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "NATS not connected".into()));
     };
-    let fut = client.request(subject.clone(), Bytes::from(req.encode_to_vec()));
+    // `traceparent` of the HTTP request (crate::audit), so the service logs the same trace id
+    let headers = fa_bus::trace::headers(&fa_bus::trace::outgoing());
+    let fut = client.request_with_headers(subject.clone(), headers, Bytes::from(req.encode_to_vec()));
     match tokio::time::timeout(CTL_TIMEOUT, fut).await {
         Ok(Ok(msg)) => CtlReply::decode(msg.payload.as_ref())
             .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("bad reply on {subject}: {e}"))),
@@ -186,8 +206,9 @@ async fn publish<M: Message>(s: &AppState, subject: String, m: &M) -> Result<(),
     let Some(client) = s.nats.as_ref().filter(|_| s.nats_connected()) else {
         return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "NATS not connected".into()));
     };
+    let headers = fa_bus::trace::headers(&fa_bus::trace::outgoing());
     client
-        .publish(subject, Bytes::from(m.encode_to_vec()))
+        .publish_with_headers(subject, headers, Bytes::from(m.encode_to_vec()))
         .await
         .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e.to_string()))?;
     client.flush().await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e.to_string()))
@@ -217,7 +238,9 @@ pub async fn ingest_control(State(s): State<AppState>, Path((source, action)): P
         return err(StatusCode::NOT_FOUND, format!("unknown action {action:?}; use start|stop"));
     }
     let req = CtlRequest { verb: action.clone(), args: [("source".to_owned(), source.clone())].into_iter().collect() };
-    match ctl_request(&s, subjects::ctl("ingest", &action), &req).await {
+    let result = ctl_request(&s, subjects::ctl("ingest", &action), &req).await;
+    audit_ctl(&s, &format!("ingest.{action}"), &source, json!({ "source": source }), &result).await;
+    match result {
         Ok(r) => ctl_reply_response(r, |m| json!({ "ok": true, "source": source, "action": action, "message": m })),
         Err(e) => e.into_response(),
     }
@@ -226,7 +249,9 @@ pub async fn ingest_control(State(s): State<AppState>, Path((source, action)): P
 /// Cancels a pending evolution job via the orchestrator's `ctl.evo.cancel`.
 pub async fn cancel_job(State(s): State<AppState>, Path(id): Path<String>) -> Response {
     let req = CtlRequest { verb: "cancel".into(), args: [("job_id".to_owned(), id.clone())].into_iter().collect() };
-    match ctl_request(&s, subjects::ctl("evo", "cancel"), &req).await {
+    let result = ctl_request(&s, subjects::ctl("evo", "cancel"), &req).await;
+    audit_ctl(&s, "evolution.job.cancel", &id, json!({ "job_id": id }), &result).await;
+    match result {
         Ok(r) => ctl_reply_response(r, |m| json!({ "ok": true, "job_id": id, "message": m })),
         Err(e) => e.into_response(),
     }
@@ -268,7 +293,12 @@ pub async fn halt(State(s): State<AppState>, body: Option<Json<HaltBody>>) -> Re
         since: Some(now()),
         manual: true,
     };
-    if let Err(e) = publish(&s, subjects::risk_halt("portfolio"), &h).await {
+    let published = publish(&s, subjects::risk_halt("portfolio"), &h).await;
+    // the operator's request; the risk-engine audits the halt it applies as `halt` (spec 50 §3)
+    let payload = json!({ "scope": "portfolio", "reason": h.reason, "published": published.is_ok(),
+        "error": published.as_ref().err().map(|ApiError(_, m)| m.clone()) });
+    crate::audit::record(&s, "halt.request", Some("portfolio"), payload).await;
+    if let Err(e) = published {
         return e.into_response();
     }
     s.live_mut().on_halt(h);
@@ -285,7 +315,11 @@ pub async fn resume(State(s): State<AppState>) -> Response {
         manual: true,
         actor: "ui".into(),
     };
-    if let Err(e) = publish(&s, subjects::risk_resume("portfolio"), &h).await {
+    let published = publish(&s, subjects::risk_resume("portfolio"), &h).await;
+    let payload = json!({ "scope": "portfolio", "reason": h.reason, "published": published.is_ok(),
+        "error": published.as_ref().err().map(|ApiError(_, m)| m.clone()) });
+    crate::audit::record(&s, "resume.request", Some("portfolio"), payload).await;
+    if let Err(e) = published {
         return e.into_response();
     }
     s.live_mut().on_resume("portfolio");
@@ -303,6 +337,10 @@ pub struct PaperOrder {
 }
 
 pub const PAPER_ACCOUNT: &str = "paper";
+
+fn body_json(o: &PaperOrder) -> serde_json::Value {
+    json!({ "instrument_id": o.instrument_id, "side": o.side, "quantity": o.quantity, "limit_price": o.limit_price, "mode": o.mode })
+}
 
 /// Builds a manual paper intent, or explains why it is refused.
 pub fn paper_intent(o: &PaperOrder) -> Result<OrderIntent, String> {
@@ -347,8 +385,12 @@ pub async fn paper_order(State(s): State<AppState>, Json(body): Json<PaperOrder>
     if s.live().is_halted("portfolio") {
         return err(StatusCode::CONFLICT, "portfolio is halted; resume before placing orders");
     }
-    if let Err(e) = publish(&s, subjects::order_intent(PAPER_ACCOUNT), &intent).await {
-        // gated by risk-engine (D-051)
+    // gated by risk-engine (D-051), which books the intent; this row is the operator's request
+    let published = publish(&s, subjects::order_intent(PAPER_ACCOUNT), &intent).await;
+    let payload = json!({ "order": body_json(&body), "intent_id": intent.intent_id, "published": published.is_ok(),
+        "error": published.as_ref().err().map(|ApiError(_, m)| m.clone()) });
+    crate::audit::record(&s, "order.manual", Some(&intent.intent_id), payload).await;
+    if let Err(e) = published {
         return e.into_response();
     }
     let id = intent.intent_id.clone();

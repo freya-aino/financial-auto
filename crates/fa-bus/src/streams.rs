@@ -57,6 +57,8 @@ impl From<Storage> for StorageType {
 pub struct WorkQueueSpec {
     pub ack_wait_secs: u64,
     pub max_deliver: i64,
+    /// Jobs in flight across all workers of a kind (each worker pulls one at a time, spec 21 §7).
+    pub max_ack_pending: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +110,7 @@ pub fn work_queue_consumer(durable: &str) -> pull::Config {
         durable_name: Some(durable.to_owned()),
         ack_wait: Duration::from_secs(wq.ack_wait_secs),
         max_deliver: wq.max_deliver,
+        max_ack_pending: wq.max_ack_pending,
         ..Default::default()
     }
 }
@@ -427,7 +430,7 @@ mod tests {
         assert_eq!(by("ORDERS").max_age_hours, 365 * 24);
         assert_eq!(by("ORDERS").storage, Storage::File);
         assert_eq!(by("JOB_RESULTS").subjects, ["jobs.result.>"]);
-        assert_eq!(t.work_queue, WorkQueueSpec { ack_wait_secs: 60, max_deliver: 5 });
+        assert_eq!(t.work_queue, WorkQueueSpec { ack_wait_secs: 60, max_deliver: 5, max_ack_pending: 64 });
         let cfg = by("MD").config();
         assert_eq!(cfg.max_age, Duration::from_secs(86_400));
         assert_eq!(cfg.retention, RetentionPolicy::Limits);
@@ -508,6 +511,7 @@ mod tests {
         let c = work_queue_consumer("evo-worker");
         assert_eq!(c.ack_wait, Duration::from_secs(60));
         assert_eq!(c.max_deliver, 5);
+        assert_eq!(c.max_ack_pending, 64);
     }
 
     /// Against the compose NATS: `FA_NATS_TEST=1 cargo test -p fa-bus -- --nocapture live`.

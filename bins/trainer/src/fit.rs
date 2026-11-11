@@ -93,6 +93,10 @@ pub struct FitSpec {
     /// Compute device of a neural fit (`cpu`, `cuda[:n]`); default `FA_ML_DEVICE`, else cpu.
     #[serde(default)]
     pub device: Option<String>,
+    /// Pinned window end (ms): generation cycles and `trainer reproduce` fix it; default = job
+    /// start (spec 36 §6.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_ms: Option<i64>,
 }
 
 fn default_hours() -> f64 {
@@ -131,6 +135,7 @@ impl FitSpec {
             family: None,
             neural: None,
             device: None,
+            end_ms: None,
         }
     }
 
@@ -476,6 +481,8 @@ impl Fit {
         if let Some(score) = self.feedback.as_ref().and_then(|f| f["search"]["chosen_score"].as_f64()) {
             metrics.insert("feedback_score".into(), score);
         }
+        // spec 36 §6.4 item 4 (MCMC calibration of the region kernel on the probe grid)
+        crate::promotion::ece_metrics(&mut metrics, &probe_keys, &latents, &regions, parent);
 
         let mut params = enc.params(&self.spec.fit);
         params["region_radius"] = json!(cand.region_radius);

@@ -3,9 +3,13 @@
 //! * `GET /api/sources`, `GET /api/sources/{id}`: the YAML catalog with the Postgres status
 //!   overlaid (`catalog.source` wins once synced, spec 11 §8), the ingestor's latest
 //!   `ingest.health.<source>` frame, cursors, recent runs/errors, gaps and unresolved symbols.
-//! * `POST /api/sources/{id}/enable|disable|backfill`: `ctl.ingest.*` requests to the ingestor;
+//! * `POST /api/sources/{id}/enable|disable|backfill|reload`: `ctl.ingest.*` requests to the ingestor;
 //!   `backfill` enqueues a `jobs.ingest.backfill` job and returns its id (watch it on
-//!   `GET /api/jobs?kind=ingest.backfill`). Each mutation is audited when Postgres is up.
+//!   `GET /api/jobs?kind=ingest.backfill`); `reload` re-reads the catalog YAML and restarts the
+//!   source if its config changed. Each mutation is audited when Postgres is up.
+//! * `PATCH /api/sources/{id}` `{rate_limit?: {per_second, burst}, config?: {symbols, queries,
+//!   timeframe, extra}, clear?: bool}`: runtime override of the rate limit / connector config
+//!   (`ctl.ingest.configure`, spec 11 §4), persisted in `catalog.source` by the ingestor.
 //! * `GET /api/instruments?q=`: `fa_warehouse::refdata::search_instruments`.
 //! * `GET /api/instruments/quarantine`, `POST /api/instruments/quarantine/{id}/resolve`: the
 //!   review loop for provisional instruments (`{id}` = provisional instrument UUID).
@@ -43,7 +47,7 @@ const ACTOR: &str = "ui";
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/sources", get(list_sources))
-        .route("/api/sources/{id}", get(get_source))
+        .route("/api/sources/{id}", get(get_source).patch(patch_source))
         .route("/api/sources/{id}/{action}", post(source_action))
         .route("/api/instruments", get(instruments))
         .route("/api/instruments/quarantine", get(quarantine))
@@ -234,6 +238,52 @@ pub struct BackfillBody {
     pub range: Option<String>,
 }
 
+/// `PATCH /api/sources/{id}` body.
+#[derive(Debug, Default, Deserialize)]
+pub struct PatchSourceBody {
+    pub rate_limit: Option<PatchRateLimit>,
+    /// `catalog.Params` (Go): symbols, queries, timeframe, extra.
+    pub config: Option<Value>,
+    #[serde(default)]
+    pub clear: bool,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+pub struct PatchRateLimit {
+    pub per_second: f64,
+    pub burst: u32,
+}
+
+async fn patch_source(State(s): State<AppState>, Path(id): Path<String>, Json(b): Json<PatchSourceBody>) -> Response {
+    let mut args = vec![("source".to_owned(), id.clone())];
+    if let Some(rl) = &b.rate_limit {
+        args.push(("rate_limit_per_second".into(), rl.per_second.to_string()));
+        args.push(("rate_limit_burst".into(), rl.burst.to_string()));
+    }
+    if let Some(c) = &b.config {
+        args.push(("config".into(), c.to_string()));
+    }
+    if b.clear {
+        args.push(("clear".into(), "1".into()));
+    }
+    let req = CtlRequest { verb: "configure".into(), args: args.into_iter().collect() };
+    let reply = match ctl_request(&s, subjects::ctl("ingest", "configure"), &req).await {
+        Ok(r) => r,
+        Err(e) => return *e,
+    };
+    if !reply.ok {
+        return ctl_error(&reply.message);
+    }
+    let effective: Value = serde_json::from_str(&reply.message).unwrap_or_else(|_| json!(reply.message));
+    if let Some(pool) = s.pg.get() {
+        let p = json!({ "rate_limit": b.rate_limit, "config": b.config, "clear": b.clear, "reply": effective });
+        if let Err(e) = crate::audit::append(pool, ACTOR, "source.configure", Some(&id), p).await {
+            tracing::warn!(error = %e, "audit append failed");
+        }
+    }
+    Json(json!({ "ok": true, "source": id, "effective": effective })).into_response()
+}
+
 async fn source_action(
     State(s): State<AppState>,
     Path((id, action)): Path<(String, String)>,
@@ -241,7 +291,7 @@ async fn source_action(
 ) -> Response {
     let mut args = vec![("source".to_owned(), id.clone())];
     let payload = match action.as_str() {
-        "enable" | "disable" => json!({}),
+        "enable" | "disable" | "reload" => json!({}),
         "backfill" => {
             let b = body.map(|Json(b)| b).unwrap_or_default();
             let mut start = b.start.clone();
@@ -263,7 +313,12 @@ async fn source_action(
             }
             json!({ "instruments": instruments, "timescale": b.timescale, "start": start, "end": b.end })
         }
-        _ => return err(StatusCode::NOT_FOUND, format!("unknown action {action:?}; use enable|disable|backfill")),
+        _ => {
+            return err(
+                StatusCode::NOT_FOUND,
+                format!("unknown action {action:?}; use enable|disable|backfill|reload"),
+            );
+        }
     };
     let req = CtlRequest { verb: action.clone(), args: args.into_iter().collect() };
     let reply = match ctl_request(&s, subjects::ctl("ingest", &action), &req).await {
@@ -276,7 +331,7 @@ async fn source_action(
     if let Some(pool) = s.pg.get() {
         let mut p = payload;
         p["reply"] = json!(reply.message);
-        if let Err(e) = fa_warehouse::audit::append(pool, ACTOR, &format!("source.{action}"), Some(&id), p).await {
+        if let Err(e) = crate::audit::append(pool, ACTOR, &format!("source.{action}"), Some(&id), p).await {
             tracing::warn!(error = %e, "audit append failed");
         }
     }
@@ -367,7 +422,7 @@ async fn quarantine_resolve(
     match refdata::resolve_quarantine(&pool, prov, &res).await {
         Ok(out) => {
             let payload = json!({ "resolution": res, "outcome": out });
-            if let Err(e) = fa_warehouse::audit::append(
+            if let Err(e) = crate::audit::append(
                 &pool,
                 ACTOR,
                 "instrument.quarantine.resolve",

@@ -6,6 +6,12 @@ pub mod v1 {
 }
 
 pub use prost::{self, Message};
+
+/// The protobuf package this build is generated from (spec 21 §6: breaking changes ship as a
+/// new major package side by side; `fa_bus::contract` rejects majors a consumer cannot decode).
+pub const PACKAGE: &str = "fa.v1";
+/// The major version of [`PACKAGE`].
+pub const MAJOR: u32 = 1;
 pub use prost_types::Timestamp;
 
 /// Converts a chrono-free `SystemTime` into a protobuf timestamp.

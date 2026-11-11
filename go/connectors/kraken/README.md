@@ -22,4 +22,4 @@ Kraken public market data (keyless REST): 1m bars, trades and L1 quotes.
 `kraken_test.go` on `testdata/` (live responses trimmed: 5 OHLC rows, 5 trades, one ticker, the unknown-pair error): poll → 4 bars + 5 trades + 1 quote, payload values, trade `since` cursor, de-dup on re-normalize, restart from persisted cursors, deterministic payloads, unresolved pair, error payload, backfill range filtering and unsupported timeframe.
 
 ## Governing specs
-- [10-ingestion](../../../specs/10-ingestion.md), [11-source-catalog](../../../specs/11-source-catalog.md), [21-bus-and-contracts](../../../specs/21-bus-and-contracts.md)
+- [Ingestion reference (ex spec 10)](../../services/ingestor/README.md#ingestion-reference), [Source catalog reference (ex spec 11)](../../pkg/catalog/README.md#source-catalog-reference), [21-bus-and-contracts](../../../specs/21-bus-and-contracts.md)

@@ -135,6 +135,23 @@ pub fn raster_ce(logp: &Tensor, target: &Tensor, res: usize) -> Result<Tensor> {
     (t * logp)?.sum_all()?.affine(-1.0 / (b * res) as f64, 0.0)
 }
 
+/// Per-slot log-softmax of logits `[B, Σ sizes]` (the `text.summary` slots), concatenated.
+pub fn slots_logp(o: &Tensor, sizes: &[usize]) -> Result<Tensor> {
+    let mut parts = Vec::with_capacity(sizes.len());
+    let mut at = 0;
+    for &k in sizes {
+        parts.push(candle_nn::ops::log_softmax(&o.narrow(1, at, k)?, D::Minus1)?);
+        at += k;
+    }
+    Tensor::cat(&parts, 1)
+}
+
+/// Mean per-slot cross-entropy `−Σ t·log p / (B · slots)` of one-hot slot targets.
+pub fn slots_ce(logp: &Tensor, target: &Tensor, slots: usize) -> Result<Tensor> {
+    let b = logp.dim(0)?;
+    (target * logp)?.sum_all()?.affine(-1.0 / (b * slots.max(1)) as f64, 0.0)
+}
+
 /// Mean `1 − cos` between predicted and target embeddings `[B, E]`.
 pub fn cosine_loss(pred: &Tensor, target: &Tensor) -> Result<Tensor> {
     let p = l2_normalize(pred)?;

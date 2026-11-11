@@ -156,7 +156,9 @@ fn bundles_round_trip_and_training_is_deterministic() {
     let (d, s) = fit("nn_forecast:h=3;lb=12;width=8;depth=1;steps=40", 900);
     let bytes = d.to_bundle().unwrap();
     let meta = NeuralDecoder::meta_of(&bytes).unwrap();
-    assert_eq!(meta, d.meta);
+    // compared after the same JSON round trip (serde_json may move an f64 by one ulp)
+    let expect: BundleMeta = serde_json::from_slice(&serde_json::to_vec(&d.meta).unwrap()).unwrap();
+    assert_eq!(meta, expect);
     let (_, ctx, text) = regime_data(900, 11);
     let loaded = NeuralDecoder::from_bundle(&bytes, &Device::Cpu)
         .unwrap()
@@ -369,4 +371,92 @@ fn steps_override_limits_training() {
     let d = train(&g, std::slice::from_ref(&s), Arc::new(ctx), Arc::new(text), &opts).unwrap();
     assert_eq!(d.meta.train.steps, 25);
     assert!(d.meta.genome.contains("steps=400"), "the genome keeps its full-fidelity steps");
+}
+
+/// `text.summary` (Q2: templated summaries of the window + its news): the latent carries the
+/// regime, so the move / close / news slots beat the training-mean distribution out of sample;
+/// the served sentence and score follow the regime.
+#[test]
+fn summary_family_decodes_the_window_story_from_the_latent() {
+    let (d, s) = fit("nn_summary:lb=24;tdim=64;tw=0.5;width=32;steps=300;lr=0.01", 2000);
+    assert_eq!(d.meta.layout.seq, 0, "latent-only input");
+    assert_eq!(d.meta.layout.out, crate::summary::width());
+    let r = d.recon_eval(std::slice::from_ref(&s), d.meta.cutoff_ms, 5000).unwrap().unwrap();
+    assert!(r.n > 500 && r.skill > 0.0, "{r:?} {:?}", d.meta.train);
+    assert!(d.forecast(&s, s.len() - 10).is_none(), "summary does not forecast");
+    let (_, ctx, text) = regime_data(2000, 11);
+    let up_t = 150 * 12 + 100;
+    let lat = ctx.latent_as_of("inst-syn", s.ts_ms[up_t]).map(|l| l.vec.clone());
+    let served = d.serve_at(&s, up_t, lat.as_deref(), &text).unwrap();
+    assert!((0.0..=1.0).contains(&served.score), "intensity on the baseline's [0, 1] scale");
+    assert!(!served.text.is_empty() && served.components.len() == 2 + crate::summary::SLOTS.len(), "{served:?}");
+    // without a news source (empty timeline) there is no target: such a run sits out
+    let g = DecoderGenome::parse("nn_summary:lb=24").unwrap();
+    assert!(data::target_at(&g, &s, 100, 1e-3, &TextTimeline::new()).is_none());
+}
+
+/// `visual.frame`: frame embeddings from the frame timeline (synthetic byte patterns that follow
+/// the regime); never read from a news timeline, and news families never read frames.
+#[test]
+fn frame_family_reconstructs_frames_and_keeps_timelines_apart() {
+    let (s, ctx, news) = regime_data(2000, 11);
+    let mut frames = TextTimeline::frames();
+    for t in (0..s.len()).step_by(5) {
+        let up = (t / 150) % 2 == 0;
+        let bytes: Vec<u8> = (0..256).map(|j| if up { (j * 3 % 251) as u8 } else { (j * 7 % 13) as u8 }).collect();
+        frames.push_features(s.ts_ms[t], data::frame_features(&bytes), &[]);
+    }
+    frames.finish();
+    let g = DecoderGenome::parse("nn_frame:lb=8;tdim=64;tw=0.2;width=32;steps=250;lr=0.01").unwrap();
+    let ctx = Arc::new(ctx);
+    let d = train(&g, std::slice::from_ref(&s), ctx.clone(), Arc::new(frames), &TrainOptions::default()).unwrap();
+    let r = d.recon_eval(std::slice::from_ref(&s), d.meta.cutoff_ms, 5000).unwrap().unwrap();
+    assert!(r.n > 200 && r.skill > 0.05, "{r:?}");
+    // a news timeline gives a frame decoder no target (and a frame timeline none to nn_news)
+    assert!(train(&g, std::slice::from_ref(&s), ctx.clone(), Arc::new(news), &TrainOptions::default()).is_err());
+    let gn = DecoderGenome::parse("nn_news:lb=8;tdim=64;tw=0.2").unwrap();
+    assert!(data::target_at(&gn, &s, 500, 1e-3, &TextTimeline::frames()).is_none());
+    assert!(data::frame_features(&[1, 2]).is_empty());
+}
+
+/// The residual start: a reconstruction decoder begins exactly at its training-mean baseline,
+/// so with zero SGD steps its out-of-sample skill is 0, never below.
+#[test]
+fn reconstruction_decoders_start_at_the_baseline() {
+    for genome in ["nn_news:lb=8;tdim=64;tw=0.5;steps=1;lr=1e-12", "nn_chart:lb=16;res=6;steps=1;lr=1e-12"] {
+        let (d, s) = fit(genome, 1500);
+        let r = d.recon_eval(std::slice::from_ref(&s), d.meta.cutoff_ms, 5000).unwrap().unwrap();
+        assert!(r.skill.abs() < 1e-4, "{genome}: {r:?}");
+    }
+}
+
+/// Spec 34 §8: re-evaluated elites decay in the feedback weights by their transfer ratio, a
+/// decoder that no longer beats naive drops out, and the §6.4 item 5 check counts them.
+#[test]
+fn transfer_records_decay_feedback_weights() {
+    let (d, _) = fit("nn_forecast:h=3;lb=12;width=8;depth=1;steps=20", 600);
+    let card = |key: &str, fam: &str, score: f64, ratio: Option<f64>| {
+        let mut meta = BundleMeta { score, output_family: fam.into(), ..d.meta.clone() };
+        if let Some(r) = ratio {
+            meta.transfer.push(Transfer { snapshot_id: "s2".into(), score: score * r, base_score: score, ratio: r, ..Default::default() });
+        }
+        feedback::EliteCard { meta, bucket: "b".into(), key: key.into(), created_ms: 0 }
+    };
+    let cards = vec![
+        card("a", "rnn_prior", 0.3, Some(1.05)),
+        card("b", "rnn_prior", 0.2, Some(0.5)),
+        card("c", "retrieval", 0.3, Some(-0.2)),
+        card("d", "retrieval", 0.1, None),
+    ];
+    let top = feedback::select_top_k(&cards, 4, None);
+    assert!(top.iter().all(|c| c.key != "c"), "failed transfer is no elite");
+    let w = feedback::quota_weights(&top);
+    let get = |k: &str| w.iter().find(|(c, _)| c.key == k).map(|x| x.1).unwrap();
+    assert!((w.iter().map(|x| x.1).sum::<f64>() - 1.0).abs() < 1e-12);
+    // rank weights inside rnn_prior are 2/3 and 1/3 of the family share; b halves
+    assert!((get("a") / get("b") - 2.0 / 0.5).abs() < 1e-9, "{w:?}");
+    assert_eq!(BundleMeta { transfer: vec![], ..d.meta.clone() }.transfer_factor(), 1.0);
+    let chk = feedback::transfer_check(&cards, 4, "s2", TRANSFER_TOL);
+    assert_eq!((chk.elites, chk.evaluated, chk.passed), (4, 3, 1));
+    assert!((chk.worst_ratio + 0.2).abs() < 1e-12);
 }

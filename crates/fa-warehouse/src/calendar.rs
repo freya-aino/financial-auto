@@ -309,7 +309,9 @@ pub fn state_in(s: &Session, at: DateTime<Utc>) -> Option<SessionState> {
 }
 
 /// Writes the rule's sessions for `[from, to]` into `ref.calendar_session` for a venue. Rows with a
-/// `source_id` (venue publication, operator correction) are kept. Returns rows written.
+/// `source_id` (venue publication, operator correction) are kept, and rows that already hold the
+/// same session are left alone (their `recorded_at` stays, so as-of reads before a re-run still
+/// see them). Returns rows inserted or changed.
 pub async fn materialize(
     pool: &PgPool,
     venue_code: &str,
@@ -334,7 +336,10 @@ pub async fn materialize(
              VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (venue_id, date) DO UPDATE SET open = excluded.open, close = excluded.close, \
                segments = excluded.segments, is_holiday = excluded.is_holiday, recorded_at = now() \
-             WHERE ref.calendar_session.source_id IS NULL",
+             WHERE ref.calendar_session.source_id IS NULL \
+               AND (ref.calendar_session.open, ref.calendar_session.close, ref.calendar_session.segments, \
+                    ref.calendar_session.is_holiday) \
+                   IS DISTINCT FROM (excluded.open, excluded.close, excluded.segments, excluded.is_holiday)",
         )
         .bind(venue_id)
         .bind(d)
@@ -348,6 +353,45 @@ pub async fn materialize(
         d += Duration::days(1);
     }
     Ok(n)
+}
+
+/// Default look-ahead of [`refresh`]: 13 months, so a monthly run always covers the next year.
+pub const REFRESH_HORIZON_DAYS: i64 = 400;
+
+/// One venue's outcome of [`refresh`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RefreshedVenue {
+    pub venue: String,
+    pub rule: CalendarRule,
+    pub from: NaiveDate,
+    pub to: NaiveDate,
+    /// Rows inserted or changed (0 when the table already matched the rule).
+    pub rows: usize,
+}
+
+/// Scheduled calendar refresh (spec 12 §7 `calendar.refresh`, monthly): materializes
+/// `[today, today + horizon_days]` for every venue in `ref.venue` that has a built-in session rule
+/// and is not always open (24/7 venues need no rows: the rule answers). Idempotent: unchanged
+/// sessions are not rewritten, venue-published rows (`source_id`) are never overwritten, so the
+/// yearly holiday roll-over and any rule fix land without an operator call.
+pub async fn refresh(
+    pool: &PgPool,
+    today: NaiveDate,
+    horizon_days: i64,
+) -> Result<Vec<RefreshedVenue>, WarehouseError> {
+    let venues = sqlx::query("SELECT code, mic, always_open FROM ref.venue ORDER BY code").fetch_all(pool).await?;
+    let to = today + Duration::days(horizon_days.max(1));
+    let mut out = Vec::new();
+    for v in venues {
+        let (code, mic, always): (String, Option<String>, bool) = (v.get("code"), v.get("mic"), v.get("always_open"));
+        let Some(rule) = rule_for_venue(&code, mic.as_deref(), always) else { continue };
+        if rule == CalendarRule::AlwaysOpen {
+            continue;
+        }
+        let rows = materialize(pool, &code, rule, today, to).await?;
+        out.push(RefreshedVenue { venue: code, rule, from: today, to, rows });
+    }
+    Ok(out)
 }
 
 /// Session state answer with provenance.
@@ -365,27 +409,36 @@ pub struct SessionAnswer {
 /// `RefData::session` (spec 12 §4): the venue's state at `at`. Reads `ref.calendar_session`
 /// first (always-open venues answer immediately), else the built-in rule, else closed with
 /// basis `missing_calendar`.
-pub async fn session_state_at(pool: &PgPool, venue_code: &str, at: DateTime<Utc>) -> Result<SessionAnswer, WarehouseError> {
+pub async fn session_state_at(
+    pool: &PgPool,
+    venue_code: &str,
+    at: DateTime<Utc>,
+) -> Result<SessionAnswer, WarehouseError> {
     let venue = sqlx::query("SELECT id, mic, always_open FROM ref.venue WHERE code = $1")
         .bind(venue_code)
         .fetch_optional(pool)
         .await?;
     let (venue_id, mic, always_open) = match &venue {
-        Some(r) => (Some(r.get::<uuid::Uuid, _>("id")), r.get::<Option<String>, _>("mic"), r.get::<bool, _>("always_open")),
+        Some(r) => {
+            (Some(r.get::<uuid::Uuid, _>("id")), r.get::<Option<String>, _>("mic"), r.get::<bool, _>("always_open"))
+        }
         None => (None, None, false),
     };
     let rule = rule_for_venue(venue_code, mic.as_deref(), always_open);
-    let answer = |state, basis, session| SessionAnswer { venue: venue_code.to_owned(), at, state, basis, rule, session };
+    let answer =
+        |state, basis, session| SessionAnswer { venue: venue_code.to_owned(), at, state, basis, rule, session };
     if rule == Some(CalendarRule::AlwaysOpen) {
         return Ok(answer(SessionState::AlwaysOpen, "rule", None));
     }
     if let Some(vid) = venue_id {
         for d in [at.date_naive(), at.date_naive() + Duration::days(1), at.date_naive() - Duration::days(1)] {
-            let row = sqlx::query("SELECT open, close, segments, is_holiday FROM ref.calendar_session WHERE venue_id = $1 AND date = $2")
-                .bind(vid)
-                .bind(d)
-                .fetch_optional(pool)
-                .await?;
+            let row = sqlx::query(
+                "SELECT open, close, segments, is_holiday FROM ref.calendar_session WHERE venue_id = $1 AND date = $2",
+            )
+            .bind(vid)
+            .bind(d)
+            .fetch_optional(pool)
+            .await?;
             if let Some(r) = row {
                 let segments: Vec<Segment> = serde_json::from_value(r.get("segments")).unwrap_or_default();
                 let s = Session {
@@ -437,8 +490,16 @@ mod tests {
         assert_eq!(
             h,
             [
-                "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19", "2026-07-03",
-                "2026-09-07", "2026-11-26", "2026-12-25"
+                "2026-01-01",
+                "2026-01-19",
+                "2026-02-16",
+                "2026-04-03",
+                "2026-05-25",
+                "2026-06-19",
+                "2026-07-03",
+                "2026-09-07",
+                "2026-11-26",
+                "2026-12-25"
             ]
         );
         // 2022: Jan 1 is a Saturday → no observed holiday on Fri 31 Dec 2021 nor in 2022

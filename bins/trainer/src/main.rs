@@ -13,15 +13,22 @@
 //! per instrument; a statistical `generation` runs the feedback search of [`search`]; `adapter` writes an
 //! `AdapterState` node; `serve` can plan adapter / generation jobs periodically.
 
+mod adapters;
 mod artifact;
 mod data;
+mod expert_health;
 mod feedback;
 mod fit;
+mod generation;
 mod gpu;
+mod holdout;
 mod neural_fit;
 mod plan;
+mod promotion;
 mod run;
+mod run_manifest;
 mod search;
+mod watch;
 mod worker;
 
 use std::path::PathBuf;
@@ -180,6 +187,28 @@ enum Cmd {
         /// Cache the loaded bars here (read if it exists, so every sweep sees the same data).
         #[arg(long)]
         bars_cache: Option<PathBuf>,
+        /// Locked holdout `start_ms:end_ms` to exclude when `validation.holdout` cannot be read
+        /// (repeatable; the recorded holdouts are always excluded when readable).
+        #[arg(long)]
+        holdout_ms: Vec<String>,
+    },
+    /// One encoder generation through the spec 36 §4.1 state machine (data freeze → family
+    /// candidates → Pareto selection → re-embedding → regions → MCMC init → decoder / strategy
+    /// seeds → validation); never promotes.
+    Cycle(CycleArgs),
+    /// Gen-0 bootstrap end to end (acceptance 1): `cycle` with `pretrain` fits of every family;
+    /// `--bars-file` (recorded bars, e.g. a sweep `--bars-cache`) and/or `--synthetic N` run it
+    /// offline.
+    Bootstrap(CycleArgs),
+    /// Re-runs a run manifest (`fa-models/runs/<snapshot>/manifest.json` or a local file) and
+    /// compares the data and weights hashes (spec 36 §6.6). Use with `--local-only --out <dir>`.
+    Reproduce {
+        /// Local path or Garage key (`runs/<snapshot>/manifest.json`).
+        #[arg(long)]
+        run: String,
+        /// Re-run against these recorded bars instead of VictoriaMetrics.
+        #[arg(long)]
+        bars_file: Option<PathBuf>,
     },
     /// Print the planner schedule and the jobs its next tick would enqueue.
     Plan(PlanArgs),
@@ -199,9 +228,99 @@ enum Cmd {
 }
 
 #[derive(clap::Args, Clone)]
+struct CycleArgs {
+    #[arg(long)]
+    timescale: Timescale,
+    /// Comma-separated neural families (default: every family allowed at the timescale).
+    #[arg(long)]
+    families: Option<String>,
+    #[arg(long, default_value_t = 12.0)]
+    window_hours: f64,
+    #[arg(long)]
+    instruments: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Genome overrides shared by every candidate.
+    #[arg(long)]
+    neural: Option<String>,
+    #[arg(long)]
+    steps: Option<usize>,
+    #[arg(long)]
+    parent: Option<String>,
+    /// Recorded bars (`Vec<BarHistory>` JSON, e.g. a `sweep --bars-cache` file).
+    #[arg(long)]
+    bars_file: Option<PathBuf>,
+    /// Add N synthetic instruments (regime-switching, not market data) of `--synthetic-bars` bars.
+    #[arg(long, default_value_t = 0)]
+    synthetic: usize,
+    #[arg(long, default_value_t = 600)]
+    synthetic_bars: usize,
+    #[arg(long, default_value_t = 8)]
+    decoder_seeds: usize,
+    #[arg(long, default_value_t = 16)]
+    strategy_seeds: usize,
+    #[arg(long, default_value_t = 512)]
+    probe_max: usize,
+}
+
+impl CycleArgs {
+    fn spec(&self, kind: &str) -> anyhow::Result<generation::CycleSpec> {
+        let mut neural: Option<serde_json::Value> = match &self.neural {
+            Some(s) => Some(serde_json::from_str(s).map_err(|e| anyhow::anyhow!("--neural: {e}"))?),
+            None => None,
+        };
+        if let Some(n) = self.steps {
+            neural.get_or_insert_with(|| serde_json::json!({}))["steps"] = serde_json::json!(n);
+        }
+        Ok(generation::CycleSpec {
+            families: self
+                .families
+                .as_deref()
+                .map(|f| f.split(',').map(|x| x.trim().to_owned()).collect())
+                .unwrap_or_default(),
+            window_hours: self.window_hours,
+            instruments: self.instruments.as_deref().map(data::Instruments::parse_cli),
+            seed: self.seed,
+            neural,
+            parent_snapshot_id: self.parent.clone(),
+            decoder_seeds: self.decoder_seeds,
+            strategy_seeds: self.strategy_seeds,
+            probe_max: self.probe_max,
+            ..generation::CycleSpec::new(self.timescale, kind)
+        })
+    }
+
+    /// Recorded + synthetic bars (`None` = read VictoriaMetrics).
+    fn frozen(&self) -> anyhow::Result<Option<Vec<data::BarHistory>>> {
+        let mut bars: Vec<data::BarHistory> = match &self.bars_file {
+            Some(p) => serde_json::from_slice(&std::fs::read(p)?)?,
+            None => Vec::new(),
+        };
+        if self.synthetic > 0 {
+            let end = bars
+                .iter()
+                .filter(|h| h.timescale == self.timescale)
+                .map(|h| h.end_ms)
+                .max()
+                .unwrap_or_else(data::now_ms);
+            let end = end - end.rem_euclid(data::step_ms(self.timescale));
+            bars.extend(generation::synthetic_bars(
+                self.timescale,
+                self.synthetic,
+                self.synthetic_bars,
+                end,
+                self.seed,
+            ));
+        }
+        Ok((!bars.is_empty()).then_some(bars))
+    }
+}
+
+#[derive(clap::Args, Clone)]
 struct PlanArgs {
-    /// Enqueue an adapter job per active snapshot this often (`off` disables).
-    #[arg(long, env = "FA_TRAIN_ADAPTER_EVERY", default_value = "1h")]
+    /// Enqueue an adapter job per active snapshot (any family) this often (`off` disables); each
+    /// LoRA job resumes the previous factors (continuous adapters, spec 36 §6.5).
+    #[arg(long, env = "FA_TRAIN_ADAPTER_EVERY", default_value = "15m")]
     adapter_every: String,
     /// Enqueue a generation job per active snapshot this often (default `off`).
     #[arg(long, env = "FA_TRAIN_GENERATION_EVERY", default_value = "off")]
@@ -227,9 +346,7 @@ impl PlanArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
-        .init();
+    fa_core::logging::init("trainer"); // FA_LOG_FORMAT=json|text (spec 60 §4)
     let args = Args::parse();
     let cfg = PlatformConfig::load(&args.config)?;
     let vm_url = args
@@ -269,7 +386,7 @@ async fn main() -> anyhow::Result<()> {
         };
         Stores { blob, hub, out_dir: args.out.clone() }
     };
-    let svc = Services { stores: &stores, tsdb: &tsdb, pg_url: Some(cfg.postgres.url.as_str()) };
+    let svc = Services::new(&stores, &tsdb, Some(cfg.postgres.url.as_str()));
 
     let outcome = match args.cmd {
         Cmd::Pretrain(f) => run::run_fit(Kind::Pretrain, f.spec()?, &svc, &Control::local("")).await,
@@ -296,7 +413,7 @@ async fn main() -> anyhow::Result<()> {
             );
             return Ok(());
         }
-        Cmd::Sweep { fit, grid, bars_cache } => {
+        Cmd::Sweep { fit, grid, bars_cache, holdout_ms } => {
             let spec = fit.spec()?;
             let family = neural_fit::family_of(&spec)?
                 .ok_or_else(|| anyhow::anyhow!("sweep needs a neural --family (fsq_hybrid | jepa_vae | ...)"))?;
@@ -325,10 +442,41 @@ async fn main() -> anyhow::Result<()> {
                     h
                 }
             };
+            // spec 36 §6.1 / acceptance 7: a sweep trains too, so cached or loaded bars lose every
+            // locked holdout (+ embargo) like a fit's
+            let history = sweep_exclude_holdouts(history, svc.pg_url, spec.timescale, &holdout_ms).await?;
             let (dev, _) = fa_expert_space::nn::device_from_str(spec.device.as_deref().unwrap_or("cpu"));
             neural_fit::sweep(family, spec.timescale, &history, &grid, spec.seed, &dev, |row| {
                 println!("{row}");
             })?;
+            return Ok(());
+        }
+        Cmd::Cycle(c) => return run_cycle_cmd(&c, "cycle", &svc, &cfg).await,
+        Cmd::Bootstrap(c) => return run_cycle_cmd(&c, "bootstrap", &svc, &cfg).await,
+        Cmd::Reproduce { run, bars_file } => {
+            let bytes = match std::fs::read(&run) {
+                Ok(b) => b,
+                Err(_) => {
+                    let blob =
+                        stores.blob.as_ref().ok_or_else(|| anyhow::anyhow!("{run}: not a file and no Garage"))?;
+                    fa_blob::BlobStore::get(
+                        blob,
+                        &fa_blob::ObjectKey { bucket: fa_blob::buckets::MODELS, key: run.clone() },
+                    )
+                    .await?
+                }
+            };
+            let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let frozen: Option<Vec<data::BarHistory>> = match bars_file {
+                Some(p) => Some(serde_json::from_slice(&std::fs::read(p)?)?),
+                None => None,
+            };
+            let rsvc = Services { frozen: frozen.as_deref(), ..svc };
+            let r = run_manifest::reproduce(&manifest, &rsvc).await?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+            if r["verified"] != serde_json::json!(true) {
+                anyhow::bail!("not reproduced");
+            }
             return Ok(());
         }
         Cmd::Plan(p) => {
@@ -368,4 +516,67 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("{:?}: {}", outcome.status, outcome.error);
     }
     Ok(())
+}
+
+/// `trainer cycle|bootstrap`: runs the generation state machine locally and prints its result.
+async fn run_cycle_cmd(c: &CycleArgs, kind: &str, svc: &Services<'_>, cfg: &PlatformConfig) -> anyhow::Result<()> {
+    let mut spec = c.spec(kind)?;
+    let frozen = c.frozen()?;
+    if let Some(f) = &frozen {
+        spec.end_ms = f.iter().filter(|h| h.timescale == c.timescale).map(|h| h.end_ms).max();
+    }
+    let bus = if svc.stores.hub.is_some() { fa_bus::Bus::connect(&cfg.nats.url).await.ok() } else { None };
+    let pg = if svc.stores.hub.is_some() { svc.pg_url } else { None };
+    let store = generation::GenStore::connect(pg, bus).await;
+    let csvc = Services { frozen: frozen.as_deref(), ..*svc };
+    let out = generation::run_cycle(spec, &csvc, &run::Control::local("cli"), &store).await;
+    println!("{}", serde_json::to_string_pretty(&out.result)?);
+    if out.status != Status::Ok {
+        anyhow::bail!("{:?}: {}", out.status, out.error);
+    }
+    Ok(())
+}
+
+/// Locked holdouts of a sweep: `validation.holdout` when readable, plus `--holdout-ms` ranges;
+/// unreadable without explicit ranges fails closed (unless `FA_TRAIN_HOLDOUT_OPTIONAL=1`).
+async fn sweep_exclude_holdouts(
+    history: Vec<data::BarHistory>,
+    pg_url: Option<&str>,
+    ts: Timescale,
+    explicit: &[String],
+) -> anyhow::Result<Vec<data::BarHistory>> {
+    let mut hs: Vec<fa_backtest::replay::Holdout> = explicit
+        .iter()
+        .map(|r| {
+            let (a, b) = r.split_once(':').ok_or_else(|| anyhow::anyhow!("--holdout-ms wants start_ms:end_ms"))?;
+            Ok(fa_backtest::replay::Holdout {
+                timescale: ts,
+                start_ms: a.trim().parse()?,
+                end_ms: b.trim().parse()?,
+                locked_at_ms: 0,
+                embargo_ms: None,
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let read = match pg_url {
+        Some(u) => holdout::holdouts(u, ts).await,
+        None => Err(anyhow::anyhow!("no Postgres URL")),
+    };
+    match read {
+        Ok(h) => hs.extend(h),
+        Err(e) if !explicit.is_empty() || holdout::optional() => {
+            eprintln!("validation.holdout unreadable ({e}); excluding the {} explicit range(s) only", explicit.len())
+        }
+        Err(e) => anyhow::bail!("locked holdouts unreadable ({e}); pass --holdout-ms or FA_TRAIN_HOLDOUT_OPTIONAL=1"),
+    }
+    let mut audit = holdout::DataAudit::default();
+    // the widest horizon a sweep genome uses (JEPA / diffusion look 4–8 steps ahead)
+    let out = holdout::exclude(history, &hs, data::step_ms(ts) * 8, &mut audit);
+    eprintln!(
+        "sweep data: {} bars excluded by {} holdout(s) {:?}",
+        audit.excluded_bars,
+        hs.len(),
+        audit.excluded_ranges
+    );
+    Ok(out)
 }

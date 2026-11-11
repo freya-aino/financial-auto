@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 use fa_patterns::{DiscoveryMethod, RegionMap, online_form};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RegionMethod {
     /// What the snapshot's family declares (manifest first, then the encoder descriptor).
     pub declared: DiscoveryMethod,

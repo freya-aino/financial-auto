@@ -13,4 +13,4 @@ Garage (S3) raw-payload writer — the ingestor's `RawArchive` (spec 10 §4.2, s
 - The evo-orchestrator reuses `S3Store` to write promotion artifacts to `fa-artifacts`.
 
 ## Governing specs
-- [10-ingestion](../../../specs/10-ingestion.md), [20-storage](../../../specs/20-storage.md) §5.5, [41-backtest-and-validation](../../../specs/41-backtest-and-validation.md) §5
+- [Ingestion reference (ex spec 10)](../../services/ingestor/README.md#ingestion-reference), [20-storage](../../../specs/20-storage.md) §5.5, [41-backtest-and-validation](../../../specs/41-backtest-and-validation.md) §5

@@ -162,6 +162,9 @@ pub struct EncoderInput {
     pub market: Vec<Vec<f32>>,
     /// Pre-computed text/image/video/audio embeddings in the window.
     pub media: Vec<(Modality, Vec<f32>)>,
+    /// Instrument of the window (VictoriaMetrics token or UUID): the asset embedding and the
+    /// cross-asset context of `asset_attn` encoders (spec 31 §6.4); `None` = unknown asset.
+    pub instrument: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -210,6 +213,14 @@ pub struct ExpertExtras {
     pub realised_prev: Option<Vec<f32>>,
     /// Full router probabilities (before top-k).
     pub probs: Vec<f32>,
+    /// `[expert][target]` log-variance of each expert's Gaussian next-step distribution
+    /// (calibrated on the training windows; `None` for snapshots without calibration).
+    #[serde(default)]
+    pub next_step_logvar: Option<Vec<Vec<f32>>>,
+    /// Cross-asset attention of the window (`asset_attn` encoders, spec 31 §6.4): weight per
+    /// peer instrument; the remainder is the null token's share.
+    #[serde(default)]
+    pub asset_attn: Option<Vec<(String, f32)>>,
 }
 
 #[cfg(test)]

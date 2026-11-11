@@ -112,6 +112,19 @@ pub fn spawn(cfg: RetentionConfig, counters: Counters) {
                     record(&counters, Err(())).await;
                 }
             }
+            // region episodes (spec 30 §10 q6): same horizon as the observation latents
+            for ts in ["1s", "1m", "1h", "1d", "1w"] {
+                let Some(cut) = cfg.policy.cutoff_ms(ts, now_ms) else { continue };
+                match hub.prune_region_episodes(ts, cut).await {
+                    Ok(n) => {
+                        *counters.lock().await.entry("hub.retention.episodes_pruned".into()).or_default() += n as f64
+                    }
+                    Err(e) => {
+                        tracing::warn!(%ts, error = %e, "region episode prune failed (retried next interval)");
+                        record(&counters, Err(())).await;
+                    }
+                }
+            }
             tokio::time::sleep(cfg.every).await;
         }
     });

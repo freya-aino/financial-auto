@@ -7,6 +7,7 @@
 	import { poll } from '../../lib/api';
 	import { applyAlertEvent, labelText, severityClass, since, sortAlerts } from '../../lib/alerts';
 	import { consoleApi, errText, type AlertEvent, type AlertsView } from '../../lib/console';
+	import { operatorApi } from '../../lib/operator';
 	import { bus } from '../../lib/ws.svelte';
 
 	let view = $state<AlertsView | null>(null);
@@ -16,6 +17,27 @@
 	let open = $state<string | null>(null);
 
 	const active = $derived(sortAlerts(view?.active ?? []));
+
+	// stored history (ops.alert_event): survives control-api restarts, unlike `recent`
+	let hSince = $state('7d');
+	let hName = $state('');
+	let history = $state<AlertEvent[]>([]);
+	let historyError = $state('');
+	const SINCE: Record<string, number> = { '1h': 3_600_000, '24h': 86_400_000, '7d': 7 * 86_400_000, '30d': 30 * 86_400_000 };
+	async function loadHistory() {
+		try {
+			const since = new Date(Date.now() - SINCE[hSince]).toISOString();
+			history = (await operatorApi.alertHistory(since, hName.trim() || undefined, 1000)).transitions;
+			historyError = '';
+		} catch (e) {
+			historyError = errText(e);
+		}
+	}
+	$effect(() => {
+		void hSince;
+		void loadHistory();
+	});
+	const firingCount = $derived(history.filter((h) => h.status === 'firing').length);
 
 	async function refresh() {
 		now = Date.now();
@@ -127,6 +149,45 @@
 		{/if}
 	</section>
 
+	<section class="panel wide">
+		<div class="panel-head">
+			<h2>History <span class="dim">({history.length} transitions, {firingCount} firing · ops.alert_event)</span></h2>
+			<form
+				class="controls"
+				onsubmit={(e) => {
+					e.preventDefault();
+					void loadHistory();
+				}}
+			>
+				<select bind:value={hSince} aria-label="since">{#each Object.keys(SINCE) as k}<option value={k}>last {k}</option>{/each}</select>
+				<input class="mono" bind:value={hName} placeholder="alertname (all)" size="20" aria-label="alertname" />
+				<button type="submit">filter</button>
+			</form>
+		</div>
+		{#if historyError}<p class="badge danger">{historyError}</p>{/if}
+		{#if history.length}
+			<div class="scroll tall">
+				<table>
+					<thead><tr><th>at</th><th>status</th><th>alert</th><th>severity</th><th>summary</th><th>started</th></tr></thead>
+					<tbody>
+						{#each history as r, i (r.fingerprint + r.at + i)}
+							<tr>
+								<td class="mono dim" title={r.at}>{r.at.slice(0, 19).replace('T', ' ')}</td>
+								<td><span class="badge" class:danger={r.status === 'firing'} class:ok={r.status === 'resolved'}>{r.status}{r.expired ? ' (expired)' : ''}</span></td>
+								<td class="mono"><button class="link" onclick={() => ((hName = r.alertname), loadHistory())}>{r.alertname}</button></td>
+								<td><span class="badge {severityClass(r.severity)}">{r.severity}</span></td>
+								<td>{r.summary}</td>
+								<td class="mono dim">{r.starts_at?.slice(0, 19).replace('T', ' ') ?? '—'}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			</div>
+		{:else if !historyError}
+			<p class="dim">No stored transitions in the window.</p>
+		{/if}
+	</section>
+
 	<section class="panel">
 		<div class="panel-head">
 			<h2>Live <code>ops.alert</code></h2>
@@ -167,6 +228,19 @@
 	}
 	.detail td {
 		white-space: pre-wrap;
+	}
+	.controls {
+		display: flex;
+		gap: 6px;
+		align-items: center;
+	}
+	.link {
+		background: none;
+		border: none;
+		padding: 0;
+		color: var(--accent);
+		cursor: pointer;
+		font: inherit;
 	}
 	.line {
 		padding: 2px 0;

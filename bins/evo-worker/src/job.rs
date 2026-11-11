@@ -146,8 +146,10 @@ impl Worker {
     }
 
     /// Every job kind this worker runs.
-    pub const KINDS: [&'static str; 7] = [
+    pub const KINDS: [&'static str; 9] = [
         KIND,
+        crate::reeval::KIND,
+        crate::lineage::FRONT_KIND,
         vary::KIND,
         strategy::KIND,
         vary_strategy::KIND,
@@ -162,6 +164,7 @@ impl Worker {
     pub async fn handle(&self, job: &Job) -> Outcome {
         let default_budget = match job.kind.as_str() {
             KIND => DEFAULT_BUDGET_MS,
+            crate::reeval::KIND => crate::reeval::DEFAULT_BUDGET_MS,
             _ => strategy::DEFAULT_BUDGET_MS,
         };
         let run = JobRun::new(job, default_budget, Some(self.bus.clone()));
@@ -177,6 +180,8 @@ impl Worker {
         }
         match job.kind.as_str() {
             KIND => self.evaluate(job, run).await,
+            crate::reeval::KIND => self.reevaluate(job, run).await,
+            crate::lineage::FRONT_KIND => self.record_front(job).await,
             vary::KIND => self.vary(job).await,
             strategy::KIND => self.evaluate_strategy(job, run).await,
             vary_strategy::KIND => self.vary_strategy(job).await,
@@ -235,6 +240,35 @@ impl Worker {
         }
     }
 
+    /// Bus context of a strategy variation: the generation's snapshot (`Job.snapshot_id`) and
+    /// the latest cross-asset pair proposals (`latent.crossprior.<ts>`, `LATENT` stream) of the
+    /// parents' timescales.
+    async fn vary_strategy_context(&self, job: &Job, req: &vary::VaryRequest) -> vary_strategy::VaryContext {
+        let mut ctx = vary_strategy::VaryContext {
+            snapshot: Some(job.snapshot_id.trim().to_owned()).filter(|s| !s.is_empty()),
+            ..Default::default()
+        };
+        let timescales: std::collections::BTreeSet<fa_core::Timescale> = req
+            .parents
+            .iter()
+            .filter_map(|p| fa_strategies::genome::StrategyGenome::parse(p.genome()).ok())
+            .map(|g| g.timescale)
+            .collect();
+        let Ok(stream) = self.bus.jetstream().get_stream("LATENT").await else { return ctx };
+        for ts in timescales {
+            let subject = fa_bus::subjects::latent_crossprior(ts);
+            let Ok(Ok(m)) =
+                tokio::time::timeout(Duration::from_secs(3), stream.get_last_raw_message_by_subject(&subject)).await
+            else {
+                continue;
+            };
+            if let Ok(p) = <fa_proto::v1::CrossAssetPriors as fa_proto::Message>::decode(&m.payload[..]) {
+                ctx.proposals.insert(ts, fa_strategies::assets::AssetProposals::from_proto(&p));
+            }
+        }
+        ctx
+    }
+
     /// `evo.vary.strategy`: parents → children (see [`crate::vary_strategy`]). CPU only.
     async fn vary_strategy(&self, job: &Job) -> Outcome {
         let started = Instant::now();
@@ -242,12 +276,32 @@ impl Worker {
             Ok(r) => r,
             Err(e) => return self.failed(job, format!("vary spec: {e}"), 0),
         };
-        let out = match vary_strategy::produce(&req) {
+        let ctx = self.vary_strategy_context(job, &req).await;
+        let mut out = match vary_strategy::produce_with(&req, &ctx) {
             Ok(o) => o,
             Err(e) => return self.failed(job, format!("vary: {e}"), started.elapsed().as_millis() as u64),
         };
-        self.progress(&job.job_id, 0.5, format!("{} children from {} parents", out.children.len(), out.parents.len()))
+        self.progress(&job.job_id, 0.3, format!("{} children from {} parents", out.children.len(), out.parents.len()))
             .await;
+        // SGD fine-tune of the marked neural children (spec 35 §6.3), best effort within the budget
+        let mut tuned = Vec::new();
+        let budget = Duration::from_millis(job.budget_gpu_ms.max(30_000));
+        for i in out.fine_tune.clone() {
+            if started.elapsed() > budget {
+                tuned.push(json!({"child": i, "skipped": "vary budget spent"}));
+                continue;
+            }
+            let g = out.children[i].clone();
+            match self.fine_tune_policy(&g, g.snapshot.as_deref().unwrap_or(&job.snapshot_id)).await {
+                Ok((t, info)) => {
+                    let replaced = vary_strategy::replace_tuned(&mut out, i, t);
+                    tuned.push(json!({"child": i, "replaced": replaced, "info": info}));
+                }
+                Err(e) => tuned.push(json!({"child": i, "skipped": e})),
+            }
+        }
+        let n_tuned = tuned.iter().filter(|t| t["replaced"] == json!(true)).count();
+        self.progress(&job.job_id, 0.5, format!("{n_tuned} neural children fine-tuned")).await;
         let helix =
             match tokio::time::timeout(Duration::from_secs(20), vary_strategy::persist(self.hub.as_ref(), &req, &out))
                 .await
@@ -259,7 +313,11 @@ impl Worker {
             tracing::warn!(job = %job.job_id, helix = %helix, "strategy lineage not (fully) persisted to Helix");
         }
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let payload = vary_strategy::payload(&req, &out, helix, &self.worker_id, elapsed_ms);
+        let mut payload = vary_strategy::payload(&req, &out, helix, &self.worker_id, elapsed_ms);
+        payload["fine_tune"] = json!(tuned);
+        payload["snapshot"] = json!(ctx.snapshot);
+        payload["asset_proposals"] =
+            json!(ctx.proposals.iter().map(|(t, p)| (t.to_string(), p.pairs.len())).collect::<std::collections::BTreeMap<_, _>>());
         tracing::info!(job = %job.job_id, parents = out.parents.len(), children = out.children.len(), immigrants = out.immigrants, "strategy variation done");
         Outcome {
             result: JobResult {
@@ -487,6 +545,8 @@ impl Worker {
             "report_ref": {"planned": format!("{}/{}", report_key.bucket, report_key.key), "persisted": self.blob.is_some()},
             "worker_id": self.worker_id,
         });
+        // EvaluatedOn / Reads (spec 34 §5), best effort
+        payload["helix"] = self.record_evaluation(job, &genome, pooled.score(), &Value::Object(objectives.clone())).await;
         if !self.persist_report(&report_key, &payload).await {
             payload["report_ref"]["persisted"] = json!(false);
         }

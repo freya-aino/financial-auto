@@ -13,9 +13,11 @@
 	import ViewHeader from '../../lib/ViewHeader.svelte';
 	import { drawdownSeries, loadHistory, pushSample, saveHistory } from '../../lib/series';
 	import { deriveStrategies } from '../../lib/strategies';
+	import { UNAVAILABLE, canSubmit, localChecks, pretradeBody, readResult, ticketKey, type CheckState, type TicketDraft } from '../../lib/ticket';
 	import { runtime } from '../../lib/runtime.svelte';
 	import { onBus, tradingWs } from '../../lib/ws.svelte';
 	import {
+		ApiError,
 		ago,
 		eur,
 		live,
@@ -56,6 +58,31 @@
 	let oBusy = $state(false);
 	let oMsg = $state('');
 	let oErr = $state('');
+	let oCheck = $state<CheckState>({ kind: 'none' });
+	const oDraft = $derived<TicketDraft>({ instrument_id: oInst, side: oSide, quantity: Number(oQty), limit_price: oLimit });
+	const oKey = $derived(ticketKey(oDraft));
+	const oLocal = $derived(localChecks(oDraft));
+	const oCurrent = $derived(oCheck.kind !== 'none' && oCheck.key === oKey);
+
+	async function checkOrder() {
+		const key = oKey;
+		if (oLocal.length) {
+			oCheck = { kind: 'rejected', key, reasons: oLocal, at: Date.now() };
+			return;
+		}
+		oCheck = { kind: 'checking', key };
+		try {
+			const r = readResult(await live.pretrade(pretradeBody(oDraft)));
+			oCheck = { kind: r.ok ? 'passed' : 'rejected', key, reasons: r.reasons, at: Date.now() };
+		} catch (e) {
+			if (e instanceof ApiError && UNAVAILABLE.includes(e.status))
+				oCheck = { kind: 'unavailable', key, message: `pre-trade check unavailable (${e.status} ${e.message}); the risk-engine still checks the intent` };
+			else if (e instanceof ApiError && (e.status === 400 || e.status === 422)) {
+				const reasons = readResult({ ...((e.body ?? {}) as Parameters<typeof readResult>[0]), ok: false }).reasons;
+				oCheck = { kind: 'rejected', key, reasons: reasons.length ? reasons : [e.message], at: Date.now() };
+			} else oCheck = { kind: 'unavailable', key, message: `pre-trade check failed: ${e instanceof Error ? e.message : String(e)}` };
+		}
+	}
 
 	const figures = $derived(risk?.reported ?? risk?.paper ?? null);
 	const figuresSource = $derived(risk?.reported ? 'risk service' : 'paper book');
@@ -191,6 +218,7 @@
 
 	async function submitOrder(ev: SubmitEvent) {
 		ev.preventDefault();
+		if (!canSubmit(oCheck, oKey)) return;
 		oBusy = true;
 		oMsg = '';
 		oErr = '';
@@ -202,6 +230,7 @@
 				...(oLimit ? { limit_price: Number(oLimit) } : {})
 			});
 			oMsg = `paper intent ${short(r.intent_id, 10)} sent (order.intent.paper → risk-engine)`;
+			oCheck = { kind: 'none' };
 			await refresh();
 		} catch (e) {
 			oErr = e instanceof Error ? e.message : String(e);
@@ -361,12 +390,27 @@
 			<label>quantity <input type="number" min="0" step="any" bind:value={oQty} /></label>
 			<label>limit (optional; rests as ack until crossed) <input type="number" min="0" step="any" bind:value={oLimit} placeholder="market" /></label>
 			<div class="wide row">
-				<button type="submit" disabled={oBusy || !oInst || risk?.portfolio_halted}>
+				<button type="button" onclick={checkOrder} disabled={oBusy || !oInst || oCheck.kind === 'checking'} title="dry run of the risk-engine pre-trade checks (POST /api/trading/pretrade); nothing is sent">
+					{oCheck.kind === 'checking' && oCurrent ? 'checking…' : 'Check risk'}
+				</button>
+				<button type="submit" disabled={oBusy || !oInst || risk?.portfolio_halted || !canSubmit(oCheck, oKey)} title={canSubmit(oCheck, oKey) ? '' : 'run the risk check for this exact ticket first'}>
 					{oBusy ? 'sending…' : `Paper ${oSide}`}
 				</button>
 				{#if risk?.portfolio_halted}<span class="badge danger">halted</span>{/if}
 				{#if oMsg}<span class="badge ok">{oMsg}</span>{/if}
 				{#if oErr}<span class="badge danger">{oErr}</span>{/if}
+			</div>
+			<div class="wide check" aria-live="polite">
+				{#if oCheck.kind === 'none' || !oCurrent}
+					<span class="dim">risk check: {oCheck.kind === 'none' ? 'not run' : 'stale — the ticket changed since the last check'}</span>
+				{:else if oCheck.kind === 'passed'}
+					<span class="badge ok">risk check passed</span><span class="dim">sanity, size, position / liquidity / class / venue / gross caps, short margin (spec 40 §6.1)</span>
+				{:else if oCheck.kind === 'rejected'}
+					<span class="badge danger">risk check rejected</span>
+					<ul>{#each oCheck.reasons as r}<li class="mono">{r}</li>{/each}</ul>
+				{:else if oCheck.kind === 'unavailable'}
+					<span class="badge warn">{oCheck.message}</span>
+				{/if}
 			</div>
 		</form>
 		<h3 class="sub">Active halts <span class="dim">({risk?.halts.length ?? 0}; scopes portfolio · daily_loss · strategy:&lt;id&gt; · source:&lt;id&gt; · broker)</span></h3>
@@ -562,6 +606,19 @@
 		display: flex;
 		align-items: center;
 		gap: 8px;
+	}
+	.check {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px 8px;
+		font-size: 12px;
+	}
+	.check ul {
+		flex-basis: 100%;
+		margin: 2px 0 0;
+		padding-left: 18px;
+		color: var(--danger);
 	}
 	.sub {
 		font-size: 12px;

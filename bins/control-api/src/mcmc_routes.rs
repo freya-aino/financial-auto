@@ -20,6 +20,7 @@
 //! | `GET /api/mcmc/{snapshot}/hierarchy` | `Hier` (REFINES) edges of the snapshot's regions |
 //! | `GET /api/mcmc/cross-priors?timescale=&limit=` | ranked `CrossPrior` proposals |
 //! | `GET /api/latent/regions/{region_id}/lineage?depth=` | ancestors, descendants, lineage members |
+//! | `GET /api/latent/regions/{region_id}/reconstructions?limit=&max_bars=` | the region's stored `RegionEpisode`s (latest exit first) each with the 1 m market path over `[t_enter, t_exit]` from VictoriaMetrics (connector bars, else last trade price per minute); per-region decoder outputs are not recorded |
 //!
 //! Helix unreachable → 503 `helix_unavailable`; unknown snapshot / expert space / region → 404;
 //! no persisted kernel yet → 404 `no_kernel`; bad parameters → 400.
@@ -68,6 +69,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/mcmc/{snapshot}/stationary", get(stationary))
         .route("/api/mcmc/{snapshot}/hierarchy", get(hierarchy))
         .route("/api/latent/regions/{region_id}/lineage", get(lineage))
+        .route("/api/latent/regions/{region_id}/reconstructions", get(reconstructions))
         .layer(CorsLayer::permissive())
 }
 
@@ -392,6 +394,94 @@ async fn lineage(State(s): State<AppState>, Path(region_id): Path<String>, Query
         Ok(None) => unknown_region(&region_id),
         Err(e) => hub_err(e),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReconQ {
+    /// Episodes (default 20, max 100).
+    pub limit: Option<usize>,
+    /// Bars per episode (default 240, max 1 440; the newest are kept).
+    pub max_bars: Option<usize>,
+}
+
+/// Unix ms of an episode time property (Helix returns RFC 3339 text or a number).
+fn episode_ms(v: Option<&Value>) -> Option<i64> {
+    match v? {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Value::String(t) => chrono::DateTime::parse_from_rfc3339(t).ok().map(|d| d.timestamp_millis()),
+        _ => None,
+    }
+}
+
+/// `GET /api/latent/regions/{region_id}/reconstructions`: what the market did while instruments
+/// sat in the region. `{region_id, episodes[{episode (the RegionEpisode row), instrument_id,
+/// t_enter_ms, t_exit_ms, source: "bars"|"trades"|"none", bars[{ts_ms, open, high, low, close,
+/// volume}], truncated, error?}], decoder_outputs: null, note}`. Bars are 1 m buckets: connector
+/// `fa_bar_*` when the instrument has them, else the last trade price per minute (OHLC equal).
+/// Decoder outputs per region are not recorded anywhere, so none are returned. 503 when Helix
+/// is unreachable; a VictoriaMetrics failure is reported per episode.
+async fn reconstructions(State(s): State<AppState>, Path(region_id): Path<String>, Query(q): Query<ReconQ>) -> Response {
+    let limit = q.limit.unwrap_or(20).clamp(1, 100);
+    let max_bars = q.max_bars.unwrap_or(240).clamp(1, 1_440);
+    let rows = match s.hub.region_episodes(&region_id, limit).await {
+        Ok(r) => r,
+        Err(e) => return hub_err(e),
+    };
+    let tsdb = fa_tsdb::Tsdb::new(s.cfg.victoriametrics.url.clone());
+    let mut episodes = Vec::with_capacity(rows.len());
+    for row in rows {
+        let p = &row.properties;
+        let inst = p.get("instrument_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (t0, t1) = (episode_ms(p.get("t_enter")), episode_ms(p.get("t_exit")));
+        let mut ep = json!({ "episode": row, "instrument_id": inst, "t_enter_ms": t0, "t_exit_ms": t1,
+            "source": "none", "bars": [], "truncated": false });
+        let (Some(t0), Some(t1)) = (t0, t1) else {
+            ep["error"] = json!("episode without t_enter / t_exit");
+            episodes.push(ep);
+            continue;
+        };
+        if inst.is_empty() {
+            episodes.push(ep);
+            continue;
+        }
+        // whole minutes covering the episode
+        let (start_s, end_s) = (t0.div_euclid(60_000) * 60, (t1 + 59_999).div_euclid(60_000) * 60);
+        let mut bars: Vec<Value> = Vec::new();
+        match tsdb.bars(Some(&inst), "1m", start_s, end_s).await {
+            Ok(series) => {
+                if let Some(sr) = series.into_iter().next() {
+                    ep["source"] = json!("bars");
+                    bars = sr.points.iter().map(|b| json!({ "ts_ms": b.ts_ms, "open": b.open, "high": b.high,
+                        "low": b.low, "close": b.close, "volume": b.volume })).collect();
+                }
+            }
+            Err(e) => ep["error"] = json!(format!("victoriametrics: {e}")),
+        }
+        if bars.is_empty() && ep.get("error").is_none() {
+            match tsdb.trade_prices_ms(&inst, t0, t1, fa_core::Timescale::Minute).await {
+                Ok(pts) if !pts.is_empty() => {
+                    ep["source"] = json!("trades");
+                    bars = pts.iter().map(|(t, p)| json!({ "ts_ms": t, "open": p, "high": p, "low": p,
+                        "close": p, "volume": null })).collect();
+                }
+                Ok(_) => {}
+                Err(e) => ep["error"] = json!(format!("victoriametrics: {e}")),
+            }
+        }
+        if bars.len() > max_bars {
+            bars.drain(..bars.len() - max_bars);
+            ep["truncated"] = json!(true);
+        }
+        ep["bars"] = Value::Array(bars);
+        episodes.push(ep);
+    }
+    Json(json!({
+        "region_id": region_id,
+        "episodes": episodes,
+        "decoder_outputs": null,
+        "note": "per-region decoder outputs are not recorded; episodes come from RegionEpisode rows (model-runtime), market paths from VictoriaMetrics 1m bars or trade prices",
+    }))
+    .into_response()
 }
 
 #[cfg(test)]

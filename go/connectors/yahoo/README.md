@@ -16,4 +16,4 @@ First-wave connector: Yahoo Finance chart endpoint (1m bars live, backfill by wi
 `yahoo_test.go` on `testdata/chart_aapl_1m.json` (live response trimmed to 5 bars): poll → 4 completed bars × 2 envelopes, de-dup, cursor persistence/resume, unresolved symbol, API error, backfill chunking (15 d → 3 requests).
 
 ## Governing specs
-- [10-ingestion](../../../specs/10-ingestion.md), [11-source-catalog](../../../specs/11-source-catalog.md), [20-storage](../../../specs/20-storage.md) §5.3
+- [Ingestion reference (ex spec 10)](../../services/ingestor/README.md#ingestion-reference), [Source catalog reference (ex spec 11)](../../pkg/catalog/README.md#source-catalog-reference), [20-storage](../../../specs/20-storage.md) §5.3

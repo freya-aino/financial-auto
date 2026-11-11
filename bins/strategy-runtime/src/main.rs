@@ -19,6 +19,7 @@
 //! baselines with a warning. Control: `ctl.strategy.reload|pause|resume|status`; the pipeline
 //! reloads with `{artifact_key: "managed"}`.
 mod prefetch;
+mod replay;
 mod runtime;
 mod source;
 
@@ -190,12 +191,7 @@ fn now_ms() -> i64 {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    fa_core::logging::init("strategy-runtime"); // FA_LOG_FORMAT=json|text (spec 60 §4)
     let args = Args::parse();
     fa_bus::metrics::serve_from_env("strategy-runtime", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config).context("loading platform config")?;
@@ -273,6 +269,16 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             while let Some((_, st)) = states.next().await {
                 rt.lock().await.on_latent(&st);
+            }
+        });
+    }
+    {
+        // a snapshot served in parallel (model-runtime `ctl.model.shadow`, spec 35 §6.5)
+        let (bus, rt) = (bus.clone(), rt.clone());
+        let mut states = bus.subscribe::<LatentState>("latent.shadow.>".into()).await?;
+        tokio::spawn(async move {
+            while let Some((_, st)) = states.next().await {
+                rt.lock().await.on_parallel_latent(&st);
             }
         });
     }
@@ -384,7 +390,17 @@ async fn main() -> anyhow::Result<()> {
     let mut tick = tokio::time::interval(Duration::from_millis(args.tick_ms.max(50)));
     loop {
         tick.tick().await;
-        let dists = rt.lock().await.tick(now_ms());
+        let (dists, shadows) = {
+            let mut r = rt.lock().await;
+            let d = r.tick(now_ms());
+            (d, r.take_shadow_signals())
+        };
+        // remapped replacements in parallel snapshot serving (spec 35 §6.5): never traded
+        for d in shadows {
+            if let Err(e) = bus.publish(format!("signal.shadow.{}", d.strategy_id), &d.to_proto()).await {
+                tracing::debug!(strategy = %d.strategy_id, error = %e, "shadow signal publish failed");
+            }
+        }
         for d in dists {
             let proto = d.to_proto();
             match bus.publish(subjects::signal_exposure(&d.strategy_id), &proto).await {

@@ -225,6 +225,22 @@ impl Persist {
         }
     }
 
+    /// EUR FX pairs in reference data whose trades are intraday rates (spec 42 §6).
+    pub async fn load_fx_crosses(&self) -> Option<Vec<fa_warehouse::fx::EurCross>> {
+        match fa_warehouse::fx::load_eur_crosses(self.pg.pool()).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(error = %e, "fx pairs not loaded");
+                None
+            }
+        }
+    }
+
+    /// Writes intraday rates into `ref.fx_rate` (idempotent on `(ccy, ts, source)`).
+    pub async fn store_fx_rates(&self, rates: &[fa_warehouse::fx::FxRate]) -> anyhow::Result<usize> {
+        Ok(fa_warehouse::fx::upsert_rates(self.pg.pool(), rates).await?)
+    }
+
     /// Fetches the ECB daily reference rates and upserts them into `ref.fx_rate`
     /// (`source = ecb_daily`, idempotent). Returns `(date, currencies, new rows)`.
     pub async fn refresh_ecb(&self, http: &reqwest::Client) -> anyhow::Result<(chrono::NaiveDate, usize, usize)> {

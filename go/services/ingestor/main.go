@@ -16,6 +16,12 @@
 //	ctl.ingest.replay   source, start, end (RFC 3339), mode=verify|publish
 //	                    re-normalizes the Garage raw archive; reply = JSON digest
 //	                    (publish re-emits on replay.<subject>, core NATS only)
+//	ctl.ingest.reload   [source]   re-read the catalog YAML (+ Postgres statuses and
+//	                    overrides), update rate limits, restart connectors whose
+//	                    config changed; reply = JSON {changed, added, removed, restarted}
+//	ctl.ingest.configure source, rate_limit_per_second + rate_limit_burst, config (JSON
+//	                    catalog.Params), clear=1   runtime override persisted in
+//	                    catalog.source (spec 11 §4 PATCH); reply = JSON effective entry
 //
 // Health (fa.v1 IngestHealth/IngestGap/IngestUnresolved; legacy JSON with
 // -health-json): ingest.health.<source> every 5 s per running connector,
@@ -35,9 +41,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -66,11 +72,30 @@ import (
 	_ "github.com/fey/financial-auto/go/connectors/kraken"
 	_ "github.com/fey/financial-auto/go/connectors/lemon"
 	_ "github.com/fey/financial-auto/go/connectors/oanda"
+	_ "github.com/fey/financial-auto/go/connectors/rss" // generic RSS/Atom adapter (spec 11 §6.3)
 	_ "github.com/fey/financial-auto/go/connectors/secedgar"
 	_ "github.com/fey/financial-auto/go/connectors/yahoo"
 )
 
 const service = "ingestor"
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
 
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -91,9 +116,16 @@ func main() {
 	healthJSON := flag.Bool("health-json", env("FA_INGEST_HEALTH_JSON", "") == "1", "publish ingest.health|gap|unresolved as the legacy D-054 JSON instead of fa.v1 protos")
 	spoolDir := flag.String("spool-dir", env("FA_ARCHIVE_SPOOL", ""), "local spool for raw-archive batches while Garage is unreachable (spec 10 §8; empty disables)")
 	metricsBind := flag.String("metrics", bus.MetricsBindDefault(service), "Prometheus GET /metrics bind (FA_METRICS_BIND; off disables)")
+	backfillLanes := flag.Int("backfill-lanes", envInt("FA_BACKFILL_LANES", 2), "backfill jobs run in parallel (spec 10 §6.4 low-priority lanes)")
+	backfillShare := flag.Float64("backfill-share", connector.DefaultBackfillShare, "share of a source's rate a backfill lane may use (0 < x ≤ 1)")
+	natsSpool := flag.String("nats-spool-dir", env("FA_NATS_SPOOL", ""), "disk buffer for envelopes while NATS is unreachable (spec 10 §8; empty disables)")
+	natsSpoolMax := flag.Int64("nats-spool-max", DefaultBusBufferBytes, "envelope disk buffer limit in bytes; when full the affected connectors stop")
+	catalogWatch := flag.Duration("catalog-watch", envDuration("FA_CATALOG_WATCH", 30*time.Second), "poll the catalog YAML and reload on change (spec 11 §7 catalog.reload_on_change; 0 disables)")
+	autoDisable := flag.Duration("auto-disable-after", envDuration("FA_AUTO_DISABLE_AFTER", DefaultAutoDisableAfter), "disable a catalog source down this long (spec 11 §7; 0 disables)")
+	gapFill := flag.Bool("gap-fill", env("FA_GAP_FILL", "1") == "1", "re-fetch bar gaps and stream silences through Backfill (spec 10 §6.3)")
 	flag.Parse()
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("svc", service)
+	log := bus.NewLogger(service) // FA_LOG_FORMAT=json|text (spec 60 §4)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -172,6 +204,7 @@ func main() {
 	health.JSON = *healthJSON
 	go health.Run(ctx, HealthInterval)
 
+	var reloader *Reloader // set below; the ref watcher re-applies stored overrides through it
 	var resolver connector.SymbolResolver = connector.NewStaticResolver()
 	var cursors connector.CursorStore = connector.NewMemCursors()
 	var backfillCursors connector.BackfillCursorStore = connector.NewMemBackfillCursors()
@@ -199,6 +232,17 @@ func main() {
 		} else if changed := cat.ApplyStatuses(st); len(changed) > 0 {
 			log.Info("catalog statuses from postgres override the yaml seed", "sources", changed)
 		}
+		// Runtime rate-limit / config overrides (ctl.ingest.configure) win over the YAML too.
+		if ov, err := store.Overrides(ctx); err != nil {
+			log.Warn("catalog overrides not applied (migration 20261114030000 missing?)", "err", err)
+		} else {
+			for id, o := range ov {
+				cat.ApplyOverride(id, o)
+			}
+			if len(ov) > 0 {
+				log.Info("catalog overrides from postgres applied", "sources", len(ov))
+			}
+		}
 		r := refdata.NewResolver(store, nil, func(err error) { counters.Add("refdata.errors", 1); log.Warn("refdata", "err", err) })
 		r.OnProvision = func(source, symbol, id string) {
 			counters.Add("provisioned."+source, 1)
@@ -212,7 +256,13 @@ func main() {
 		// catalog changes (enable/disable) invalidate the cache; a catalog change also re-reads
 		// catalog.source statuses into the in-memory catalog.
 		watch := &RefWatcher{Invalidate: r.Invalidate, Statuses: store.Statuses, Catalog: cat, Counters: counters,
-			Log: func(msg string, args ...any) { log.Info(msg, args...) }}
+			Log: func(msg string, args ...any) { log.Info(msg, args...) },
+			Overrides: func(ctx context.Context) ([]string, error) {
+				if reloader == nil {
+					return nil, nil
+				}
+				return reloader.ApplyStoredOverrides(ctx)
+			}}
 		if err := watch.Subscribe(pub.NC); err != nil {
 			log.Warn("ref.changed/catalog.changed subscription", "err", err)
 		}
@@ -236,30 +286,48 @@ func main() {
 		}
 	}
 
-	// One token bucket per source, shared by the live connector and backfill
-	// jobs so the catalog limit holds across both (spec 10 §6.4).
+	// One token bucket per source with a live and a low-priority backfill lane
+	// (spec 10 §6.4): the catalog limit holds for the sum, backfill yields to
+	// live requests and uses at most -backfill-share of the rate.
 	var limMu sync.Mutex
+	lanes := map[string]*connector.LaneLimiter{}
 	limiters := map[string]*connector.MeteredLimiter{}
-	limiterFor := func(src catalog.Source) *connector.MeteredLimiter {
+	laneFor := func(src catalog.Source) (*connector.LaneLimiter, *connector.MeteredLimiter) {
 		limMu.Lock()
 		defer limMu.Unlock()
-		if l, ok := limiters[src.ID]; ok {
-			return l
+		if l, ok := lanes[src.ID]; ok {
+			return l, limiters[src.ID]
 		}
-		l := connector.NewMeteredLimiter(connector.NewLimiter(src.Limit()))
-		limiters[src.ID] = l
-		return l
+		l := connector.NewLaneLimiter(src.Limit(), *backfillShare)
+		m := connector.NewMeteredLimiter(l.Live()) // saturation = live lane only
+		lanes[src.ID], limiters[src.ID] = l, m
+		return l, m
 	}
 	deps := func(src catalog.Source) connector.Deps {
+		_, live := laneFor(src)
 		return connector.Deps{
-			Limiter:  limiterFor(src),
+			Limiter:  live,
 			Resolver: resolver,
 			Archive:  arch,
 			Clock:    connector.SystemClock{},
 			Cursors:  cursors,
 		}
 	}
-	pipe := &Pipeline{Pub: pub, Writer: writer, Archive: arch, Counters: counters, Health: health, SeedGaps: seedGaps, NewsSeen: connector.NewSeen(50_000)}
+	backfillDeps := func(src catalog.Source) connector.Deps {
+		d := deps(src)
+		l, _ := laneFor(src)
+		d.Limiter = l.Backfill()
+		return d
+	}
+	pipe := &Pipeline{Pub: pub, Writer: writer, Archive: arch, Counters: counters, Health: health, SeedGaps: seedGaps, NewsSeen: connector.NewSeen(50_000),
+		Skew: NewSkewMonitor(counters, func(id string) time.Duration {
+			if s, ok := cat.ByID(id); ok && s.Backfill != nil {
+				return time.Duration(s.Backfill.KnowledgeDelaySecs) * time.Second
+			}
+			return 0
+		}),
+		Params: func(id string) catalog.Params { s, _ := cat.ByID(id); return s.Params() }}
+	go pipe.Skew.Run(ctx, 15*time.Second)
 	if store != nil {
 		pipe.Warehouse = warehouse.NewWriter(store.Pool) // macro vintages → wh.macro_observation
 	}
@@ -268,12 +336,82 @@ func main() {
 	sup.RunLog = runLog
 	sup.Health = health
 	sup.Statuses = statuses
+	sup.BackfillDeps = backfillDeps
+
+	if *gapFill {
+		pipe.GapFill = &GapFiller{Pipe: pipe, Counters: counters, Log: log.With("worker", "gapfill"),
+			Instance: func(ctx context.Context, id string) (connector.Connector, error) {
+				c, _, _, err := sup.Instance(ctx, id, true)
+				return c, err
+			}}
+		go pipe.GapFill.Run(ctx)
+	}
+
+	// NATS-outage disk buffer (spec 10 §8): envelopes spool to disk while NATS is unreachable
+	// and replay in order on reconnect; a full buffer stops the affected connectors, which are
+	// restarted once it drained.
+	if *natsSpool != "" {
+		buf, err := OpenBusBuffer(pub.NC, *natsSpool, *natsSpoolMax, counters)
+		if err != nil {
+			log.Error("nats spool", "err", err)
+			os.Exit(1)
+		}
+		defer buf.Close()
+		if n := buf.Records(); n > 0 {
+			log.Info("envelopes buffered by a previous run will be replayed", "records", n)
+		}
+		buf.OnDrained = func() {
+			for _, id := range pipe.TakeBusStopped() {
+				if err := sup.Start(ctx, id); err != nil {
+					log.Warn("restart after bus buffer drain", "source", id, "err", err)
+				} else {
+					log.Info("connector restarted after bus buffer drain", "source", id)
+				}
+			}
+		}
+		pub.NC.SetReconnectHandler(func(*nats.Conn) { buf.Kick() })
+		pipe.Out = buf
+		go buf.Run(ctx.Done(), 5*time.Second, func(msg string, args ...any) { log.Info(msg, args...) })
+	}
+
+	reloader = &Reloader{Path: *catalogPath, Cat: cat, Sup: sup,
+		SetLimit: func(src catalog.Source) { l, _ := laneFor(src); l.SetLimit(src.Limit()) },
+		Changed: func(id, change string, attrs map[string]string) {
+			_ = pub.Publish(bus.CatalogChanged(id), &fav1.RefChanged{Entity: "source", Ids: []string{id}, Change: change,
+				At: timestamppb.Now(), Actor: "system:ingestor", SourceId: id, Attrs: attrs})
+		},
+		Log: func(msg string, args ...any) { log.Info(msg, args...) }}
+	if store != nil {
+		reloader.Store = store
+	}
+	go reloader.Watch(ctx, *catalogWatch)
+
+	autoDis := &AutoDisabler{After: *autoDisable,
+		InCatalog: func(id string) bool { _, ok := cat.ByID(id); return ok },
+		Disable: func(ctx context.Context, id, note string) error {
+			if _, err := sup.Disable(ctx, id); err != nil {
+				return err
+			}
+			if store != nil {
+				if err := store.SetStatusNote(ctx, id, "disabled", note); err != nil {
+					log.Warn("auto-disable note not persisted", "source", id, "err", err)
+				}
+			}
+			counters.Add("catalog.auto_disabled", 1)
+			catalogChanged(pub, id, "disabled", "system:auto-disable")
+			return nil
+		},
+		Log: func(msg string, args ...any) { log.Warn(msg, args...) }}
+	health.OnFrame = autoDis.Observe
+	go autoDis.Run(ctx, time.Minute)
 
 	backfiller, err := NewBackfiller(ctx, pub.NC, sup, pipe, backfillCursors, runLog, log.With("worker", "backfill"), counters, instance)
 	if err != nil {
 		log.Warn("backfill work queue unavailable (jobs.ingest.backfill disabled)", "err", err)
 	} else {
-		go backfiller.Run(ctx)
+		for range max(1, *backfillLanes) {
+			go backfiller.Run(ctx)
+		}
 	}
 	if archWriter != nil {
 		go func() {
@@ -317,6 +455,8 @@ func main() {
 			} else {
 				reply.Ok, reply.Message = true, msg
 			}
+			_, l := bus.Consumed(ctx, log, m) // trace id from control-api (spec 60 §6.5)
+			l.Info("ctl", "subject", m.Subject, "source", req.Args["source"], "ok", reply.Ok, "message", reply.Message)
 			if b, err := proto.Marshal(reply); err == nil && m.Reply != "" {
 				_ = m.Respond(b)
 			}
@@ -390,6 +530,26 @@ func main() {
 		b, err := json.Marshal(res)
 		return string(b), err
 	})
+	handle("reload", func(r *fav1.CtlRequest) (string, error) {
+		rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+		res, err := reloader.Reload(rctx, strings.TrimSpace(r.Args["source"]))
+		if err != nil {
+			return "", err
+		}
+		b, err := json.Marshal(res)
+		return string(b), err
+	})
+	handle("configure", func(r *fav1.CtlRequest) (string, error) {
+		rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+		res, err := reloader.Configure(rctx, r.Args)
+		if err != nil {
+			return "", err
+		}
+		b, err := json.Marshal(res)
+		return string(b), err
+	})
 	handle("status", func(*fav1.CtlRequest) (string, error) {
 		st := map[string]any{"running": sup.Running(), "connectors": connector.Registered(), "health": health.Frames()}
 		if store != nil {
@@ -401,11 +561,19 @@ func main() {
 		}
 		limMu.Lock()
 		lim := map[string]connector.LimiterStats{}
+		laneSt := map[string]map[string]any{}
 		for id, l := range limiters {
 			lim[id] = l.Snapshot(false)
+			live, bf := lanes[id].Counts()
+			laneSt[id] = map[string]any{"rate_limit": lanes[id].Limit(), "live_requests": live, "backfill_requests": bf}
 		}
 		limMu.Unlock()
 		st["limiters"] = lim
+		st["lanes"] = laneSt
+		st["ingest_lag"] = pipe.Skew.Stats()
+		if b, ok := pipe.Out.(*BusBuffer); ok {
+			st["nats_buffer_records"] = b.Records()
+		}
 		b, err := json.Marshal(st)
 		if err != nil {
 			return "", err

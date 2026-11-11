@@ -117,14 +117,7 @@ pub fn reply_status(message: &str) -> StatusCode {
 }
 
 async fn audit(s: &AppState, action: &str, subject: Option<&str>, payload: Value) -> bool {
-    let Some(pool) = s.pg.get() else { return false };
-    match fa_warehouse::audit::append(pool, ACTOR, action, subject, payload).await {
-        Ok(_) => true,
-        Err(e) => {
-            tracing::warn!(error = %e, action, "audit append failed");
-            false
-        }
-    }
+    crate::audit::record(s, action, subject, payload).await
 }
 
 // ------------------------------------------------------------------ decoders (D-068)
@@ -419,7 +412,7 @@ async fn risk_events(State(s): State<AppState>, Query(q): Query<EventsQuery>) ->
     let rows = sqlx::query(
         "SELECT id, at, actor, action, subject, payload FROM audit.log \
          WHERE ($1::timestamptz IS NULL OR at >= $1) \
-           AND (action LIKE 'risk.event.%' OR action IN ('halt', 'resume', 'halt.rearm', 'reconciliation.diff')) \
+           AND (action LIKE 'risk.event.%' OR action IN ('halt', 'resume', 'halt.rearm', 'halt.request', 'resume.request', 'reconciliation.diff')) \
            AND ($3::text IS NULL OR action LIKE $3) \
          ORDER BY at DESC, id DESC LIMIT $2",
     )
@@ -430,7 +423,7 @@ async fn risk_events(State(s): State<AppState>, Query(q): Query<EventsQuery>) ->
     .await;
     let counts = sqlx::query(
         "SELECT action, count(*) AS n FROM audit.log WHERE ($1::timestamptz IS NULL OR at >= $1) \
-           AND (action LIKE 'risk.event.%' OR action IN ('halt', 'resume', 'halt.rearm', 'reconciliation.diff')) \
+           AND (action LIKE 'risk.event.%' OR action IN ('halt', 'resume', 'halt.rearm', 'halt.request', 'resume.request', 'reconciliation.diff')) \
          GROUP BY action ORDER BY n DESC",
     )
     .bind(since)

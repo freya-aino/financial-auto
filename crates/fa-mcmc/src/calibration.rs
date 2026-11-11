@@ -253,6 +253,20 @@ impl Arena {
         }
     }
 
+    /// Support-based pruning of every sampler's evidence (spec 33 §8); returns the serving
+    /// sampler's report (all samplers hold the same evidence, so the reports agree).
+    pub fn prune(&mut self, min_edge: f64) -> crate::PruneReport {
+        let serving = self.serving().name().to_owned();
+        let mut out = crate::PruneReport::default();
+        for s in &mut self.samplers {
+            let rep = s.prune(min_edge);
+            if s.name() == serving {
+                out = rep;
+            }
+        }
+        out
+    }
+
     /// Replaces every sampler's evidence (kernel transfer); scores are kept.
     pub fn replace_graph(&mut self, g: &crate::MarkovGraph) {
         for s in &mut self.samplers {

@@ -27,7 +27,8 @@ use fa_mcmc::{
     rich::{HierAsset, LogitCov, SecondOrder, SemiMarkov},
 };
 use fa_patterns::{
-    DescentKind, DriftReport, ExpertRegionMap, HierarchyCfg, HierarchyTracker, RegionLifecycle, RegionStat,
+    CoherenceCfg, CoherenceTracker, DescentKind, DriftReport, ExpertRegionMap, HierarchyCfg, HierarchyTracker,
+    RegionLifecycle, RegionStat,
 };
 use fa_proto::v1::{
     CrossAssetPair, CrossAssetPriors, ExpertSpaceRef, HierEdge, KernelUpdate, LatentState, RegionAncestor, RegionDist,
@@ -61,6 +62,9 @@ pub struct KernelCfg {
     pub refit_min_obs: usize,
     /// Observation window per expert space.
     pub refit_window: usize,
+    /// Support-based pruning with every kernel summary (spec 33 §8): edges whose decayed count
+    /// fell below this are removed, and retired rows nothing points to (0 disables).
+    pub prune_min_edge: f64,
 }
 
 impl Default for KernelCfg {
@@ -77,6 +81,7 @@ impl Default for KernelCfg {
             refit_every_ms: 3_600_000,
             refit_min_obs: 500,
             refit_window: 20_000,
+            prune_min_edge: fa_mcmc::DEFAULT_PRUNE_MIN_EDGE,
         }
     }
 }
@@ -188,6 +193,9 @@ impl TransitionModel for ArenaTransitions {
     }
     fn replace_graph(&mut self, g: MarkovGraph) {
         self.arena.replace_graph(&g);
+    }
+    fn prune(&mut self, min_edge: f64) -> usize {
+        self.arena.prune(min_edge).edges
     }
 }
 
@@ -431,6 +439,9 @@ pub struct CrossScale {
     dwell: HashMap<(Timescale, String), Vec<(String, u32)>>,
     /// Evolution evidence of src→target pairs per timescale (spec 33 §6.5 feedback).
     evidence: BTreeMap<Timescale, BTreeMap<(String, String), PairEvidence>>,
+    /// Predictive coherence of the regions per (timescale, expert) (spec 30 §6.1 point 3):
+    /// next-bar returns after a step in a region vs after steps elsewhere.
+    coherence: HashMap<(Timescale, u32), CoherenceTracker>,
 }
 
 /// Running-mean horizon of the region-conditional returns (then an EWMA).
@@ -452,7 +463,20 @@ impl CrossScale {
             prev_view: HashMap::new(),
             dwell: HashMap::new(),
             evidence: BTreeMap::new(),
+            coherence: HashMap::new(),
         }
+    }
+
+    /// `coherence.<ts>.e<k>.tested|coherent` gauges: regions with a coherence test and how many
+    /// of them are predictively coherent (`p < coherence_alpha`).
+    pub fn coherence_gauges(&mut self) -> Vec<(String, f64)> {
+        let mut out = Vec::new();
+        for ((ts, k), t) in &mut self.coherence {
+            let (tested, coherent) = t.summary();
+            out.push((format!("coherence.{ts}.e{k}.tested"), tested as f64));
+            out.push((format!("coherence.{ts}.e{k}.coherent"), coherent as f64));
+        }
+        out
     }
 
     /// `coarse_ln_dwell` covariate per expert for a step of `ts` (spec 33 §10 q3):
@@ -473,25 +497,35 @@ impl CrossScale {
 
     /// Expert residual of a closed-bar return (spec 33 §6.5): `r − Σ_k w_k · μ_k(region_k)` with
     /// the regions and router weights of the previous close; then the region means learn `r`.
+    /// Only **predictively coherent** regions (spec 30 §6.1 point 3, soft score: KS p-value of
+    /// the next-bar returns after the region vs after other regions below `coherence_alpha`)
+    /// contribute their mean; an incoherent or untested region has no view (0).
     fn expert_residual(&mut self, ts: Timescale, inst: &str, ret: f64, regions: &[String], weights: &[f32]) -> f64 {
         let key = (ts, inst.to_owned());
-        let resid = match self.prev_view.get(&key) {
+        let resid = match self.prev_view.get(&key).cloned() {
             Some((prev, w)) => {
                 let wsum: f64 = w.iter().map(|x| f64::from(*x)).sum::<f64>().max(1e-12);
-                let pred: f64 = prev
-                    .iter()
-                    .zip(w)
-                    .enumerate()
-                    .map(|(k, (r, wk))| {
-                        let (m, n) = self.region_ret.get(&(ts, k as u32, r.clone())).copied().unwrap_or((0.0, 0.0));
-                        // shrink thin regions toward 0 (no view)
-                        f64::from(*wk) / wsum * m * n / (n + 5.0)
-                    })
-                    .sum();
+                let mut pred = 0.0;
+                for (k, (r, wk)) in prev.iter().zip(&w).enumerate() {
+                    let coherent = self
+                        .coherence
+                        .entry((ts, k as u32))
+                        .or_insert_with(|| CoherenceTracker::new(CoherenceCfg::default()))
+                        .coherent(r);
+                    if !coherent {
+                        continue;
+                    }
+                    let (m, n) = self.region_ret.get(&(ts, k as u32, r.clone())).copied().unwrap_or((0.0, 0.0));
+                    // shrink thin regions toward 0 (no view)
+                    pred += f64::from(*wk) / wsum * m * n / (n + 5.0);
+                }
                 for (k, r) in prev.iter().enumerate() {
                     let e = self.region_ret.entry((ts, k as u32, r.clone())).or_insert((0.0, 0.0));
                     e.1 = (e.1 + 1.0).min(REGION_RET_HORIZON);
                     e.0 += (ret - e.0) / e.1;
+                    if let Some(c) = self.coherence.get_mut(&(ts, k as u32)) {
+                        c.observe(r, ret);
+                    }
                 }
                 ret - pred
             }
@@ -602,6 +636,9 @@ impl CrossScale {
         for (t, _, _) in self.hier.values_mut() {
             t.forget(region_id);
         }
+        for c in self.coherence.values_mut() {
+            c.forget(region_id);
+        }
     }
 
     pub fn hierarchy(&self, as_of_ms: i64) -> Vec<RegionHierarchy> {
@@ -645,11 +682,13 @@ impl CrossScale {
         self.cross
             .iter()
             .map(|(ts, c)| {
-                let all = c.all_pairs();
-                let evaluated = all.len();
                 let empty = BTreeMap::new();
-                let proposals = c
-                    .proposals_with_evidence(self.evidence.get(ts).unwrap_or(&empty))
+                // spec 33 §10 q5: candidate screen above `exhaustive_max` instruments; the
+                // exploration draw rotates once per graph minute
+                let ranked = c.rank(self.evidence.get(ts).unwrap_or(&empty), (as_of_ms / 60_000).max(0) as u64);
+                let evaluated = ranked.evaluated;
+                let proposals = ranked
+                    .proposals
                     .into_iter()
                     .map(|p| CrossAssetPair {
                         source_instrument_id: p.source,

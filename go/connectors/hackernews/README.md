@@ -14,4 +14,4 @@ First-wave connector: Hacker News (text).
 `hackernews_test.go` on `testdata/{topstories,item_8863,algolia_search_by_date}.json`: poll + fetch bounding, de-dup across polls and restarts, cursor, field mapping, HTML cleaning, Algolia backfill.
 
 ## Governing specs
-- [10-ingestion](../../../specs/10-ingestion.md), [11-source-catalog](../../../specs/11-source-catalog.md)
+- [Ingestion reference (ex spec 10)](../../services/ingestor/README.md#ingestion-reference), [Source catalog reference (ex spec 11)](../../pkg/catalog/README.md#source-catalog-reference)

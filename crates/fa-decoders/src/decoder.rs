@@ -1,5 +1,5 @@
 //! The unified decoder interface of spec 34 §4.1, implemented by **every** genome family: the
-//! CPU baselines (`forecast`, `retrieval`, wrapped [`crate::baseline::SeriesDecoder`]s) and the six
+//! CPU baselines (`forecast`, `retrieval`, wrapped [`crate::baseline::SeriesDecoder`]s) and the eight
 //! trained candle families ([`crate::neural::NeuralDecoder`]).
 //!
 //! | spec 34 §4.1 | here |
@@ -236,14 +236,16 @@ mod tests {
     const INST: &str = "0190aaaa";
 
     /// SYNTHETIC regime series with a two-expert latent: expert 0 carries the regime, expert 1
-    /// noise; regime-worded news every 10 steps, tagged with the instrument every other time.
-    fn data(n: usize) -> (Series, DecodeCtx, TextTimeline, Vec<ExpertView>) {
+    /// noise; regime-worded news every 10 steps, tagged with the instrument every other time;
+    /// a regime-dependent synthetic "frame" (byte pattern) every 5 steps on the frame timeline.
+    fn data(n: usize) -> (Series, DecodeCtx, TextTimeline, Vec<ExpertView>, TextTimeline) {
         let mut rng = Rng::seed(5);
         let mut lp = 4.6;
         let (mut ts, mut log_price) = (Vec::new(), Vec::new());
         let mut ctx = DecodeCtx::default();
         ctx.set_layout(INST, vec![(0, 2), (1, 3)]);
         let mut text = TextTimeline::new();
+        let mut frames = TextTimeline::frames();
         let mut views = Vec::new();
         for i in 0..n {
             let r = if (i / 150) % 2 == 0 { 1.0 } else { -1.0 };
@@ -285,9 +287,16 @@ mod tests {
                 let tags = if i % 20 == 0 { vec![INST.to_owned()] } else { Vec::new() };
                 text.push_tagged(i as i64 * 1000, words, "", &tags);
             }
+            if i % 5 == 0 {
+                let pixel: u8 = if r > 0.0 { 200 } else { 40 };
+                let bytes: Vec<u8> =
+                    (0..512).map(|j| pixel.wrapping_add((j % 7) as u8 * if r > 0.0 { 3 } else { 11 })).collect();
+                frames.push_features(i as i64 * 1000, crate::neural::data::frame_features(&bytes), &[]);
+            }
         }
         text.finish();
-        (Series { instrument_id: INST.into(), ts_ms: ts, log_price, step_ms: 1000 }, ctx, text, views)
+        frames.finish();
+        (Series { instrument_id: INST.into(), ts_ms: ts, log_price, step_ms: 1000 }, ctx, text, views, frames)
     }
 
     /// Every genome family implements the §4.1 interface: forward at a point in time, a target
@@ -295,9 +304,10 @@ mod tests {
     /// round trip; masked decoders read only their experts.
     #[test]
     fn every_family_conforms() {
-        let (s, ctx, text, views) = data(1800);
+        let (s, ctx, news, views, frames) = data(1800);
         let ctx = Arc::new(ctx);
-        let text = Arc::new(text);
+        let news = Arc::new(news);
+        let frames = Arc::new(frames);
         let genomes = [
             "forecast:h=5;lb=32",
             "retrieval:h=5;lb=16;k=10;lat=0.5",
@@ -307,10 +317,13 @@ mod tests {
             "nn_future:h=5;lb=16;res=6;steps=40",
             "nn_news:lb=16;tdim=32;tw=1;steps=40;ninst=1",
             "nn_narrative:lb=16;tdim=32;tw=1;steps=40",
+            "nn_summary:lb=16;tdim=32;tw=1;steps=60",
+            "nn_frame:lb=16;tdim=32;tw=0.2;steps=40",
         ];
         let mut families = std::collections::HashSet::new();
         for raw in genomes {
             let g = DecoderGenome::parse(raw).unwrap();
+            let text = if g.family.uses_frames() { frames.clone() } else { news.clone() };
             let d: Box<dyn Decoder> = if g.family.is_neural() {
                 Box::new(
                     train(&g, std::slice::from_ref(&s), ctx.clone(), text.clone(), &TrainOptions::default()).unwrap(),
@@ -360,6 +373,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(families.len(), 6, "rnn_prior, retrieval, visual.chart/future, text.news/narrative");
+        assert_eq!(families.len(), 8, "every output family of spec 34 §3");
+        assert!(crate::Family::ALL.iter().all(|f| families.contains(f)));
     }
 }

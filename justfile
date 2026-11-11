@@ -83,6 +83,34 @@ metrics service="control-api":
     esac
     curl -fsS "http://127.0.0.1:$p/metrics"
 
+# Instant / range MetricsQL through control-api's limited passthrough (spec 50 §5): just metrics-query 'up' [range]
+metrics-query query range="":
+    #!/usr/bin/env sh
+    set -eu
+    if [ -n "{{range}}" ]; then
+        curl -fsS -G 'http://127.0.0.1:7700/api/metrics/query_range' --data-urlencode 'query={{query}}' --data-urlencode 'start=-{{range}}'
+    else
+        curl -fsS -G 'http://127.0.0.1:7700/api/metrics/query' --data-urlencode 'query={{query}}'
+    fi
+
+# Follow one service's logs as JSON lines (needs FA_LOG_FORMAT=json in the service env): just logs-json risk-engine
+logs-json service:
+    {{compose}} --profile app logs -f --no-log-prefix --tail 100 {{service}}
+
+# evo-worker kill drill off the compose stack (scratch NATS, two native workers; ~2 min, spec 60 §9)
+worker-kill-drill *args:
+    {{root}}/scripts/worker-kill-drill.sh {{args}}
+
+# ── secrets (spec 60 §6.7) ──────────────────────────────────────────────
+
+# Scan tracked files for credentials and forbidden files: just secret-scan [--staged|--history]
+secret-scan *args:
+    {{root}}/scripts/secret-scan.sh {{args}}
+
+# Install the pre-commit hook that runs `secret-scan --staged`
+secret-hook:
+    {{root}}/scripts/secret-scan.sh --install-hook
+
 # ── backups (spec 60 §6.6, spec 20 §6.6, D-056) ─────────────────────────
 
 # Postgres dump + HelixDB volume tar (helix paused for seconds) + Garage critical buckets → backups/<timestamp>/
@@ -126,6 +154,10 @@ proto:
         docker run --rm -e HOME=/tmp -v "{{root}}":/repo -w /repo/proto {{buf_image}} lint
         docker run --rm -e HOME=/tmp -v "{{root}}":/repo -w /repo/proto {{buf_image}} generate
     fi
+
+# Contract CI (spec 21 §6): buf lint + buf breaking of proto/ against a git ref (default main)
+proto-check against="main":
+    scripts/buf-check.sh --against {{against}}
 
 # ── rust ────────────────────────────────────────────────────────────────
 

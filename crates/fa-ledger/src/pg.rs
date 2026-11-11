@@ -332,6 +332,21 @@ impl PgLedger {
         strategy_ids: &[String],
         d: &FillDetails,
     ) -> Result<bool, PgError> {
+        self.record_fill_weighted(f, filled_at, strategy_ids, &[], d).await
+    }
+
+    /// [`Self::record_fill_with`] with attribution weights aligned with `strategy_ids` (spec 40
+    /// §10 Q3, causal pro-rata): each strategy's quantity and fee share is its weight's fraction
+    /// of the fill, the last one takes the remainder so the shares sum to the fill exactly;
+    /// missing, mismatched or zero-sum weights split evenly (D-047).
+    pub async fn record_fill_weighted(
+        &self,
+        f: &Fill,
+        filled_at: DateTime<Utc>,
+        strategy_ids: &[String],
+        weights: &[f64],
+        d: &FillDetails,
+    ) -> Result<bool, PgError> {
         let mut tx = self.pool.begin().await?;
         let known: Option<(String,)> =
             sqlx::query_as("SELECT client_order_id FROM ledger.venue_order WHERE client_order_id = $1")
@@ -366,16 +381,15 @@ impl PgLedger {
         .await?
         .rows_affected();
         if inserted > 0 && !strategy_ids.is_empty() {
-            let n = Decimal::from(strategy_ids.len());
-            for s in strategy_ids {
+            for (s, (qty, fee)) in strategy_ids.iter().zip(attribution_split(x.qty.abs(), x.fee_eur, strategy_ids.len(), weights)) {
                 sqlx::query(
                     "INSERT INTO ledger.fill_attribution (fill_id, strategy_id, qty, fee_share) \
                      VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
                 )
                 .bind(fill_uuid)
                 .bind(uuid_of(s))
-                .bind(money::div(x.qty.abs(), n))
-                .bind(money::div(x.fee_eur, n))
+                .bind(qty)
+                .bind(fee)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -848,9 +862,50 @@ pub fn quantities(ledger: &Ledger) -> BTreeMap<InstrumentId, f64> {
 }
 
 /// Live tests run only with `DATABASE_URL` set (the compose Postgres with migrations applied).
+/// Quantity and fee shares of `n` contributors: even (`qty / n`, D-047) without usable
+/// weights, else by weight with the last contributor taking the remainder, so the weighted
+/// shares sum to the fill exactly (spec 40 §10 Q3).
+pub fn attribution_split(qty: Decimal, fee: Decimal, n: usize, weights: &[f64]) -> Vec<(Decimal, Decimal)> {
+    let total: f64 = weights.iter().filter(|w| w.is_finite() && **w > 0.0).sum();
+    if n == 0 {
+        return Vec::new();
+    }
+    if weights.len() != n || !(total > 0.0 && total.is_finite()) {
+        let d = Decimal::from(n);
+        return vec![(money::div(qty, d), money::div(fee, d)); n];
+    }
+    let mut out = Vec::with_capacity(n);
+    let (mut q_left, mut f_left) = (qty, fee);
+    for (k, w) in weights.iter().enumerate() {
+        if k + 1 == n {
+            out.push((q_left, f_left));
+            break;
+        }
+        let frac = money::dec(if w.is_finite() && *w > 0.0 { w / total } else { 0.0 });
+        let (q, fe) = (money::mul(qty, frac), money::mul(fee, frac));
+        q_left -= q;
+        f_left -= fe;
+        out.push((q, fe));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weighted_attribution_sums_to_the_fill_exactly() {
+        let (q, fee) = (money::dec(0.3), money::dec(1.0));
+        let w = attribution_split(q, fee, 3, &[1.0, 1.0, 1.0]);
+        assert_eq!(w.iter().map(|x| x.0).sum::<Decimal>(), q);
+        assert_eq!(w.iter().map(|x| x.1).sum::<Decimal>(), fee);
+        let w = attribution_split(q, fee, 2, &[3.0, 1.0]);
+        assert_eq!(w[0].0, money::dec(0.225));
+        assert_eq!(w[0].0 + w[1].0, q);
+        // no usable weights: the even split of D-047
+        assert_eq!(attribution_split(q, fee, 2, &[]), vec![(money::dec(0.15), money::dec(0.5)); 2]);
+    }
 
     async fn ledger() -> Option<PgLedger> {
         let url = std::env::var("DATABASE_URL").ok()?;

@@ -2,7 +2,7 @@
 
 Execution adapters: order intents → venues; paper mode first.
 
-**Status:** implemented (paper only, D-051 + execution algorithms) — executes `order.approved.>` intents against the live tape with the cost + slippage model of spec 41 §6.3 (`costs.yaml`), publishes `OrderEvent` on `order.event.<account>` with `fee`, `arrival_price`, the realised `slippage_bps` and, per fill, a unique `venue_fill_id` (`pf-<unix ns>-<seq>`) plus `instrument_id` / `venue_symbol` (D-078; the ledger keys fills `intent:venue_order:vf:<id>` and books orphans from them), idempotent by `intent_id`. Execution algorithms (`algo.go`): market, limit, smart-limit, TWAP, VWAP, POV and an `auto` choice; working orders can be cancelled with `OrderCancel`. Live fills recalibrate the impact coefficient (`calib.go`). Working orders, resting limits, intent ids and positions persist across restarts, and risk-increasing intents are rejected while the risk-engine heartbeat is missing (`state.go`, D-079). Live mode is rejected; `VenueAdapter` is the interface the paper engine implements and a live adapter will share.
+**Status:** implemented (paper only, D-051 + execution algorithms) — executes `order.approved.>` intents against the live tape with the cost + slippage model of spec 41 §6.3 (`costs.yaml`), publishes `OrderEvent` on `order.event.<account>` with `fee`, `arrival_price`, the realised `slippage_bps` and, per fill, a unique `venue_fill_id` (`pf-<unix ns>-<seq>`) plus `instrument_id` / `venue_symbol` (D-078; the ledger keys fills `intent:venue_order:vf:<id>` and books orphans from them), idempotent by `intent_id`. Execution algorithms (`algo.go`): market, limit, smart-limit, TWAP, VWAP, POV and an `auto` choice; working orders can be cancelled with `OrderCancel`. Live fills recalibrate the impact coefficient (`calib.go`). Working orders, resting limits, intent ids and positions persist across restarts, and risk-increasing intents are rejected while the risk-engine heartbeat is missing (`state.go`, D-079). Open positions pay the schedule's funding / borrow carry (`carry.go`, charged hourly on `exec.carry.<account>`). Live mode is rejected; `VenueAdapter` is the interface the paper engine implements and a live adapter will share.
 
 ## Execution algorithms (`exec_algo`, spec 40 §6.4)
 Grammar: `name` or `name:k=v,k=v`; empty = `market`. Unknown names, unknown parameters or out-of-range values → `REJECTED` with the reason.
@@ -38,11 +38,14 @@ Per venue / asset class fee schedule, looked up in this order: `venues.<venue>.c
 | fill | `last ± (half spread + impact)` (+ buy, − sell); passive limit fills: at the limit price, no spread, no impact |
 | fee | `max(commission_min_eur, |qty · fill| · commission_bps / 1e4)`, EUR |
 | `slippage_bps` | signed cost vs the arrival price (last trade when the intent was accepted), positive = paid |
-| funding / borrow | `funding_bps_day`, `borrow_bps_day` carried in the schedule, not yet charged (placeholder) |
+| funding / borrow | charged on open positions per carry period (below): `funding_bps_day` on any position, `borrow_bps_day` on shorts — the backtest's rule (`fa_backtest::cost::ClassCosts::carry`) |
 
 Without a costs file the built-in default applies (5 bps commission, 1 EUR minimum, 5 bps spread, k 0.1, σ 2 %/day, ADV 10 M EUR). The repo `costs.yaml` makes the synthetic `sim` venue costless so the baseline paper P&L stays readable, maps the Kraken pairs (`XBTEUR`, `ETHEUR`, `SOLEUR`) and Yahoo `BTC-USD` to class `crypto`, and prices venue `kraken` with Kraken Pro's lowest-tier 40 bp taker fee (assumed, D-079); a minimum fee per order is why the risk-engine's cost-aware rebalancing (`fa_risk::rebalance`) skips small rebalances.
 
 `testdata/cost_fixture.json` is exported from `costs.yaml` by `TestFixtureMatchesModel` (`UPDATE_FIXTURE=1 go test ./services/broker-gateway` regenerates it): the model as JSON plus input → expected `fee`, `fill_price`, `half_spread`, `impact`, `slippage_bps` cases, so `crates/fa-backtest` can assert it prices fills identically.
+
+## Paper carry (`carry.go`, spec 40 §6.5 shorts)
+Every scheduler tick integrates each open `account|instrument` position at the then-last mark: `|qty · last| · dt / 1 d` notional-days, times the schedule's `funding_bps_day` (any side) and, for shorts, `borrow_bps_day` (schedule of the instrument's md venue and `costs.yaml` class, as for fees). At the end of every `-carry-period` (1 h, UTC grid) each non-zero accrual becomes one charge on `exec.carry.<account>` (JSON `{account, instrument_id, kind: funding|borrow, amount (negative = paid, in the instrument's price currency), ccy ("" = quote currency), bps_day, notional_days, venue, class, period_start, period_end, reference}`; `reference = carry:<instrument>:<kind>:<period end unix>`). The last 6 periods are re-announced with every new one, so a consumer that was down books them late; the risk-engine books each reference once as `ledger.cash_movement` of that kind (converted to EUR at `period_end`). Accruals and the recent periods persist in `orders.json` (`carry`), so a restart neither repeats nor drops a period; time the gateway was down is accrued on the next tick (≤ 7 days) at the mark then known — a position whose instrument has no mark yet accrues nothing for that interval. Counters `carry.charges`, `carry.funding_paid`, `carry.borrow_paid`, `carry.publish_errors`. The repo schedule charges equity borrow 0.3 bp/day, FX funding 0.5 bp/day and default crypto funding 1 bp/day (Kraken spot 0).
 
 ## Subjects
 | Subject | Direction | Payload |
@@ -52,6 +55,7 @@ Without a costs file the built-in default applies (5 bps commission, 1 EUR minim
 | `md.quote.>` | in | `Envelope{Quote}`: spread for the next fills |
 | `order.cancel.<account>` | in | `OrderCancel{intent_id, account_id, reason, at, actor}` (a legacy `OrderIntent` payload still decodes: field 1 is the intent id in both); cancels a resting limit or a working algo order → `CANCELED`, ignored (`cancels.unknown`) when nothing is working |
 | `order.event.<account>` | out | `OrderEvent` (`ACK` / `PARTIAL_FILL` / `FILL` / `CANCELED` / `REJECTED`) |
+| `exec.carry.<account>` | out | JSON carry charge per (instrument, kind, period), see paper carry |
 | `exec.costs.calibrated` | out | JSON calibration report `{at, applied, path, error?, entries[{venue, class, fills, informative, echo, k_prior, k_fit, weight, k_new, clamped, realised_bps_ewma, model_bps_ewma, status}]}` |
 
 Heartbeat counters (also `fa_heartbeat_counter{service="broker-gateway",key=…}` on `/metrics`, spec 60 §6.5): `events.<KIND>`, `resting`, `working`, `quotes`, `intents.duplicate`, `cancels.unknown`, `errors.decode`, `algo.<name>.working|done|cancelled`, `algo.auto.<chosen>`, `slippage.<venue>.<class>.bps_mean` (realised vs arrival, EWMA α 0.05), `slippage.<venue>.<class>.model_bps_mean` (modelled half spread + impact), `slippage.<venue>.<class>.n`, `exec_slippage_bps.<algo>` (EWMA), `costs.k.<venue>.<class>` (impact coefficient in use), `calibrations`, `risk_heartbeat_age_s`, `risk_heartbeat_alive`, `failclosed.rejected`, `state.saves`, `state.save_errors`, `state.restored_working`.
@@ -61,7 +65,7 @@ In compose the gateway loads the repo `costs.yaml` baked into the image (`FA_COS
 ## Run
 ```sh
 go/bin/broker-gateway -nats nats://127.0.0.1:4222 -costs go/services/broker-gateway/costs.yaml
-go test ./services/broker-gateway        # cost model, fixture, limit/cancel paths, algos, cancel decode, recalibration
+go test ./services/broker-gateway        # cost model, fixture, limit/cancel paths, algos, cancel decode, recalibration, carry
 ```
 | Flag | Env | Default |
 |---|---|---|
@@ -72,12 +76,13 @@ go test ./services/broker-gateway        # cost model, fixture, limit/cancel pat
 | `-recalibrate-every` / `-recalibrate-apply` / `-recalibrate-min-samples` | | `15m` / `true` / `30` |
 | `-algo-tick` | | `1s` |
 | `-risk-heartbeat-timeout` | | `15s` (0 disables fail-closed) |
+| `-carry-period` | | `1h` (0 disables funding / borrow charges) |
 | `-metrics` | `FA_METRICS_BIND` | host port of `docker/README.md` (compose `0.0.0.0:9100`; `off` disables) |
 
 ## Owns
 Venue adapters and exec algos transport.
 
 ## Governing specs
-- [40-execution-and-risk](../../../specs/40-execution-and-risk.md)
+- [Execution & risk (ex spec 40)](../../../bins/risk-engine/README.md#execution-and-risk-lasting-content-of-the-retired-spec-40)
 - [41-backtest-and-validation](../../../specs/41-backtest-and-validation.md) §6.3
-- [42-ledger-and-accounting](../../../specs/42-ledger-and-accounting.md)
+- [fa-ledger README](../../../crates/fa-ledger/README.md) (retired spec 42, Ledger & accounting)

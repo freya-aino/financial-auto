@@ -1,4 +1,4 @@
-//! Concrete genome encoding of every decoder family — the two CPU baselines and the six neural
+//! Concrete genome encoding of every decoder family — the two CPU baselines and the eight neural
 //! families of [`crate::neural`] (spec 34 §4.2, D-044, D-068, D-074).
 //!
 //! The evo-orchestrator forwards whatever the UI/API sent as `Job.genome_id`; this module
@@ -73,10 +73,18 @@ pub enum BaselineFamily {
     /// Forecast narrative: latent + return window + current news embedding → embedding of the
     /// news published in the next text window; output family `text.narrative`.
     NnNarrative,
+    /// Event summary: latent (return window if unconditioned) → per-slot distributions of the
+    /// templated summary of the lookback window and its news ([`crate::summary`], spec 34 Q2),
+    /// mean per-slot cross-entropy; output family `text.summary`.
+    NnSummary,
+    /// Broadcast frames: return window + latent → hashed embedding of the media frames of
+    /// `(t − tw, t]` (the frame timeline, [`crate::neural::data::frame_features`]), `1 − cos`;
+    /// output family `visual.frame`.
+    NnFrame,
 }
 
 impl BaselineFamily {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::Forecast,
         Self::Retrieval,
         Self::NnForecast,
@@ -85,9 +93,19 @@ impl BaselineFamily {
         Self::NnFuture,
         Self::NnNews,
         Self::NnNarrative,
+        Self::NnSummary,
+        Self::NnFrame,
     ];
-    pub const NEURAL: [Self; 6] =
-        [Self::NnForecast, Self::NnRetrieval, Self::NnChart, Self::NnFuture, Self::NnNews, Self::NnNarrative];
+    pub const NEURAL: [Self; 8] = [
+        Self::NnForecast,
+        Self::NnRetrieval,
+        Self::NnChart,
+        Self::NnFuture,
+        Self::NnNews,
+        Self::NnNarrative,
+        Self::NnSummary,
+        Self::NnFrame,
+    ];
 
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -99,6 +117,8 @@ impl BaselineFamily {
             "nn_future" | "neural_future" => Some(Self::NnFuture),
             "nn_news" | "neural_news" => Some(Self::NnNews),
             "nn_narrative" | "neural_narrative" => Some(Self::NnNarrative),
+            "nn_summary" | "neural_summary" => Some(Self::NnSummary),
+            "nn_frame" | "neural_frame" => Some(Self::NnFrame),
             _ => None,
         }
     }
@@ -113,6 +133,8 @@ impl BaselineFamily {
             Self::NnFuture => "nn_future",
             Self::NnNews => "nn_news",
             Self::NnNarrative => "nn_narrative",
+            Self::NnSummary => "nn_summary",
+            Self::NnFrame => "nn_frame",
         }
     }
 
@@ -128,12 +150,31 @@ impl BaselineFamily {
 
     /// Families with a reconstruction target (`recon` / `recon_skill` objectives).
     pub fn reconstructs(self) -> bool {
-        matches!(self, Self::NnChart | Self::NnFuture | Self::NnNews | Self::NnNarrative)
+        matches!(
+            self,
+            Self::NnChart | Self::NnFuture | Self::NnNews | Self::NnNarrative | Self::NnSummary | Self::NnFrame
+        )
     }
 
     /// Families that read the news timeline.
     pub fn uses_text(self) -> bool {
-        matches!(self, Self::NnNews | Self::NnNarrative)
+        matches!(self, Self::NnNews | Self::NnNarrative | Self::NnSummary)
+    }
+
+    /// Families that read the media-frame timeline (instead of the news).
+    pub fn uses_frames(self) -> bool {
+        matches!(self, Self::NnFrame)
+    }
+
+    /// Families whose target is an embedding scored with `1 − cos`.
+    pub fn embeds(self) -> bool {
+        matches!(self, Self::NnNews | Self::NnNarrative | Self::NnFrame)
+    }
+
+    /// Families whose output layer starts at the training-mean target (residual around the
+    /// reconstruction baseline: zero output weights, bias = the mean in output space).
+    pub fn residual_init(self) -> bool {
+        matches!(self, Self::NnChart | Self::NnNews | Self::NnNarrative | Self::NnSummary | Self::NnFrame)
     }
 
     /// Family string used on `decoder.output.<family>` (proto `DecoderOutput.family`).
@@ -145,6 +186,8 @@ impl BaselineFamily {
             Self::NnFuture => Family::VisualFuture,
             Self::NnNews => Family::TextNews,
             Self::NnNarrative => Family::TextNarrative,
+            Self::NnSummary => Family::TextSummary,
+            Self::NnFrame => Family::VisualFrame,
         }
     }
 }
@@ -693,7 +736,8 @@ impl DecoderGenome {
                 match f {
                     BaselineFamily::NnRetrieval => format!(" k={} emb={} temp={}", self.k, self.nn.emb, self.nn.temp),
                     BaselineFamily::NnChart | BaselineFamily::NnFuture => format!(" res={}", self.nn.res),
-                    BaselineFamily::NnNews | BaselineFamily::NnNarrative => {
+                    BaselineFamily::NnSummary => format!(" tw={}m", self.nn.tw_min),
+                    BaselineFamily::NnNews | BaselineFamily::NnNarrative | BaselineFamily::NnFrame => {
                         format!(" tdim={} tw={}m", self.nn.tdim, self.nn.tw_min)
                     }
                     _ => String::new(),
@@ -916,7 +960,7 @@ mod tests {
             assert!(same_genes(&g, &g.with_params(&p).unwrap()));
         }
         let fams: std::collections::HashSet<_> = BaselineFamily::ALL.iter().map(|f| f.output_family()).collect();
-        assert_eq!(fams.len(), 6, "rnn_prior, retrieval, visual.chart/future, text.news/narrative");
+        assert_eq!(fams.len(), 8, "every output family of spec 34 §3");
         let mut m = g.params();
         m.insert("width".into(), 1000.0);
         m.insert("lr".into(), 5.0);

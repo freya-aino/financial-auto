@@ -11,7 +11,8 @@
 //! active → retired); [`pretrade`] the checks for foreign/manual orders; [`health`] the
 //! per-instrument stale-feed freeze and bad-tick filter; [`calibrate`] the limit calibration
 //! rules (suggestions, tighten-only); [`rebalance`] the cost-aware trade decision (benefit vs
-//! full expected cost, min order notional from the fee minimum, turnover budget, batching).
+//! full expected cost, min order notional from the fee minimum, turnover budget, batching);
+//! [`session`] the daily-loss day per trading calendar (UTC for 24/7, exchange day otherwise).
 
 pub mod calibrate;
 pub mod exec;
@@ -19,6 +20,7 @@ pub mod health;
 pub mod pipeline;
 pub mod pretrade;
 pub mod rebalance;
+pub mod session;
 pub mod strategy;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -288,6 +290,18 @@ impl RiskEngine {
         self.halts.remove(&HaltScope::DailyLoss);
     }
 
+    /// Moves the daily-loss baseline after a calendar roll ([`session::SessionDays::advance`])
+    /// and clears the daily-loss halt only when the loss against the new baseline is below the
+    /// limit (a session-day loss keeps the halt until that exchange day ends). Returns whether
+    /// the halt was cleared.
+    pub fn roll_day_start(&mut self, day_start: f64, equity: f64) -> bool {
+        if day_start.is_finite() {
+            self.day_start_equity = day_start;
+        }
+        let dl = if self.day_start_equity > 0.0 { 1.0 - equity / self.day_start_equity } else { 0.0 };
+        dl < self.cfg.max_daily_loss && self.halts.remove(&HaltScope::DailyLoss).is_some()
+    }
+
     /// Updates equity; returns newly triggered halts.
     pub fn on_equity(&mut self, equity: f64) -> Vec<(HaltScope, HaltReason)> {
         self.peak_equity = self.peak_equity.max(equity);
@@ -399,6 +413,11 @@ impl RiskEngine {
                 let Some(m) = market.get(i) else {
                     return (*i, 0.0);
                 }; // unknown market → no position
+                // a non-finite target (NaN / ±inf from a broken allocation) is no position, not
+                // a cap-sized one: NaN would pass every comparison below
+                if !t.is_finite() {
+                    return (*i, 0.0);
+                }
                 let liq_cap = self.cfg.liquidity_k * m.horizon_volume_eur;
                 let cap = if m.provisional { prov_cap } else { pos_cap }.min(liq_cap);
                 // no borrow → no short (spec 40 §10 Q5)

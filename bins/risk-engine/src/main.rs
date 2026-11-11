@@ -37,6 +37,7 @@ mod engine;
 mod persist;
 mod pipeline;
 mod recon;
+mod risk_io;
 mod settings;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -265,12 +266,22 @@ async fn handle_ctl(
                 Some(p) => evidence_for(engine, p, &id).await,
                 None => Evidence::default(),
             };
-            let (state, gate) = {
+            let (before, result, gate) = {
                 let mut e = engine.lock().await;
-                let state = e.strategy_action(&id, action, &ev, now)?;
+                let before = e.strategy(&id).map(|s| s.status.as_str());
+                let result = e.strategy_action(&id, action, &ev, now);
                 let gate = e.checklist(&id, &ev, now);
-                (state, gate)
+                (before, result, gate)
             };
+            // spec 40 §5 promotion_review: every promote attempt, granted or refused
+            if action == StrategyAction::Promote
+                && let (Some(p), Some(g)) = (store, gate.as_ref())
+            {
+                let after = result.as_ref().ok().map(|s| s.status.as_str());
+                let evidence = serde_json::json!({"deflated_sharpe": ev.deflated_sharpe, "pbo": ev.pbo, "error": result.as_ref().err()});
+                risk_io::review(p, &id, "promote", &actor, before, after, g, evidence).await;
+            }
+            let state = result?;
             if let Some(p) = store {
                 p.strategy_state(&state, None, gate.as_ref()).await;
                 p.audit_as(
@@ -426,12 +437,7 @@ async fn evidence_for(engine: &Shared, p: &Persist, id: &str) -> Evidence {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    fa_core::logging::init("risk-engine"); // FA_LOG_FORMAT=json|text (spec 60 §4)
     let args = Args::parse();
     fa_bus::metrics::serve_from_env("risk-engine", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config).context("loading platform config")?;
@@ -489,6 +495,7 @@ async fn main() -> anyhow::Result<()> {
                 let refs = p.load_refdata().await;
                 let shortable = p.load_shortable().await;
                 let fx = p.load_fx(&fx_settings.source, fx_settings.history_days).await;
+                let fx_crosses = p.load_fx_crosses().await;
                 let reserve = p.payout_reserve_today().await;
                 let risk_state = p.load_risk_state().await;
                 let mut e = engine.lock().await;
@@ -506,12 +513,17 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(m) = shortable {
                     e.set_shortable(m);
                 }
+                if let Some(x) = fx_crosses {
+                    tracing::info!(pairs = ?x.iter().map(|x| (&x.ccy, &x.source)).collect::<Vec<_>>(), "intraday fx pairs loaded");
+                    e.set_fx_crosses(x);
+                }
                 if let Some(t) = fx {
                     tracing::info!(rates = t.len(), currencies = ?t.currencies().collect::<Vec<_>>(), "fx table loaded");
                     let _ = e.set_fx(t, now_ms());
                 }
                 e.set_reserved_payout(reserve);
                 drop(e);
+                risk_io::load_calendars(&engine, &p).await;
                 p.audit("limits.loaded", Some(&settings.account), limits).await;
                 Some(Arc::new(p))
             }
@@ -852,6 +864,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // paper carry (exec.carry.<account>), pre-submit checks (ctl.risk.pretrade), risk-chain history
+    risk_io::spawn_carry(&bus, engine.clone(), store.clone(), &settings.account).await?;
+    risk_io::serve_pretrade(&bus, engine.clone()).await?;
+    if let Some(p) = &store {
+        risk_io::spawn_history(engine.clone(), p.clone(), &settings);
+    }
+
     // control plane: ctl.risk.strategy | limits | flatten | pipeline | allocators (request/reply, CtlReply)
     for verb in ["strategy", "limits", "flatten", "pipeline", "allocators"] {
         let (bus, engine, store, pipe) = (bus.clone(), engine.clone(), store.clone(), pipe.clone());
@@ -940,6 +959,10 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(m) = p_f.load_shortable().await {
                     engine_f.lock().await.set_shortable(m);
                 }
+                risk_io::load_calendars(&engine_f, &p_f).await;
+                if let Some(x) = p_f.load_fx_crosses().await {
+                    engine_f.lock().await.set_fx_crosses(x);
+                }
             }
         });
         // ECB daily reference rates → ref.fx_rate → in-memory FX table (spec 12 §6, spec 42 §6)
@@ -974,6 +997,26 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(t) = p_x.load_fx(&fx_x.source, fx_x.history_days).await {
                     let outs = engine_x.lock().await.set_fx(t, now_ms());
                     publish_outs(&bus_x, &Some(p_x.clone()), &engine_x, outs).await;
+                }
+            }
+        });
+        // intraday FX rates (trades of EUR FX pairs) → ref.fx_rate, so fills booked at them
+        // carry a stored rate (ledger.fill_valued) and the ledger values at them (spec 42 §6)
+        let (engine_r, p_r) = (engine.clone(), p.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                let rates = engine_r.lock().await.take_fx_pending();
+                if rates.is_empty() {
+                    continue;
+                }
+                match p_r.store_fx_rates(&rates).await {
+                    Ok(n) => tracing::debug!(rates = rates.len(), new_rows = n, "intraday fx rates stored"),
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "intraday fx rates not stored");
+                        *engine_r.lock().await.counters.entry("fx.intraday_store_errors").or_insert(0.0) += 1.0;
+                    }
                 }
             }
         });

@@ -7,6 +7,7 @@
 	import { eur, num, poll, short } from '../../../lib/api';
 	import { consoleApi, errText, type PnlBreakdown, type PnlParts } from '../../../lib/console';
 	import { canBook, orphanConfirmText, orphanResolveBody, orphanRow, payoutBody, payoutConfirmText } from '../../../lib/ledgerForms';
+	import { operatorApi, restatementConfirmText, restatementRequest, sameRequest, type RestatementReply, type RestatementRequest } from '../../../lib/operator';
 	import { loadPref, savePref } from '../../../lib/prefs';
 	import { runtime } from '../../../lib/runtime.svelte';
 
@@ -70,6 +71,61 @@
 		if ('error' in p) return ((actionMsg = p.error), (actionOk = false));
 		void act(payoutConfirmText(p.body), () => consoleApi.bookPayout(p.body), 'payout');
 	}
+
+	// FX restatement (spec 42 §6): dry run first; apply only for the plan on screen, with a reason
+	// and an explicit confirm (the API also answers 428 without `confirm`).
+	let rs = $state({ instrument: '', ccy: '', from_ccy: '', check_hours: '' });
+	let rsPlanned = $state<RestatementRequest | null>(null);
+	let rsReply = $state<RestatementReply | null>(null);
+	let rsReason = $state('');
+	let rsMsg = $state('');
+	let rsOk = $state(true);
+	let rsBusy = $state(false);
+	const rsCurrent = $derived.by(() => {
+		const r = restatementRequest({ book, ...rs });
+		return 'req' in r ? r.req : null;
+	});
+	const rsCanApply = $derived(!!rsReply?.dry_run && rsReply.fills_total > 0 && sameRequest(rsPlanned, rsCurrent) && rsReason.trim().length > 0);
+
+	async function restateDryRun() {
+		const r = restatementRequest({ book, ...rs });
+		if ('error' in r) return ((rsMsg = r.error), (rsOk = false));
+		rsBusy = true;
+		try {
+			rsReply = await operatorApi.restateFxDryRun(r.req, 50);
+			rsPlanned = r.req;
+			rsMsg = `dry run: ${rsReply.fills_total} fill(s) would change; nothing written`;
+			rsOk = true;
+		} catch (e) {
+			rsReply = null;
+			rsPlanned = null;
+			rsMsg = `dry run failed: ${errText(e)}`;
+			rsOk = false;
+		} finally {
+			rsBusy = false;
+		}
+	}
+
+	async function restateApply() {
+		if (!rsReply || !rsPlanned || !rsCanApply) return;
+		if (!confirm(restatementConfirmText(rsReply, rsReason.trim()))) return;
+		rsBusy = true;
+		try {
+			const r = await operatorApi.restateFxApply(rsPlanned, rsReason.trim());
+			rsReply = r;
+			rsMsg = r.applied ? `applied as batch ${r.applied.batch_id}: ${r.applied.fills} fill(s), cash delta ${Number(r.applied.cash_delta_eur).toFixed(2)} EUR — restart the risk-engine now` : 'the API answered without applying';
+			rsOk = !!r.applied;
+			await refresh();
+		} catch (e) {
+			rsMsg = `apply failed: ${errText(e)}`;
+			rsOk = false;
+		} finally {
+			rsBusy = false;
+		}
+	}
+
+	const figure = (v: unknown) => (v === null || v === undefined || v === '' ? '—' : Number.isFinite(Number(v)) ? Number(v).toFixed(2) : String(v));
+	const pnlNet = (b: Record<string, unknown> | undefined) => (b?.pnl as Record<string, unknown> | undefined)?.net_eur;
 
 	async function refresh() {
 		const f = from || undefined;
@@ -247,6 +303,70 @@
 		</div>
 		<p class="dim small"><code>POST /api/trading/payouts</code> (spec 42 §6): a cash movement out of the book, after a confirmation; the risk-engine's daily quota (<code>[payout]</code>) is advisory, booking stays an operator action.</p>
 	</section>
+
+	<section class="panel wide">
+		<div class="panel-head"><h2>FX restatement <span class="dim">(book {book})</span></h2><span class="dim">POST /api/trading/restatements/fx · dry run first</span></div>
+		<form class="toolbar" onsubmit={(e) => (e.preventDefault(), restateDryRun())}>
+			<label>instrument <input class="mono" bind:value={rs.instrument} placeholder="UUID" size="36" /></label>
+			<label title="target currency; default the instrument's quote_ccy">to ccy <input bind:value={rs.ccy} placeholder="quote" size="4" /></label>
+			<label title="only fills booked in this currency (default EUR)">from ccy <input bind:value={rs.from_ccy} placeholder="EUR" size="4" /></label>
+			<label title="window of the per-strategy vs book check (default 24)">check h <input bind:value={rs.check_hours} placeholder="24" size="4" /></label>
+			<button type="submit" disabled={rsBusy || !rs.instrument}>dry run</button>
+		</form>
+		{#if rsMsg}<p class="badge" class:ok={rsOk} class:danger={!rsOk}>{rsMsg}</p>{/if}
+		{#if rsReply}
+			{@const p = rsReply.plan}
+			<div class="grid two">
+				<table>
+					<tbody>
+						<tr><th>fills</th><td class="mono">{rsReply.fills_total} ({p.from_ccy} → {p.ccy}){rsReply.fills_total > p.fills.length ? ` · ${p.fills.length} listed` : ''}</td></tr>
+						<tr><th>by old source</th><td class="mono">{Object.entries(p.by_old_source).map(([k, v]) => `${k}: ${v}`).join(' · ') || '—'}</td></tr>
+						<tr><th>missing rate</th><td class="mono" class:neg={p.missing_rate.length > 0}>{p.missing_rate.length} fill(s) not restated</td></tr>
+						<tr><th>cash delta</th><td class="mono">{figure(p.cash_delta_eur)} EUR</td></tr>
+						<tr><th>planned</th><td class="mono dim">{p.planned_at} · check from {p.check_from}</td></tr>
+					</tbody>
+				</table>
+				<table>
+					<thead><tr><th></th><th>before</th><th>after</th></tr></thead>
+					<tbody>
+						<tr><th>cash EUR</th><td class="mono">{figure(p.before.cash_eur)}</td><td class="mono">{figure(p.after.cash_eur)}</td></tr>
+						<tr><th>equity EUR</th><td class="mono">{figure(p.before.equity_eur)}</td><td class="mono">{figure(p.after.equity_eur)}</td></tr>
+						<tr><th>P&amp;L net EUR</th><td class="mono">{figure(pnlNet(p.before))}</td><td class="mono">{figure(pnlNet(p.after))}</td></tr>
+						<tr><th title="strategy sum − book over the check window (0 = consistent)">strategy gap EUR</th><td class="mono">{figure(p.before.window_strategy_gap_eur)}</td><td class="mono">{figure(p.after.window_strategy_gap_eur)}</td></tr>
+					</tbody>
+				</table>
+			</div>
+			{#if p.notes.length}<ul class="small">{#each p.notes as n}<li>{n}</li>{/each}</ul>{/if}
+			{#if p.fills.length}
+				<div class="scroll tall">
+					<table>
+						<thead><tr><th>filled</th><th>venue fill</th><th>qty</th><th>price</th><th>old</th><th>new</th><th>rate time</th><th>cash Δ EUR</th></tr></thead>
+						<tbody>
+							{#each p.fills as f, i (String(f.fill_uuid ?? i))}
+								<tr>
+									<td class="mono dim">{String(f.filled_at ?? '').slice(0, 19)}</td>
+									<td class="mono">{short(String(f.venue_fill_id ?? ''), 12)}</td>
+									<td class="mono">{figure(f.qty)}</td>
+									<td class="mono">{figure(f.price)}</td>
+									<td class="mono dim">{f.old_ccy} {f.old_fx} ({f.old_source})</td>
+									<td class="mono">{f.new_ccy} {f.new_fx} ({f.new_source})</td>
+									<td class="mono dim">{String(f.rate_ts ?? '').slice(0, 19)}</td>
+									<td class="mono">{figure(f.cash_delta_eur)}</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+			{/if}
+			{#if rsReply.dry_run}
+				<div class="toolbar apply">
+					<label>reason <input bind:value={rsReason} placeholder="required, goes into the audit row" size="40" /></label>
+					<button class="danger" disabled={rsBusy || !rsCanApply} onclick={restateApply} title={rsCanApply ? '' : !sameRequest(rsPlanned, rsCurrent) ? 'the form changed: run the dry run again' : rsReply.fills_total === 0 ? 'nothing to restate' : 'a reason is required'}>apply restatement…</button>
+					<span class="dim small">rewrites booked fills after a confirmation; restart the risk-engine afterwards (spec 42 §6)</span>
+				</div>
+			{/if}
+		{/if}
+	</section>
 </div>
 
 <style>
@@ -274,6 +394,17 @@
 	}
 	.cols {
 		grid-template-columns: repeat(auto-fill, minmax(460px, 1fr));
+	}
+	.wide {
+		grid-column: 1 / -1;
+	}
+	.two {
+		grid-template-columns: 1fr 1fr;
+	}
+	.apply {
+		margin-top: 10px;
+		padding-top: 8px;
+		border-top: 1px dashed var(--danger);
 	}
 	.tall {
 		max-height: 420px;

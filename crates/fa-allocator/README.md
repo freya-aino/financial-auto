@@ -15,6 +15,8 @@ Pluggable meta-allocators, cross-strategy netting and the evolvable allocator ge
 
 `net_targets(dists, alloc, deployable)` nets `w · deployable / n_assets · mean / (1 + stddev)` per instrument (D-040); `net_targets_shrunk(…, shrink)` uses `(1 + stddev)^shrink` (`0` ignores the uncertainty, `1` = live).
 
+**Fill attribution of netted orders** (spec 40 §10 Q3, causal pro-rata): `attribution_weights(Δ, [(c_s, h_s)])` weights each contributor by `max(0, sign(Δ)·(c_s − h_s))` — its own signed EUR contribution to the target minus what its sub-book already holds, in the order's direction — falling back to `|c_s|`, then to an even split; `attribution_shares(n, weights)` normalises them (even when missing). The risk-engine attributes fills to sub-books with them and the ledger stores the shares (`PgLedger::record_fill_weighted`).
+
 ## Allocator genome (`genome`)
 Text form (one line, canonical gene order, ≤ 6 decimals; `parse` ↔ `Display` round trip; id `alloc-<fnv64 of the text>`):
 ```
@@ -46,4 +48,4 @@ risk-engine also takes `{"allocator": {"genome": "alloc:…"}}`; the switch is a
 `Allocator` trait and implementations, netting, `PerformanceTracker`, `AllocatorGenome` / `AllocatorOps` / `AllocatorSpec`, live `Tournament`.
 
 ## Governing specs
-- [40-execution-and-risk](../../specs/40-execution-and-risk.md) §3, §6.2, §6.3; decisions D-040, D-064, D-071
+- Retired spec 40 → [risk-engine README](../../bins/risk-engine/README.md#execution-and-risk-lasting-content-of-the-retired-spec-40) (decisions, netting attribution); decisions D-040, D-064, D-071

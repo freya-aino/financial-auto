@@ -123,7 +123,7 @@ Strategies entering shadow run on live data with the paper venue. Tracked: calen
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
 |---|---|---|
-| `holdout.length.<timescale>` | seconds: 3d, minutes: 1m, hours: 3m, days: 1y | running values `risk.toml [holdout.length_secs]`: 2 h / 12 h / 90 d / 365 d until the history is longer |
+| `holdout.length.<timescale>` | 1s 2 h, 1m 12 h, 1h 90 d, 1d 365 d | `risk.toml [holdout.length_secs]` (Q1 decided) |
 | `embargo.<timescale>` | 2 × horizon | floor per timescale `risk.toml [holdout.embargo_secs]` (5 min / 1 h / 2 d / 10 d), stored with the lock; selection windows end `max(floor, 2 × strategy horizon, 60 s)` before the holdout |
 | `holdout.min_bars` | 300 | a segment with fewer bars is not locked (reported instead) |
 | `pbo.n_blocks` | 16 | CSCV partitions |
@@ -131,29 +131,28 @@ Strategies entering shadow run on live data with the paper venue. Tracked: calen
 | `dsr.min_for_promotion` | 0.95 | probability |
 | `cost.impact_coeff` | 0.1 | sqrt-impact |
 | `backfill.knowledge_delay.<source>` | catalog | `sources.yaml` `backfill.knowledge_delay_secs`: kraken 120 s, yahoo 100 s (measured, §6.2); others 0 |
+| `coverage.min_coverage` / `gap_bars` / `min_gap` / `session_gap` | 0.5 / 5 / 15 min / 72 h | missing-data cut (§8), `ReplaySpec::coverage` |
+| `latency.<venue>` | 1 s (every paper venue) | decision → fill latency of the strategy replay (§10 Q3), `ReplaySpec::latency` |
+| `holdout.relock_after_days` | 7 | Q5; effective age `max(7 d, holdout length)` |
 
 ## 8. Failure modes
 | Failure | Response |
 |---|---|
-| Missing data in window | report marks coverage; candidates with < min coverage get no fitness |
+| Missing data in window | report marks coverage; candidates with < min coverage get no fitness. **Implemented** (`fa_backtest::coverage`, `ReplaySpec::coverage`): a gap longer than `max(5 bars, 15 min)` (session classes equity/etf/index: 72 h) is missing data; instrument coverage = 1 − missing / data span; instruments below `min_coverage` (0.5) are not traded; a window whose data spans < 50 % of it, or with no instrument left, fails with `ReplayError::Coverage` (job failed, no trial row); `EvalReport::coverage` and the job result carry the marks |
 | Look-ahead detected (assertion: event used before knowledge time) | evaluation fails hard; bug, not a fitness penalty |
-| Holdout accessed by selection job | job rejected, audit event |
+| Holdout accessed by selection job | job rejected, audit event. **Implemented:** evo-worker writes `audit.log` `validation.holdout.access_rejected` (actor `system:evo-worker`, subject = job id, payload: candidate, window, error) |
 | Non-deterministic replay | CI failure |
-| Cost model stale vs live slippage | alert, recalibration job |
+| Cost model stale vs live slippage | alert, recalibration job. **Implemented:** vmalert `CostModelStale` (realised EWMA slippage vs model differs > 5 bps and > 50 % for 1 h with ≥ 30 fills per venue/class, from the gateway's `slippage.<venue>.<class>.*` gauges); the gateway refits `k` every 15 min. The backtest keeps the repo `costs.yaml`: paper fits measure drift, not impact (§6.3) |
 
 ## 9. Acceptance criteria
-**Remaining (checked against the code at e25e9b5):**
-- **Full-day decision replay** (AC 1): reproduced on a 240 s recorded window, not a day (`MD` retention); the recorder is an in-process `Engine`, not the deployed service; latents → strategy decisions are not compared signal-for-signal against `SIGNAL`.
-- **Coverage** (§8 "missing data in window"): `fa_backtest::replay` fails only when no bars exist at all (`ReplayError::NoData`); a partial window gets no coverage mark and no minimum-coverage cut.
-- **Holdout access audit** (§8): a Selection replay that intersects a holdout fails the job (`rejected: …`, worker log) but writes no audit event.
-- **Stale cost model alert** (§8): the gateway recalibrates `k` every 15 min, but nothing alerts on realised-vs-model slippage divergence; the backtest prices with the repo `costs.yaml`, not the calibrated overlay.
-- **Latency simulation** (§10 Q3): replays fill at the deciding bar's close (zero latency); no per-venue order latency model.
-- Open questions 1 (holdout lengths: running values scaled to the stack's history) and 5 (re-lock cadence, default never) remain the user's calibration calls.
+**Remaining (checked against the code of the 2026-11-11 evening round):**
+- **Full-day decision replay** (AC 1): the tooling replays any retained span of the **deployed** strategy-runtime from the streams and compares signal-for-signal (below), but no day of one deployment exists yet (the service restarted 2026-11-11 16:18 UTC; `MD` keeps 24 h), the full span since that restart was not run (the compose stack was stopped at 21:06 UTC during this work), and the risk-engine half has no live intents to compare: the paper book is under the portfolio kill-switch halt since 2026-11-11 04:17 UTC (manual re-arm, a user decision). To close: after ≥ 24 h of one deployment, run `deployed_signals_from_retained_streams` over it; after a re-arm, record a day of risk-engine intents.
 
 - Replaying a recorded live day reproduces the live paper decisions exactly (same orders, same timestamps). **Met for the execution half and for strategy decisions → intents on a recorded window; not for a full day or for latents → strategy decisions:**
   - execution: a recorded live venue window reproduces every paper fill (`tests/venue_identity.rs`, §6.3; pinned to the capture-time `costs.yaml`, `testdata/venue_fixture_costs.yaml`);
   - decisions (`bins/risk-engine/src/decision_replay.rs`): the deployed engine's decision ticks sit on the 1 s wall-clock grid, so a window is replayable. A recorder (`FA_DECISION_RECORD_SECS=240 cargo test -p risk-engine -- --ignored record_live_decision_window`) runs the risk-engine's `Engine` read-only on the live bus — every `signal.exposure.*` and `md.trade.*` applied at its receive time, ticks on the grid, intents filled in-process at the mark with the venue commission, nothing published — and writes inputs, ticks and approved intents to `bins/risk-engine/testdata/decision_fixture.jsonl` (2026-11-11, 240 ticks, 1 518 strategy signals, 275 trades, 30 intents under the cost-aware rule). `decision_fixture_reproduces_the_live_intents` (always run) replays the inputs through a fresh engine and requires byte-identical intents at the same ticks (ids excluded). `FA_DECISION_STREAMS=1 … --ignored decision_window_from_retained_streams` rebuilds the same window from the retained `SIGNAL` and `MD` JetStream streams alone (knowledge time = stream publish time): 1 780 inputs read, **30 of 30 live intents reproduced identically** (asserted ≥ 95 %). The same live window under the D-041 band alone yields 242 intents and 13.76 EUR of commission against the cost-aware rule's 30 and 1.05 EUR (most of it on the costless `sim` venue).
-  - Open: the recorder is an in-process engine, not the deployed service (whose book was under a kill-switch halt during this work, so it emitted no intents to compare); a full day needs `MD` retention beyond its present ~1.5 h of messages (24 h `max_age`, recreated 03:31); latents → strategy decisions (strategy-runtime) are replayed by `fa_backtest::replay` per genome but not compared signal-for-signal against `SIGNAL`.
+  - latents → strategy decisions, **deployed service** (`bins/strategy-runtime/src/replay.rs`): a cold `Runtime` with the deployed population and settings is fed every retained input (`MD` `md.trade.>`, `LATENT` `latent.state|shadow|region|transition|lifecycle.>` and `decoder.output.>`) in knowledge-time order through the same dispatch as `main.rs` (a test pins the subject set to `main.rs`), ticked at every `as_of` the live service emitted at, and each replayed `ExposureDistribution` is compared with the recorded `SIGNAL` one: byte-identical, equal within 1e-9 (only float noise, max 1.1e-16), different, live-only or replay-only. Non-bus inputs are reconstructed: analog outcome prices the service fetched from VictoriaMetrics (`prefetch.rs`) are fetched again after each tick (recorded as `analog.fill` for fixtures); step-budget skips are taken from the record (a known strategy silent at an emitting tick); the subscription time after the process start and the Kraken trades the restarted ingestor re-sent (JetStream drops them as duplicates within the 60 s window, core subscribers still get them) are inferred from the first live ticks. Result on the first 5 min after the 16:18:24 UTC restart (300 ticks, 1 883 live distributions, 9 strategies): **steady state 100 % reproduced** (725 identical, 1 084 equal); the cold-start transient (until each Kraken symbol's second post-restart batch, 89 s) has 74 differing `baseline-quantile-1s` steps on one instrument (a re-sent trade no stream records). `signal_fixture_reproduces_the_deployed_runtime` (always run) replays the first 150 s (`testdata/signal_fixture.jsonl`) and requires 100 % in the steady state.
+  - Open: the risk-engine recorder is an in-process engine, not the deployed service (whose book was under a kill-switch halt during this work, so it emitted no intents to compare); a full day needs `MD` retention beyond its present ~1.5 h of messages (24 h `max_age`, recreated 03:31); latents → strategy decisions (strategy-runtime) are replayed by `fa_backtest::replay` per genome but not compared signal-for-signal against `SIGNAL`.
 - Determinism test: identical spec+seed → identical report hash. **Met** (`replay_is_deterministic_and_pays_costs`, `evaluation_is_deterministic_and_reasonable`, the allocator replay fixture).
 - Look-ahead guard: synthetic test injecting a future-dated event is caught. **Met** (`look_ahead_guard_catches_future_event`, `replay_in_order_and_rejects_lookahead`).
 - Holdout is immutable via API; selection jobs touching it are rejected. **Met**, and a holdout per configured timescale is locked automatically (§6.4).
@@ -161,11 +160,11 @@ Strategies entering shadow run on live data with the paper venue. Tracked: calen
 - Fitness values reported to evolution are net of the cost model. **Met** (`fa_backtest::cost` in every strategy / allocator replay, `cost_sensitivity` at 2×).
 
 ## 10. Open questions
-1. Holdout length per timescale (placeholders) — blocks gate calibration.
+1. Holdout length per timescale (placeholders) — blocks gate calibration. *(Decided: the running `risk.toml [holdout.length_secs]` values — 1s 2 h, 1m 12 h, 1h 90 d, 1d 365 d — each holding ≥ `min_bars` (300) bars and ≥ `holdout_min_obs` (100) non-overlapping horizons of the timescale's strategies; the §7 targets 3 d / 1 month for 1s / 1m are dropped: they would withhold more recent data from selection than the stack keeps for those timescales.)*
 2. Should online adapters be replayed online or frozen during selection replay? — affects evaluation cost and realism. *(Implemented answer, D-059: neither; replays feed the recorded `LATENT` outputs the serving snapshot published, which already include the online adapters' effect.)*
-3. Latency simulation: model order latency per venue, or assume next-event execution? — affects short timescales.
+3. Latency simulation: model order latency per venue, or assume next-event execution? — affects short timescales. *(Decided and implemented, `fa_backtest::latency`: per-venue latency, on by default at 1 s for every paper venue — measured intent → fill p50 1 ms, max 19 ms on 7 267 market orders; the risk-engine's 1 s decision grid dominates — so a decision at bar close `t` fills at the venue's last price at `t + 1 s`; `LatencyModel::zero()` reproduces older trials.)*
 4. Effective-trials estimation method for DSR with huge correlated populations. *(Mean-correlation estimate implemented; eigenvalue / clustering methods remain options.)*
-5. Re-lock cadence for the holdout as the system ages. *(Mechanism exists: `[holdout] relock_after_days`; the cadence is still open, default never.)*
+5. Re-lock cadence for the holdout as the system ages. *(Decided: weekly — `[holdout] relock_after_days = 7`; a re-lock happens once the latest holdout ended `max(7 d, its length)` ago, so segments are full-length and disjoint (`fa_backtest::holdout::plan_lock`). Verdicts already given on an older holdout stay valid: each was on a holdout its candidate's selection never touched; new candidates use the newest such holdout.)*
 
 ## 11. Deferred
 - Walk-forward / purged CV inside evolution (explicitly rejected for now; revisit when compute scales).

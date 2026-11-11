@@ -28,12 +28,14 @@ integration tests, see below). Supersedes the D-012 assumption of CLI-compiled
   score}` snapshot → elite decoder genome, upsert by `genome_id`; trainer, D-009),
   `genome_trained_on`, `snapshot_feedback`.
 - `reference` – the Postgres `ref` mirror (spec 12 §5), written by control-api `ref_mirror.rs`:
-  `upsert_ref_entities`, `upsert_ref_venues`, `upsert_ref_instruments` (nodes first, then each
+  `upsert_ref_entities` (entity nodes, then one `Sector` node per distinct `ref.entity.sector`
+  — `sector_id` = lowercase slug — and each entity's `InSector` edge made equal to its current
+  sector: `IN_SECTOR` of spec 12 §5), `upsert_ref_venues`, `upsert_ref_instruments` (nodes first, then each
   instrument's `IssuedBy` / `ListedOn` / `SameExposure` out-edges made equal to the given sets:
   stale edges dropped, current ones upserted by an edge key), `retire_ref_instruments`
   (`status = inactive`, out-edges dropped), `sync_reference(entities, venues, instruments, full)`
   (`full` retires mirrored instruments absent from the input), `ref_instrument_ids`,
-  `instrument_reference`. 25 rows per write batch.
+  `instrument_reference` (also returns the issuer's sector via `IssuedBy` → `InSector`). 25 rows per write batch.
 - `catalog` – the **whitelist** of read-only named queries behind `POST /api/graph/query`
   (`NAMED_QUERIES`, `HubClient::run_named(name, params)`); business-id parameters, no raw trees.
   Includes `instrumentReference`, `genomeTrainedOn` and `snapshotFeedback`.
@@ -63,6 +65,11 @@ integration tests, see below). Supersedes the D-012 assumption of CLI-compiled
 - `experts` (D-073) – `Expert` nodes (`expert_uid = <snapshot>/e<id>`), `ExpertOf`,
   `AlignedTo{cka}`: `upsert_expert`, `align_expert`, `retire_expert` (`died_gen`),
   `snapshot_experts`, `expert_parents`, `expert_alignments`.
+- `evolution` (D-085) – decoder-population rows of the retired spec 34 §5: `record_evaluation`
+  (`EvaluatedOn{generation, gen_index, rung, score, objectives, job_id}` genome → snapshot, upsert
+  per pair, and `Reads{expert_id}` genome → each `Expert` its mask selects), `upsert_pareto_front`
+  (`ParetoFront{front_id = <generation>/<loop>, …, hypervolume}` + `InFront{rank, hv, crowding,
+  score}` → genomes), `pareto_fronts(generation_id)`.
 - `retention` – `prune_space_observations`, `prune_snapshot_observations`, `prune_observations`
   with a `RetentionPolicy` (old `observation` latents folded into `kind=aggregate` rows per region;
   version rows older than the cut-off thinned to the one in force). model-runtime runs it on a
@@ -218,6 +225,8 @@ The live tests create `test-<nanos>-…` rows and drop them afterwards; the inde
 idempotent `ensure_*`/`upsert_*` writers, lifecycle marks, `snapshot_graph`, `resolve_node`, the
 named-query catalog, the evo-worker business-id writers and the `AdapterState` round trip
 (`adapter_state_round_trip_and_snapshot_manifest`).
+
+**k-NN benchmark** (spec 20 §6.4, criterion 4): `cargo build --release -p fa-hub --example knn_bench`, then run it against a **scratch** HelixDB (`--url`, refuses port 6969; `--n 10000,25000,50000 --queries 200 --drain-secs 900`; `--query-space <id>` re-measures an existing space). 2026-11-11, v0.0.14, dim 32, k = 10: idle p95 93 ms at 50 k vectors, 213–300 ms at 250 k (latency follows the whole `vec<d>` index, not the queried space), recall@10 ≥ 0.997, ≈ 21 KB per vector, 429 `index_backpressure` at 250 k pending.
 
 ## Governing specs
 - [20-storage](../../specs/20-storage.md) §5.2, [ADR 0002](../../specs/adr/0002-helixdb-hub.md), D-012, D-033, D-043, D-048, D-067, D-069, D-073, D-078, D-084

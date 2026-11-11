@@ -12,9 +12,11 @@ Non-evolvable hard risk limits, kill switch, health halts, strategy lifecycle an
 - **`health`:** per-instrument `FeedGuard` (stale freeze, reduce-only; optional stale flatten; bad-tick jump held until confirmed).
 - **`pretrade`:** `check_order` for manual / foreign orders (sanity, fat-finger size and price band, post-trade position / liquidity / class / venue / gross caps, short borrow and margin; reductions always pass).
 - **`calibrate`:** limit suggestions from hourly equity and instrument marks with the tighten-only set to apply.
+- **`session`:** the daily-loss day per calendar group (`SessionDays`: UTC for 24/7 venues, the exchange day otherwise; a session group's roll banks its finished day into the day start, the UTC roll restarts the 24/7 part; `RiskEngine::roll_day_start` clears the daily-loss halt only when the remaining loss is below the limit) — spec 40 §10 Q4.
+- **Randomised chain tests** (`tests/risk_chain_props.rs`, proptest): random limits, markets, equity, payout reserve, positions, halts and targets (incl. NaN / ±inf) through `cap_targets` → `gate_for` → `Rebalancer::decide`; every cap, the halt semantics and the trade rule's bypasses are asserted on the output. Non-finite targets are no position (found by it).
 
 ## Owns
-Hard limits and pre-trade checks, halt state machine, feed guard, lifecycle rules and promotion gate, pipeline decisions, execution-algorithm choice, cost-aware rebalancing, limit calibration.
+Hard limits and pre-trade checks, halt state machine, daily-loss day, feed guard, lifecycle rules and promotion gate, pipeline decisions, execution-algorithm choice, cost-aware rebalancing, limit calibration.
 
 ## Governing specs
-- [40-execution-and-risk](../../specs/40-execution-and-risk.md), [35-strategies](../../specs/35-strategies.md) §6.4, [41-backtest-and-validation](../../specs/41-backtest-and-validation.md) §6.6
+- Retired spec 40 → [risk-engine README](../../bins/risk-engine/README.md#execution-and-risk-lasting-content-of-the-retired-spec-40), [35-strategies](../../specs/35-strategies.md) §6.4, [41-backtest-and-validation](../../specs/41-backtest-and-validation.md) §6.6

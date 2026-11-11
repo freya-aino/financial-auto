@@ -4,8 +4,11 @@
 //! The pipeline never talks to Helix: [`HubSink::observe`] turns a [`StepOutput`] into
 //! [`HubEvent`]s and `try_send`s them into a **bounded** channel; a single background task
 //! drains it and writes through `fa_hub`. Bus publishing is therefore never blocked or slowed by
-//! Helix. When Helix is unreachable the task logs once, drops writes (counted in
-//! `hub.dropped`) and retries connecting every [`RECONNECT_EVERY`].
+//! Helix. When Helix is unreachable (or answers 5xx / 429) the task logs once, **defers** every
+//! write to the disk-backed observation log ([`crate::hub_log`], `--hub-log-dir`) and retries
+//! connecting every [`RECONNECT_EVERY`]; on reconnect the backlog is replayed in order before
+//! new writes go direct (spec 30 §8, spec 33 §8). Only a full channel (`hub.dropped`) or a full
+//! log (`hub.log_full`) loses writes, both counted and alerted.
 //!
 //! What is written
 //! - the `Snapshot` (`stat-v1-<ts>`) and its `ExpertSpace`s once per process (get-or-create);
@@ -22,7 +25,8 @@
 //! - every `--hub-state-secs`: the `RegionSet` (serialised region set + kernel, restored on
 //!   restart), region statistics and moved centroids;
 //! - `KernelModel` per expert space on every `KernelUpdate`, `Hier` edges on every hierarchy
-//!   update, `CrossPrior` rows on every cross-asset update (spec 33 §5, §6.5).
+//!   update, `CrossPrior` rows on every cross-asset update (spec 33 §5, §6.5);
+//! - `RegionEpisode` rows (spec 30 §5) as the occupancy stage closes them.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -34,7 +38,7 @@ use std::{
 use fa_core::Timescale;
 use fa_hub::{
     HubClient, HubError, NewCrossPrior, NewDescent, NewExpertSpace, NewHierEdge, NewKernelModel, NewLatent, NewRegion,
-    NewRegionSet, NewSnapshot, NewTransition, RegionStatsUpdate, TransitionUpsert,
+    NewRegionEpisode, NewRegionSet, NewSnapshot, NewTransition, RegionStatsUpdate, TransitionUpsert,
 };
 use fa_proto::v1::{
     CrossAssetPriors, ExpertLatent, ExpertSpaceRef, KernelUpdate, RegionEvent, RegionHierarchy, RegionLifecycleEvent,
@@ -43,6 +47,7 @@ use fa_proto::v1::{
 use tokio::sync::{Mutex, mpsc};
 
 use crate::{
+    hub_log::{self, HubLog, TRANSITIONS_KEY},
     pipeline::{ExpertPersist, StepOutput},
     region_method::RegionMethod,
 };
@@ -64,10 +69,16 @@ pub struct SinkConfig {
     pub latent_timescales: BTreeSet<Timescale>,
     /// Channel capacity; when full, events are dropped (`hub.dropped`).
     pub queue: usize,
+    /// Observation log directory (`--hub-log-dir`); `None` drops writes while Helix is down.
+    pub log_dir: Option<std::path::PathBuf>,
+    /// Bound of the ordered log (`--hub-log-max-mb`).
+    pub log_max_bytes: u64,
+    /// `region_weight` series and region episodes (spec 30 §5); `None` disables both.
+    pub occupancy: Option<crate::occupancy::OccupancyCfg>,
 }
 
 /// A pipeline's snapshot as the sink needs it to (re)create `Snapshot` + `ExpertSpace` rows.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotDesc {
     pub snapshot_id: String,
     pub timescale: Timescale,
@@ -107,6 +118,10 @@ pub enum HubEvent {
     Persist(Vec<ExpertPersist>),
     Hierarchy(RegionHierarchy),
     CrossPriors(CrossAssetPriors),
+    /// Coalesced `Transition` rows (what the drain writes; also their deferred form).
+    TransitionRows(Vec<TransitionUpsert>),
+    /// Closed region episodes (spec 30 §5).
+    Episodes(Vec<NewRegionEpisode>),
 }
 
 /// Expert-space business id: `<snapshot_id>-e<k>` (what `LatentVec.expert_space_id` partitions on).
@@ -175,6 +190,7 @@ pub struct HubSink {
     tx: mpsc::Sender<HubEvent>,
     counters: Counters,
     latent_timescales: BTreeSet<Timescale>,
+    occupancy: Option<crate::occupancy::OccupancyHandle>,
 }
 
 impl HubSink {
@@ -183,8 +199,9 @@ impl HubSink {
     pub fn spawn(cfg: SinkConfig, counters: Counters) -> Self {
         let (tx, rx) = mpsc::channel(cfg.queue.max(1));
         let latent_timescales = cfg.latent_timescales.clone();
+        let occupancy = cfg.occupancy.clone().map(|o| crate::occupancy::spawn(o, tx.clone(), counters.clone()));
         tokio::spawn(Drain::new(cfg, counters.clone()).run(rx));
-        Self { tx, counters, latent_timescales }
+        Self { tx, counters, latent_timescales, occupancy }
     }
 
     /// Enqueue without waiting; a full queue drops the event (`hub.dropped`).
@@ -214,6 +231,11 @@ impl HubSink {
         if !bar_closed {
             return;
         }
+        if let (Some(occ), Some(m)) = (&self.occupancy, &out.membership)
+            && occ.wants(ts)
+        {
+            occ.send(m.clone());
+        }
         let state = out.state.as_ref();
         for tr in &out.transitions {
             // The observed successor of expert k is the region the state landed in at this step.
@@ -242,7 +264,24 @@ async fn bump(counters: &Counters, key: &str, by: f64) {
     *counters.lock().await.entry(key.to_owned()).or_default() += by;
 }
 
+/// Errors after which a write is kept for replay (Helix unreachable, 5xx, 429, retryable) —
+/// the same split as `fa_hub::buffer`; anything else is a rejected write.
+fn is_transient(e: &HubError) -> bool {
+    match e {
+        HubError::Http(_) => true,
+        HubError::Server { status, retryable, .. } => *status >= 500 || *retryable == Some(true) || *status == 429,
+        _ => false,
+    }
+}
+
 type EdgeKey = (String, String, String); // from, to, sampler
+
+/// Replay work per tick, so the channel keeps draining while a backlog is written.
+const REPLAY_BUDGET: Duration = Duration::from_millis(500);
+/// How often the offline transition rows are written to the keyed log.
+const SPILL_EVERY: Duration = Duration::from_secs(30);
+/// Transition rows per replayed upsert batch.
+const ROWS_PER_BATCH: usize = 500;
 
 struct Drain {
     hub: HubClient,
@@ -261,13 +300,52 @@ struct Drain {
     counts: HashMap<EdgeKey, i64>,
     /// Last centroid written per region (only moved centroids are rewritten).
     centroids: HashMap<String, Vec<f32>>,
+    /// Observation log for writes Helix could not take (spec 30 §8, spec 33 §8); `None` when
+    /// the sink runs without one (writes are then dropped and counted, the pre-log behaviour).
+    log: Option<HubLog>,
+    /// Keyed state records other than the transition rows are waiting.
+    keyed_pending: bool,
+    /// Deferred transition rows, latest per edge (spilled to the keyed log every 30 s).
+    offline_rows: HashMap<EdgeKey, TransitionUpsert>,
+    rows_dirty: bool,
+    last_spill: Instant,
+    log_warned: bool,
 }
 
 /// A centroid is rewritten when it moved farther than this (latent units).
 const CENTROID_MOVE: f32 = 0.05;
 
+fn edge_key(r: &TransitionUpsert) -> EdgeKey {
+    (r.from_region_id.clone(), r.to_region_id.clone(), r.transition.sampler_id.clone())
+}
+
 impl Drain {
     fn new(cfg: SinkConfig, counters: Counters) -> Self {
+        let mut log = cfg.log_dir.as_ref().and_then(|d| match HubLog::open(d, cfg.log_max_bytes) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                tracing::error!(dir = %d.display(), error = %e, "hub log unavailable; Helix writes during an outage will be dropped");
+                None
+            }
+        });
+        let mut offline_rows = HashMap::new();
+        let mut keyed_pending = false;
+        if let Some(l) = log.as_mut() {
+            if let Ok(Some(b)) = l.keyed_get(TRANSITIONS_KEY)
+                && let Ok(HubEvent::TransitionRows(rows)) = hub_log::decode(&b)
+            {
+                offline_rows = rows.into_iter().map(|r| (edge_key(&r), r)).collect();
+            }
+            keyed_pending = l.keyed_names().is_ok_and(|n| n.iter().any(|x| x != TRANSITIONS_KEY));
+            if l.pending() || keyed_pending || !offline_rows.is_empty() {
+                tracing::info!(
+                    log_bytes = l.bytes(),
+                    keyed = keyed_pending,
+                    transition_rows = offline_rows.len(),
+                    "hub log holds a backlog from a previous run; replaying once Helix answers"
+                );
+            }
+        }
         Self {
             hub: HubClient::with_timeout(cfg.url.clone(), REQUEST_TIMEOUT),
             coalescer: Coalescer::new(cfg.flush),
@@ -281,11 +359,17 @@ impl Drain {
             latent_dims: HashSet::new(),
             counts: HashMap::new(),
             centroids: HashMap::new(),
+            log,
+            keyed_pending,
+            offline_rows,
+            rows_dirty: false,
+            last_spill: Instant::now(),
+            log_warned: false,
         }
     }
 
     async fn run(mut self, mut rx: mpsc::Receiver<HubEvent>) {
-        tracing::info!(url = %self.cfg.url, flush_secs = self.cfg.flush.as_secs(), latent_timescales = ?self.cfg.latent_timescales, "hub sink started");
+        tracing::info!(url = %self.cfg.url, flush_secs = self.cfg.flush.as_secs(), latent_timescales = ?self.cfg.latent_timescales, log = ?self.cfg.log_dir, "hub sink started");
         let mut tick = tokio::time::interval(Duration::from_secs(1).min(self.cfg.flush));
         loop {
             tokio::select! {
@@ -293,13 +377,19 @@ impl Drain {
                     Some(ev) => self.handle(ev).await,
                     None => break,
                 },
-                _ = tick.tick() => self.flush_due().await,
+                _ = tick.tick() => self.on_tick().await,
             }
         }
+        self.spill(true);
         tracing::info!("hub sink stopped");
     }
 
-    /// Make sure the server is reachable and the schema exists; drops writes while it is not.
+    /// Writes are waiting in the log: new ones queue behind them to keep the order.
+    fn backlog(&self) -> bool {
+        self.log.as_ref().is_some_and(|l| l.pending()) || self.keyed_pending || !self.offline_rows.is_empty()
+    }
+
+    /// Make sure the server is reachable and the schema exists.
     async fn connected(&mut self) -> bool {
         if self.ready {
             return true;
@@ -315,15 +405,17 @@ impl Drain {
                 self.warned = false;
                 self.latent_dims.clear();
                 self.spaces.clear();
-                tracing::info!(url = %self.cfg.url, "helix reachable; persisting snapshots, regions, transitions and latents");
+                tracing::info!(url = %self.cfg.url, backlog = self.backlog(), "helix reachable; persisting snapshots, regions, transitions and latents");
                 let descs: Vec<SnapshotDesc> = self.snapshots.values().cloned().collect();
                 for d in descs {
-                    self.ensure_snapshot(&d).await;
+                    if let Err(e) = self.ensure_snapshot(&d).await {
+                        self.fail(&e, "ensure_snapshot failed").await;
+                    }
                 }
                 self.ready
             }
             Err(e) => {
-                self.fail(&e, "helix unreachable at start; dropping hub writes until it answers").await;
+                self.fail(&e, "helix unreachable; deferring hub writes to the observation log until it answers").await;
                 false
             }
         }
@@ -331,7 +423,7 @@ impl Drain {
 
     async fn fail(&mut self, e: &HubError, what: &str) {
         bump(&self.counters, "hub.errors", 1.0).await;
-        if e.is_unreachable() {
+        if is_transient(e) {
             self.ready = false;
             self.next_probe = Instant::now() + RECONNECT_EVERY;
             if !self.warned {
@@ -345,46 +437,248 @@ impl Drain {
     }
 
     async fn handle(&mut self, ev: HubEvent) {
-        match ev {
+        let ev = match ev {
+            HubEvent::Transition { update, observed_to } => return self.transition(update, observed_to).await,
             HubEvent::Snapshot(desc) => {
                 self.snapshots.insert(desc.snapshot_id.clone(), desc.clone());
-                if self.connected().await {
-                    self.ensure_snapshot(&desc).await;
+                HubEvent::Snapshot(desc)
+            }
+            ev => ev,
+        };
+        if self.backlog() || !self.connected().await {
+            return self.defer(ev).await;
+        }
+        self.write(ev).await;
+    }
+
+    /// Applies one event; a transient failure defers it, a rejection is counted.
+    async fn write(&mut self, ev: HubEvent) {
+        match self.apply(&ev).await {
+            Ok(()) => bump(&self.counters, "hub.writes", 1.0).await,
+            Err(e) => {
+                let transient = is_transient(&e);
+                self.fail(&e, "hub write failed").await;
+                if transient {
+                    self.defer(ev).await;
+                } else {
+                    bump(&self.counters, "hub.rejected", 1.0).await;
                 }
             }
-            HubEvent::Region { event, radius } => {
-                if !self.connected().await {
-                    bump(&self.counters, "hub.dropped", 1.0).await;
-                    return;
-                }
-                self.region(event, radius).await;
+        }
+    }
+
+    async fn apply(&mut self, ev: &HubEvent) -> Result<(), HubError> {
+        match ev {
+            HubEvent::Snapshot(d) => {
+                self.snapshots.insert(d.snapshot_id.clone(), d.clone());
+                self.ensure_snapshot(d).await
             }
-            HubEvent::Transition { update, observed_to } => self.transition(update, observed_to).await,
+            HubEvent::Region { event, radius } => self.region(event, *radius).await,
+            // routed through the coalescer before it gets here
+            HubEvent::Transition { .. } => Ok(()),
+            HubEvent::TransitionRows(rows) => self.hub.upsert_transitions(rows).await.map(drop),
             HubEvent::Latent { space, instrument_id, ts_ms, experts } => {
-                if !self.connected().await {
-                    bump(&self.counters, "hub.dropped", 1.0).await;
-                    return;
-                }
-                self.latents(&space.snapshot_id, &instrument_id, ts_ms, &experts).await;
+                self.latents(&space.snapshot_id, instrument_id, *ts_ms, experts).await
             }
-            other => {
-                if !self.connected().await {
-                    bump(&self.counters, "hub.dropped", 1.0).await;
+            HubEvent::Lifecycle(ev) => self.lifecycle(ev).await,
+            HubEvent::Kernel(k) => self.kernel(k).await,
+            HubEvent::Persist(rows) => self.persist(rows).await,
+            HubEvent::Hierarchy(h) => self.hierarchy(h).await,
+            HubEvent::CrossPriors(c) => self.cross_priors(c).await,
+            HubEvent::Episodes(rows) => self.hub.upsert_region_episodes(rows).await,
+        }
+    }
+
+    /// Keeps a write for replay: transition rows in the latest-per-edge map, superseded state
+    /// in the keyed log, everything else in the ordered log.
+    async fn defer(&mut self, ev: HubEvent) {
+        let Some(log) = self.log.as_mut() else {
+            bump(&self.counters, "hub.dropped", 1.0).await;
+            return;
+        };
+        if let HubEvent::TransitionRows(rows) = ev {
+            for r in rows {
+                self.offline_rows.insert(edge_key(&r), r);
+            }
+            self.rows_dirty = true;
+            return;
+        }
+        let res = match hub_log::keyed_name(&ev) {
+            Some(name) => log.keyed_put(&name, &hub_log::encode(&ev)).map(|()| {
+                self.keyed_pending = true;
+                true
+            }),
+            None => log.append(&hub_log::encode(&ev)),
+        };
+        match res {
+            Ok(true) => bump(&self.counters, "hub.deferred", 1.0).await,
+            Ok(false) => {
+                bump(&self.counters, "hub.log_full", 1.0).await;
+                if !self.log_warned {
+                    self.log_warned = true;
+                    tracing::error!(
+                        max_bytes = self.cfg.log_max_bytes,
+                        "hub log full; refusing further ordered writes until Helix takes the backlog"
+                    );
+                }
+            }
+            Err(e) => {
+                bump(&self.counters, "hub.log_errors", 1.0).await;
+                if !self.log_warned {
+                    self.log_warned = true;
+                    tracing::error!(error = %e, "hub log write failed");
+                }
+            }
+        }
+    }
+
+    async fn on_tick(&mut self) {
+        self.flush_due().await;
+        if self.backlog() && self.connected().await {
+            self.replay().await;
+        }
+        self.spill(false);
+        if let Some(l) = self.log.as_ref() {
+            let bytes = (l.bytes() + l.keyed_bytes()) as f64;
+            let mut c = self.counters.lock().await;
+            c.insert("hub.log_bytes".into(), bytes);
+            c.insert("hub.backlog".into(), f64::from(u8::from(self.backlog())));
+            c.insert("hub.offline_rows".into(), self.offline_rows.len() as f64);
+        }
+    }
+
+    /// Writes the offline transition rows to the keyed log (every 30 s while they change).
+    fn spill(&mut self, force: bool) {
+        if !self.rows_dirty || (!force && self.last_spill.elapsed() < SPILL_EVERY) {
+            return;
+        }
+        let Some(log) = self.log.as_ref() else { return };
+        let rows: Vec<TransitionUpsert> = self.offline_rows.values().cloned().collect();
+        let res = if rows.is_empty() {
+            log.keyed_remove(TRANSITIONS_KEY)
+        } else {
+            log.keyed_put(TRANSITIONS_KEY, &hub_log::encode(&HubEvent::TransitionRows(rows)))
+        };
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "spilling deferred transition rows failed");
+        }
+        self.rows_dirty = false;
+        self.last_spill = Instant::now();
+    }
+
+    /// Writes the backlog in order: the ordered log, then the keyed state, then the transition
+    /// rows; stops at the first transient failure (retried on a later tick).
+    async fn replay(&mut self) {
+        let started = Instant::now();
+        // 1. ordered log
+        while self.log.as_ref().is_some_and(HubLog::pending) && started.elapsed() < REPLAY_BUDGET {
+            let batch = match self.log.as_mut().map(|l| l.read(64)) {
+                Some(Ok(b)) => b,
+                Some(Err(e)) => {
+                    tracing::error!(error = %e, "reading the hub log failed");
                     return;
                 }
-                let res = match other {
-                    HubEvent::Lifecycle(ev) => self.lifecycle(ev).await,
-                    HubEvent::Kernel(k) => self.kernel(k).await,
-                    HubEvent::Persist(rows) => self.persist(rows).await,
-                    HubEvent::Hierarchy(h) => self.hierarchy(h).await,
-                    HubEvent::CrossPriors(c) => self.cross_priors(c).await,
-                    _ => Ok(()),
+                None => return,
+            };
+            if batch.is_empty() {
+                return;
+            }
+            let mut last = self.log.as_ref().map_or((0, 0), HubLog::cursor);
+            let mut stopped = false;
+            for (bytes, pos) in batch {
+                match hub_log::decode(&bytes) {
+                    Err(e) => {
+                        tracing::warn!(error = %e, "skipping an undecodable hub log record");
+                        bump(&self.counters, "hub.log_corrupt", 1.0).await;
+                    }
+                    Ok(ev) => match self.apply(&ev).await {
+                        Ok(()) => bump(&self.counters, "hub.replayed", 1.0).await,
+                        Err(e) if is_transient(&e) => {
+                            self.fail(&e, "replay stopped: helix unavailable").await;
+                            stopped = true;
+                            break;
+                        }
+                        Err(e) => {
+                            self.fail(&e, "replayed write rejected").await;
+                            bump(&self.counters, "hub.rejected", 1.0).await;
+                        }
+                    },
+                }
+                last = pos;
+            }
+            // `last` is past the last record handled (a stopped record is replayed again)
+            if let Some(l) = self.log.as_mut()
+                && let Err(e) = l.commit(last)
+            {
+                tracing::error!(error = %e, "committing the hub log cursor failed");
+            }
+            if stopped {
+                return;
+            }
+        }
+        if self.log.as_ref().is_some_and(HubLog::pending) {
+            return;
+        }
+        // 2. keyed state
+        if self.keyed_pending {
+            let names = self.log.as_ref().and_then(|l| l.keyed_names().ok()).unwrap_or_default();
+            for name in names.into_iter().filter(|n| n != TRANSITIONS_KEY) {
+                if started.elapsed() >= REPLAY_BUDGET {
+                    return;
+                }
+                let Some(bytes) = self.log.as_ref().and_then(|l| l.keyed_get(&name).ok().flatten()) else { continue };
+                let done = match hub_log::decode(&bytes) {
+                    Err(_) => {
+                        bump(&self.counters, "hub.log_corrupt", 1.0).await;
+                        true
+                    }
+                    Ok(ev) => match self.apply(&ev).await {
+                        Ok(()) => {
+                            bump(&self.counters, "hub.replayed", 1.0).await;
+                            true
+                        }
+                        Err(e) if is_transient(&e) => {
+                            self.fail(&e, "replay stopped: helix unavailable").await;
+                            return;
+                        }
+                        Err(e) => {
+                            self.fail(&e, "replayed write rejected").await;
+                            bump(&self.counters, "hub.rejected", 1.0).await;
+                            true
+                        }
+                    },
                 };
-                match res {
-                    Ok(()) => bump(&self.counters, "hub.writes", 1.0).await,
-                    Err(e) => self.fail(&e, "region/graph write failed").await,
+                if done && let Some(l) = self.log.as_ref() {
+                    let _ = l.keyed_remove(&name);
                 }
             }
+            self.keyed_pending = false;
+        }
+        // 3. transition rows, latest per edge
+        while !self.offline_rows.is_empty() && started.elapsed() < REPLAY_BUDGET {
+            let keys: Vec<EdgeKey> = self.offline_rows.keys().take(ROWS_PER_BATCH).cloned().collect();
+            let rows: Vec<TransitionUpsert> = keys.iter().filter_map(|k| self.offline_rows.get(k).cloned()).collect();
+            match self.hub.upsert_transitions(&rows).await {
+                Ok(_) => bump(&self.counters, "hub.replayed", rows.len() as f64).await,
+                Err(e) if is_transient(&e) => {
+                    self.fail(&e, "replay stopped: helix unavailable").await;
+                    return;
+                }
+                Err(e) => {
+                    self.fail(&e, "replayed transition rows rejected").await;
+                    bump(&self.counters, "hub.rejected", rows.len() as f64).await;
+                }
+            }
+            for k in keys {
+                self.offline_rows.remove(&k);
+            }
+            self.rows_dirty = true;
+        }
+        if self.offline_rows.is_empty() && self.rows_dirty {
+            self.spill(true);
+        }
+        if !self.backlog() {
+            tracing::info!("hub log backlog written; back to direct writes");
         }
     }
 
@@ -410,7 +704,7 @@ impl Drain {
         Ok(())
     }
 
-    async fn lifecycle(&mut self, ev: RegionLifecycleEvent) -> Result<(), HubError> {
+    async fn lifecycle(&mut self, ev: &RegionLifecycleEvent) -> Result<(), HubError> {
         use region_lifecycle_event::Kind;
         let Some(space) = ev.space.clone() else { return Ok(()) };
         match Kind::try_from(ev.kind).unwrap_or(Kind::Unspecified) {
@@ -440,7 +734,7 @@ impl Drain {
         }
     }
 
-    async fn kernel(&mut self, k: KernelUpdate) -> Result<(), HubError> {
+    async fn kernel(&mut self, k: &KernelUpdate) -> Result<(), HubError> {
         let Some(space) = k.space.as_ref() else { return Ok(()) };
         let scores: Vec<serde_json::Value> = k
             .samplers
@@ -476,11 +770,11 @@ impl Drain {
             .await
     }
 
-    async fn persist(&mut self, rows: Vec<ExpertPersist>) -> Result<(), HubError> {
+    async fn persist(&mut self, rows: &[ExpertPersist]) -> Result<(), HubError> {
         for r in rows {
             let Some(state) = r.region_state.as_ref() else { continue };
             // make sure the expert space exists (a reload may have introduced it)
-            if self.space_node(&r.space).await.is_none() {
+            if self.space_node(&r.space).await?.is_none() {
                 continue;
             }
             let cfg = state.get("cfg").map(ToString::to_string).unwrap_or_default();
@@ -517,7 +811,7 @@ impl Drain {
         Ok(())
     }
 
-    async fn hierarchy(&mut self, h: RegionHierarchy) -> Result<(), HubError> {
+    async fn hierarchy(&mut self, h: &RegionHierarchy) -> Result<(), HubError> {
         let rows: Vec<NewHierEdge> = h
             .edges
             .iter()
@@ -534,7 +828,7 @@ impl Drain {
         self.hub.upsert_hier_edges(&rows).await
     }
 
-    async fn cross_priors(&mut self, c: CrossAssetPriors) -> Result<(), HubError> {
+    async fn cross_priors(&mut self, c: &CrossAssetPriors) -> Result<(), HubError> {
         let rows: Vec<NewCrossPrior> = c
             .proposals
             .iter()
@@ -557,7 +851,7 @@ impl Drain {
         self.hub.upsert_cross_priors(&rows).await
     }
 
-    async fn ensure_snapshot(&mut self, d: &SnapshotDesc) {
+    async fn ensure_snapshot(&mut self, d: &SnapshotDesc) -> Result<(), HubError> {
         let snap = NewSnapshot {
             snapshot_id: d.snapshot_id.clone(),
             timescale: d.timescale.to_string(),
@@ -566,10 +860,7 @@ impl Drain {
             garage_key: d.garage_key.clone(),
             status: d.status.clone(),
         };
-        let snap = match self.hub.ensure_snapshot(&snap).await {
-            Ok(s) => s,
-            Err(e) => return self.fail(&e, "ensure_snapshot failed").await,
-        };
+        let snap = self.hub.ensure_snapshot(&snap).await?;
         bump(&self.counters, "hub.writes", 1.0).await;
         for k in 0..d.n_experts {
             let id = expert_space_id(&d.snapshot_id, k);
@@ -579,14 +870,11 @@ impl Drain {
                 index: k,
                 dim: d.dim,
             };
-            match self.hub.ensure_expert_space(snap.id, &space).await {
-                Ok(s) => {
-                    self.spaces.insert(id, s.id);
-                    bump(&self.counters, "hub.writes", 1.0).await;
-                }
-                Err(e) => return self.fail(&e, "ensure_expert_space failed").await,
-            }
+            let s = self.hub.ensure_expert_space(snap.id, &space).await?;
+            self.spaces.insert(id, s.id);
+            bump(&self.counters, "hub.writes", 1.0).await;
         }
+        Ok(())
     }
 
     /// `RegionSet.method` of a snapshot's sets (`leader` for an unannounced snapshot).
@@ -599,26 +887,30 @@ impl Drain {
         self.snapshots.get(snapshot_id).map_or("leader", |d| d.region_method.region_label(region_id)).to_owned()
     }
 
-    async fn space_node(&mut self, space: &ExpertSpaceRef) -> Option<u64> {
+    /// Helix node of an expert space (created with its snapshot when needed); `None` when the
+    /// snapshot was never announced.
+    async fn space_node(&mut self, space: &ExpertSpaceRef) -> Result<Option<u64>, HubError> {
         let id = expert_space_id(&space.snapshot_id, space.expert_index);
         if let Some(n) = self.spaces.get(&id) {
-            return Some(*n);
+            return Ok(Some(*n));
         }
-        let desc = self.snapshots.get(&space.snapshot_id).cloned()?;
-        self.ensure_snapshot(&desc).await;
-        self.spaces.get(&id).copied()
+        let Some(desc) = self.snapshots.get(&space.snapshot_id).cloned() else { return Ok(None) };
+        self.ensure_snapshot(&desc).await?;
+        Ok(self.spaces.get(&id).copied())
     }
 
-    async fn region(&mut self, ev: RegionEvent, radius: f64) {
-        let Some(space) = ev.space.clone() else { return };
+    async fn region(&mut self, ev: &RegionEvent, radius: f64) -> Result<(), HubError> {
+        let Some(space) = ev.space.clone() else { return Ok(()) };
         let kind = region_event::Kind::try_from(ev.kind).unwrap_or(region_event::Kind::Unspecified);
         let related = ev.related_region_ids.first().cloned().unwrap_or_default();
-        let res = match kind {
+        match kind {
             // a split child is a new region like a birth (its lineage edge comes with the lifecycle)
             region_event::Kind::Created | region_event::Kind::Split => {
-                let Some(space_node) = self.space_node(&space).await else {
-                    bump(&self.counters, "hub.dropped", 1.0).await;
-                    return;
+                let Some(space_node) = self.space_node(&space).await? else {
+                    return Err(HubError::NotFound {
+                        label: "ExpertSpace".into(),
+                        id: expert_space_id(&space.snapshot_id, space.expert_index),
+                    });
                 };
                 let region = NewRegion {
                     region_id: ev.region_id.clone(),
@@ -637,11 +929,7 @@ impl Drain {
             region_event::Kind::Retired => {
                 self.hub.mark_region_status(&ev.region_id, "retired", &related).await.map(drop)
             }
-            _ => return,
-        };
-        match res {
-            Ok(()) => bump(&self.counters, "hub.writes", 1.0).await,
-            Err(e) => self.fail(&e, "region write failed").await,
+            _ => Ok(()),
         }
     }
 
@@ -691,17 +979,20 @@ impl Drain {
         if rows.is_empty() {
             return;
         }
-        if !self.connected().await {
-            bump(&self.counters, "hub.dropped", rows.len() as f64).await;
-            return;
+        let ev = HubEvent::TransitionRows(rows);
+        if self.backlog() || !self.connected().await {
+            return self.defer(ev).await;
         }
-        match self.hub.upsert_transitions(&rows).await {
-            Ok(_) => bump(&self.counters, "hub.writes", 1.0).await,
-            Err(e) => self.fail(&e, "transition upsert failed").await,
-        }
+        self.write(ev).await;
     }
 
-    async fn latents(&mut self, snapshot_id: &str, instrument_id: &str, ts_ms: i64, experts: &[ExpertLatent]) {
+    async fn latents(
+        &mut self,
+        snapshot_id: &str,
+        instrument_id: &str,
+        ts_ms: i64,
+        experts: &[ExpertLatent],
+    ) -> Result<(), HubError> {
         let mut rows = Vec::with_capacity(experts.len());
         for e in experts {
             let dim = e.mean.len();
@@ -712,9 +1003,7 @@ impl Drain {
                 continue;
             }
             if !self.latent_dims.contains(&dim) {
-                if let Err(err) = self.hub.ensure_latent_index_ready(dim, INDEX_WAIT).await {
-                    return self.fail(&err, "ensure_latent_index failed").await;
-                }
+                self.hub.ensure_latent_index_ready(dim, INDEX_WAIT).await?;
                 self.latent_dims.insert(dim);
             }
             let var = if e.log_var.is_empty() {
@@ -733,12 +1022,9 @@ impl Drain {
             });
         }
         if rows.is_empty() {
-            return;
+            return Ok(());
         }
-        match self.hub.add_latents(&rows).await {
-            Ok(_) => bump(&self.counters, "hub.writes", 1.0).await,
-            Err(e) => self.fail(&e, "latent write failed").await,
-        }
+        self.hub.add_latents(&rows).await.map(drop)
     }
 }
 
@@ -786,6 +1072,9 @@ mod tests {
             flush: Duration::from_secs(1),
             latent_timescales: BTreeSet::new(),
             queue: 1,
+            log_dir: None,
+            log_max_bytes: 0,
+            occupancy: None,
         };
         let mut drain = Drain::new(cfg, Counters::default());
         let desc = |id: &str, rm: RegionMethod| SnapshotDesc {

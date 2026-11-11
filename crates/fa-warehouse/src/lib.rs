@@ -3,8 +3,10 @@
 //! functions in [`refdata`] (D-054), the instrument → asset class / venue / currency / source
 //! lookup in [`venues`] and the EUR accounting FX table in [`fx`] (D-061); point-in-time
 //! reference reads in [`asof`], trading calendars in [`calendar`] and corporate actions,
-//! adjusted series and symbol changes in [`corpactions`] (spec 12 §4); the `ops` schema (alert
+//! adjusted series and symbol changes in [`corpactions`] (spec 12 §4), materialised adjusted daily
+//! bars in [`adjusted`] (spec 12 §7); the `ops` schema (alert
 //! history, job runs, config snapshots) in [`ops`] (spec 20 §5.4).
+pub mod adjusted;
 pub mod asof;
 pub mod audit;
 pub mod calendar;

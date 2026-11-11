@@ -11,5 +11,5 @@
     { "name": "JOB_RESULTS", "subjects": ["jobs.result.>"],       "max_age_hours": 720, "max_mib": 2048,  "storage": "file", "description": "work-queue job results" },
     { "name": "DLQ",         "subjects": ["dlq.>"],               "max_age_hours": 720,  "max_mib": 1024,  "storage": "file", "description": "dead letters: dlq.<stream>.<subject> copies of messages that hit max_deliver or were terminated (spec 21 §8)" }
   ],
-  "work_queue": { "ack_wait_secs": 60, "max_deliver": 5 }
+  "work_queue": { "ack_wait_secs": 60, "max_deliver": 5, "max_ack_pending": 64 }
 }

@@ -43,6 +43,26 @@ pub struct MoeConfig {
     /// Std of the router noise during training (0 = off).
     pub router_noise: f64,
     pub prune_usage_below: f64,
+    /// Load balancing (spec 32 §6.1): `aux` = the Switch auxiliary loss weighted by
+    /// `lambda_bal` (default); `bias` = auxiliary-loss-free balancing: a per-expert routing bias
+    /// `moe.route_bias` (not trained by gradient) is added to the router logits and nudged after
+    /// every step by `bias_rate · sign(mean load − load_k)` ([`MoeExpertSpace::update_route_bias`]),
+    /// so balancing does not fight the decorrelation loss. With `bias` the auxiliary loss is off.
+    #[serde(default)]
+    pub balance: String,
+    /// Step of the bias update (`balance = bias`).
+    #[serde(default = "default_bias_rate")]
+    pub bias_rate: f64,
+    /// EMA decay of the residual moments the decorrelation term reads (spec 32 §6.3 / §7
+    /// `cov_ema`): the penalty's covariances mix the detached running moments with the current
+    /// minibatch's (`α·ema + (1 − α)·batch`), so it estimates a correlation over many batches
+    /// rather than one ([`decorrelation_loss_gated_ema`]). 0 = minibatch only.
+    #[serde(default)]
+    pub cov_ema: f64,
+}
+
+fn default_bias_rate() -> f64 {
+    1e-3
 }
 
 impl Default for MoeConfig {
@@ -57,7 +77,17 @@ impl Default for MoeConfig {
             beta_kl: 1e-3,
             router_noise: 0.3,
             prune_usage_below: 0.05,
+            balance: String::new(),
+            bias_rate: default_bias_rate(),
+            cov_ema: 0.0,
         }
+    }
+}
+
+impl MoeConfig {
+    /// Auxiliary-loss-free balancing by routing bias (`balance = "bias"`).
+    pub fn bias_balancing(&self) -> bool {
+        self.balance == "bias"
     }
 }
 
@@ -100,6 +130,9 @@ impl MoeExpertSpace {
         for e in 0..k {
             ps.get(&format!("moe.lvbias{e}"), &[cfg.expert_dim], Init::Const(-2.0))?;
         }
+        if cfg.bias_balancing() {
+            ps.get(ROUTE_BIAS, &[k], Init::Zeros)?;
+        }
         Ok(Self { cfg: cfg.clone(), d_in, n_targets, active: (0..k).collect() })
     }
 
@@ -125,7 +158,11 @@ impl MoeExpertSpace {
 
     /// [`Self::forward`] reading every parameter through `w` (EMA copies, adapted views).
     pub fn forward_w(&self, ps: &dyn Weights, h: &Tensor, noise: Option<&Tensor>) -> Result<MoeOutput> {
-        let logits_all = linear_w(ps, "moe.router", h)?; // [B, K_max]
+        let mut logits_all = linear_w(ps, "moe.router", h)?; // [B, K_max]
+        if self.cfg.bias_balancing() {
+            // balancing bias: steers routing, never trained by gradient
+            logits_all = logits_all.broadcast_add(&ps.w(ROUTE_BIAS)?.detach())?;
+        }
         let logits_all = match noise {
             Some(n) => (logits_all + n)?,
             None => logits_all,
@@ -168,6 +205,181 @@ impl MoeExpertSpace {
             codes: if codes.is_empty() { None } else { Some(Tensor::stack(&codes, 1)?) },
         })
     }
+}
+
+/// Routing-bias parameter of auxiliary-loss-free balancing (`[K_max]`).
+pub const ROUTE_BIAS: &str = "moe.route_bias";
+
+/// Share of rows whose top-k contains each expert (`probs [B, K]`, host side): the load the
+/// bias update balances.
+pub fn top_k_load(probs: &Tensor, top_k: usize) -> Result<Vec<f64>> {
+    let rows = probs.detach().to_dtype(DType::F32)?.to_vec2::<f32>()?;
+    let k = rows.first().map_or(0, Vec::len);
+    let mut load = vec![0.0; k];
+    for r in &rows {
+        for (e, g) in top_k_gates(r, top_k).iter().enumerate() {
+            if *g > 0.0 {
+                load[e] += 1.0 / rows.len() as f64;
+            }
+        }
+    }
+    Ok(load)
+}
+
+impl MoeExpertSpace {
+    /// Auxiliary-loss-free balancing step (spec 32 §6.1): every active expert's routing bias
+    /// moves by `bias_rate` toward the mean top-k load (`+` when under-loaded, `−` when
+    /// over-loaded, unchanged at the mean). No-op unless `balance = bias`.
+    pub fn update_route_bias(&self, ps: &mut ParamStore, probs: &Tensor) -> Result<()> {
+        if !self.cfg.bias_balancing() {
+            return Ok(());
+        }
+        let load = top_k_load(probs, self.cfg.top_k)?;
+        if load.is_empty() {
+            return Ok(());
+        }
+        let mean = load.iter().sum::<f64>() / load.len() as f64;
+        let mut b = ps.w(ROUTE_BIAS)?.to_vec1::<f32>()?;
+        for (pos, &e) in self.active.iter().enumerate() {
+            let d = mean - load[pos];
+            if d.abs() > 1e-12 {
+                b[e] += (self.cfg.bias_rate * d.signum()) as f32;
+            }
+        }
+        let n = b.len();
+        let t = Tensor::from_vec(b, n, ps.device())?;
+        ps.load(&std::collections::HashMap::from([(ROUTE_BIAS.to_owned(), t)]))?;
+        Ok(())
+    }
+
+    /// Expert **split** (spec 32 §6.1): expert `to` (an unused slot) becomes a perturbed clone of
+    /// `from` — projector, log-variance bias and next-step head copied with seeded noise of
+    /// relative size `scale`, router column copied and both router biases lowered by `ln 2`, so
+    /// the two share `from`'s routing mass and diverge from there. `extra` names further
+    /// per-expert parameters to clone (`<prefix>{e}` with the expert id appended, e.g. a family
+    /// head). Activates `to` after `from`.
+    pub fn split_expert(
+        &mut self,
+        ps: &mut ParamStore,
+        from: usize,
+        to: usize,
+        extra: &[&str],
+        scale: f64,
+        seed: u64,
+    ) -> Result<()> {
+        if from == to || to >= self.cfg.max_experts || self.active.contains(&to) || !self.active.contains(&from) {
+            candle_core::bail!("split {from} → {to}: `to` must be a free slot and `from` active");
+        }
+        let mut rng = fa_core::rng::Rng::seed(seed);
+        let mut vals = std::collections::HashMap::new();
+        let mut names: Vec<(String, String)> = Vec::new();
+        for pre in ["moe.proj", "moe.pred"] {
+            for suf in ["w", "b"] {
+                names.push((format!("{pre}{from}.{suf}"), format!("{pre}{to}.{suf}")));
+            }
+        }
+        names.push((format!("moe.lvbias{from}"), format!("moe.lvbias{to}")));
+        for pre in extra {
+            names.push((format!("{pre}{from}"), format!("{pre}{to}")));
+        }
+        for (src, dst) in names {
+            let t = ps.w(&src)?;
+            let v = t.flatten_all()?.to_vec1::<f32>()?;
+            let rms = (v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / v.len().max(1) as f64).sqrt().max(1e-3);
+            let noisy: Vec<f32> = v.iter().map(|x| x + (rng.normal() * scale * rms) as f32).collect();
+            vals.insert(dst, Tensor::from_vec(noisy, t.dims(), ps.device())?);
+        }
+        let w = ps.w("moe.router.w")?.to_vec2::<f32>()?; // [d_in, K]
+        let mut w2 = w.clone();
+        for row in w2.iter_mut() {
+            row[to] = row[from] + (rng.normal() * scale * 1e-2) as f32;
+        }
+        let mut b = ps.w("moe.router.b")?.to_vec1::<f32>()?;
+        let ln2 = std::f32::consts::LN_2;
+        b[to] = b[from] - ln2;
+        b[from] -= ln2;
+        let (din, k) = (w2.len(), b.len());
+        vals.insert("moe.router.w".into(), Tensor::from_vec(w2.concat(), (din, k), ps.device())?);
+        vals.insert("moe.router.b".into(), Tensor::from_vec(b, k, ps.device())?);
+        if self.cfg.bias_balancing() {
+            let mut rb = ps.w(ROUTE_BIAS)?.to_vec1::<f32>()?;
+            rb[to] = rb[from];
+            vals.insert(ROUTE_BIAS.into(), Tensor::from_vec(rb, k, ps.device())?);
+        }
+        ps.load(&vals)?;
+        let at = self.active.iter().position(|e| *e == from).map_or(self.active.len(), |p| p + 1);
+        self.active.insert(at, to);
+        Ok(())
+    }
+}
+
+/// Running (detached) residual moments of the gated decorrelation term (`cov_ema`):
+/// `[pairs, 6, T]` = weight mass, `E_w[r_i]`, `E_w[r_j]`, `E_w[r_i r_j]`, `E_w[r_i²]`, `E_w[r_j²]`
+/// per expert pair `i < j` (row-major) and target.
+#[derive(Debug, Clone)]
+pub struct DecorEma(pub Tensor);
+
+/// [`decorrelation_loss_gated`] over moments mixed with running ones: for every pair the
+/// gate-weighted first and second moments of the minibatch are blended as
+/// `α·ema + (1 − α)·batch` with the detached running moments `ema` (none on the first step),
+/// and the correlation is taken from the blended moments. The blend is straight-through: its
+/// value is the running estimate, its gradient that of the minibatch moments at full weight, so
+/// `cov_ema` lowers the variance of the penalty without shrinking its strength. Returns the loss and the updated
+/// running moments (detached). `α = 0` equals [`decorrelation_loss_gated`] up to the
+/// centring convention (moments instead of centred sums; identical in exact arithmetic).
+pub fn decorrelation_loss_gated_ema(
+    resid: &Tensor,
+    probs: &Tensor,
+    ema: Option<&DecorEma>,
+    alpha: f64,
+) -> Result<(Tensor, Option<DecorEma>)> {
+    let (b, k, t) = resid.dims3()?;
+    if k < 2 || b < 3 {
+        return Ok((Tensor::zeros((), DType::F32, resid.device())?, ema.cloned()));
+    }
+    let p = probs.detach();
+    let mut moments = Vec::new();
+    let mut acc: Option<Tensor> = None;
+    let mut pair = 0usize;
+    for i in 0..k {
+        for j in (i + 1)..k {
+            let w = (p.narrow(1, i, 1)? * p.narrow(1, j, 1)?)?; // [B, 1]
+            let w = w.broadcast_div(&(w.sum_all()? + 1e-8)?)?;
+            let ri = resid.narrow(1, i, 1)?.squeeze(1)?; // [B, T]
+            let rj = resid.narrow(1, j, 1)?.squeeze(1)?;
+            let m = |x: &Tensor| x.broadcast_mul(&w)?.sum(0); // [T]
+            let batch = [m(&ri)?, m(&rj)?, m(&(&ri * &rj)?)?, m(&ri.sqr()?)?, m(&rj.sqr()?)?];
+            let mixed: Vec<Tensor> = match ema {
+                Some(e) if alpha > 0.0 => batch
+                    .iter()
+                    .enumerate()
+                    .map(|(q, bm)| {
+                        // value α·ema + (1 − α)·batch, gradient of the batch moment at full
+                        // weight (a straight-through running estimate: blending alone would scale
+                        // the penalty's gradient down by 1 − α)
+                        let old = e.0.narrow(0, pair, 1)?.squeeze(0)?.narrow(0, q + 1, 1)?.squeeze(0)?;
+                        bm + (old - bm)?.affine(alpha, 0.0)?.detach()
+                    })
+                    .collect::<Result<_>>()?,
+                _ => batch.to_vec(),
+            };
+            let cov = (&mixed[2] - (&mixed[0] * &mixed[1])?)?;
+            let vi = (&mixed[3] - mixed[0].sqr()?)?.relu()?;
+            let vj = (&mixed[4] - mixed[1].sqr()?)?.relu()?;
+            let c2 = cov.sqr()?.div(&((vi * vj)? + 1e-8)?)?.sum_all()?;
+            acc = Some(match acc {
+                Some(a) => (a + c2)?,
+                None => c2,
+            });
+            let mass = Tensor::ones(t, DType::F32, resid.device())?;
+            let mut rows = vec![mass];
+            rows.extend(mixed.iter().map(Tensor::detach));
+            moments.push(Tensor::stack(&rows, 0)?); // [6, T]
+            pair += 1;
+        }
+    }
+    let state = (alpha > 0.0).then(|| Tensor::stack(&moments, 0).map(DecorEma)).transpose()?;
+    Ok((acc.expect("k ≥ 2").affine(2.0 / t as f64, 0.0)?, state))
 }
 
 /// Finite scalar quantisation (Mentzer et al. 2023) of `z [B, q]` with `levels[q]`:
@@ -327,6 +539,82 @@ mod tests {
         let a = scalar(&decorrelation_loss(&x).unwrap()).unwrap();
         let b = scalar(&decorrelation_loss_gated(&x, &p).unwrap()).unwrap();
         assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+    }
+
+    #[test]
+    fn ema_decorrelation_matches_gated_without_history_and_smooths_with_it() {
+        let dev = Device::Cpu;
+        let mut rng = fa_core::rng::Rng::seed(4);
+        let mut draw = |n| {
+            Tensor::from_vec((0..n * 3 * 2).map(|_| rng.normal() as f32).collect::<Vec<_>>(), (n, 3, 2), &dev).unwrap()
+        };
+        let (x, y) = (draw(50), draw(50));
+        let p = Tensor::ones((50, 3), DType::F32, &dev).unwrap().affine(1.0 / 3.0, 0.0).unwrap();
+        let plain = scalar(&decorrelation_loss_gated(&x, &p).unwrap()).unwrap();
+        let (l0, st) = decorrelation_loss_gated_ema(&x, &p, None, 0.9).unwrap();
+        assert!((scalar(&l0).unwrap() - plain).abs() < 1e-3, "first batch: plain moments");
+        let st = st.expect("running moments");
+        assert_eq!(st.0.dims(), &[3, 6, 2]);
+        // with α → 1 the second batch reads (almost only) the running moments of the first
+        let (l1, _) = decorrelation_loss_gated_ema(&y, &p, Some(&st), 0.999).unwrap();
+        let fresh = scalar(&decorrelation_loss_gated(&y, &p).unwrap()).unwrap();
+        let l1 = scalar(&l1).unwrap();
+        assert!((l1 - plain).abs() < 2e-3 && (fresh - plain).abs() > 2e-3, "{l1} ≈ {plain}, not {fresh}");
+        // straight-through: the gradient keeps the minibatch's full weight (not scaled by 1 − α)
+        let yv = candle_core::Var::from_tensor(&y).unwrap();
+        let grad_norm = |l: Tensor| {
+            let g = l.backward().unwrap();
+            scalar(&g.get(yv.as_tensor()).unwrap().sqr().unwrap().sum_all().unwrap().sqrt().unwrap()).unwrap()
+        };
+        let g_ema = grad_norm(decorrelation_loss_gated_ema(yv.as_tensor(), &p, Some(&st), 0.999).unwrap().0);
+        let g_plain = grad_norm(decorrelation_loss_gated(yv.as_tensor(), &p).unwrap());
+        assert!(g_ema > 0.1 * g_plain, "gradient {g_ema} vs plain {g_plain}");
+        // α = 0 ignores history
+        let (l2, none) = decorrelation_loss_gated_ema(&y, &p, Some(&st), 0.0).unwrap();
+        assert!((scalar(&l2).unwrap() - fresh).abs() < 1e-3 && none.is_none());
+    }
+
+    #[test]
+    fn bias_balancing_moves_load_toward_the_mean_and_split_clones_an_expert() {
+        let dev = Device::Cpu;
+        let cfg = MoeConfig {
+            max_experts: 3,
+            expert_dim: 2,
+            top_k: 1,
+            balance: "bias".into(),
+            bias_rate: 0.05,
+            router_noise: 0.0,
+            ..Default::default()
+        };
+        let mut ps = ParamStore::new(1, &dev);
+        let mut moe = MoeExpertSpace::new(&mut ps, &cfg, 4, 2).unwrap();
+        // a router that sends everything to expert 0
+        let mut b = vec![0f32; 3];
+        b[0] = 2.0;
+        ps.load(&std::collections::HashMap::from([("moe.router.b".to_owned(), Tensor::from_vec(b, 3, &dev).unwrap())]))
+            .unwrap();
+        let x = Tensor::from_vec((0..64 * 4).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect::<Vec<_>>(), (64, 4), &dev)
+            .unwrap();
+        let load0 = top_k_load(&moe.forward(&ps, &x, None).unwrap().probs, 1).unwrap();
+        assert!(load0[0] > 0.9, "{load0:?}");
+        for _ in 0..80 {
+            let o = moe.forward(&ps, &x, None).unwrap();
+            moe.update_route_bias(&mut ps, &o.probs).unwrap();
+        }
+        let load1 = top_k_load(&moe.forward(&ps, &x, None).unwrap().probs, 1).unwrap();
+        assert!(load1[0] < 0.7, "bias spreads the load: {load1:?}");
+        // the bias is not a gradient parameter: a loss on the probabilities leaves it alone
+        let o = moe.forward(&ps, &x, None).unwrap();
+        let grads = o.probs.sum_all().unwrap().backward().unwrap();
+        assert!(grads.get(ps.vars().find(|(k, _)| k.as_str() == ROUTE_BIAS).unwrap().1.as_tensor()).is_none());
+        // split: expert 2 pruned, then re-born as a perturbed clone of expert 0
+        moe.select(vec![0, 1]);
+        moe.split_expert(&mut ps, 0, 2, &[], 0.1, 7).unwrap();
+        assert_eq!(moe.active, vec![0, 2, 1]);
+        let o = moe.forward(&ps, &x, None).unwrap();
+        let p = o.probs.to_vec2::<f32>().unwrap();
+        assert!((p[0][0] - p[0][1]).abs() < 0.1, "clone shares the parent's routing mass: {:?}", p[0]);
+        assert!(moe.split_expert(&mut ps, 0, 1, &[], 0.1, 7).is_err(), "occupied slot");
     }
 
     #[test]

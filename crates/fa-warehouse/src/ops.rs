@@ -145,7 +145,7 @@ pub async fn record_job_run(pool: &PgPool, j: &JobRun) -> Result<bool, Warehouse
 /// Job runs, newest first, optionally of one kind (prefix match: `evo` matches `evo.eval.decoder`).
 pub async fn job_runs(pool: &PgPool, kind: Option<&str>, limit: i64) -> Result<Vec<JobRun>, WarehouseError> {
     let rows = sqlx::query(
-        "SELECT job_id, kind, status, worker_id, error, used_gpu_ms, output_refs, checkpoint_ref, result, stream_seq, \
+        "SELECT job_id, kind, status, worker_id, error, used_gpu_ms, output_refs, checkpoint_ref, result::text AS result, stream_seq, \
          finished_at FROM ops.job_run WHERE ($1::text IS NULL OR kind = $1 OR kind LIKE $1 || '.%') \
          ORDER BY finished_at DESC, job_id LIMIT $2",
     )
@@ -164,11 +164,62 @@ pub async fn job_runs(pool: &PgPool, kind: Option<&str>, limit: i64) -> Result<V
             used_gpu_ms: r.get("used_gpu_ms"),
             output_refs: serde_json::from_value(r.get("output_refs")).unwrap_or_default(),
             checkpoint_ref: r.get("checkpoint_ref"),
-            result: r.get("result"),
+            result: r.get::<Option<String>, _>("result").map(|t| lenient_json(&t)),
             stream_seq: r.get("stream_seq"),
             finished_at: r.get("finished_at"),
         })
         .collect())
+}
+
+/// Parses JSON text read back from a `jsonb` column. Postgres prints numbers in full, so an
+/// `f64::MAX` sentinel stored by a worker comes back as a 309-digit integer that serde_json
+/// rejects ("number out of range"); such literals are re-read as `f64` (`null` when not finite)
+/// instead of failing the whole row. Unparsable text becomes `{"undecodable": …}`.
+pub fn lenient_json(text: &str) -> Value {
+    if let Ok(v) = serde_json::from_str(text) {
+        return v;
+    }
+    let mut out = String::with_capacity(text.len());
+    let (mut in_str, mut esc) = (false, false);
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if in_str {
+            out.push(c);
+            match (esc, c) {
+                (true, _) => esc = false,
+                (false, '\\') => esc = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+            out.push(c);
+        } else if c == '-' || c.is_ascii_digit() {
+            let mut end = i + c.len_utf8();
+            while let Some(&(j, d)) = chars.peek() {
+                if d.is_ascii_digit() || matches!(d, '.' | 'e' | 'E' | '+' | '-') {
+                    end = j + 1;
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let lit = &text[i..end];
+            if serde_json::from_str::<Value>(lit).is_ok() {
+                out.push_str(lit);
+            } else {
+                match lit.parse::<f64>() {
+                    Ok(f) if f.is_finite() => out.push_str(&format!("{f:e}")),
+                    _ => out.push_str("null"),
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    serde_json::from_str(&out).unwrap_or_else(|e| serde_json::json!({ "undecodable": e.to_string() }))
 }
 
 /// Counts per `(kind, status)` since `since` (the registry overview).
@@ -257,6 +308,26 @@ pub async fn config_snapshots(
 
 /// Live tests against the compose Postgres (`DATABASE_URL`, migration `20261113000013` applied).
 /// They use unique names and remove their rows.
+#[cfg(test)]
+mod lenient_tests {
+    use super::lenient_json;
+
+    /// `GET /api/ops/jobs` panicked on a stored `f64::MAX` (Postgres prints it as 309 digits).
+    #[test]
+    fn huge_integers_from_jsonb_parse() {
+        let max = format!("{}", f64::MAX); // "1797693134862315700000…" (309 digits)
+        assert!(serde_json::from_str::<serde_json::Value>(&max).is_err(), "serde_json rejects it");
+        let v = lenient_json(&format!(r#"{{"a": {max}, "b": -{max}, "c": 1.5, "s": "x{max}\"y", "n": [1, 2]}}"#));
+        assert_eq!(v["a"].as_f64(), Some(f64::MAX));
+        assert_eq!(v["b"].as_f64(), Some(f64::MIN));
+        assert_eq!(v["c"].as_f64(), Some(1.5));
+        assert_eq!(v["s"].as_str().unwrap(), format!("x{max}\"y"));
+        assert_eq!(v["n"], serde_json::json!([1, 2]));
+        assert_eq!(lenient_json(r#"{"a": 1e999}"#)["a"], serde_json::Value::Null);
+        assert!(lenient_json("{oops").get("undecodable").is_some());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

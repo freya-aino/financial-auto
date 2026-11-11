@@ -20,10 +20,12 @@
 mod bars;
 mod decoders;
 mod expert_view;
+mod hub_log;
 mod hub_retention;
 mod hub_sink;
 mod mcmc_jobs;
 mod neural_serving;
+mod occupancy;
 mod pipeline;
 mod region_method;
 mod regions;
@@ -83,6 +85,26 @@ struct Args {
     /// Do not persist anything to HelixDB.
     #[arg(long)]
     no_hub: bool,
+    /// Observation log for Helix writes during an outage, replayed on reconnect (spec 30 §8,
+    /// spec 33 §8; default `FA_HUB_LOG_DIR`, else `var/model-runtime/hub-log`).
+    #[arg(long, env = "FA_HUB_LOG_DIR")]
+    hub_log_dir: Option<std::path::PathBuf>,
+    /// Bound of the ordered observation log in MiB (beyond it writes are refused: `hub.log_full`).
+    #[arg(long, default_value_t = 2048)]
+    hub_log_max_mb: u64,
+    /// Drop Helix writes during an outage instead of logging them.
+    #[arg(long)]
+    no_hub_log: bool,
+    /// Timescales whose closed bars write the `fa_region_weight` series and region episodes
+    /// (spec 30 §5; empty disables).
+    #[arg(long, default_value = "1m,1h,1d,1w", value_delimiter = ',')]
+    occupancy_timescales: Vec<String>,
+    /// VictoriaMetrics for the `fa_region_weight` series (default: `victoriametrics.url`).
+    #[arg(long)]
+    vm_url: Option<String>,
+    /// Support-based pruning of transition edges below this decayed count (spec 33 §8; 0 = off).
+    #[arg(long, default_value_t = fa_mcmc::DEFAULT_PRUNE_MIN_EDGE)]
+    mcmc_prune_min: f64,
     /// Helix retention (spec 20 §6.5): `timescale=duration` horizons of observation latents and
     /// transition/status versions (`default=…` for unlisted timescales, else kept forever).
     #[arg(long, env = "FA_HUB_RETENTION", default_value = "1s=2d,1m=14d,1h=180d")]
@@ -499,7 +521,19 @@ impl Runtime {
         self.counters.lock().await.insert("crossprior.evidence_pairs".into(), pairs as f64);
         let hier = self.xscale.hierarchy(now);
         let cross = self.xscale.cross_priors(now);
+        let coherence = self.xscale.coherence_gauges();
         let mut c = self.counters.lock().await;
+        // spec 30 §6.1 point 3, §8 and spec 33 §8: coherence, collapse guard, pruning
+        c.extend(coherence);
+        for st in &self.states {
+            let ts = st.pipeline.timescale();
+            for (k, reason) in st.pipeline.region_validity() {
+                c.insert(format!("regions_invalid.{ts}.e{k}"), f64::from(u8::from(reason.is_some())));
+            }
+            for (k, n) in st.pipeline.pruned_edges().iter().enumerate() {
+                c.insert(format!("mcmc.{ts}.e{k}.pruned_edges"), *n as f64);
+            }
+        }
         for h in hier {
             let (Some(f), Some(co)) = (h.fine.as_ref(), h.coarse.as_ref()) else { continue };
             let (Ok(fine), Ok(coarse)) = (f.timescale.parse::<Timescale>(), co.timescale.parse::<Timescale>()) else {
@@ -585,6 +619,12 @@ impl Runtime {
         if previous == loaded.desc.snapshot_id {
             return CtlReply { ok: true, message: format!("unchanged {previous}") };
         }
+        // spec 30 §8: a snapshot whose fitted region set collapsed is refused; the current one serves on
+        if let Err(msg) = st.pipeline.check_region_map(loaded.region_map.as_ref()) {
+            tracing::warn!(%ts, snapshot = %loaded.desc.snapshot_id, "reload refused: {msg}");
+            *self.counters.lock().await.entry(format!("regions_invalid_refused.{ts}")).or_default() += 1.0;
+            return CtlReply { ok: false, message: msg };
+        }
         let seeded = loaded.region_map.as_ref().map_or(0, fa_patterns::RegionMap::n_regions);
         let carried = loaded.region_map.as_ref().map_or(0.0, fa_patterns::RegionMap::carried_mass);
         let report = st.pipeline.swap_encoder(&self.pcfg, loaded.encoder, loaded.region_map.as_ref());
@@ -613,12 +653,41 @@ impl Runtime {
             c.insert(format!("regime_break.{ts}"), f64::from(u8::from(regime_break)));
             c.remove(&format!("adapter.{ts}.ts_ms"));
         }
+        // Spec 36 §6.4: the swapped-in snapshot resumes from its newest (non-frozen) adapter state —
+        // after a rollback that is the restored snapshot's last adapter; a fresh promotion has none.
+        let restored = self.adapter(ts, None).await;
+        tracing::info!(%ts, ok = restored.ok, message = %restored.message, "adapter restore after swap");
         CtlReply {
             ok: true,
             message: format!(
-                "{ts}: {previous} -> {} (gen {}, {}, {seeded} seeded regions, carried mass {carried:.3}, kernel carried {:.3} over {} rows)",
-                loaded.desc.snapshot_id, loaded.desc.generation, loaded.source, report.carried, report.rows_carried
+                "{ts}: {previous} -> {} (gen {}, {}, {seeded} seeded regions, carried mass {carried:.3}, kernel carried {:.3} over {} rows; adapter: {})",
+                loaded.desc.snapshot_id,
+                loaded.desc.generation,
+                loaded.source,
+                report.carried,
+                report.rows_carried,
+                if restored.ok { restored.message } else { format!("none ({})", restored.message) }
             ),
+        }
+    }
+
+    /// After a restart: re-applies every served snapshot's newest adapter and restarts the shadow
+    /// Helix records for each timescale (`status = shadow`; control-api sets it on
+    /// `POST …/shadow` and clears it on stop / promotion).
+    async fn restore_lifecycle(&mut self) {
+        let tss: Vec<Timescale> = self.states.iter().map(|s| s.pipeline.timescale()).collect();
+        for ts in tss {
+            let r = self.adapter(ts, None).await;
+            tracing::info!(%ts, ok = r.ok, message = %r.message, "startup adapter restore");
+            match self.loader.shadow_snapshot(ts).await {
+                Ok(Some(id)) => {
+                    let r = self.shadow(ts, Some(id.clone())).await;
+                    tracing::info!(%ts, shadow = %id, ok = r.ok, "shadow restored after restart");
+                    *self.counters.lock().await.entry(format!("shadow_restored.{ts}")).or_default() += f64::from(u8::from(r.ok));
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(%ts, error = %e, "persisted shadow unreadable"),
+            }
         }
     }
 
@@ -718,9 +787,7 @@ impl Runtime {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
-        .init();
+    fa_core::logging::init("model-runtime"); // FA_LOG_FORMAT=json|text (spec 60 §4)
     let args = Args::parse();
     fa_bus::metrics::serve_from_env("model-runtime", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config)?;
@@ -737,6 +804,7 @@ async fn main() -> anyhow::Result<()> {
             smc_particles: args.smc_particles,
             kernel_every_ms: (args.kernel_every_secs * 1000) as i64,
             refit_every_ms: (args.mcmc_refit_secs * 1000) as i64,
+            prune_min_edge: args.mcmc_prune_min,
             ..regions::KernelCfg::default()
         },
         ..PipelineConfig::default()
@@ -785,6 +853,13 @@ async fn main() -> anyhow::Result<()> {
                 flush: Duration::from_secs(args.hub_flush_secs.max(1)),
                 latent_timescales: args.hub_latent_timescales.iter().filter_map(|t| t.trim().parse().ok()).collect(),
                 queue: args.hub_queue,
+                log_dir: (!args.no_hub_log).then(|| args.hub_log_dir.clone().unwrap_or_else(hub_log::default_dir)),
+                log_max_bytes: args.hub_log_max_mb.max(1) << 20,
+                occupancy: Some(occupancy::OccupancyCfg {
+                    timescales: args.occupancy_timescales.iter().filter_map(|t| t.trim().parse().ok()).collect(),
+                    vm_url: Some(args.vm_url.clone().unwrap_or_else(|| cfg.victoriametrics.url.clone())),
+                })
+                .filter(|o| !o.timescales.is_empty()),
             },
             counters.clone(),
         );
@@ -867,7 +942,9 @@ async fn main() -> anyhow::Result<()> {
             &bus,
             fa_core::Secrets::load().ok().and_then(|s| fa_blob::S3BlobStore::from_config(&cfg, &s).ok()),
         ),
-        experts: expert_view::ExpertPublisher::default(),
+        experts: expert_view::ExpertPublisher::with_vm(fa_tsdb::Tsdb::new(
+            args.vm_url.clone().unwrap_or_else(|| cfg.victoriametrics.url.clone()),
+        )),
     };
     // Cross-asset tracker and the refitted kernels of the restored spaces survive restarts.
     if let Some(v) = rt.mcmc.load_cross().await {
@@ -875,6 +952,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(instruments = n, "cross-asset tracker restored from Garage");
     }
     rt.mcmc.reload(rt.states.iter().flat_map(|s| s.pipeline.refit_refs()).collect());
+    // Spec 36 §6.4/§6.5: the serving snapshot's last adapter and the persisted shadow (Helix
+    // status `shadow`, set by control-api) survive a restart.
+    rt.restore_lifecycle().await;
 
     let mut trades = bus.subscribe::<Envelope>(subjects::ALL_MD_TRADES.into()).await?;
     let mut bars_sub = bus.subscribe::<Envelope>("md.bar.>".into()).await?;

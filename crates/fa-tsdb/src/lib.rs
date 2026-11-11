@@ -11,6 +11,9 @@ use std::{collections::BTreeMap, time::Duration};
 use fa_core::Timescale;
 use serde::Deserialize;
 
+pub mod asof;
+pub mod retention;
+
 #[derive(Debug, thiserror::Error)]
 pub enum TsdbError {
     #[error("http: {0}")]
@@ -21,10 +24,14 @@ pub enum TsdbError {
     InvalidName(String),
     #[error("label {0} is not allowed (unbounded cardinality)")]
     ForbiddenLabel(String),
+    #[error("io: {0}")]
+    Io(String),
 }
 
 /// Labels allowed on market series; anything else is rejected to protect cardinality.
-pub const ALLOWED_LABELS: &[&str] = &["inst", "venue", "tf", "src", "lvl", "feat_set"];
+/// `expert` / `region` label model-runtime's `fa_region_weight` occupancy series (spec 30 §5;
+/// bounded: expert spaces × the ≤ 4 soft-membership regions an instrument visits).
+pub const ALLOWED_LABELS: &[&str] = &["inst", "venue", "tf", "src", "lvl", "feat_set", "expert", "region"];
 
 /// One sample to import.
 #[derive(Debug, Clone, PartialEq)]

@@ -348,7 +348,7 @@
 								<td class="mono">{p.candidates}</td>
 								<td class="mono">{p.stats?.deflated_sharpe?.toFixed(4) ?? '—'}</td>
 								<td class="mono" class:warn={(p.stats?.pbo ?? 0) > 0.5}>{p.stats?.pbo === null || p.stats?.pbo === undefined ? '—' : `${(100 * p.stats.pbo).toFixed(0)}%`}</td>
-								<td class="mono dim" title={p.stats?.best_candidate ?? ''}><button class="link" onclick={(e) => (e.stopPropagation(), (genomeId = candidateLabel(p.stats?.best_candidate ?? '', 200)), (validationCandidate = genomeId))}>{candidateLabel(p.stats?.best_candidate ?? '', 24) || '—'}</button></td>
+								<td class="mono dim" title={p.stats?.best_candidate ?? ''}><button class="link" onclick={(e) => (e.stopPropagation(), (genomeId = candidateLabel(p.stats?.best_candidate ?? '', Infinity)), (validationCandidate = genomeId))}>{candidateLabel(p.stats?.best_candidate ?? '', 24) || '—'}</button></td>
 								<td class="mono dim">{ago(p.last_at, now)}</td>
 							</tr>
 						{/each}
@@ -394,7 +394,7 @@
 	<Validation candidate={validationCandidate} />
 </div>
 
-<GenomeDrawer {genomeId} onclose={() => (genomeId = null)} />
+<GenomeDrawer {genomeId} onclose={() => (genomeId = null)} onopen={(id) => (genomeId = id)} />
 
 <style>
 	.gens {

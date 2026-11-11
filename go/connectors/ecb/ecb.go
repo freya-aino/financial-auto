@@ -91,12 +91,28 @@ var berlin = func() *time.Location {
 	return l
 }()
 
-func init() { connector.Register(ID, func() connector.Connector { return &Connector{} }) }
+// Adapter is the catalog `adapter:` name of the generic SDMX-JSON connector
+// (spec 11 §6.3): the same code serves any SDMX 2.1 REST endpoint answering
+// `format=jsondata` (ECB, OECD, IMF SDMX Central …). Its catalog entry names
+// the endpoint in `config.extra.base_url` (…/service/data or …/rest/data)
+// and the series as `config.queries` "<FLOW>/<KEY>"; there are no default
+// queries. History-less daily series get the ECB-style estimated vintage
+// (16:00 Europe/Berlin, flagged publish_time_estimated). No catalog entry uses
+// the adapter yet (Eurostat answers JSON-stat, not SDMX-JSON, and needs its own
+// parser).
+const Adapter = "sdmx"
+
+func init() {
+	connector.Register(ID, func() connector.Connector { return &Connector{} })
+	connector.RegisterAdapter(Adapter, func(id string) connector.Connector { return &Connector{SourceID: id} })
+}
 
 // Connector implements Connector, Poller, Backfiller and Normalizer.
 type Connector struct {
 	BaseURL string
 	Fetch   *connector.Fetcher
+	// SourceID is the catalog id when running as the generic `sdmx` adapter ("" = ecb).
+	SourceID string
 
 	deps    connector.Deps
 	queries []string
@@ -107,7 +123,14 @@ type Connector struct {
 	floor, cursor map[string]time.Time
 }
 
-func (c *Connector) ID() string { return ID }
+func (c *Connector) ID() string { return c.id() }
+
+func (c *Connector) id() string {
+	if c.SourceID != "" {
+		return c.SourceID
+	}
+	return ID
+}
 
 func (c *Connector) Capabilities() connector.Capabilities {
 	return connector.Capabilities{Poll: true, Backfill: true, Events: []connector.EventKind{connector.KindMacro}}
@@ -118,6 +141,13 @@ func (c *Connector) Init(ctx context.Context, cfg connector.SourceConfig, deps c
 		deps.Clock = connector.SystemClock{}
 	}
 	c.deps = deps
+	adapter := c.SourceID != "" && c.SourceID != ID
+	if adapter && c.BaseURL == "" {
+		c.BaseURL = strings.TrimRight(cfg.Source.Params().Extra["base_url"], "/")
+		if c.BaseURL == "" {
+			return fmt.Errorf("sdmx %s: config.extra.base_url is required", c.SourceID)
+		}
+	}
 	if c.BaseURL == "" {
 		c.BaseURL = DefaultBaseURL
 	}
@@ -131,6 +161,9 @@ func (c *Connector) Init(ctx context.Context, cfg connector.SourceConfig, deps c
 		}
 	}
 	if len(c.queries) == 0 {
+		if adapter {
+			return fmt.Errorf("sdmx %s: config.queries is empty", c.SourceID)
+		}
 		c.queries = DefaultQueries
 	}
 	for _, q := range c.queries {
@@ -142,7 +175,7 @@ func (c *Connector) Init(ctx context.Context, cfg connector.SourceConfig, deps c
 	c.floor, c.cursor = map[string]time.Time{}, map[string]time.Time{}
 	if deps.Cursors != nil {
 		for _, q := range c.queries {
-			t, ok, err := deps.Cursors.GetCursor(ctx, ID, "", scope(q))
+			t, ok, err := deps.Cursors.GetCursor(ctx, c.id(), "", scope(q))
 			if err != nil {
 				return fmt.Errorf("ecb: cursor: %w", err)
 			}
@@ -215,7 +248,7 @@ func (c *Connector) raw(query, u string, b []byte, backfill bool) connector.RawM
 	if backfill {
 		meta[connector.MetaBackfill] = "1"
 	}
-	return connector.RawMessage{SourceID: ID, ReceivedAt: c.deps.Clock.Now(), TransportMeta: meta, Bytes: b, ContentType: "application/json"}
+	return connector.RawMessage{SourceID: c.id(), ReceivedAt: c.deps.Clock.Now(), TransportMeta: meta, Bytes: b, ContentType: "application/json"}
 }
 
 // Backfill walks [From, To) in five-year startPeriod/endPeriod windows for
@@ -507,7 +540,7 @@ func (c *Connector) Normalize(raw connector.RawMessage) ([]*fav1.Envelope, []con
 		}
 		envs = append(envs, &fav1.Envelope{
 			EventId:              ulid.Make().String(),
-			SourceId:             ID,
+			SourceId:             c.id(),
 			EventTime:            timestamppb.New(end),
 			PublishTime:          timestamppb.New(publish),
 			IngestTime:           timestamppb.New(raw.ReceivedAt),
@@ -526,7 +559,7 @@ func (c *Connector) Normalize(raw connector.RawMessage) ([]*fav1.Envelope, []con
 		c.cursor[q] = newest
 		if c.deps.Cursors != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = c.deps.Cursors.SetCursor(ctx, ID, "", scope(q), newest)
+			_ = c.deps.Cursors.SetCursor(ctx, c.id(), "", scope(q), newest)
 			cancel()
 		}
 	}

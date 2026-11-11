@@ -86,11 +86,21 @@ pub fn norm_ppf(p: f64) -> f64 {
 
 /// Probabilistic Sharpe ratio: P(true SR > `sr_benchmark`) given the observed returns.
 pub fn probabilistic_sharpe(r: &[f64], sr_benchmark: f64) -> f64 {
-    let n = r.len() as f64;
-    let sr = sharpe(r);
     let (skew, kurt) = moments(r);
+    psr_from_stats(sharpe(r), r.len(), skew, kurt, sr_benchmark)
+}
+
+/// PSR from summary statistics (Bailey & López de Prado 2012, eq. 8): per-period Sharpe `sr`
+/// over `n_obs` observations with skewness `skew` and (non-excess) kurtosis `kurt`.
+pub fn psr_from_stats(sr: f64, n_obs: usize, skew: f64, kurt: f64, sr_benchmark: f64) -> f64 {
+    let n = n_obs as f64;
     let denom = (1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr).max(1e-12).sqrt();
     norm_cdf((sr - sr_benchmark) * (n - 1.0).sqrt() / denom)
+}
+
+/// Deflated Sharpe ratio from summary statistics (Bailey & López de Prado 2014, eq. 2).
+pub fn deflated_sharpe_from_stats(sr: f64, n_obs: usize, skew: f64, kurt: f64, n_trials: usize, var_sr: f64) -> f64 {
+    psr_from_stats(sr, n_obs, skew, kurt, expected_max_sharpe(n_trials, var_sr))
 }
 
 /// Expected maximum Sharpe among `n_trials` independent trials with Sharpe variance `var_sr`
@@ -173,6 +183,34 @@ mod tests {
         for p in [0.01, 0.2, 0.5, 0.9, 0.999] {
             assert!((norm_cdf(norm_ppf(p)) - p).abs() < 1e-4, "p={p}");
         }
+    }
+
+    /// The numerical example of Bailey & López de Prado (2014), "The Deflated Sharpe Ratio",
+    /// J. Portfolio Management 40(5): 5 years of daily returns (T = 1250), annualised SR 2.5,
+    /// skewness −3, kurtosis 10, N = 100 independent trials whose annualised Sharpe ratios have
+    /// variance 1/2. The paper reports the expected maximum (non-annualised) SR₀ ≈ 0.1132 and
+    /// DSR ≈ 0.9004 (the strategy fails a 95 % threshold despite its SR of 2.5).
+    #[test]
+    fn deflated_sharpe_matches_the_published_example() {
+        let periods = 250.0_f64;
+        let sr = 2.5 / periods.sqrt();
+        let var_sr = 0.5 / periods;
+        let sr0 = expected_max_sharpe(100, var_sr);
+        assert!((sr0 - 0.1132).abs() < 5e-4, "SR0 {sr0}");
+        assert!((sr0 * periods.sqrt() - 1.79).abs() < 0.01, "annualised SR0 {}", sr0 * periods.sqrt());
+        let dsr = deflated_sharpe_from_stats(sr, 1250, -3.0, 10.0, 100, var_sr);
+        assert!((dsr - 0.9004).abs() < 5e-4, "DSR {dsr}");
+        // the same strategy with one trial is the PSR against 0 (≈ 1), and normal returns
+        // (skew 0, kurtosis 3) deflate less than the fat left tail
+        assert!(psr_from_stats(sr, 1250, -3.0, 10.0, 0.0) > 0.999);
+        assert!(deflated_sharpe_from_stats(sr, 1250, 0.0, 3.0, 100, var_sr) > dsr);
+        // the returns-based entry points agree with the statistics form
+        let mut rng = Rng::seed(3);
+        let r: Vec<f64> = (0..800).map(|_| 0.03 + rng.normal() * (1.0 + 0.3 * rng.normal())).collect();
+        let (skew, kurt) = moments(&r);
+        let a = deflated_sharpe(&r, 50, 0.004);
+        let b = deflated_sharpe_from_stats(sharpe(&r), r.len(), skew, kurt, 50, 0.004);
+        assert!((a - b).abs() < 1e-12);
     }
 
     #[test]

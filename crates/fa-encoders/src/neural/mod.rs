@@ -19,6 +19,7 @@
 //! `cuda` cargo feature); without the feature every request resolves to the CPU.
 
 pub mod adapter;
+pub mod assets;
 pub mod data;
 pub mod heads;
 pub mod model;
@@ -64,6 +65,8 @@ pub struct NeuralEncoder {
     descriptor: FamilyDescriptor,
     sizing: ScaleSizing,
     snapshot_id: String,
+    /// Live cross-asset context (`asset_attn`): every instrument's latest window.
+    book: std::sync::Mutex<assets::AssetBook>,
 }
 
 impl std::fmt::Debug for NeuralEncoder {
@@ -101,7 +104,37 @@ impl NeuralEncoder {
             latent_dim: model.cfg.moe.expert_dim as u32,
             ..default_sizing(ts)
         };
-        Self { descriptor: descriptor(model.cfg.family, ts), sizing, snapshot_id: snapshot_id.into(), model }
+        Self {
+            descriptor: descriptor(model.cfg.family, ts),
+            sizing,
+            snapshot_id: snapshot_id.into(),
+            model,
+            book: std::sync::Mutex::new(assets::AssetBook::default()),
+        }
+    }
+
+    /// Encodes windows `ends` of one instrument's series with bar end times, with the
+    /// cross-asset context of `peers` (the series of the fit; spec 31 §6.4). Without
+    /// `asset_attn` this is [`Self::encode_windows`].
+    pub fn encode_series_windows(
+        &self,
+        peers: &[Series],
+        series: usize,
+        ends: &[usize],
+    ) -> Result<Vec<Encoded>, EncoderError> {
+        let s = &peers[series];
+        if !self.model.cfg.asset_attn {
+            return self.encode_windows(&s.bars, ends);
+        }
+        let mut out = Vec::with_capacity(ends.len());
+        for chunk in ends.chunks(256) {
+            let wins: Vec<(&[[f32; N_FEATURES]], usize)> = chunk.iter().map(|&e| (s.feats.as_slice(), e)).collect();
+            let idx: Vec<(usize, usize)> = chunk.iter().map(|&e| (series, e)).collect();
+            let ab = assets::batch_from_series(&self.model.cfg, &self.model.norm, peers, &idx, self.model.device())
+                .map_err(err)?;
+            out.extend(self.encode_inputs_ctx(&wins, Some(&ab))?);
+        }
+        Ok(out)
     }
 
     /// Rebuilds a snapshot from its manifest and safetensors `weights.bin` on `dev`.
@@ -216,8 +249,20 @@ impl NeuralEncoder {
     }
 
     fn encode_inputs(&self, wins: &[(&[[f32; N_FEATURES]], usize)]) -> Result<Vec<Encoded>, EncoderError> {
+        self.encode_inputs_ctx(wins, None)
+    }
+
+    fn encode_inputs_ctx(
+        &self,
+        wins: &[(&[[f32; N_FEATURES]], usize)],
+        asset: Option<&assets::AssetBatch>,
+    ) -> Result<Vec<Encoded>, EncoderError> {
         let x = self.model.input(wins).map_err(err)?;
-        let f = self.model.forward(&x, None).map_err(err)?;
+        let f = self.model.forward_ctx(&self.model.ps, &x, asset, None, None).map_err(err)?;
+        let attn = match &f.asset_attn {
+            Some(a) => Some(a.to_vec2::<f32>().map_err(err)?),
+            None => None,
+        };
         let mu = f.out.mu.to_vec3::<f32>().map_err(err)?;
         let lv = f.out.logvar.to_vec3::<f32>().map_err(err)?;
         let probs = f.out.probs.to_vec2::<f32>().map_err(err)?;
@@ -234,8 +279,22 @@ impl NeuralEncoder {
                 gates: top_k_gates(&probs[i], self.model.cfg.moe.top_k),
                 probs: probs[i].clone(),
                 codes: codes.as_ref().map(|c| c[i].iter().map(|v| *v as u32).collect()),
+                asset_attn: match (&attn, asset) {
+                    (Some(a), Some(ab)) => Some(assets::row_weights(&a[i], &ab.names[i]).0),
+                    _ => None,
+                },
             })
             .collect())
+    }
+
+    /// Per expert and target, the log-variance of the calibrated next-step distribution.
+    fn next_step_logvar(&self) -> Option<Vec<Vec<f32>>> {
+        let m = &self.model;
+        m.moe
+            .active
+            .iter()
+            .map(|e| m.pred_sd.get(e).map(|sd| sd.iter().map(|v| 2.0 * v.max(1e-6).ln()).collect()))
+            .collect()
     }
 }
 
@@ -250,6 +309,8 @@ pub struct Encoded {
     pub gates: Vec<f32>,
     pub probs: Vec<f32>,
     pub codes: Option<Vec<u32>>,
+    /// Cross-asset attention per peer (`asset_attn` encoders with a context).
+    pub asset_attn: Option<Vec<(String, f32)>>,
 }
 
 impl EncoderFamily for NeuralEncoder {
@@ -278,7 +339,26 @@ impl EncoderFamily for NeuralEncoder {
         }
         let bars: Vec<MarketBar> = input.market.iter().map(|r| MarketBar::from_row(r)).collect::<Result<_, _>>()?;
         let feats = data::bar_features(&bars);
-        let e = self.encode_inputs(&[(feats.as_slice(), feats.len())])?.pop().expect("one window");
+        let asset = if self.model.cfg.asset_attn {
+            // peers' latest windows strictly before this one, then this window into the book
+            let cfg = &self.model.cfg;
+            let inst = input.instrument.clone().unwrap_or_default();
+            let mut book = self.book.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ab = {
+                let book_ref = &*book;
+                let t = input.as_of_ms;
+                let rows: Vec<assets::AssetRow<'_>> =
+                    vec![(inst.clone(), Box::new(move |peer: &str| book_ref.before(peer, t, cfg.asset_max_age_ms)))];
+                assets::build(cfg, &rows, self.model.device()).map_err(err)?
+            };
+            if !inst.is_empty() {
+                book.record(&inst, input.as_of_ms, self.model.norm.window(&feats, feats.len(), cfg.asset_ctx.max(1)));
+            }
+            Some(ab)
+        } else {
+            None
+        };
+        let e = self.encode_inputs_ctx(&[(feats.as_slice(), feats.len())], asset.as_ref())?.pop().expect("one window");
         // Fewer bars than the context: widen the posterior by the missing share (log scale).
         let missing =
             self.model.cfg.context_steps as f32 / (bars.len().min(self.model.cfg.context_steps).max(1) as f32);
@@ -296,6 +376,8 @@ impl EncoderFamily for NeuralEncoder {
             prior_score,
             realised_prev,
             probs: e.probs.clone(),
+            next_step_logvar: self.next_step_logvar(),
+            asset_attn: e.asset_attn.clone(),
         };
         let experts =
             e.mu.into_iter()
@@ -460,6 +542,151 @@ mod tests {
             );
             assert!(NeuralEncoder::from_manifest_on(&other, &tr.weights().unwrap(), &dev).is_err());
         }
+    }
+
+    fn timed(name: &str, n: usize, seed: u64) -> Series {
+        Series::with_times(name, synthetic(n, seed), (0..n as i64).map(|i| (i + 1) * 60_000).collect())
+    }
+
+    /// Spec 31 §6.4 + spec 32 §6.1/§6.3/§6.4 genes end to end on synthetic data: asset embeddings
+    /// and cross-asset attention (exported per window and per instrument), bias balancing,
+    /// `cov_ema`, the decorrelation hold-out, calibration and the collapse monitor; checkpoint
+    /// resume stays bit-exact with the running moments; a save/load round trip keeps the
+    /// vocabulary, the calibrated `next_step` spread and the live asset book works.
+    #[test]
+    fn asset_attention_balancing_and_calibration() {
+        let dev = Device::Cpu;
+        let mut cfg = small(NeuralFamily::FsqHybrid);
+        cfg.asset_attn = true;
+        cfg.asset_ctx = 2;
+        cfg.asset_vocab = vec!["a".into(), "b".into(), "c".into()];
+        cfg.asset_max_age_ms = 180_000;
+        cfg.moe.balance = "bias".into();
+        cfg.moe.cov_ema = 0.9;
+        cfg.decor_holdout = 0.2;
+        let ds = Dataset::build(vec![timed("a", 300, 1), timed("b", 300, 2), timed("c", 300, 3)], 16, 1, 0.15);
+        let mut tr = NeuralTrainer::new(cfg.clone(), &ds, 3, &dev).unwrap();
+        let before = tr.evaluate(&ds, &ds.val).unwrap();
+        tr.train_steps(&ds, 60).unwrap();
+        assert!(tr.decor_ema.is_some(), "running moments kept");
+        let ck = tr.checkpoint().unwrap();
+        tr.train_steps(&ds, 20).unwrap();
+        let mut back = NeuralTrainer::from_checkpoint(&ck, &dev).unwrap();
+        back.train_steps(&ds, 20).unwrap();
+        assert_eq!(params(&back.weights().unwrap()), params(&tr.weights().unwrap()), "resume with cov_ema + bias");
+        let bias = tr.model.ps.tensor(fa_expert_space::moe::ROUTE_BIAS).unwrap().to_vec1::<f32>().unwrap();
+        assert!(bias.iter().any(|b| *b != 0.0), "routing bias moved: {bias:?}");
+        tr.calibrate_pred_sd(&ds, 512).unwrap();
+        let after = tr.evaluate(&ds, &ds.val).unwrap();
+        assert!(after.loss.pred < before.loss.pred);
+        let h = &after.health;
+        assert_eq!(h.crps.len(), 3);
+        assert!(h.pit_ks.iter().all(|k| (0.0..=1.0).contains(k)));
+        assert_eq!(h.active_units.len(), 3);
+        assert_eq!(h.code_perplexity.len(), 3, "fsq codes monitored");
+        assert_eq!(after.asset_attn.len(), 3, "attention summary per instrument");
+        assert!(after.asset_attn["a"].keys().all(|k| k == "b" || k == "c"), "{:?}", after.asset_attn["a"]);
+        assert!(after.asset_null > 0.0 && after.asset_null < 1.0);
+
+        // artifact round trip and live serving with the asset book
+        let m = manifest("snap", NeuralFamily::FsqHybrid);
+        let enc = NeuralEncoder::from_manifest_on(&m, &tr.weights().unwrap(), &dev).unwrap();
+        assert_eq!(enc.model().cfg.asset_vocab.len(), 3);
+        assert_eq!(enc.model().pred_sd, tr.model.pred_sd);
+        let bars_b = synthetic(40, 5);
+        let mut ib = EncoderInput::from_bars(60_000, &bars_b);
+        ib.instrument = Some("b".into());
+        let (_, xb) = enc.encode_with_extras(&ib).unwrap();
+        assert!(xb.as_ref().unwrap().asset_attn.as_ref().unwrap().is_empty(), "no peer seen yet");
+        let mut ia = EncoderInput::from_bars(120_000, &synthetic(40, 6));
+        ia.instrument = Some("a".into());
+        let (_, xa) = enc.encode_with_extras(&ia).unwrap();
+        let xa = xa.unwrap();
+        let attn = xa.asset_attn.unwrap();
+        assert_eq!(attn.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), vec!["b"], "reads b's earlier window");
+        assert_eq!(xa.next_step_logvar.as_ref().unwrap().len(), 3);
+        // batch path with the fit's series equals the trainer's evaluation inputs
+        let enc_all = enc.encode_series_windows(&ds.series, 0, &[100, 101]).unwrap();
+        assert!(enc_all.iter().all(|e| e.asset_attn.as_ref().is_some_and(|a| a.len() == 2)));
+    }
+
+    /// Spec 31 §8: a step over the memory budget fails as out-of-memory and the trainer halves
+    /// the batch until it fits, finishing the requested steps; spec 32 §6.1 split adds an expert.
+    #[test]
+    fn oom_retry_halves_the_batch_and_split_revives_a_slot() {
+        let dev = Device::Cpu;
+        let cfg = small(NeuralFamily::JepaVae);
+        let ds = Dataset::build(vec![Series::new("a", synthetic(300, 4))], cfg.min_window, cfg.horizon(), 0.2);
+        let mut tr = NeuralTrainer::new(cfg.clone(), &ds, 1, &dev).unwrap();
+        let full = tr.step_mem_mb();
+        tr.mem_limit_mb = Some(full * 0.4);
+        let e = tr.train_steps(&ds, 1).unwrap_err();
+        assert!(train::is_oom(&e), "{e}");
+        tr.train_steps_oom_safe(&ds, 10, 4).unwrap();
+        assert_eq!(tr.step, 10);
+        assert!(tr.model.cfg.batch <= 12 && tr.oom_retries >= 2, "{} after {}", tr.model.cfg.batch, tr.oom_retries);
+        tr.mem_limit_mb = Some(1e-6);
+        assert!(tr.train_steps_oom_safe(&ds, 5, 2).is_err(), "gives up at the retry cap / minimum batch");
+
+        let mut tr = NeuralTrainer::new(NeuralConfig { split_resid_ratio: 1e-9, ..cfg }, &ds, 1, &dev).unwrap();
+        tr.train_steps(&ds, 30).unwrap();
+        tr.prune(&[0.6, 0.0, 0.4], 2);
+        assert_eq!(tr.model.moe.active, vec![0, 2]);
+        let split = tr.split_experts(&ds, 400).unwrap();
+        // whether an expert is bimodal depends on the data; when one splits it takes slot 1
+        for (from, to) in &split {
+            assert_eq!(*to, 1);
+            assert!(tr.model.moe.active.contains(from) && tr.model.moe.active.contains(to));
+        }
+        assert_eq!(tr.model.moe.n_active(), 2 + split.len());
+        tr.train_steps(&ds, 5).unwrap();
+        let mut rng = fa_core::rng::Rng::seed(8);
+        let two: Vec<Vec<f64>> =
+            (0..200).map(|i| vec![3.0 * (i % 2) as f64 + 0.2 * rng.normal(), 0.1 * rng.normal()]).collect();
+        let one: Vec<Vec<f64>> = (0..200).map(|_| vec![rng.normal(), 0.3 * rng.normal()]).collect();
+        assert!(train::bimodality(&two) > 5.0 / 9.0 && train::bimodality(&one) < 5.0 / 9.0);
+    }
+
+    /// Spec 31 §9.4 on the CPU (the reference GPU is out of scope): per-step serving latency of
+    /// the default ladder genome per family and timescale. `cargo test --release -p fa-encoders
+    /// serving_latency -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn serving_latency() {
+        let dev = Device::Cpu;
+        for (family, ts) in [
+            (NeuralFamily::JepaVae, Timescale::Minute),
+            (NeuralFamily::FsqHybrid, Timescale::Minute),
+            (NeuralFamily::HierVaeFlow, Timescale::Hour),
+            (NeuralFamily::LatentDiffusion, Timescale::Day),
+        ] {
+            let cfg = NeuralConfig::for_timescale(family, ts);
+            let model = NeuralModel::new(cfg.clone(), InputNorm::default(), 1, &dev).unwrap();
+            let enc = NeuralEncoder::new(model, ts, "lat");
+            let bars = synthetic(cfg.context_steps + 1, 9);
+            let input = EncoderInput::from_bars(1, &bars);
+            enc.encode_with_extras(&input).unwrap();
+            let n = 50;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                enc.encode_with_extras(&input).unwrap();
+            }
+            eprintln!("{family:?} @ {ts}: {:.2} ms per step", t0.elapsed().as_secs_f64() * 1e3 / n as f64);
+        }
+    }
+
+    #[test]
+    fn capacity_ladder_grows_with_the_timescale() {
+        let s = NeuralConfig::for_timescale(NeuralFamily::JepaVae, Timescale::Second);
+        let d = NeuralConfig::for_timescale(NeuralFamily::JepaVae, Timescale::Day);
+        assert!(d.d_model > s.d_model && d.layers > s.layers && d.moe.expert_dim > s.moe.expert_dim);
+        assert!(d.moe.max_experts > s.moe.max_experts && d.context_steps < s.context_steps);
+        let m = NeuralConfig::for_timescale(NeuralFamily::JepaVae, Timescale::Minute);
+        assert_eq!(
+            (m.d_model, m.layers, m.moe.expert_dim, m.moe.max_experts),
+            (32, 4, 8, 4),
+            "1m keeps the D-070 defaults"
+        );
     }
 
     #[test]

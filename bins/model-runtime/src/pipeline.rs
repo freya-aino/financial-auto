@@ -21,7 +21,8 @@ use fa_mcmc::{
     refit::{COV_DIM, ObsDump, ObsRecord, ObsWindow, RefitOutcome},
 };
 use fa_patterns::{
-    DriftMonitor, OnlineRegionCfg, OnlineRegionDiscovery, OnlineRegionSet, RegionLifecycle, RegionMap, RegionStat,
+    DriftMonitor, ExpertRegionMap, OnlineRegionCfg, OnlineRegionDiscovery, OnlineRegionSet, RegionLifecycle, RegionMap,
+    RegionStat, check_online, check_set,
 };
 use fa_proto::{
     Timestamp,
@@ -124,6 +125,10 @@ pub trait TransitionModel: Send {
     /// Garage keys of the refits in use (reloaded after a restart).
     fn refit_refs(&self) -> Vec<String> {
         Vec::new()
+    }
+    /// Support-based edge pruning (spec 33 §8); returns the edges removed.
+    fn prune(&mut self, _min_edge: f64) -> usize {
+        0
     }
 }
 
@@ -236,6 +241,33 @@ pub struct TimescalePipeline {
     rng: Rng,
     /// `novelty_threshold` of the region sets (out-of-region flag of memberships).
     novelty_threshold: f32,
+    /// `max_regions_per_set`: the online cap, also what a snapshot's map is checked against.
+    max_regions: usize,
+    /// Collapse guard per expert (spec 30 §8): `map_<reason>` when the snapshot's fitted set was
+    /// collapsed (the expert then started unseeded), `<reason>` when the live set is collapsed
+    /// after warm-up; `None` = valid.
+    invalid: Vec<Option<String>>,
+    /// Edges removed by support-based pruning per expert (spec 33 §8), cumulative.
+    pruned: Vec<u64>,
+}
+
+/// The map entry of expert `k` when it can seed the live set: present and not collapsed under
+/// `cap` (spec 30 §8). A collapsed expert starts unseeded.
+fn usable_expert(map: Option<&RegionMap>, k: u32, cap: usize) -> Option<&ExpertRegionMap> {
+    map.and_then(|m| m.expert(k)).filter(|e| check_set(e.regions.len(), cap).is_none())
+}
+
+/// `map_<reason>` per expert whose fitted set is collapsed.
+fn map_invalid(map: Option<&RegionMap>, n_experts: usize, cap: usize) -> Vec<Option<String>> {
+    (0..n_experts)
+        .map(|k| {
+            let c = map.and_then(|m| m.expert(k as u32)).and_then(|e| check_set(e.regions.len(), cap))?;
+            if let Some(m) = map {
+                tracing::warn!(snapshot = %m.snapshot_id, expert = k, reason = c.as_str(), "region map of this expert is collapsed: marked invalid, starting unseeded (spec 30 §8)");
+            }
+            Some(format!("map_{}", c.as_str()))
+        })
+        .collect()
 }
 
 impl TimescalePipeline {
@@ -273,6 +305,9 @@ impl TimescalePipeline {
             kcfg: cfg.kernel,
             rng: Rng::seed(cfg.seed ^ 0xD1A6),
             novelty_threshold: cfg.regions.novelty_threshold,
+            max_regions: cfg.regions.max_regions,
+            invalid: map_invalid(region_map, n_experts, cfg.regions.max_regions),
+            pruned: vec![0; n_experts],
         }
     }
 
@@ -289,7 +324,7 @@ impl TimescalePipeline {
     /// Drift references: the fitted region masses of a trained snapshot, else captured live.
     fn drift_monitors(cfg: &PipelineConfig, n_experts: usize, region_map: Option<&RegionMap>) -> Vec<DriftMonitor> {
         (0..n_experts)
-            .map(|k| match region_map.and_then(|m| m.expert(k as u32)) {
+            .map(|k| match usable_expert(region_map, k as u32, cfg.regions.max_regions) {
                 Some(e) => DriftMonitor::with_reference(
                     cfg.kernel.drift_refit_kl,
                     e.regions.iter().map(|r| (r.region_id.clone(), r.mass)),
@@ -327,7 +362,7 @@ impl TimescalePipeline {
                 // Region ids: `<ts>-e<k>-r<nnn>` for the in-process baseline, `<snapshot>-e<k>-r<nnn>` for a
                 // trained snapshot (its `regions.json` uses that prefix, so new births continue the series).
                 let prefix = if region_map.is_some() { format!("{snapshot}-e{k}") } else { format!("{ts}-e{k}") };
-                let set = match region_map.and_then(|m| m.expert(k as u32)) {
+                let set = match usable_expert(region_map, k as u32, cfg.regions.max_regions) {
                     Some(e) => OnlineRegionSet::seeded(cfg.regions, snapshot, k as u32, prefix, &e.regions),
                     None => OnlineRegionSet::new(cfg.regions, snapshot, k as u32, prefix),
                 };
@@ -337,7 +372,7 @@ impl TimescalePipeline {
         let transitions = (0..n_experts)
             .map(|k| {
                 let mut t = Self::transition_model(cfg, ts, k, None);
-                if let Some(e) = region_map.and_then(|m| m.expert(k as u32)) {
+                if let Some(e) = usable_expert(region_map, k as u32, cfg.regions.max_regions) {
                     for r in &e.regions {
                         t.register_region(&r.region_id);
                         if cfg.kernel.geo_prior {
@@ -373,6 +408,7 @@ impl TimescalePipeline {
         let parent = map.parent_snapshot_id.clone();
         map.experts
             .iter()
+            .filter(|e| usable_expert(region_map, e.expert_index, self.max_regions).is_some())
             .flat_map(|e| {
                 let space = self.space_ref(e.expert_index);
                 let ps = parent.as_ref().map(|p| ExpertSpaceRef { snapshot_id: p.clone(), ..space.clone() });
@@ -403,7 +439,7 @@ impl TimescalePipeline {
         if let Some(map) = region_map {
             report.regime_break = map.regime_break();
             for (k, model) in transitions.iter_mut().enumerate() {
-                let Some(e) = map.expert(k as u32) else { continue };
+                let Some(e) = usable_expert(Some(map), k as u32, cfg.regions.max_regions) else { continue };
                 // Spec 30 §8: an alignment that kept < 50 % of the probe mass is a regime break
                 // of the representation; the kernel restarts from the (geometric) prior.
                 if e.regime_break {
@@ -442,11 +478,18 @@ impl TimescalePipeline {
         self.drift = Self::drift_monitors(cfg, n_experts, region_map);
         self.observed = vec![0; n_experts];
         self.last_kernel_ms = vec![i64::MIN; n_experts];
+        self.max_regions = cfg.regions.max_regions;
+        self.invalid = map_invalid(region_map, n_experts, cfg.regions.max_regions);
+        self.pruned = vec![0; n_experts];
         report.events = self.seeded_region_events();
         if let Some(map) = region_map {
             let now =
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
-            for e in &map.experts {
+            for e in map
+                .experts
+                .iter()
+                .filter(|e| usable_expert(Some(map), e.expert_index, cfg.regions.max_regions).is_some())
+            {
                 let space = self.space_ref(e.expert_index);
                 let ps = ExpertSpaceRef { snapshot_id: previous.clone(), ..space.clone() };
                 report.lifecycle.extend(lifecycle_map(&space, Some(&ps), now, e));
@@ -490,6 +533,33 @@ impl TimescalePipeline {
             }
         }
         true
+    }
+
+    /// Collapse guard per expert (spec 30 §8): `(expert, reason)`, `None` = valid.
+    pub fn region_validity(&self) -> Vec<(u32, Option<&str>)> {
+        self.invalid.iter().enumerate().map(|(k, r)| (k as u32, r.as_deref())).collect()
+    }
+
+    /// Edges removed by support-based pruning per expert (spec 33 §8), cumulative.
+    pub fn pruned_edges(&self) -> &[u64] {
+        &self.pruned
+    }
+
+    /// Refuses a snapshot whose fitted region map has a collapsed expert (spec 30 §8: the
+    /// previous snapshot and its region sets stay active).
+    pub fn check_region_map(&self, map: Option<&RegionMap>) -> Result<(), String> {
+        let Some(map) = map else { return Ok(()) };
+        let bad = map.collapsed(self.max_regions);
+        if bad.is_empty() {
+            return Ok(());
+        }
+        let list: Vec<String> = bad.iter().map(|(k, c)| format!("e{k}: {}", c.as_str())).collect();
+        Err(format!(
+            "region set of {} invalid ({}; cap {}): previous snapshot kept active (spec 30 §8)",
+            map.snapshot_id,
+            list.join(", "),
+            self.max_regions
+        ))
     }
 
     pub fn n_experts(&self) -> usize {
@@ -562,8 +632,11 @@ impl TimescalePipeline {
     }
 
     pub fn step(&mut self, input: &StepInput<'_>) -> Result<StepOutput, fa_encoders::EncoderError> {
-        let (mut view, extras) =
-            self.encoder.encode_with_extras(&EncoderInput::from_bars(input.as_of_ms, input.bars))?;
+        let (mut view, extras) = self.encoder.encode_with_extras(&EncoderInput {
+            // the asset embedding / cross-asset context of `asset_attn` encoders (spec 31 §6.4)
+            instrument: Some(fa_tsdb::inst_token(input.instrument_id)),
+            ..EncoderInput::from_bars(input.as_of_ms, input.bars)
+        })?;
         // A neural encoder ships its learned top-k gates (spec 32 §6.1); only encoders without a
         // learned gate (the statistical family) are routed by the baseline router.
         if view.router_weights.len() != view.experts.len() {
@@ -752,6 +825,21 @@ impl TimescalePipeline {
                 self.drift[k].capture(live.clone());
             }
             let drift = self.drift[k].check(&live);
+            if self.kcfg.prune_min_edge > 0.0 {
+                self.pruned[k] += self.transitions[k].prune(self.kcfg.prune_min_edge) as u64;
+            }
+            // Spec 30 §8 collapse guard on the live set (after warm-up); a map-level mark stays
+            // until the live set has warmed up and is valid.
+            match check_online(stats.len(), self.observed[k], self.kcfg.drift_warmup, self.max_regions) {
+                Some(c) => {
+                    if self.invalid[k].as_deref() != Some(c.as_str()) {
+                        tracing::warn!(ts = %self.ts, expert = k, live = stats.len(), reason = c.as_str(), "live region set collapsed: marked invalid (spec 30 §8)");
+                    }
+                    self.invalid[k] = Some(c.as_str().to_owned());
+                }
+                None if self.observed[k] >= self.kcfg.drift_warmup => self.invalid[k] = None,
+                None => {}
+            }
             let space = self.space_ref(k as u32);
             if let Some(u) = kernel_update(
                 &space,
@@ -1286,22 +1374,35 @@ mod tests {
             carry_threshold: 0.5,
             experts: vec![fa_patterns::ExpertRegionMap {
                 expert_index: 0,
-                regions: vec![fa_patterns::FittedRegion {
-                    region_id: "snap-b-e0-r000".into(),
-                    lineage_id: "snap-b-e0-r000".into(),
-                    expert_index: 0,
-                    centroid: vec![0.1; 8],
-                    radius: 1.0,
-                    mass: 1.0,
-                    parent_region_id: None,
-                    score: 0.0,
-                    ancestors: vec![fa_patterns::Ancestor {
-                        region_id: old_id.clone(),
-                        lineage_id: old_id.clone(),
-                        overlap: 0.3,
-                        kind: fa_patterns::DescentKind::Partial,
-                    }],
-                }],
+                regions: vec![
+                    fa_patterns::FittedRegion {
+                        region_id: "snap-b-e0-r000".into(),
+                        lineage_id: "snap-b-e0-r000".into(),
+                        expert_index: 0,
+                        centroid: vec![0.1; 8],
+                        radius: 1.0,
+                        mass: 1.0,
+                        parent_region_id: None,
+                        score: 0.0,
+                        ancestors: vec![fa_patterns::Ancestor {
+                            region_id: old_id.clone(),
+                            lineage_id: old_id.clone(),
+                            overlap: 0.3,
+                            kind: fa_patterns::DescentKind::Partial,
+                        }],
+                    },
+                    fa_patterns::FittedRegion {
+                        region_id: "snap-b-e0-r001".into(),
+                        lineage_id: "snap-b-e0-r001".into(),
+                        expert_index: 0,
+                        centroid: vec![-0.5; 8],
+                        radius: 1.0,
+                        mass: 0.0,
+                        parent_region_id: None,
+                        score: 0.0,
+                        ancestors: vec![],
+                    },
+                ],
                 parent_regions: 1,
                 matched: 0,
                 carried_mass: 0.0,
@@ -1321,15 +1422,65 @@ mod tests {
         assert_eq!(pl.transition_rows(), 0, "posteriors restarted from the prior");
         use fa_proto::v1::region_lifecycle_event::Kind;
         let kinds: Vec<i32> = report.lifecycle.iter().map(|l| l.kind).collect();
-        assert_eq!(kinds, vec![Kind::Born as i32, Kind::Died as i32]);
+        assert_eq!(kinds, vec![Kind::Born as i32, Kind::Born as i32, Kind::Died as i32]);
         assert_eq!(report.lifecycle[0].ancestors[0].kind, "partial");
         assert!(report.lifecycle.iter().all(|l| l.regime_break));
         assert_eq!(
-            report.lifecycle[1].space.as_ref().unwrap().snapshot_id,
+            report.lifecycle[2].space.as_ref().unwrap().snapshot_id,
             "stat-v1-1m",
             "dead parent in the old space"
         );
         let seeded = pl.seeded_lifecycle(Some(&map), 0);
-        assert_eq!(seeded.len(), 2);
+        assert_eq!(seeded.len(), 3);
+    }
+
+    #[test]
+    fn a_collapsed_region_map_is_refused_on_reload_and_unseeded_at_start() {
+        let cfg = PipelineConfig::default();
+        let all = bars(30, 8);
+        let stats = StatisticalEncoder::fit(Timescale::Minute, &all, &fa_encoders::FitConfig::default()).unwrap();
+        let region = |i: usize| fa_patterns::FittedRegion {
+            region_id: format!("snap-c-e0-r{i:03}"),
+            lineage_id: format!("snap-c-e0-r{i:03}"),
+            expert_index: 0,
+            centroid: vec![i as f32; 8],
+            radius: 1.0,
+            mass: 1.0,
+            parent_region_id: None,
+            score: 0.0,
+            ancestors: vec![],
+        };
+        let map = |n: usize| RegionMap {
+            snapshot_id: "snap-c".into(),
+            parent_snapshot_id: None,
+            probe_set_version: "p".into(),
+            n_probes: 10,
+            carry_threshold: 0.5,
+            experts: vec![fa_patterns::ExpertRegionMap {
+                expert_index: 0,
+                regions: (0..n).map(region).collect(),
+                parent_regions: 0,
+                matched: 0,
+                carried_mass: 0.0,
+                dead_parents: vec![],
+                split_parents: vec![],
+                regime_break: false,
+            }],
+            note: None,
+        };
+        let base = TimescalePipeline::baseline(Timescale::Minute, &cfg);
+        assert!(base.check_region_map(Some(&map(3))).is_ok());
+        let err = base.check_region_map(Some(&map(1))).unwrap_err();
+        assert!(err.contains("e0: single_region"), "{err}");
+        assert!(base.check_region_map(Some(&map(cfg.regions.max_regions))).unwrap_err().contains("at_cap"));
+        let pl = TimescalePipeline::with_encoder(
+            Timescale::Minute,
+            &cfg,
+            Box::new(StatisticalEncoder::with_stats(Timescale::Minute, "snap-c", stats)),
+            Some(&map(1)),
+        );
+        assert_eq!(pl.region_validity()[0], (0, Some("map_single_region")));
+        assert_eq!(pl.region_validity()[1], (1, None));
+        assert!(pl.regions[0].regions().is_empty(), "collapsed expert starts unseeded");
     }
 }

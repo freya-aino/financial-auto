@@ -1906,6 +1906,9 @@ type ExpertView struct {
 	// denoising score); has_prior_score = false for families without one.
 	PriorScore    float64 `protobuf:"fixed64,9,opt,name=prior_score,json=priorScore,proto3" json:"prior_score,omitempty"`
 	HasPriorScore bool    `protobuf:"varint,10,opt,name=has_prior_score,json=hasPriorScore,proto3" json:"has_prior_score,omitempty"`
+	// Cross-asset attention of the window (spec 31 §6.4, encoders with the asset_attn gene):
+	// peer instrument → weight; the remaining mass is the null token's (no peer read).
+	AssetAttn     map[string]float32 `protobuf:"bytes,11,rep,name=asset_attn,json=assetAttn,proto3" json:"asset_attn,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"fixed32,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2008,6 +2011,13 @@ func (x *ExpertView) GetHasPriorScore() bool {
 		return x.HasPriorScore
 	}
 	return false
+}
+
+func (x *ExpertView) GetAssetAttn() map[string]float32 {
+	if x != nil {
+		return x.AssetAttn
+	}
+	return nil
 }
 
 // latent.expert.health (spec 32 §4.3, §6.4): per-expert usage, skill and the residual
@@ -2315,7 +2325,7 @@ const file_fa_v1_latent_proto_rawDesc = "" +
 	"region_ids\x18\x01 \x03(\tR\tregionIds\x12%\n" +
 	"\x0ekernel_subject\x18\x02 \x01(\tR\rkernelSubject\x12\x1d\n" +
 	"\n" +
-	"sampler_id\x18\x03 \x01(\tR\tsamplerId\"\x94\x03\n" +
+	"sampler_id\x18\x03 \x01(\tR\tsamplerId\"\x93\x04\n" +
 	"\n" +
 	"ExpertView\x12\x1f\n" +
 	"\vsnapshot_id\x18\x01 \x01(\tR\n" +
@@ -2332,7 +2342,12 @@ const file_fa_v1_latent_proto_rawDesc = "" +
 	"\vprior_score\x18\t \x01(\x01R\n" +
 	"priorScore\x12&\n" +
 	"\x0fhas_prior_score\x18\n" +
-	" \x01(\bR\rhasPriorScore\"\xd8\x02\n" +
+	" \x01(\bR\rhasPriorScore\x12?\n" +
+	"\n" +
+	"asset_attn\x18\v \x03(\v2 .fa.v1.ExpertView.AssetAttnEntryR\tassetAttn\x1a<\n" +
+	"\x0eAssetAttnEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\x02R\x05value:\x028\x01\"\xd8\x02\n" +
 	"\fExpertHealth\x12\x1f\n" +
 	"\vsnapshot_id\x18\x01 \x01(\tR\n" +
 	"snapshotId\x12\x1c\n" +
@@ -2364,7 +2379,7 @@ func file_fa_v1_latent_proto_rawDescGZIP() []byte {
 }
 
 var file_fa_v1_latent_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_fa_v1_latent_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
+var file_fa_v1_latent_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_fa_v1_latent_proto_goTypes = []any{
 	(RegionEvent_Kind)(0),          // 0: fa.v1.RegionEvent.Kind
 	(RegionLifecycleEvent_Kind)(0), // 1: fa.v1.RegionLifecycleEvent.Kind
@@ -2391,44 +2406,46 @@ var file_fa_v1_latent_proto_goTypes = []any{
 	(*McmcStateRef)(nil),           // 22: fa.v1.McmcStateRef
 	(*ExpertView)(nil),             // 23: fa.v1.ExpertView
 	(*ExpertHealth)(nil),           // 24: fa.v1.ExpertHealth
-	(*timestamppb.Timestamp)(nil),  // 25: google.protobuf.Timestamp
+	nil,                            // 25: fa.v1.ExpertView.AssetAttnEntry
+	(*timestamppb.Timestamp)(nil),  // 26: google.protobuf.Timestamp
 }
 var file_fa_v1_latent_proto_depIdxs = []int32{
-	25, // 0: fa.v1.LatentState.as_of:type_name -> google.protobuf.Timestamp
+	26, // 0: fa.v1.LatentState.as_of:type_name -> google.protobuf.Timestamp
 	4,  // 1: fa.v1.LatentState.experts:type_name -> fa.v1.ExpertLatent
 	0,  // 2: fa.v1.RegionEvent.kind:type_name -> fa.v1.RegionEvent.Kind
 	2,  // 3: fa.v1.RegionEvent.space:type_name -> fa.v1.ExpertSpaceRef
 	2,  // 4: fa.v1.TransitionUpdate.space:type_name -> fa.v1.ExpertSpaceRef
 	7,  // 5: fa.v1.TransitionUpdate.to:type_name -> fa.v1.TransitionProb
-	25, // 6: fa.v1.TransitionUpdate.as_of:type_name -> google.protobuf.Timestamp
+	26, // 6: fa.v1.TransitionUpdate.as_of:type_name -> google.protobuf.Timestamp
 	8,  // 7: fa.v1.ExpertMembership.weights:type_name -> fa.v1.RegionWeight
-	25, // 8: fa.v1.RegionMembership.as_of:type_name -> google.protobuf.Timestamp
+	26, // 8: fa.v1.RegionMembership.as_of:type_name -> google.protobuf.Timestamp
 	9,  // 9: fa.v1.RegionMembership.experts:type_name -> fa.v1.ExpertMembership
 	1,  // 10: fa.v1.RegionLifecycleEvent.kind:type_name -> fa.v1.RegionLifecycleEvent.Kind
 	2,  // 11: fa.v1.RegionLifecycleEvent.space:type_name -> fa.v1.ExpertSpaceRef
-	25, // 12: fa.v1.RegionLifecycleEvent.as_of:type_name -> google.protobuf.Timestamp
+	26, // 12: fa.v1.RegionLifecycleEvent.as_of:type_name -> google.protobuf.Timestamp
 	11, // 13: fa.v1.RegionLifecycleEvent.ancestors:type_name -> fa.v1.RegionAncestor
 	2,  // 14: fa.v1.KernelUpdate.space:type_name -> fa.v1.ExpertSpaceRef
-	25, // 15: fa.v1.KernelUpdate.as_of:type_name -> google.protobuf.Timestamp
+	26, // 15: fa.v1.KernelUpdate.as_of:type_name -> google.protobuf.Timestamp
 	14, // 16: fa.v1.KernelUpdate.samplers:type_name -> fa.v1.SamplerScore
 	13, // 17: fa.v1.KernelUpdate.stationary:type_name -> fa.v1.RegionDist
 	2,  // 18: fa.v1.RegionHierarchy.fine:type_name -> fa.v1.ExpertSpaceRef
 	2,  // 19: fa.v1.RegionHierarchy.coarse:type_name -> fa.v1.ExpertSpaceRef
-	25, // 20: fa.v1.RegionHierarchy.as_of:type_name -> google.protobuf.Timestamp
+	26, // 20: fa.v1.RegionHierarchy.as_of:type_name -> google.protobuf.Timestamp
 	16, // 21: fa.v1.RegionHierarchy.edges:type_name -> fa.v1.HierEdge
-	25, // 22: fa.v1.CrossAssetPriors.as_of:type_name -> google.protobuf.Timestamp
+	26, // 22: fa.v1.CrossAssetPriors.as_of:type_name -> google.protobuf.Timestamp
 	18, // 23: fa.v1.CrossAssetPriors.proposals:type_name -> fa.v1.CrossAssetPair
 	9,  // 24: fa.v1.ExpertViewLatent.region:type_name -> fa.v1.ExpertMembership
 	20, // 25: fa.v1.ExpertViewLatent.next_step:type_name -> fa.v1.PredictiveDist
-	25, // 26: fa.v1.ExpertView.t:type_name -> google.protobuf.Timestamp
+	26, // 26: fa.v1.ExpertView.t:type_name -> google.protobuf.Timestamp
 	21, // 27: fa.v1.ExpertView.experts:type_name -> fa.v1.ExpertViewLatent
 	22, // 28: fa.v1.ExpertView.mcmc_state:type_name -> fa.v1.McmcStateRef
-	25, // 29: fa.v1.ExpertHealth.as_of:type_name -> google.protobuf.Timestamp
-	30, // [30:30] is the sub-list for method output_type
-	30, // [30:30] is the sub-list for method input_type
-	30, // [30:30] is the sub-list for extension type_name
-	30, // [30:30] is the sub-list for extension extendee
-	0,  // [0:30] is the sub-list for field type_name
+	25, // 29: fa.v1.ExpertView.asset_attn:type_name -> fa.v1.ExpertView.AssetAttnEntry
+	26, // 30: fa.v1.ExpertHealth.as_of:type_name -> google.protobuf.Timestamp
+	31, // [31:31] is the sub-list for method output_type
+	31, // [31:31] is the sub-list for method input_type
+	31, // [31:31] is the sub-list for extension type_name
+	31, // [31:31] is the sub-list for extension extendee
+	0,  // [0:31] is the sub-list for field type_name
 }
 
 func init() { file_fa_v1_latent_proto_init() }
@@ -2442,7 +2459,7 @@ func file_fa_v1_latent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_fa_v1_latent_proto_rawDesc), len(file_fa_v1_latent_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   23,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

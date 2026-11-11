@@ -10,5 +10,10 @@ fa-core.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# randomised risk-chain tests (spec 40 §9 AC 1)
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
+uuid.workspace = true
+
 [lints]
 workspace = true

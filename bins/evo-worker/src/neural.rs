@@ -135,6 +135,7 @@ struct Trained {
     reports: Vec<EvalReport>,
     recon: Option<ReconReport>,
     bundle: Result<Vec<u8>, String>,
+    samples: Value,
 }
 
 impl Worker {
@@ -184,29 +185,17 @@ impl Worker {
         }
         let (ctx, latent_block) = self.training_latents(&window, src.window_start_ms, src.window_end_ms).await;
         let (latent_inst, latent_points) = ctx.stats();
-        let (text, text_block) = if genome.family.uses_text() {
-            let from = src.window_start_ms - text_window_ms(&genome);
-            let opts = ReadOptions { max_messages: MAX_NEWS, ..Default::default() };
-            let read = tokio::time::timeout(
-                Duration::from_secs(120),
-                read_range(&self.bus.jetstream(), "TEXT", "news.item.>", from, src.window_end_ms, &opts),
-            )
-            .await;
-            match read {
-                Ok(Ok(msgs)) => {
-                    let index = self.news_refs.index();
-                    let (t, bad) = timeline_of(&msgs, &index);
-                    let block = json!({"source": "TEXT", "messages": msgs.len(), "items": t.len(), "matched": t.matched(),
-                                       "reference_instruments": index.len(), "scope": if genome.nn.news_inst { "instrument" } else { "market" },
-                                       "undecodable": bad, "from_ms": from});
-                    (t, block)
-                }
-                Ok(Err(e)) => (TextTimeline::new(), json!({"source": "TEXT", "error": e.to_string()})),
-                Err(_) => (TextTimeline::new(), json!({"source": "TEXT", "error": "read timeout"})),
-            }
-        } else {
-            (TextTimeline::new(), Value::Null)
-        };
+        let (text, text_block) = self.context_timeline(&genome, src.window_start_ms, src.window_end_ms).await;
+        if genome.family.uses_frames() && text.is_empty() {
+            release.await;
+            return self.failed(
+                job,
+                format!(
+                    "no frames: the MEDIA stream has no image / video chunk with a readable blob in the window                      (visual.frame needs a media producer, spec 10); {text_block}"
+                ),
+                started.elapsed().as_millis() as u64,
+            );
+        }
         let warm_ref = warm_start_ref(job);
         let train_steps = steps_fraction(job).map(|f| ((genome.nn.steps as f64 * f).ceil() as usize).max(1));
         let cost_bps: Vec<f64> =
@@ -250,7 +239,9 @@ impl Worker {
                     steps: train_steps,
                     ..Default::default()
                 };
-                let decoder = neural::train(&genome, &series, ctx, Arc::new(text), &opts).map_err(|e| e.to_string())?;
+                let text = Arc::new(text);
+                let decoder =
+                    neural::train(&genome, &series, ctx, text.clone(), &opts).map_err(|e| e.to_string())?;
                 let cutoff = decoder.meta.cutoff_ms;
                 let mut reports = Vec::new();
                 if genome.family.forecasts() {
@@ -272,7 +263,8 @@ impl Worker {
                 }
                 let recon = decoder.recon_eval(&series, cutoff, RECON_ROWS).map_err(|e| e.to_string())?;
                 let bundle = decoder.to_bundle().map_err(|e| e.to_string());
-                Ok(Trained { decoder, reports, recon, bundle })
+                let samples = inspection_samples(&decoder, &series, &text, SAMPLES);
+                Ok(Trained { decoder, reports, recon, bundle, samples })
             })
         };
         let done = run.drive(task, &genome.summary()).await;
@@ -286,7 +278,7 @@ impl Worker {
         if let Some(out) = run.interrupted(&self.worker_id) {
             return out;
         }
-        let Trained { mut decoder, reports, recon, bundle } = trained;
+        let Trained { mut decoder, reports, recon, bundle, samples } = trained;
         let pooled = pool(&reports);
         if genome.family.forecasts() && pooled.is_none() && recon.is_none_or(|r| r.n == 0) {
             let status = if run.over_budget() { Status::BudgetExceeded } else { Status::Failed };
@@ -386,6 +378,9 @@ impl Worker {
             "report_ref": {"planned": format!("{}/{}", report_key.bucket, report_key.key), "persisted": self.blob.is_some()},
             "worker_id": self.worker_id,
         });
+        // EvaluatedOn / Reads (spec 34 §5) and inspection samples (decoder-out/), best effort
+        payload["helix"] = self.record_evaluation(job, &genome, score, &Value::Object(objectives_json.clone())).await;
+        payload["decoder_out"] = self.persist_samples(job, &decoder, samples).await;
         if !self.persist_report(&report_key, &payload).await {
             payload["report_ref"]["persisted"] = json!(false);
         }
@@ -418,10 +413,58 @@ impl Worker {
         }
     }
 
+    /// News timeline (`TEXT`, text families) or frame timeline (`MEDIA` + Garage blobs,
+    /// `nn_frame`) over `[start − tw, end]` by receive time; empty for the other families.
+    pub(crate) async fn context_timeline(&self, genome: &DecoderGenome, start_ms: i64, end_ms: i64) -> (TextTimeline, Value) {
+        if genome.family.uses_text() {
+            let from = start_ms - text_window_ms(genome);
+            let opts = ReadOptions { max_messages: MAX_NEWS, ..Default::default() };
+            let read = tokio::time::timeout(
+                Duration::from_secs(120),
+                read_range(&self.bus.jetstream(), "TEXT", "news.item.>", from, end_ms, &opts),
+            )
+            .await;
+            match read {
+                Ok(Ok(msgs)) => {
+                    let index = self.news_refs.index();
+                    let (t, bad) = timeline_of(&msgs, &index);
+                    let block = json!({"source": "TEXT", "messages": msgs.len(), "items": t.len(), "matched": t.matched(),
+                                       "reference_instruments": index.len(), "scope": if genome.nn.news_inst { "instrument" } else { "market" },
+                                       "undecodable": bad, "from_ms": from});
+                    (t, block)
+                }
+                Ok(Err(e)) => (TextTimeline::new(), json!({"source": "TEXT", "error": e.to_string()})),
+                Err(_) => (TextTimeline::new(), json!({"source": "TEXT", "error": "read timeout"})),
+            }
+        } else if genome.family.uses_frames() {
+            let from = start_ms - text_window_ms(genome);
+            let opts = ReadOptions { max_messages: crate::frames::MAX_FRAMES, ..Default::default() };
+            let read = tokio::time::timeout(
+                Duration::from_secs(120),
+                read_range(&self.bus.jetstream(), "MEDIA", "media.>", from, end_ms, &opts),
+            )
+            .await;
+            match read {
+                Ok(Ok(msgs)) => {
+                    let (refs, skipped) = crate::frames::frame_refs(&msgs);
+                    let (t, mut block) = crate::frames::timeline(self.blob.as_ref(), &refs).await;
+                    block["messages"] = json!(msgs.len());
+                    block["skipped"] = json!(skipped);
+                    block["from_ms"] = json!(from);
+                    (t, block)
+                }
+                Ok(Err(e)) => (TextTimeline::frames(), json!({"source": "MEDIA", "error": e.to_string()})),
+                Err(_) => (TextTimeline::frames(), json!({"source": "MEDIA", "error": "read timeout"})),
+            }
+        } else {
+            (TextTimeline::new(), Value::Null)
+        }
+    }
+
     /// Latents for training: the recorded `LATENT` stream over the whole window whenever the
     /// recorder is enabled (training needs the past, which the live buffer only has since the
     /// worker started), else the same choice as the baselines.
-    async fn training_latents(
+    pub(crate) async fn training_latents(
         &self,
         window: &DataWindow,
         start_ms: i64,
@@ -468,6 +511,72 @@ impl Worker {
         };
         json!({"persisted": true, "bucket": fa_blob::buckets::MODELS, "key": key, "card": card_key.key,
                "card_persisted": card_ok, "bytes": size})
+    }
+}
+
+/// Inspection samples per evaluated decoder (spec 34 §5 "outputs for inspection").
+const SAMPLES: usize = 6;
+
+/// Up to `n` out-of-sample outputs of a trained decoder, evenly spread over the evaluation window
+/// of its longest series: what it produced (quantiles / raster / embedding / summary), what was
+/// realised, and the summary sentences for `text.summary` — the evolution lab's sample view.
+pub fn inspection_samples(d: &NeuralDecoder, series: &[Series], text: &TextTimeline, n: usize) -> Value {
+    let g = d.genome();
+    let Some(s) = series.iter().max_by_key(|s| s.len()) else { return json!([]) };
+    let first = s.ts_ms.partition_point(|t| *t < d.meta.cutoff_ms).max(g.lookback);
+    let last = s.len().saturating_sub(g.horizon + 1);
+    if first >= last || n == 0 {
+        return json!([]);
+    }
+    let round = |v: &[f32]| -> Vec<f64> { v.iter().map(|x| (f64::from(*x) * 1e4).round() / 1e4).collect() };
+    let step = ((last - first) / n).max(1);
+    let mut out = Vec::new();
+    for t in (first..last).step_by(step).take(n) {
+        let lat = d.own_latent(s, t);
+        let Some(o) = d.serve_at(s, t, lat.as_deref(), text) else { continue };
+        let sigma = fa_decoders::neural::data::sigma_at(s, t, g.lookback).unwrap_or(1.0);
+        let target = fa_decoders::neural::data::target_at(g, s, t, sigma, text).map(|(y, _)| y);
+        let mut row = json!({"instrument_id": s.instrument_id, "ts_ms": s.ts_ms[t], "score": o.score,
+                             "components": o.components});
+        if !o.quantiles.is_empty() {
+            row["quantiles"] = json!(o.quantiles);
+            row["levels"] = json!(o.levels);
+            row["realized"] = json!(s.forward_return(t, g.horizon));
+        }
+        if g.family.reconstructs() {
+            row["recon"] = json!(round(&o.recon));
+            row["target"] = json!(target.as_deref().map(round));
+            if matches!(g.family, fa_decoders::genome::BaselineFamily::NnChart | fa_decoders::genome::BaselineFamily::NnFuture) {
+                row["res"] = json!(g.nn.res);
+            }
+        }
+        if !o.text.is_empty() {
+            row["text"] = json!(o.text);
+            row["target_text"] = json!(target.as_deref().map(fa_decoders::summary::summary_text));
+        }
+        out.push(row);
+    }
+    Value::Array(out)
+}
+
+impl Worker {
+    /// Writes the inspection samples to `fa-artifacts/decoder-out/<decoder_id>/<job_id>.json`.
+    async fn persist_samples(&self, job: &Job, d: &NeuralDecoder, samples: Value) -> Value {
+        let n = samples.as_array().map_or(0, Vec::len);
+        let key = ObjectKey {
+            bucket: fa_blob::buckets::ARTIFACTS,
+            key: format!("decoder-out/{}/{}.json", d.decoder_id(), job.job_id),
+        };
+        let Some(blob) = &self.blob else {
+            return json!({"persisted": false, "reason": "no Garage credentials", "samples": n});
+        };
+        let doc = json!({"protocol": "decoder-out/v1", "decoder_id": d.decoder_id(), "genome": d.meta.genome,
+                         "output_family": d.meta.output_family, "cutoff_ms": d.meta.cutoff_ms, "job_id": job.job_id,
+                         "generation": job.parent_job_id, "score": d.meta.score, "samples": samples});
+        match blob.put(&key, serde_json::to_vec(&doc).unwrap_or_default(), fa_blob::JSON).await {
+            Ok(()) => json!({"persisted": true, "bucket": key.bucket, "key": key.key, "samples": n}),
+            Err(e) => json!({"persisted": false, "error": e.to_string(), "samples": n}),
+        }
     }
 }
 
@@ -591,6 +700,46 @@ mod tests {
             );
             assert!(out.result.objectives.contains_key("recon_skill"));
             assert!(v["neural"]["train"]["steps"].as_u64().unwrap() > 0);
+        }
+    }
+
+    /// Read-only probe of arbitrary genomes on live data (no Garage, no registry, no outputs):
+    /// `FA_NATS_TEST=1 FA_PROBE='nn_chart:ts=1m;lb=16@24|nn_news:tw=60@12' cargo test -p evo-worker
+    /// -- --nocapture neural_probe_live` — `|`-separated `genome@hours` (window ending 2 min ago).
+    #[tokio::test]
+    async fn neural_probe_live() {
+        let (Ok(_), Ok(probe)) = (std::env::var("FA_NATS_TEST"), std::env::var("FA_PROBE")) else {
+            eprintln!("skipping (set FA_NATS_TEST=1 and FA_PROBE)");
+            return;
+        };
+        let mut worker = crate::holdout::tests::offline_worker().await;
+        worker.tsdb = Some(fa_tsdb::Tsdb::new(std::env::var("FA_VM_URL").unwrap_or_else(|_| "http://127.0.0.1:8428".into())));
+        worker.recorded = crate::recorded::RecordedStore::default();
+        let now = now_ms();
+        for item in probe.split('|').filter(|s| !s.trim().is_empty()) {
+            let (genome, hours) = item.rsplit_once('@').map_or((item, 1.0), |(g, h)| (g, h.parse().unwrap_or(1.0)));
+            let spec = format!(
+                r#"{{"genome":"{genome}","data_window":{{"start_ms":{},"end_ms":{}}}}}"#,
+                now - (hours * 3_600_000.0) as i64 - 120_000,
+                now - 120_000
+            );
+            let job = Job {
+                job_id: format!("nn-probe-{}", ulid::Ulid::generate()),
+                kind: crate::job::KIND.into(),
+                budget_gpu_ms: 900_000,
+                spec: spec.into_bytes(),
+                ..Default::default()
+            };
+            let out = worker.handle(&job).await;
+            if out.result.status != Status::Ok as i32 {
+                eprintln!("PROBE {genome}@{hours}: FAILED {}", out.result.error);
+                continue;
+            }
+            let v: Value = serde_json::from_slice(&out.result.result).unwrap();
+            eprintln!(
+                "PROBE {genome}@{hours}: score {} recon {} train {} text {} latents {}",
+                v["score"], v["neural"]["recon"], v["neural"]["train"], v["data"]["text"], v["data"]["latents"]["points"]
+            );
         }
     }
 

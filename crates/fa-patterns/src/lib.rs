@@ -5,9 +5,11 @@
 //! batch discoveries of spec 30 §6.2 (HDBSCAN density, Mapper, codebook) for any encoder output. [`lineage`] aligns region sets across refits (Hungarian
 //! matching on probe overlap, [`hungarian`]) and classifies carry / split / merge / birth /
 //! death; [`region_map`] stores the result per snapshot. [`hierarchy`] estimates the
-//! cross-timescale `REFINES` edges, [`drift`] the occupancy drift monitor, and [`conformance`]
+//! cross-timescale `REFINES` edges, [`drift`] the occupancy drift monitor, [`coherence`] the
+//! predictive-coherence score (§6.1 point 3), [`validity`] the collapse guard (§8), and [`conformance`]
 //! is the shared test every `RegionDiscovery` implementation must pass (spec 30 §9.1).
 
+pub mod coherence;
 pub mod conformance;
 pub mod drift;
 pub mod hierarchy;
@@ -16,7 +18,9 @@ pub mod lineage;
 pub mod methods;
 pub mod online;
 pub mod region_map;
+pub mod validity;
 
+pub use coherence::{Coherence, CoherenceCfg, CoherenceTracker, coherence_of};
 pub use drift::{DriftMonitor, DriftReport};
 pub use hierarchy::{HierEdge, HierarchyCfg, HierarchyTracker, HierarchyUpdate};
 pub use lineage::{AlignCfg, Alignment, Descent, DescentKind, align};
@@ -29,6 +33,7 @@ pub use region_map::{
     AlignInput, Ancestor, ExpertRegionMap, FittedRegion, ParentIds, RegionMap, align_expert, align_expert_with,
 };
 use serde::{Deserialize, Serialize};
+pub use validity::{Collapse, check_online, check_set};
 
 pub type RegionId = String;
 pub type LineageId = String;

@@ -19,6 +19,7 @@ fa-hub.workspace = true
 fa-mcmc.workspace = true
 fa-patterns.workspace = true
 fa-proto.workspace = true
+fa-tsdb.workspace = true
 fa-warehouse.workspace = true
 futures.workspace = true
 serde.workspace = true

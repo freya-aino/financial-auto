@@ -905,6 +905,172 @@
         "x-handler": "bins/control-api/src/evolution_routes.rs::run_action"
       }
     },
+    "/api/generations": {
+      "get": {
+        "operationId": "latent_generations_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "encoder generation records (spec 36 §4.1 state machine, validation.encoder_generation), newest first; ?timescale=&limit=",
+        "tags": [
+          "latent"
+        ],
+        "x-handler": "bins/control-api/src/latent_routes.rs::generations_list"
+      },
+      "post": {
+        "operationId": "latent_generation_start",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "enqueues a train.cycle job (CycleSpec body, at least {timescale}); 202 with generation_id",
+        "tags": [
+          "latent"
+        ],
+        "x-handler": "bins/control-api/src/latent_routes.rs::generation_start"
+      }
+    },
+    "/api/generations/{id}": {
+      "get": {
+        "operationId": "latent_generation_detail",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "the full generation record (phase events, frozen data window, candidates, Pareto selection, artefacts, validation) + data_window rows",
+        "tags": [
+          "latent"
+        ],
+        "x-handler": "bins/control-api/src/latent_routes.rs::generation_detail"
+      }
+    },
+    "/api/generations/{id}/abort": {
+      "post": {
+        "operationId": "latent_generation_abort",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "marks a running generation aborting and cancels its job (ctl.train.cancel)",
+        "tags": [
+          "latent"
+        ],
+        "x-handler": "bins/control-api/src/latent_routes.rs::generation_abort"
+      }
+    },
     "/api/gpu": {
       "get": {
         "operationId": "routes_gpu",
@@ -972,7 +1138,7 @@
             "description": "error"
           }
         },
-        "summary": "genome_by_id + genome_ancestry + genome_fitness",
+        "summary": "genome_by_id + genome_ancestry + genome_fitness + genome_parents per node (edges[{from: parent, to: child, from_id, to_id}])",
         "tags": [
           "graph"
         ],
@@ -1415,6 +1581,48 @@
           "mcmc"
         ],
         "x-handler": "bins/control-api/src/mcmc_routes.rs::lineage"
+      }
+    },
+    "/api/latent/regions/{region_id}/reconstructions": {
+      "get": {
+        "operationId": "mcmc_reconstructions",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "region_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "the region's stored RegionEpisodes (latest exit first) each with the 1 m market path over [t_enter, t_exit] from VictoriaMetrics (connector bars, else last trade price per minute); per-region decoder outputs are not recorded",
+        "tags": [
+          "mcmc"
+        ],
+        "x-handler": "bins/control-api/src/mcmc_routes.rs::reconstructions"
       }
     },
     "/api/latent/snapshots": {
@@ -2355,6 +2563,70 @@
         "x-handler": "bins/control-api/src/mcmc_routes.rs::transition"
       }
     },
+    "/api/metrics/query": {
+      "get": {
+        "operationId": "metrics_query",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "instant MetricsQL/PromQL query: VictoriaMetrics' /api/v1/query JSON, verbatim",
+        "tags": [
+          "metrics"
+        ],
+        "x-handler": "bins/control-api/src/metrics_routes.rs::query"
+      }
+    },
+    "/api/metrics/query_range": {
+      "get": {
+        "operationId": "metrics_query_range",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "range query: VictoriaMetrics' /api/v1/query_range JSON, verbatim",
+        "tags": [
+          "metrics"
+        ],
+        "x-handler": "bins/control-api/src/metrics_routes.rs::query_range"
+      }
+    },
     "/api/openapi.json": {
       "get": {
         "operationId": "openapi_serve",
@@ -3203,6 +3475,56 @@
           "sources"
         ],
         "x-handler": "bins/control-api/src/sources_routes.rs::get_source"
+      },
+      "patch": {
+        "operationId": "sources_patch_source",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Patch source",
+        "tags": [
+          "sources"
+        ],
+        "x-handler": "bins/control-api/src/sources_routes.rs::patch_source"
       }
     },
     "/api/sources/{id}/{action}": {
@@ -4095,6 +4417,48 @@
         "x-handler": "bins/control-api/src/routes.rs::lr::positions"
       }
     },
+    "/api/trading/pretrade": {
+      "post": {
+        "operationId": "trading_pretrade",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Pretrade",
+        "tags": [
+          "trading"
+        ],
+        "x-handler": "bins/control-api/src/trading_routes.rs::pretrade"
+      }
+    },
     "/api/trading/reconciliation": {
       "get": {
         "operationId": "ledger_reconciliation",
@@ -4429,6 +4793,38 @@
           "trading"
         ],
         "x-handler": "bins/control-api/src/trading_routes.rs::strategy_action"
+      }
+    },
+    "/api/trading/tax/realised": {
+      "get": {
+        "operationId": "refdata_tax_realised",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Tax realised",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::tax_realised"
       }
     },
     "/api/validation/holdout": {

@@ -3,6 +3,7 @@
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use fa_core::Timescale;
 
+pub mod gc;
 pub mod s3;
 pub mod sigv4;
 

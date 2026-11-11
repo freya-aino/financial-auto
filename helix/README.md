@@ -34,7 +34,7 @@ evo-worker writes genomes/lineage/fitness through `upsert_genome` / `link_parent
 snapshot (`TrainedOn`, `link_trained_on`) and the trainer links a neural snapshot to the elite
 decoder genomes of its D-009 feedback set (`FeedbackFrom{weight}`, `link_feedback_from`, from
 `manifest.feedback`). control-api (`ref_mirror.rs`) writes the **reference mirror** from Postgres
-`ref` (`Instrument`, `Entity`, `Venue`, `IssuedBy`, `ListedOn`, `SameExposure`; full sync at start
+`ref` (`Instrument`, `Entity`, `Venue`, `Sector`, `IssuedBy`, `ListedOn`, `SameExposure`, `InSector`; full sync at start
 and every `FA_REF_MIRROR_FULL_SECS`, incremental on `ref.changed.*`, spec 12 §6). `bins/control-api` (`graph_routes.rs`, `latent_routes.rs`, `mcmc_routes.rs`)
 serves spec 50 §4.4/§4.5 from these rows, including the named-query whitelist of
 `fa-hub::catalog` behind `POST /api/graph/query`.
@@ -42,7 +42,7 @@ serves spec 50 §4.4/§4.5 from these rows, including the named-query whitelist 
 ## Contents
 | Area | Nodes / vectors | Edges |
 |---|---|---|
-| Reference (mirror of Postgres `ref`) | Instrument, Entity, Venue | IssuedBy, ListedOn, SameExposure |
+| Reference (mirror of Postgres `ref`) | Instrument, Entity, Venue, Sector | IssuedBy, ListedOn, SameExposure, InSector (Entity → Sector) |
 | Snapshots / experts | Snapshot, ExpertSpace, Expert, AdapterState | HasSpace, SnapshotParent, HasAdapter, ExpertOf, AlignedTo |
 | Regions / Markov graph | LatentRegion, Window, `V::LatentVec`, RegionSet, KernelModel, CrossPrior | InSpace, Transition, Hier, RegionMatch, DescendsFrom, HasRegionSet, HasKernel, Contains |
 | Versions (as-of overlay) | TransitionVersion, RegionStatusVersion | – |
@@ -59,7 +59,7 @@ serves spec 50 §4.4/§4.5 from these rows, including the named-query whitelist 
   (`ensureSnapshot`, `ensureExpertSpace`, `upsertRegion`, `upsertTransition`, `upsertGenome`,
   `upsertRef*`, `linkTrainedOn`, `linkFeedbackFrom`) as conditional batches (lookup → `UPDATE`,
   else `AddN`/`AddE`). Upserted edges carry the key they are found by (`Transition.to_region_id`,
-  `ListedOn.listing_key`, `SameExposure.exposure_key`, `IssuedBy.entity_id`,
+  `ListedOn.listing_key`, `SameExposure.exposure_key`, `IssuedBy.entity_id`, `InSector.sector_id`,
   `TrainedOn.snapshot_id`, `FeedbackFrom.genome_id`). `Transition` edges carry
   `from_region_id`/`to_region_id` so an edge can be found again (`From::OutE<Transition>::WHERE`)
   and updated in place; `LatentRegion` has `status` (live | merged | retired) and

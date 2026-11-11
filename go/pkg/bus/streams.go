@@ -35,6 +35,9 @@ type StreamSpec struct {
 type WorkQueueSpec struct {
 	AckWaitSecs uint64 `json:"ack_wait_secs"`
 	MaxDeliver  int    `json:"max_deliver"`
+	// MaxAckPending caps jobs in flight across all workers of a kind (spec 21 §7: each worker
+	// pulls one job at a time, so this is the most workers that can run concurrently).
+	MaxAckPending int `json:"max_ack_pending"`
 }
 
 // StreamTable is the parsed fixture.
@@ -149,10 +152,11 @@ func WorkQueueSubject(kind string) string {
 func WorkQueueConsumer(durable string) jetstream.ConsumerConfig {
 	wq := Table().WorkQueue
 	return jetstream.ConsumerConfig{
-		Durable:    durable,
-		AckPolicy:  jetstream.AckExplicitPolicy,
-		AckWait:    time.Duration(wq.AckWaitSecs) * time.Second,
-		MaxDeliver: wq.MaxDeliver,
+		Durable:       durable,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       time.Duration(wq.AckWaitSecs) * time.Second,
+		MaxDeliver:    wq.MaxDeliver,
+		MaxAckPending: wq.MaxAckPending,
 	}
 }
 

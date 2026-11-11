@@ -20,7 +20,9 @@ use candle_core::{Device, Result, Tensor};
 use fa_core::rng::Rng;
 use fa_expert_space::{
     health::HealthReport,
-    moe::{decorrelation_loss_gated, gaussian_kl, load_balance_loss, router_noise},
+    moe::{
+        DecorEma, decorrelation_loss_gated, decorrelation_loss_gated_ema, gaussian_kl, load_balance_loss, router_noise,
+    },
     nn::{Adam, from_safetensors, mse, scalar, to_safetensors},
 };
 use serde::{Deserialize, Serialize};
@@ -114,6 +116,9 @@ pub struct LossLog {
     /// Effective `λ_dec` of the step (differs from the genome with dual ascent).
     #[serde(default)]
     pub lambda_dec: f64,
+    /// Entropy of the cross-asset attention (`asset_attn`, spec 31 §6.4).
+    #[serde(default)]
+    pub asset_entropy: f64,
     pub grad_norm: f64,
 }
 
@@ -131,7 +136,23 @@ pub struct EvalReport {
     /// irreducible scalarised noise `V` every expert shares (spec 32 §6.3 feasibility bound).
     #[serde(default)]
     pub mix_resid_var: f64,
+    /// Mean cross-asset attention per own instrument → candidate instrument (`asset_attn`).
+    #[serde(default)]
+    pub asset_attn: BTreeMap<String, BTreeMap<String, f64>>,
+    /// Mean attention on the null token (share of windows reading no peer).
+    #[serde(default)]
+    pub asset_null: f64,
     pub n: usize,
+}
+
+/// `(fit windows, held-out windows)` of [`NeuralTrainer::decor_split`].
+pub type WindowSplit = (Vec<(usize, usize)>, Vec<(usize, usize)>);
+
+/// Whether an error is an out-of-memory condition (device allocator, or the trainer's own
+/// memory budget, [`NeuralTrainer::mem_limit_mb`]).
+pub fn is_oom(e: &candle_core::Error) -> bool {
+    let m = e.to_string().to_ascii_lowercase();
+    m.contains("out of memory") || m.contains("cuda_error_out_of_memory") || m.contains("memory allocation")
 }
 
 pub struct NeuralTrainer {
@@ -145,6 +166,14 @@ pub struct NeuralTrainer {
     pub log: Vec<LossLog>,
     /// Current `λ_dec` under dual ascent (`decor_dual_lr > 0`); `None` = the genome's value.
     pub lambda_dec: Option<f64>,
+    /// Running residual moments of the decorrelation term (`moe.cov_ema > 0`).
+    pub decor_ema: Option<DecorEma>,
+    /// Memory budget of a step (MB; spec 31 §8 OOM handling): a step whose estimated working
+    /// set exceeds it fails with an out-of-memory error before allocating, which
+    /// [`Self::train_steps_oom_safe`] answers by halving the batch. `None` = no budget.
+    pub mem_limit_mb: Option<f64>,
+    /// Batch halvings after out-of-memory errors (recorded per fit; spec 31 §8).
+    pub oom_retries: usize,
 }
 
 const META_FORMAT: &str = "fa-neural-v1";
@@ -177,6 +206,9 @@ impl NeuralTrainer {
             feedback: Vec::new(),
             log: Vec::new(),
             lambda_dec: None,
+            decor_ema: None,
+            mem_limit_mb: None,
+            oom_retries: 0,
         }
     }
 
@@ -220,7 +252,77 @@ impl NeuralTrainer {
         } else {
             None
         };
-        Ok(Batch { x, y, recon, future, windows: idx.to_vec() })
+        let (asset, future_asset) = if m.cfg.asset_attn {
+            let a = super::assets::batch_from_series(&m.cfg, &m.norm, &ds.series, idx, m.device())?;
+            let fa = if m.cfg.needs_future() {
+                let h = m.cfg.horizon();
+                let fidx: Vec<(usize, usize)> = idx.iter().map(|&(s, e)| (s, e + h)).collect();
+                Some(super::assets::batch_from_series(&m.cfg, &m.norm, &ds.series, &fidx, m.device())?)
+            } else {
+                None
+            };
+            (Some(a), fa)
+        } else {
+            (None, None)
+        };
+        Ok(Batch { x, y, recon, future, windows: idx.to_vec(), asset, future_asset })
+    }
+
+    /// Estimated working set of one step in MB (parameters with gradients and Adam moments, plus
+    /// the backbone activations of a batch; doubled with a decorrelation hold-out batch).
+    pub fn step_mem_mb(&self) -> f64 {
+        let c = &self.model.cfg;
+        let params = self.model.ps.n_params() as f64 * 4.0 * 4.0;
+        let per = (c.batch * c.context_steps * c.d_model * (c.layers + 2)) as f64 * 4.0 * 3.0;
+        let batches = if c.decor_holdout > 0.0 { 2.0 } else { 1.0 } * if c.needs_future() { 2.0 } else { 1.0 };
+        (params + per * batches) / 1e6
+    }
+
+    /// [`Self::train_steps`] with the spec 31 §8 out-of-memory response: on an out-of-memory
+    /// error ([`is_oom`]: the device allocator, or a step over [`Self::mem_limit_mb`]) the
+    /// batch is halved (not below 4) and the remaining steps continue from the current state;
+    /// after `max_retries` halvings the error is returned. Halvings are counted in
+    /// [`Self::oom_retries`] (the fit records them; the Pareto selection penalises them).
+    pub fn train_steps_oom_safe(&mut self, ds: &Dataset, n: usize, max_retries: usize) -> Result<LossLog> {
+        let target = self.step + n as u64;
+        loop {
+            let left = target.saturating_sub(self.step) as usize;
+            if left == 0 {
+                return Ok(self.log.last().cloned().unwrap_or_default());
+            }
+            match self.train_steps(ds, left) {
+                Ok(l) => return Ok(l),
+                Err(e) if is_oom(&e) && self.oom_retries < max_retries && self.model.cfg.batch > 4 => {
+                    self.model.cfg.batch = (self.model.cfg.batch / 2).max(4);
+                    self.oom_retries += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Training windows split for the decorrelation hold-out (`decor_holdout`): `(fit, held)`,
+    /// the held windows being the latest `decor_holdout` share of each series' training windows
+    /// after an embargo of the horizon.
+    pub fn decor_split(&self, ds: &Dataset) -> WindowSplit {
+        let frac = self.model.cfg.decor_holdout.clamp(0.0, 0.5);
+        if frac <= 0.0 {
+            return (ds.train.clone(), Vec::new());
+        }
+        let h = self.model.cfg.horizon();
+        let mut by: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for &(s, e) in &ds.train {
+            by.entry(s).or_default().push(e);
+        }
+        let (mut fit, mut held) = (Vec::new(), Vec::new());
+        for (s, mut ends) in by {
+            ends.sort_unstable();
+            let n_held = ((ends.len() as f64) * frac).round() as usize;
+            let cut = ends.len() - n_held;
+            fit.extend(ends[..cut.saturating_sub(h)].iter().map(|e| (s, *e)));
+            held.extend(ends[cut..].iter().map(|e| (s, *e)));
+        }
+        (fit, held)
     }
 
     /// Loss of a batch (`train` adds router noise).
@@ -235,6 +337,21 @@ impl NeuralTrainer {
         b: &Batch,
         noise_seed: Option<u64>,
     ) -> Result<(Tensor, LossLog, super::model::Forward)> {
+        let (t, l, f, _) = self.losses_full(w, b, None, noise_seed, None)?;
+        Ok((t, l, f))
+    }
+
+    /// The full objective: `decor_b` = the decorrelation hold-out batch (`decor_holdout`; the
+    /// D-008 term is computed on it instead of `b`), `ema` = running residual moments
+    /// (`cov_ema`). Also returns the updated running moments.
+    fn losses_full(
+        &self,
+        w: &dyn Weights,
+        b: &Batch,
+        decor_b: Option<&Batch>,
+        noise_seed: Option<u64>,
+        ema: Option<&DecorEma>,
+    ) -> Result<(Tensor, LossLog, super::model::Forward, Option<DecorEma>)> {
         let m = &self.model;
         let c = &m.cfg;
         let k = m.moe.n_active();
@@ -253,7 +370,7 @@ impl NeuralTrainer {
             }
             _ => None,
         };
-        let f = m.forward_w(w, &b.x, noise.as_ref(), top_eps.as_ref())?;
+        let f = m.forward_ctx(w, &b.x, b.asset.as_ref(), noise.as_ref(), top_eps.as_ref())?;
         let resid = f.out.pred.broadcast_sub(&b.y.unsqueeze(1)?)?; // [B, K, T]
         // Σ_k L_pred,k: every expert is scored on every window (each must carry information,
         // spec 32 §6.3 gen 0) plus, with weight `gated_pred`, on the windows it is routed to
@@ -263,13 +380,34 @@ impl NeuralTrainer {
         let pred_gated = (&per * &f.out.probs)?.sum(1)?.mean_all()?;
         let pred = (pred_all.affine(1.0 - c.gated_pred, 0.0)? + pred_gated.affine(c.gated_pred * k as f64, 0.0)?)?;
         let mix = mse(&NeuralModel::mixture(&f)?, &b.y)?;
-        let decor = if c.decor_scalar {
-            decorrelation_loss_gated(&resid.mean_keepdim(2)?, &f.out.probs)?
+        // D-008 term: on the hold-out batch when given (spec 32 §6.3.1 generalisation fix),
+        // over running moments when `cov_ema` > 0
+        let held = match decor_b {
+            Some(db) => {
+                let noise2 = noise_seed
+                    .filter(|_| c.moe.router_noise > 0.0)
+                    .map(|s| router_noise(db.x.dim(0)?, c.moe.max_experts, c.moe.router_noise, s ^ 0xDEC0, m.device()))
+                    .transpose()?;
+                let f2 = m.forward_ctx(w, &db.x, db.asset.as_ref(), noise2.as_ref(), None)?;
+                Some((f2.out.pred.broadcast_sub(&db.y.unsqueeze(1)?)?, f2.out.probs))
+            }
+            None => None,
+        };
+        let (d_resid, d_probs) = match &held {
+            Some((r, p)) => (r, p),
+            None => (&resid, &f.out.probs),
+        };
+        let d_resid = if c.decor_scalar { d_resid.mean_keepdim(2)? } else { d_resid.clone() };
+        let (decor, new_ema) = if c.moe.cov_ema > 0.0 && noise_seed.is_some() {
+            let ema = ema.filter(|e| e.0.dim(0).ok() == Some(k * k.saturating_sub(1) / 2));
+            decorrelation_loss_gated_ema(&d_resid, d_probs, ema, c.moe.cov_ema)?
         } else {
-            decorrelation_loss_gated(&resid, &f.out.probs)?
+            (decorrelation_loss_gated(&d_resid, d_probs)?, None)
         };
         let lambda_dec = self.lambda_dec.unwrap_or(c.moe.lambda_dec);
         let balance = load_balance_loss(&f.out.probs)?;
+        // auxiliary-loss-free balancing replaces the Switch loss
+        let lambda_bal = if c.moe.bias_balancing() { 0.0 } else { c.moe.lambda_bal };
         let mut kl = gaussian_kl(&f.out.mu_raw, &f.out.logvar)?;
         if let Some(t) = &f.top {
             kl = (kl + gaussian_kl(&t.mu.unsqueeze(1)?, &t.logvar.unsqueeze(1)?)?)?;
@@ -296,7 +434,7 @@ impl NeuralTrainer {
             }
             NeuralFamily::LatentDiffusion => {
                 let fut = b.future.as_ref().expect("future window");
-                let ff = m.forward_w(w, fut, None, None)?;
+                let ff = m.forward_ctx(w, fut, b.future_asset.as_ref(), None, None)?;
                 let x0 = m.full_latent(&ff.out.mu)?.detach();
                 let cond = m.full_latent(&f.out.mu)?.detach();
                 Some(super::prior::diffusion_loss(w, &x0, &cond, c.diffusion_steps, c.cond_drop, prior_seed)?)
@@ -306,7 +444,7 @@ impl NeuralTrainer {
         let mut total = (pred.affine(c.lambda_next, 0.0)?
             + mix.affine(c.lambda_mix, 0.0)?
             + decor.affine(lambda_dec, 0.0)?
-            + balance.affine(c.moe.lambda_bal, 0.0)?
+            + balance.affine(lambda_bal, 0.0)?
             + kl.affine(c.moe.beta_kl, 0.0)?
             + ssl.affine(c.lambda_ssl, 0.0)?)?;
         let prior_v = match &prior {
@@ -328,6 +466,13 @@ impl NeuralTrainer {
             prior: prior_v,
             ..Default::default()
         };
+        if let Some(at) = &f.asset_attn
+            && c.asset_attn_sparsity > 0.0
+        {
+            let h = super::assets::entropy(at)?;
+            log.asset_entropy = scalar(&h)?;
+            total = (total + h.affine(c.asset_attn_sparsity, 0.0)?)?;
+        }
         if c.lambda_ncl > 0.0 && k > 1 {
             let sp = f.out.pred.mean(2)?; // [B, K]
             let spread = sp.broadcast_sub(&sp.mean_keepdim(1)?)?.sqr()?.sum(1)?.mean_all()?;
@@ -385,7 +530,7 @@ impl NeuralTrainer {
             }
         }
         log.total = scalar(&total)?;
-        Ok((total, log, f))
+        Ok((total, log, f, new_ema))
     }
 
     /// `n` optimisation steps; returns the last step's log.
@@ -394,13 +539,36 @@ impl NeuralTrainer {
             candle_core::bail!("no training windows");
         }
         let mut last = LossLog::default();
+        let (fit, held) = self.decor_split(ds);
+        let pool = if fit.is_empty() { &ds.train } else { &fit };
         for _ in 0..n {
+            if let Some(limit) = self.mem_limit_mb {
+                let need = self.step_mem_mb();
+                if need > limit {
+                    candle_core::bail!("out of memory: a step needs ≈ {need:.1} MB, budget {limit:.1} MB");
+                }
+            }
             let mut rng = Rng::seed(self.seed ^ (self.step + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let bsz = self.model.cfg.batch.min(ds.train.len()).max(1);
-            let idx: Vec<(usize, usize)> = (0..bsz).map(|_| ds.train[rng.below(ds.train.len())]).collect();
+            let bsz = self.model.cfg.batch.min(pool.len()).max(1);
+            let idx: Vec<(usize, usize)> = (0..bsz).map(|_| pool[rng.below(pool.len())]).collect();
             let b = self.batch(ds, &idx)?;
-            let (loss, mut log, _) = self.losses(&b, Some(rng.next_u64()))?;
+            let db = if held.is_empty() {
+                None
+            } else {
+                let hb = self.model.cfg.batch.min(held.len()).max(1);
+                let hidx: Vec<(usize, usize)> = (0..hb).map(|_| held[rng.below(held.len())]).collect();
+                Some(self.batch(ds, &hidx)?)
+            };
+            let noise_seed = rng.next_u64();
+            let ema = self.decor_ema.take();
+            let (loss, mut log, f, new_ema) =
+                self.losses_full(&self.model.ps, &b, db.as_ref(), Some(noise_seed), ema.as_ref())?;
+            self.decor_ema = new_ema;
             log.grad_norm = self.opt.step(&self.model.ps, &loss)?;
+            if self.model.cfg.moe.bias_balancing() {
+                let moe = self.model.moe.clone();
+                moe.update_route_bias(&mut self.model.ps, &f.out.probs)?;
+            }
             self.step += 1;
             let c = &self.model.cfg;
             if c.decor_dual_lr > 0.0 {
@@ -528,9 +696,18 @@ impl NeuralTrainer {
             } else {
                 super::heads::HeadSolverCfg::default().sweeps
             },
+            ridge: if c.head_solver_ridge > 0.0 {
+                c.head_solver_ridge
+            } else {
+                super::heads::HeadSolverCfg::default().ridge
+            },
             ..Default::default()
         };
-        let (heads, report) = super::heads::solve(&mu, &gates, &y, init, &cfg);
+        let (heads, report) = if c.head_solver == "disagree" {
+            super::heads::disagree(&mu, &gates, &y, init, &cfg)
+        } else {
+            super::heads::solve(&mu, &gates, &y, init, &cfg)
+        };
         let dev = self.model.device().clone();
         let mut fitted = HashMap::new();
         for (n, th) in names.iter().zip(&heads) {
@@ -564,9 +741,45 @@ impl NeuralTrainer {
         let mut mix_scalar: Vec<f64> = Vec::new();
         let mut sum = LossLog::default();
         let mut chunks = 0.0;
+        // calibration (§6.4) and collapse monitor (spec 31 §8)
+        let mut ys: Vec<Vec<f64>> = Vec::new();
+        let mut means: Vec<Vec<Vec<f64>>> = vec![Vec::new(); k];
+        let mut mus: Vec<Vec<Vec<f64>>> = vec![Vec::new(); k];
+        let mut codes: Vec<Vec<u32>> = vec![Vec::new(); k];
+        let mut attn_sum: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+        let mut attn_n: BTreeMap<String, f64> = BTreeMap::new();
+        let mut null_sum = 0.0;
         for chunk in windows.chunks(256) {
             let b = self.batch(ds, chunk)?;
             let (_, log, f) = self.losses(&b, None)?;
+            let mu3 = f.out.mu.to_vec3::<f32>()?;
+            let pr3 = f.out.pred.to_vec3::<f32>()?;
+            let code2 = match &f.out.codes {
+                Some(c) => Some(c.to_vec2::<f32>()?),
+                None => None,
+            };
+            for bi in 0..chunk.len() {
+                for e in 0..k {
+                    mus[e].push(mu3[bi][e].iter().map(|v| f64::from(*v)).collect());
+                    means[e].push(pr3[bi][e].iter().map(|v| f64::from(*v)).collect());
+                    if let Some(c) = &code2 {
+                        codes[e].push(c[bi][e] as u32);
+                    }
+                }
+            }
+            if let (Some(at), Some(ab)) = (&f.asset_attn, &b.asset) {
+                let rows = at.to_vec2::<f32>()?;
+                for (bi, &(s, _)) in chunk.iter().enumerate() {
+                    let own = ds.series[s].instrument.clone();
+                    let (ws, null) = super::assets::row_weights(&rows[bi], &ab.names[bi]);
+                    null_sum += f64::from(null);
+                    *attn_n.entry(own.clone()).or_default() += 1.0;
+                    let slot = attn_sum.entry(own).or_default();
+                    for (name, v) in ws {
+                        *slot.entry(name).or_default() += f64::from(v);
+                    }
+                }
+            }
             let w = chunk.len() as f64;
             for (acc, v) in [
                 (&mut sum.total, log.total),
@@ -596,6 +809,7 @@ impl NeuralTrainer {
                 gates.push(fa_expert_space::moe::top_k_gates(&p[bi], top_k));
                 let yy = y[bi].iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / N_TARGETS as f64;
                 y2.push(yy);
+                ys.push(y[bi].iter().map(|v| f64::from(*v)).collect());
                 naive += yy;
                 mixsq +=
                     y[bi].iter().zip(&mixp[bi]).map(|(a, b)| f64::from(a - b).powi(2)).sum::<f64>() / N_TARGETS as f64;
@@ -629,7 +843,27 @@ impl NeuralTrainer {
         sum.step = self.step;
         // spec 32 §6.3/§6.4: residual correlation over windows where both experts are active,
         // skill of each expert over the windows routed to it (top-k gate weighted)
-        let health = HealthReport::compute_gated(&resid, &sq, &y2, &gates, usage.iter().map(|u| u / nf).collect(), 30);
+        let mut health =
+            HealthReport::compute_gated(&resid, &sq, &y2, &gates, usage.iter().map(|u| u / nf).collect(), 30);
+        let active = &self.model.moe.active;
+        if active.iter().all(|e| self.model.pred_sd.contains_key(e)) {
+            let sd: Vec<Vec<Vec<f64>>> = active
+                .iter()
+                .map(|e| {
+                    let row: Vec<f64> = self.model.pred_sd[e].iter().map(|v| f64::from(*v)).collect();
+                    vec![row; n]
+                })
+                .collect();
+            health = health.with_calibration(&ys, &means, &sd, &gates);
+        }
+        let code_rows: Vec<Vec<u32>> = if self.model.cfg.moe.fsq_levels.is_empty() { Vec::new() } else { codes };
+        health = health.with_collapse(&mus, &code_rows);
+        for (own, m) in attn_sum.iter_mut() {
+            let cnt = attn_n.get(own).copied().unwrap_or(1.0);
+            for v in m.values_mut() {
+                *v /= cnt;
+            }
+        }
         let ms = mix_scalar.iter().sum::<f64>() / nf;
         let mix_resid_var = mix_scalar.iter().map(|v| (v - ms).powi(2)).sum::<f64>() / nf;
         let target_skill =
@@ -640,8 +874,120 @@ impl NeuralTrainer {
             mix_skill: if naive > 0.0 { 1.0 - mixsq / naive } else { 0.0 },
             target_skill,
             mix_resid_var,
+            asset_null: if attn_n.is_empty() { 0.0 } else { null_sum / nf },
+            asset_attn: attn_sum,
             n,
         })
+    }
+
+    /// Calibrates each active expert's predictive standard deviation per target
+    /// ([`NeuralModel::pred_sd`]): the router-probability-weighted RMS of its next-step residual
+    /// on up to `max_windows` training windows (spec 32 §6.4 calibration of `next_step`).
+    pub fn calibrate_pred_sd(&mut self, ds: &Dataset, max_windows: usize) -> Result<()> {
+        if ds.train.is_empty() {
+            return Ok(());
+        }
+        let stride = (ds.train.len() / max_windows.max(1)).max(1);
+        let idx: Vec<(usize, usize)> = ds.train.iter().step_by(stride).copied().collect();
+        let k = self.model.moe.n_active();
+        let mut num = vec![[0f64; N_TARGETS]; k];
+        let mut den = vec![0f64; k];
+        for chunk in idx.chunks(256) {
+            let b = self.batch(ds, chunk)?;
+            let f = self.model.forward_ctx(&self.model.ps, &b.x, b.asset.as_ref(), None, None)?;
+            let r = f.out.pred.broadcast_sub(&b.y.unsqueeze(1)?)?.to_vec3::<f32>()?;
+            let p = f.out.probs.to_vec2::<f32>()?;
+            for (bi, row) in r.iter().enumerate() {
+                for (e, rt) in row.iter().enumerate() {
+                    let g = f64::from(p[bi][e]).max(1e-6);
+                    den[e] += g;
+                    for (t, v) in rt.iter().enumerate().take(N_TARGETS) {
+                        num[e][t] += g * f64::from(*v).powi(2);
+                    }
+                }
+            }
+        }
+        let active = self.model.moe.active.clone();
+        for (pos, e) in active.iter().enumerate() {
+            let sd = num[pos].iter().map(|v| ((v / den[pos].max(1e-12)).sqrt().max(1e-3)) as f32).collect();
+            self.model.pred_sd.insert(*e, sd);
+        }
+        Ok(())
+    }
+
+    /// Expert **split** (spec 32 §6.1) on up to `max_windows` training windows: an active expert
+    /// splits into a free slot (pruned or never used, `< K_max`) when its routed scalarised
+    /// residual variance exceeds `split_resid_ratio` × the experts' mean **and** its routed
+    /// latents are multimodal (Sarle's bimodality coefficient of their first principal component
+    /// above 5/9). The clone gets the parent's projector, head and family SSL head with seeded noise
+    /// and half of its routing mass ([`fa_expert_space::moe::MoeExpertSpace::split_expert`]).
+    /// Returns the `(from, to)` expert ids split; the caller trains `split_steps` afterwards.
+    pub fn split_experts(&mut self, ds: &Dataset, max_windows: usize) -> Result<Vec<(usize, usize)>> {
+        let ratio = self.model.cfg.split_resid_ratio;
+        if ratio <= 0.0 || ds.train.is_empty() {
+            return Ok(Vec::new());
+        }
+        let stride = (ds.train.len() / max_windows.max(1)).max(1);
+        let idx: Vec<(usize, usize)> = ds.train.iter().step_by(stride).copied().collect();
+        let k = self.model.moe.n_active();
+        let top_k = self.model.cfg.moe.top_k;
+        let mut routed_r: Vec<Vec<f64>> = vec![Vec::new(); k];
+        let mut routed_mu: Vec<Vec<Vec<f64>>> = vec![Vec::new(); k];
+        for chunk in idx.chunks(256) {
+            let b = self.batch(ds, chunk)?;
+            let f = self.model.forward_ctx(&self.model.ps, &b.x, b.asset.as_ref(), None, None)?;
+            let r = f.out.pred.broadcast_sub(&b.y.unsqueeze(1)?)?.to_vec3::<f32>()?;
+            let mu = f.out.mu.to_vec3::<f32>()?;
+            let p = f.out.probs.to_vec2::<f32>()?;
+            for bi in 0..chunk.len() {
+                let g = fa_expert_space::moe::top_k_gates(&p[bi], top_k);
+                for e in 0..k {
+                    if g[e] > 0.0 {
+                        routed_r[e].push(r[bi][e].iter().map(|v| f64::from(*v)).sum::<f64>() / N_TARGETS as f64);
+                        routed_mu[e].push(mu[bi][e].iter().map(|v| f64::from(*v)).collect());
+                    }
+                }
+            }
+        }
+        let var = |v: &[f64]| {
+            if v.len() < 2 {
+                return 0.0;
+            }
+            let m = v.iter().sum::<f64>() / v.len() as f64;
+            v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64
+        };
+        let vars: Vec<f64> = routed_r.iter().map(|r| var(r)).collect();
+        let mean_var = vars.iter().sum::<f64>() / k.max(1) as f64;
+        let mut cands: Vec<(usize, f64)> = (0..k)
+            .filter(|&e| {
+                vars[e] > ratio * mean_var && routed_mu[e].len() >= 30 && bimodality(&routed_mu[e]) > 5.0 / 9.0
+            })
+            .map(|e| (e, vars[e]))
+            .collect();
+        cands.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut free: Vec<usize> =
+            (0..self.model.cfg.moe.max_experts).filter(|e| !self.model.moe.active.contains(e)).collect();
+        let mut done = Vec::new();
+        for (pos, _) in cands {
+            let Some(to) = (!free.is_empty()).then(|| free.remove(0)) else { break };
+            let from = self.model.moe.active[pos];
+            self.model.moe.split_expert(
+                &mut self.model.ps,
+                from,
+                to,
+                &["ssl.h"],
+                0.05,
+                self.seed ^ (to as u64) << 8,
+            )?;
+            if let Some(sd) = self.model.pred_sd.get(&from).cloned() {
+                self.model.pred_sd.insert(to, sd);
+            }
+            done.push((from, to));
+        }
+        if !done.is_empty() {
+            self.decor_ema = None;
+        }
+        Ok(done)
     }
 
     /// Emergent expert count (spec 32 §6.1): drops experts whose validation usage is below
@@ -670,7 +1016,11 @@ impl NeuralTrainer {
         if let Some(e) = &self.ema {
             t.extend(e.iter().map(|(k, v)| (format!("ema.{k}"), v.clone())));
         }
+        if let Some(d) = &self.decor_ema {
+            t.push(("decor_ema".into(), d.0.clone()));
+        }
         let mut meta = weights_meta(&self.model);
+        meta.insert("oom_retries".into(), self.oom_retries.to_string());
         meta.insert("kind".into(), "checkpoint".into());
         meta.insert("step".into(), self.step.to_string());
         meta.insert("seed".into(), self.seed.to_string());
@@ -697,6 +1047,8 @@ impl NeuralTrainer {
         }
         tr.log = meta.get("log").and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
         tr.lambda_dec = meta.get("lambda_dec").and_then(|s| s.parse().ok());
+        tr.decor_ema = vals.get("decor_ema").map(|t| DecorEma(t.clone()));
+        tr.oom_retries = meta.get("oom_retries").and_then(|s| s.parse().ok()).unwrap_or(0);
         Ok(tr)
     }
 
@@ -713,6 +1065,7 @@ pub(crate) fn weights_meta(m: &NeuralModel) -> HashMap<String, String> {
         ("config".to_owned(), serde_json::to_string(&m.cfg).unwrap_or_default()),
         ("norm".to_owned(), serde_json::to_string(&m.norm).unwrap_or_default()),
         ("active".to_owned(), serde_json::to_string(&m.moe.active).unwrap_or_default()),
+        ("pred_sd".to_owned(), serde_json::to_string(&m.pred_sd).unwrap_or_default()),
     ])
 }
 
@@ -747,5 +1100,47 @@ pub(crate) fn model_from_parts(
     if !active.is_empty() {
         model.moe.select(active);
     }
+    model.pred_sd = meta.get("pred_sd").and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
     Ok(model)
+}
+
+/// Sarle's bimodality coefficient of the first principal component of `x[n][d]`
+/// (`(γ² + 1) / (κ + 3(n−1)²/((n−2)(n−3)))`, γ skewness, κ excess kurtosis; above 5/9 suggests
+/// a multimodal distribution).
+pub fn bimodality(x: &[Vec<f64>]) -> f64 {
+    let n = x.len();
+    let Some(d) = x.first().map(Vec::len) else { return 0.0 };
+    if n < 4 || d == 0 {
+        return 0.0;
+    }
+    let mean: Vec<f64> = (0..d).map(|j| x.iter().map(|r| r[j]).sum::<f64>() / n as f64).collect();
+    let mut cov = vec![vec![0.0; d]; d];
+    for r in x {
+        for i in 0..d {
+            for j in 0..d {
+                cov[i][j] += (r[i] - mean[i]) * (r[j] - mean[j]) / n as f64;
+            }
+        }
+    }
+    // power iteration (deterministic start)
+    let mut v = vec![1.0 / (d as f64).sqrt(); d];
+    for _ in 0..50 {
+        let w: Vec<f64> = (0..d).map(|i| (0..d).map(|j| cov[i][j] * v[j]).sum()).collect();
+        let nrm = w.iter().map(|a| a * a).sum::<f64>().sqrt();
+        if nrm <= 1e-12 {
+            return 0.0;
+        }
+        v = w.iter().map(|a| a / nrm).collect();
+    }
+    let p: Vec<f64> = x.iter().map(|r| (0..d).map(|j| (r[j] - mean[j]) * v[j]).sum()).collect();
+    let nf = n as f64;
+    let m2 = p.iter().map(|a| a * a).sum::<f64>() / nf;
+    if m2 <= 1e-12 {
+        return 0.0;
+    }
+    let m3 = p.iter().map(|a| a.powi(3)).sum::<f64>() / nf;
+    let m4 = p.iter().map(|a| a.powi(4)).sum::<f64>() / nf;
+    let g = m3 / m2.powf(1.5);
+    let kappa = m4 / (m2 * m2) - 3.0;
+    (g * g + 1.0) / (kappa + 3.0 * (nf - 1.0).powi(2) / ((nf - 2.0) * (nf - 3.0)))
 }

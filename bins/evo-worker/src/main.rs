@@ -16,15 +16,19 @@
 
 mod allocator;
 mod data;
+mod frames;
 mod gpu;
 mod holdout;
 mod job;
 mod latent;
+mod lineage;
 mod live_rule;
 mod market;
 mod neural;
+mod neural_policy;
 mod news;
 mod recorded;
+mod reeval;
 mod run;
 mod strategy;
 mod trials;
@@ -83,9 +87,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
-        .init();
+    fa_core::logging::init("evo-worker"); // FA_LOG_FORMAT=json|text (spec 60 §4)
     let args = Args::parse();
     fa_bus::metrics::serve_from_env("evo-worker", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config)?;
@@ -332,7 +334,7 @@ fn status_name(s: Status) -> &'static str {
 }
 
 mod worker {
-    pub const KINDS: [&str; 7] = crate::job::Worker::KINDS;
+    pub const KINDS: [&str; 9] = crate::job::Worker::KINDS;
 }
 
 async fn publish_result(bus: &Bus, kind: &str, result: &JobResult) -> anyhow::Result<()> {

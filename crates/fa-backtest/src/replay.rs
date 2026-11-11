@@ -49,7 +49,7 @@ use fa_risk::rebalance::{CostQuote, RebalanceStats, Rebalancer, TradeCandidate, 
 use fa_strategies::{
     ExposureDistribution, GpStrategy, Strategy, StrategyContext,
     decoders::PriceLookup,
-    features::{FallbackContext, LiveContext, VirtualBook},
+    features::{FallbackContext, LiveContext, PortfolioSummary, VirtualBook},
     population::StrategyDef,
 };
 use serde::{Deserialize, Serialize};
@@ -59,6 +59,8 @@ use crate::{
     cost::{ClassCosts, CostInputs, CostModel},
     eval::Stop,
     latents::{FeedCounters, LatentFeed, RecordedLatents, SnapshotCheck, SourceCounts, check_snapshot},
+    coverage::{CoveragePolicy, CoverageReport},
+    latency::{self, LatencyModel},
     run_replay, stats,
     trade_rule::TradeRule,
 };
@@ -105,6 +107,14 @@ pub struct ReplaySpec {
     /// at event time become visible at event time + the source's catalog delay.
     #[serde(default = "crate::knowledge::catalog_delays")]
     pub knowledge_delays: crate::knowledge::KnowledgeDelays,
+    /// Missing-data cut (spec 41 §8, [`crate::coverage`]): instruments below the minimum
+    /// coverage are not traded; a window below it fails with [`ReplayError::Coverage`].
+    #[serde(default)]
+    pub coverage: CoveragePolicy,
+    /// Decision → fill latency per venue ([`crate::latency`], spec 41 §10 Q3); absent = the
+    /// measured deployed path.
+    #[serde(default)]
+    pub latency: LatencyModel,
 }
 
 impl ReplaySpec {
@@ -124,6 +134,8 @@ impl ReplaySpec {
             min_trade_fraction: 0.02,
             trade_rule: TradeRule::Fraction,
             knowledge_delays: crate::knowledge::catalog_delays(),
+            coverage: CoveragePolicy::default(),
+            latency: LatencyModel::builtin(),
         }
     }
 }
@@ -219,15 +231,21 @@ pub struct Trade {
     pub cost: f64,
     /// Exposure the strategy asked for (mean of its distribution).
     pub target_exposure: f64,
+    /// Venue price at decision time + latency the fill was priced from (= `price` at zero
+    /// latency or when no newer close was known).
+    #[serde(default)]
+    pub exec_price: f64,
 }
 
 /// Ranked objective directions of the strategy report (spec 35 §6.2).
-pub const DIRECTIONS: [(&str, &str); 6] = [
+pub const DIRECTIONS: [(&str, &str); 8] = [
     ("deflated_sharpe", "max"),
     ("sharpe", "max"),
     ("max_drawdown", "min"),
+    ("cvar", "min"),
     ("turnover", "min"),
     ("cost_sensitivity", "min"),
+    ("calibration", "max"),
     ("compute_cost", "min"),
 ];
 
@@ -254,6 +272,9 @@ pub struct EvalReport {
     pub deflated_sharpe: f64,
     pub n_trials: usize,
     pub max_drawdown: f64,
+    /// CVaR(5 %) of the period returns as a positive loss (spec 35 §6.2), see [`cvar`].
+    #[serde(default)]
+    pub cvar: f64,
     pub turnover: f64,
     pub cost_share: f64,
     pub cost_sensitivity: f64,
@@ -284,6 +305,12 @@ pub struct EvalReport {
     /// Decisions of the cost-aware rule (`TradeRule::CostAware`).
     #[serde(default)]
     pub rebalance: Option<RebalanceStats>,
+    /// Missing-data coverage of the window and the instruments it excluded.
+    #[serde(default)]
+    pub coverage: CoverageReport,
+    /// Order latency the fills were simulated with.
+    #[serde(default = "LatencyModel::zero")]
+    pub latency: LatencyModel,
 }
 
 /// Recorded-latent bookkeeping of a report.
@@ -313,6 +340,7 @@ impl EvalReport {
             ("deflated_sharpe", f(self.deflated_sharpe)),
             ("sharpe", f(self.sharpe)),
             ("max_drawdown", f(self.max_drawdown)),
+            ("cvar", f(self.cvar)),
             ("turnover", f(self.turnover)),
             ("cost_sensitivity", f(self.cost_sensitivity)),
             ("compute_cost", f(self.compute_cost)),
@@ -360,8 +388,8 @@ pub struct PipelineReplay<'a> {
 impl Evaluator for PipelineReplay<'_> {
     fn evaluate(&self, spec: &ReplaySpec, candidate: &StrategyDef) -> Result<EvalReport, ReplayError> {
         check_holdout(spec, self.holdouts)?;
-        let strategy = candidate.build().map_err(|e| ReplayError::Candidate(e.to_string()))?;
-        replay(&strategy, candidate.lookback_bars, self.data, spec, self.cost, &self.controls, self.latents)
+        let strategy = candidate.build_dyn().map_err(|e| ReplayError::Candidate(e.to_string()))?;
+        replay_strategy(strategy, candidate.lookback_bars, self.data, spec, self.cost, &self.controls, self.latents)
     }
 }
 
@@ -400,6 +428,11 @@ struct Sleeve {
     last_price: f64,
     book: VirtualBook,
     pending_decision: bool,
+    /// The whole (knowledge-shifted) series in the window: the venue's prices after a decision.
+    exec_ts: Vec<i64>,
+    exec_px: Vec<f64>,
+    /// Decision → fill latency of the sleeve's venue (ms).
+    latency_ms: i64,
 }
 
 /// Cash + mark-to-market accounting: `equity = cash + Σ units · last_price`; every cost is
@@ -419,7 +452,7 @@ impl PriceLookup for SleevePrices<'_> {
 }
 
 struct Engine<'a> {
-    strategy: GpStrategy,
+    strategy: Box<dyn Strategy>,
     lookback: usize,
     /// Strategy horizon in bars (the `k` of `analog_forecast`).
     steps: u32,
@@ -487,7 +520,7 @@ struct LiveRule {
 impl<'a> Engine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        strategy: GpStrategy,
+        strategy: Box<dyn Strategy>,
         lookback: usize,
         spec: &'a ReplaySpec,
         controls: &'a ReplayControls,
@@ -498,7 +531,7 @@ impl<'a> Engine<'a> {
     ) -> Self {
         let n = sleeves.len().max(1) as f64;
         Self {
-            steps: strategy.horizon.steps.max(1),
+            steps: strategy.horizon().steps.max(1),
             strategy,
             lookback: lookback.max(2),
             feed,
@@ -618,6 +651,11 @@ impl<'a> Engine<'a> {
             f.advance(ts);
         }
         let (lookback, steps, timescale) = (self.lookback, self.steps, self.spec.timescale);
+        // strategy-level book for `exposure_gross` / `drawdown` (spec 35 §4.2)
+        let portfolio = PortfolioSummary {
+            exposure_gross: self.sleeves.iter().map(|s| s.book.exposure.abs()).sum(),
+            drawdown: ((self.peak - self.equity) / self.spec.capital).max(0.0),
+        };
         let (dist, stds, sources) = {
             let view = self.feed.as_ref().map(|f| f.graph.at(timescale, ts));
             let prices: Vec<SleevePrices<'_>> = ready
@@ -630,7 +668,8 @@ impl<'a> Engine<'a> {
                 .map(|(&i, p)| {
                     let s = &self.sleeves[i];
                     let from = s.closes.len() - (lookback + 1);
-                    let mut c = LiveContext::new(FallbackContext::new(&s.closes[from..], None, s.book), s.id, steps);
+                    let fb = FallbackContext::new(&s.closes[from..], None, s.book).with_portfolio(portfolio);
+                    let mut c = LiveContext::new(fb, s.id, steps);
                     if let Some(v) = &view {
                         c = c.with_graph(v);
                     }
@@ -692,6 +731,14 @@ impl<'a> Engine<'a> {
         let sleeve_capital = self.sleeve_capital;
         let s = &mut self.sleeves[i];
         let price = s.last_price;
+        // the order (decided at this close) executes at the venue's price `latency` later
+        let exec = if s.latency_ms > 0 {
+            latency::price_at(&s.exec_ts, &s.exec_px, ts.saturating_add(s.latency_ms))
+                .filter(|p| *p > 0.0 && p.is_finite())
+                .unwrap_or(price)
+        } else {
+            price
+        };
         let target_units = target_exposure * sleeve_capital / price;
         let delta = target_units - s.units;
         let notional = (delta * price).abs();
@@ -716,7 +763,7 @@ impl<'a> Engine<'a> {
                         holding_secs: l.hold_secs,
                         urgent: false,
                         limit_bound: false,
-                        contributors: if target_eur != 0.0 { vec![self.strategy.id.clone()] } else { Vec::new() },
+                        contributors: if target_eur != 0.0 { vec![self.strategy.id().to_owned()] } else { Vec::new() },
                         cost: CostQuote {
                             commission_bps: sched.commission_bps,
                             commission_min_eur: sched.commission_min_eur,
@@ -726,7 +773,7 @@ impl<'a> Engine<'a> {
                             adv_eur: self.cost.default_adv_eur,
                         },
                     };
-                    let sleeves = BTreeMap::from([(self.strategy.id.clone(), self.spec.capital)]);
+                    let sleeves = BTreeMap::from([(self.strategy.id().to_owned(), self.spec.capital)]);
                     let band = l.min_eur.max(l.frac * target_eur.abs());
                     l.frozen || !l.rb.decide(&cand, band, l.min_eur, &sleeves, ts).trades()
                 }
@@ -739,7 +786,7 @@ impl<'a> Engine<'a> {
             venue: s.venue.clone(),
             class: s.class.clone(),
             side: if delta > 0.0 { "buy".into() } else { "sell".into() },
-            price,
+            price: exec,
             qty: delta.abs(),
             sigma: sigma * self.sigma_scale,
             ..Default::default()
@@ -748,10 +795,10 @@ impl<'a> Engine<'a> {
         let priced_2x = self.cost_2x.price(&inputs);
         let same_side = s.units == 0.0 || delta.signum() == s.units.signum();
         if s.units == 0.0 || (!same_side && delta.abs() > s.units.abs()) {
-            s.entry_price = price; // opened or flipped at this close
+            s.entry_price = exec; // opened or flipped by this order
         } else if same_side {
             let total = s.units + delta;
-            s.entry_price = (s.units * s.entry_price + delta * price) / total;
+            s.entry_price = (s.units * s.entry_price + delta * exec) / total;
         }
         let sign_changed = s.units == 0.0 || (s.units > 0.0) != (target_units > 0.0);
         s.units = target_units;
@@ -778,6 +825,7 @@ impl<'a> Engine<'a> {
                 slippage_bps: priced.slippage_bps,
                 cost,
                 target_exposure,
+                exec_price: exec,
             });
         }
     }
@@ -832,6 +880,20 @@ pub fn replay(
     controls: &ReplayControls,
     latents: Option<&RecordedLatents>,
 ) -> Result<EvalReport, ReplayError> {
+    replay_strategy(Box::new(strategy.clone()), lookback_bars, data, spec, cost, controls, latents)
+}
+
+/// [`replay`] for any representation (GP program or neural policy, spec 35 §3).
+#[allow(clippy::too_many_arguments)]
+pub fn replay_strategy(
+    strategy: Box<dyn Strategy>,
+    lookback_bars: usize,
+    data: &[BarSeries],
+    spec: &ReplaySpec,
+    cost: &CostModel,
+    controls: &ReplayControls,
+    latents: Option<&RecordedLatents>,
+) -> Result<EvalReport, ReplayError> {
     let started = Instant::now();
     if spec.capital.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || !spec.capital.is_finite() {
         return Err(ReplayError::Candidate("capital must be positive".into()));
@@ -859,6 +921,29 @@ pub fn replay(
     if selected.is_empty() {
         return Err(ReplayError::NoData);
     }
+    // missing-data cut (spec 41 §8): mark coverage, drop instruments below the minimum, refuse a
+    // window below it (the candidate gets no fitness)
+    let step_ms = i64::try_from(spec.timescale.duration().as_millis()).unwrap_or(1000).max(1);
+    let coverage = crate::coverage::measure(
+        &selected,
+        spec.window_ms,
+        step_ms,
+        |s| cost.class_of(&s.instrument_id),
+        &spec.coverage,
+    );
+    if coverage.instruments.iter().all(|c| c.bars == 0) {
+        return Err(ReplayError::NoData);
+    }
+    if coverage.window < spec.coverage.min_coverage || coverage.instruments.iter().all(|c| c.excluded) {
+        return Err(ReplayError::Coverage {
+            window: coverage.window,
+            best_instrument: coverage.instruments.iter().map(|c| c.coverage).fold(0.0, f64::max),
+            min: spec.coverage.min_coverage,
+        });
+    }
+    let selected: Vec<&BarSeries> =
+        selected.into_iter().zip(&coverage.instruments).filter(|(_, c)| !c.excluded).map(|(s, _)| s).collect();
+    let (w0, w1) = spec.window_ms;
     let sleeves: Vec<Sleeve> = selected
         .iter()
         .map(|s| Sleeve {
@@ -875,10 +960,12 @@ pub fn replay(
             last_price: 0.0,
             book: VirtualBook::default(),
             pending_decision: false,
+            exec_ts: s.ts_ms.iter().copied().filter(|t| *t >= w0 && *t <= w1).collect(),
+            exec_px: s.ts_ms.iter().zip(&s.close).filter(|(t, _)| **t >= w0 && **t <= w1).map(|(_, c)| *c).collect(),
+            latency_ms: spec.latency.of(&s.venue),
         })
         .collect();
     // Totally ordered event stream: (close time, instrument index).
-    let (w0, w1) = spec.window_ms;
     let mut events: Vec<(i64, Event)> = Vec::new();
     for (i, s) in selected.iter().enumerate() {
         for (t, c) in s.ts_ms.iter().zip(&s.close) {
@@ -894,7 +981,7 @@ pub fn replay(
     let distinct_steps = events.windows(2).filter(|w| w[0].0 != w[1].0).count() + 1;
     let feed = latents.map(LatentFeed::new);
     let n_sleeves = sleeves.len();
-    let mut engine = Engine::new(strategy.clone(), lookback_bars, spec, controls, cost, sleeves, distinct_steps, feed);
+    let mut engine = Engine::new(strategy, lookback_bars, spec, controls, cost, sleeves, distinct_steps, feed);
     if let TradeRule::CostAware { frac, min_eur, cfg, decay } = &spec.trade_rule {
         let mut cfg = cfg.clone();
         // The live engine re-decides every second, so a target held for `confirm_secs` is sent
@@ -942,11 +1029,14 @@ pub fn replay(
     let cost_share =
         if gross_abs + engine.total_cost > 0.0 { engine.total_cost / (gross_abs + engine.total_cost) } else { 0.0 };
     let calibration = correlation(&engine.calib_pairs);
-    let nodes = (strategy.signal.size() + strategy.uncertainty.size()) as f64 * selected.len() as f64;
+    // representation-independent compute unit (spec 35 §10 Q3): estimated operations per step
+    let ops = engine.strategy.ops_per_asset() * selected.len() as f64;
+    let cvar_5 = cvar(&engine.equity_curve, spec.capital, 0.05);
+    let (strategy_id, genome_id) = (engine.strategy.id().to_owned(), engine.strategy.genome_id().to_owned());
     let stop = if engine.n_steps == 0 { Stop::NoData } else { engine.stop };
     Ok(EvalReport {
-        strategy_id: strategy.id.clone(),
-        genome_id: strategy.genome_id.clone(),
+        strategy_id,
+        genome_id,
         timescale: spec.timescale,
         purpose: spec.purpose,
         cost_model: cost.id.clone(),
@@ -963,6 +1053,7 @@ pub fn replay(
         deflated_sharpe: dsr,
         n_trials: spec.n_trials.max(1),
         max_drawdown: engine.max_dd,
+        cvar: cvar_5,
         turnover: if engine.n_steps > 0 {
             engine.turnover_notional / spec.capital / engine.n_steps as f64
         } else {
@@ -971,7 +1062,7 @@ pub fn replay(
         cost_share,
         cost_sensitivity: sharpe - sharpe_2x,
         calibration,
-        compute_cost: nodes.max(1.0).log10(),
+        compute_cost: ops.max(1.0).log10(),
         n_trades: engine.n_trades,
         gross_pnl: engine.gross_pnl,
         total_cost: engine.total_cost,
@@ -985,7 +1076,45 @@ pub fn replay(
         latents: latents_report,
         trade_rule: spec.trade_rule.name().to_owned(),
         rebalance: engine.live.map(|l| l.rb.stats),
+        coverage,
+        latency: spec.latency.clone(),
     })
+}
+
+/// CVaR at `alpha` (expected shortfall) of the period returns of an equity curve, as a positive
+/// loss fraction of `capital` (spec 35 §6.2 "CVaR(5 %) of daily returns"): the returns are
+/// aggregated per UTC day when the curve spans ≥ 20 days, else per step (selection windows are
+/// hours long); the mean of the worst `ceil(alpha · n)` returns, negated, floored at 0. Fewer
+/// than 2 periods → 0.
+pub fn cvar(equity: &[(i64, f64)], capital: f64, alpha: f64) -> f64 {
+    if equity.len() < 3 || capital <= 0.0 {
+        return 0.0;
+    }
+    const DAY_MS: i64 = 86_400_000;
+    let span_days = (equity[equity.len() - 1].0 - equity[0].0) as f64 / DAY_MS as f64;
+    let mut rets: Vec<f64> = if span_days >= 20.0 {
+        let mut closes: Vec<f64> = Vec::new();
+        let mut day = None;
+        for (t, e) in equity {
+            let d = t.div_euclid(DAY_MS);
+            if day == Some(d) {
+                *closes.last_mut().expect("non-empty") = *e;
+            } else {
+                day = Some(d);
+                closes.push(*e);
+            }
+        }
+        closes.windows(2).map(|w| (w[1] - w[0]) / capital).collect()
+    } else {
+        equity.windows(2).map(|w| (w[1].1 - w[0].1) / capital).collect()
+    };
+    rets.retain(|r| r.is_finite());
+    if rets.len() < 2 {
+        return 0.0;
+    }
+    rets.sort_by(f64::total_cmp);
+    let k = ((alpha.clamp(1e-6, 1.0) * rets.len() as f64).ceil() as usize).clamp(1, rets.len());
+    (-(rets[..k].iter().sum::<f64>() / k as f64)).max(0.0)
 }
 
 /// `InstrumentId` from a dashed UUID or a 32-hex token; anything else hashes into a stable id.
@@ -1052,7 +1181,55 @@ mod tests {
             signal: signal.into(),
             uncertainty: "region_entropy".into(),
             snapshot: None,
+            assets: Vec::new(),
+            policy: None,
         }
+    }
+
+    #[test]
+    fn cvar_is_the_mean_of_the_worst_tail_as_a_loss() {
+        // per-step returns −3, −1, +1 … on capital 100
+        let curve: Vec<(i64, f64)> =
+            [100.0, 97.0, 96.0, 97.0, 98.0, 99.0, 100.0, 101.0, 102.0, 103.0, 104.0].iter().enumerate().map(|(i, e)| (i as i64 * 1000, *e)).collect();
+        // 10 returns: worst ceil(0.05·10) = 1 → 0.03; at 20 %: worst 2 → (0.03 + 0.01) / 2
+        assert!((cvar(&curve, 100.0, 0.05) - 0.03).abs() < 1e-12);
+        assert!((cvar(&curve, 100.0, 0.2) - 0.02).abs() < 1e-12);
+        let up: Vec<(i64, f64)> = (0..10).map(|i| (i * 1000, 100.0 + i as f64)).collect();
+        assert_eq!(cvar(&up, 100.0, 0.05), 0.0, "no losses → 0");
+        // ≥ 20 days aggregates per day (intraday noise nets out)
+        let day = 86_400_000i64;
+        let daily: Vec<(i64, f64)> = (0..30 * 4).map(|i| (i * day / 4, 100.0 + if i % 2 == 0 { 0.0 } else { -5.0 })).collect();
+        assert!(cvar(&daily, 100.0, 0.05) < 0.051, "{}", cvar(&daily, 100.0, 0.05));
+        assert_eq!(cvar(&daily[..2], 100.0, 0.05), 0.0);
+    }
+
+    #[test]
+    fn neural_policies_and_asset_sets_replay_through_the_same_engine() {
+        use fa_strategies::neural::{ALL_FEATURES, Act, PolicyNet};
+        let net = PolicyNet::random(&mut fa_core::rng::Rng::seed(4), ALL_FEATURES, 0, 0, vec![8], Act::Tanh)
+            .perturb(&mut fa_core::rng::Rng::seed(5), 3.0);
+        let nn = StrategyDef { policy: Some(net.to_string()), id: "nn-t".into(), ..def("0") };
+        let d = data(3);
+        let spec = ReplaySpec { capital: 10_000.0, ..ReplaySpec::selection(Timescale::Second, 0, i64::MAX) };
+        let cost = CostModel::default();
+        let ev = |c: &StrategyDef, s: &ReplaySpec| {
+            PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ReplayControls::default(), latents: None }
+                .evaluate(s, c)
+                .unwrap()
+        };
+        let a = ev(&nn, &spec);
+        let b = ev(&nn, &spec);
+        assert_eq!(serde_json::to_string(&a.returns).unwrap(), serde_json::to_string(&b.returns).unwrap(), "deterministic");
+        assert!(a.n_steps > 0 && a.n_trades > 0, "a perturbed net trades: {} trades", a.n_trades);
+        assert_eq!(a.strategy_id, "nn-t");
+        // compute cost: the net's operation estimate, comparable with a GP program's
+        let gp = ev(&def("(mul 100 analog_forecast)"), &spec);
+        assert!(a.compute_cost > gp.compute_cost, "{} vs {}", a.compute_cost, gp.compute_cost);
+        assert!(a.cvar >= 0.0 && a.objectives().iter().any(|(k, _)| *k == "cvar"));
+        // an asset set restricts the sleeves
+        let one = ReplaySpec { instruments: vec![d[0].instrument_id.clone()], ..spec.clone() };
+        let r = ev(&nn, &one);
+        assert_eq!(r.instruments, vec![d[0].instrument_id.clone()]);
     }
 
     fn data(seed: u64) -> Vec<BarSeries> {

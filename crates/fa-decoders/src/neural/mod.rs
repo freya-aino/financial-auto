@@ -1,6 +1,6 @@
 //! Trainable neural decoder families on candle (spec 34 §4.1, §6.1; ADR 0003 pure-Rust ML).
 //!
-//! Six families extend the D-044 genome ([`crate::genome::BaselineFamily`]):
+//! Eight families extend the D-044 genome ([`crate::genome::BaselineFamily`]):
 //!
 //! | genome family | output family | input | target / loss |
 //! |---|---|---|---|
@@ -10,6 +10,11 @@
 //! | `nn_future` | `visual.future` | return window + latent | raster of the next `h` steps, column CE |
 //! | `nn_news` | `text.news` | return window + latent | news embedding of `(t − tw, t]`, 1 − cos |
 //! | `nn_narrative` | `text.narrative` | return window + news embedding + latent | news embedding of `(t, t + tw]`, 1 − cos |
+//! | `nn_summary` | `text.summary` | latent (return window if unconditioned) | templated summary slots ([`crate::summary`]), per-slot CE |
+//! | `nn_frame` | `visual.frame` | return window + latent | frame-timeline embedding of `(t − tw, t]` ([`data::frame_features`]), 1 − cos |
+//!
+//! Reconstruction families start at their training-mean baseline (zero output weights, bias =
+//! the mean target in output space) and validate on a purged tail (D-085).
 //!
 //! [`train`] fits a genome on everything **before the train cutoff** (`train` gene: share of the
 //! window by time; a sample is used only once its target is known, `outcome_end ≤ cutoff`), with
@@ -125,9 +130,55 @@ pub struct BundleMeta {
     pub job_id: String,
     #[serde(default)]
     pub generation: String,
+    /// Re-evaluations of the frozen decoder on later data / encoder snapshots (spec 34 §8,
+    /// `evo.reeval.decoder`), oldest first; the latest one sets the feedback decay
+    /// ([`Self::transfer_factor`]).
+    #[serde(default)]
+    pub transfer: Vec<Transfer>,
 }
 
+/// One re-evaluation of a trained decoder (frozen weights) after its training cutoff.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Transfer {
+    /// Encoder snapshot whose latents the re-evaluation read (`live` when unknown).
+    pub snapshot_id: String,
+    /// Family score on the re-evaluation window (`crps_skill` / `recon_skill`).
+    pub score: f64,
+    /// The score at training ([`BundleMeta::score`]).
+    pub base_score: f64,
+    /// `score / base_score` (1 = no loss; ≤ 0 = no longer beats the naive baseline).
+    pub ratio: f64,
+    pub n_eval: usize,
+    pub window_start_ms: i64,
+    pub window_end_ms: i64,
+    pub at_ms: i64,
+    #[serde(default)]
+    pub job_id: String,
+}
+
+/// Default tolerated loss of a re-evaluated elite (spec 36 §6.4 item 5 `transfer_tol`).
+pub const TRANSFER_TOL: f64 = 0.10;
+
 impl BundleMeta {
+    /// Latest re-evaluation, if any.
+    pub fn latest_transfer(&self) -> Option<&Transfer> {
+        self.transfer.last()
+    }
+
+    /// Feedback-weight decay of a decoder (spec 34 §8 "feedback weight decays for decoders
+    /// failing transfer"): 1 before any re-evaluation, else the latest `ratio` clipped to
+    /// `[0, 1]` — a decoder that kept its skill keeps its weight, one that lost half of it gets
+    /// half, one that no longer beats naive gets none.
+    pub fn transfer_factor(&self) -> f64 {
+        self.latest_transfer().map_or(1.0, |t| if t.ratio.is_finite() { t.ratio.clamp(0.0, 1.0) } else { 0.0 })
+    }
+
+    /// Whether the latest re-evaluation lost at most `tol` of the training score (`true`
+    /// before any re-evaluation).
+    pub fn transfers(&self, tol: f64) -> bool {
+        self.latest_transfer().is_none_or(|t| t.ratio >= 1.0 - tol)
+    }
+
     /// Whether the bundle uses the current latent normaliser.
     pub fn is_current(&self) -> bool {
         self.norm_version >= NORM_VERSION
@@ -168,6 +219,8 @@ pub struct Served {
     pub analogs: Vec<Analog>,
     /// Raw reconstruction (raster probabilities / embedding) for online scoring.
     pub recon: Vec<f32>,
+    /// Decoded text (`text.summary`: the summary sentence of the most likely slot phrases).
+    pub text: String,
 }
 
 type ForecastCache = HashMap<(String, usize, i64), Arc<Vec<Option<SeriesForecast>>>>;
@@ -257,9 +310,10 @@ impl NeuralDecoder {
     /// probabilities (column-major) or normalised text embeddings.
     pub fn head(&self, raw: &Tensor) -> Result<Tensor, NeuralError> {
         Ok(match self.genome.family {
-            BaselineFamily::NnRetrieval | BaselineFamily::NnNews | BaselineFamily::NnNarrative => {
+            BaselineFamily::NnRetrieval | BaselineFamily::NnNews | BaselineFamily::NnNarrative | BaselineFamily::NnFrame => {
                 net::l2_normalize(raw)?
             }
+            BaselineFamily::NnSummary => net::slots_logp(raw, &crate::summary::slot_sizes())?.exp()?,
             BaselineFamily::NnChart | BaselineFamily::NnFuture => {
                 let b = raw.dim(0)?;
                 net::raster_logp(raw, self.genome.nn.res)?
@@ -492,6 +546,10 @@ impl NeuralDecoder {
                 -pred.iter().zip(target).map(|(p, t)| f64::from(*t) * f64::from(p.max(1e-12)).ln()).sum::<f64>()
                     / res as f64
             }
+            BaselineFamily::NnSummary => {
+                -pred.iter().zip(target).map(|(p, t)| f64::from(*t) * f64::from(p.max(1e-12)).ln()).sum::<f64>()
+                    / crate::summary::SLOTS.len() as f64
+            }
             _ => {
                 let dot: f64 = pred.iter().zip(target).map(|(a, b)| f64::from(a * b)).sum();
                 let na: f64 = pred.iter().map(|a| f64::from(a * a)).sum::<f64>().sqrt();
@@ -565,6 +623,30 @@ impl NeuralDecoder {
             }
             BaselineFamily::NnChart => {
                 out.score = render::direction(&y, g.nn.res);
+                if let Some((target, _)) = data::target_at(g, s, t, sigma, text) {
+                    out.components = vec![self.row_loss(&y, &target)];
+                }
+                out.recon = y;
+            }
+            BaselineFamily::NnSummary => {
+                // event intensity in [0, 1] (the baseline's novelty scale); components follow the
+                // model-runtime contract (`text.*`: components[0] = 1 − loss), then the signed
+                // move expectation and the slot classes
+                out.score = crate::summary::intensity_score(&y);
+                let classes: Vec<f64> = crate::summary::argmax(&y).into_iter().map(|c| c as f64).collect();
+                out.components = match data::target_at(g, s, t, sigma, text) {
+                    Some((target, _)) => [1.0 - self.row_loss(&y, &target), crate::summary::move_score(&y)]
+                        .into_iter()
+                        .chain(classes)
+                        .collect(),
+                    None => Vec::new(),
+                };
+                out.text = crate::summary::summary_text(&y);
+                out.recon = y;
+            }
+            BaselineFamily::NnFrame => {
+                // frame embeddings have no direction: score 0, the embedding is the output; the
+                // online loss only against a frame timeline (a news timeline gives no target)
                 if let Some((target, _)) = data::target_at(g, s, t, sigma, text) {
                     out.components = vec![self.row_loss(&y, &target)];
                 }

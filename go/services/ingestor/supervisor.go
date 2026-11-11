@@ -58,6 +58,9 @@ type Supervisor struct {
 	Health *Tracker
 	// Statuses, when set, persists enable/disable (catalog.source.status).
 	Statuses StatusStore
+	// BackfillDeps, when set, builds deps on the low-priority backfill lane
+	// (backfill jobs, gap-fill; spec 10 §6.4); nil uses the live deps.
+	BackfillDeps func(src catalog.Source) connector.Deps
 
 	mu      sync.Mutex
 	running map[string]*instance
@@ -81,8 +84,8 @@ func (s *Supervisor) Resolve(id string) (catalog.Source, error) {
 	if id == "" {
 		return catalog.Source{}, fmt.Errorf("%w: empty source id", ErrInvalid)
 	}
-	registered := slices.Contains(connector.Registered(), id)
 	src, inCatalog := s.cat.ByID(id)
+	registered := connector.HasConnector(id, src.Adapter)
 	switch {
 	case !inCatalog && !registered:
 		return catalog.Source{}, fmt.Errorf("%w: source %q is neither in the catalog nor a registered connector", ErrNotFound, id)
@@ -109,7 +112,7 @@ func (s *Supervisor) Start(parent context.Context, id string) error {
 	if _, ok := s.running[id]; ok {
 		return fmt.Errorf("%w: source %q is already running", ErrConflict, id)
 	}
-	c, err := connector.New(id)
+	c, err := connector.NewFor(id, src.Adapter)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrNotFound, err)
 	}
@@ -196,6 +199,44 @@ func (s *Supervisor) Stop(id string) error {
 	return nil
 }
 
+// Instance creates and initialises a fresh connector for a catalog source
+// outside the supervisor's lifecycle (backfill jobs, gap-fill, replay); with
+// backfillLane its limiter is the source's low-priority backfill lane.
+func (s *Supervisor) Instance(ctx context.Context, id string, backfillLane bool) (connector.Connector, catalog.Source, connector.Deps, error) {
+	src, err := s.Resolve(id)
+	if err != nil {
+		return nil, src, connector.Deps{}, err
+	}
+	c, err := connector.NewFor(id, src.Adapter)
+	if err != nil {
+		return nil, src, connector.Deps{}, fmt.Errorf("%w: %v", ErrNotFound, err)
+	}
+	cfg := connector.SourceConfig{Source: src}
+	if s.Secrets != nil {
+		cfg.Secrets = s.Secrets(id)
+	}
+	deps := s.deps(src)
+	if backfillLane && s.BackfillDeps != nil {
+		deps = s.BackfillDeps(src)
+	}
+	if err := c.Init(ctx, cfg, deps); err != nil {
+		return nil, src, deps, fmt.Errorf("init %s: %w", id, err)
+	}
+	return c, src, deps, nil
+}
+
+// Restart stops a running connector and starts it again with the current
+// catalog entry (ctl.ingest.reload / configure). Not running → no-op, false.
+func (s *Supervisor) Restart(ctx context.Context, id string) (bool, error) {
+	if !s.IsRunning(id) {
+		return false, nil
+	}
+	if err := s.Stop(id); err != nil {
+		return false, err
+	}
+	return true, s.Start(ctx, id)
+}
+
 // IsRunning reports whether id has a live connector.
 func (s *Supervisor) IsRunning(id string) bool {
 	s.mu.Lock()
@@ -239,8 +280,9 @@ func (s *Supervisor) Disable(ctx context.Context, id string) (bool, error) {
 // be registered) and starts the connector unless it already runs.
 // Returns whether a connector was started.
 func (s *Supervisor) Enable(ctx context.Context, id string) (bool, error) {
-	if !slices.Contains(connector.Registered(), id) {
-		if _, ok := s.cat.ByID(id); !ok {
+	src, inCatalog := s.cat.ByID(id)
+	if !connector.HasConnector(id, src.Adapter) {
+		if !inCatalog {
 			return false, fmt.Errorf("%w: source %q is not in the catalog", ErrNotFound, id)
 		}
 		return false, fmt.Errorf("%w: source %q has no connector; enable it once one exists", ErrConflict, id)

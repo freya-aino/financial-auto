@@ -2,6 +2,7 @@ package googlenews
 
 import (
 	"context"
+	"github.com/fey/financial-auto/go/connectors/rss"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -87,7 +88,7 @@ func TestHelpers(t *testing.T) {
 	if title, outlet := splitOutlet("A - B", ""); title != "A" || outlet != "B" {
 		t.Fatal(title, outlet)
 	}
-	if _, err := parseDate("garbage"); err == nil {
+	if _, err := rss.ParseDate("garbage"); err == nil {
 		t.Fatal("expected error")
 	}
 	c := &Connector{BaseURL: "https://x", HL: "de", GL: "DE", CEID: "DE:de"}

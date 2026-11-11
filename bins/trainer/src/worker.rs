@@ -119,6 +119,8 @@ pub async fn serve(bus: Bus, svc: Services<'_>, cfg: WorkerConfig) -> anyhow::Re
             tokio::spawn(crate::plan::run(bus.clone(), svc.stores.hub.clone(), kind, every, cfg.plan.clone()));
         }
     }
+    // drift triggers and auto-rollback (spec 36 §6.3, §8), each off unless enabled by env
+    crate::watch::spawn(bus.clone(), svc.stores.hub.clone(), svc.pg_url.map(str::to_owned));
     let counters = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<String, f64>::new()));
     spawn_heartbeat(bus.clone(), worker_id.clone(), counters.clone());
     let bump = |k: &str| {
@@ -223,7 +225,7 @@ async fn handle(
     job: &Job,
 ) -> Outcome {
     let Some(kind) = Kind::parse_job_kind(&job.kind) else {
-        return failed(&job.kind, format!("unknown job kind `{}` (train.pretrain|generation|adapter)", job.kind));
+        return failed(&job.kind, format!("unknown job kind `{}` (train.pretrain|generation|adapter|cycle)", job.kind));
     };
     let budget = (job.budget_gpu_ms > 0).then(|| Duration::from_millis(job.budget_gpu_ms));
     let deadline = Instant::now() + budget.unwrap_or(Duration::from_secs(600)) + Duration::from_secs(30);
@@ -276,6 +278,19 @@ async fn handle(
             }
             run::run_adapter(spec, svc, &ctl).await
         }
+        Kind::Cycle => match parse_spec::<crate::generation::CycleSpec>(&job.spec) {
+            Ok(mut spec) => {
+                if spec.parent_snapshot_id.is_none() && !job.snapshot_id.is_empty() {
+                    spec.parent_snapshot_id = Some(job.snapshot_id.clone());
+                }
+                if job.seed != 0 {
+                    spec.seed = job.seed;
+                }
+                let store = crate::generation::GenStore::connect(svc.pg_url, Some(bus.clone())).await;
+                crate::generation::run_cycle(spec, svc, &ctl, &store).await
+            }
+            Err(e) => failed(&job.kind, format!("spec: {e} (need at least {{\"timescale\":\"1m\"}})")),
+        },
         _ => match parse_spec::<FitSpec>(&job.spec) {
             Ok(mut spec) => {
                 if spec.parent_snapshot_id.is_none() && !job.snapshot_id.is_empty() {

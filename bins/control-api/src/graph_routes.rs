@@ -4,7 +4,7 @@
 //! | Route | Source |
 //! |---|---|
 //! | `GET /api/graph/neighborhood?node=&depth=` | `HubClient::resolve_node` + `neighborhood` |
-//! | `GET /api/graph/lineage/{genome_id}` | `genome_by_id` + `genome_ancestry` + `genome_fitness` |
+//! | `GET /api/graph/lineage/{genome_id}` | `genome_by_id` + `genome_ancestry` + `genome_fitness` + `genome_parents` per node (`edges[{from: parent, to: child, from_id, to_id}]`) |
 //! | `GET /api/graph/query` | the named-query catalog (`fa_hub::catalog::NAMED_QUERIES`) |
 //! | `POST /api/graph/query` `{name, params}` | `HubClient::run_named` (whitelist; never raw trees) |
 //! | `GET /api/latent/snapshots` | `list_snapshots` |
@@ -117,10 +117,47 @@ async fn lineage(State(s): State<AppState>, Path(genome_id): Path<String>) -> Re
         };
         let (ancestry, fitness) =
             tokio::try_join!(s.hub.genome_ancestry(genome.id, LINEAGE_DEPTH), s.hub.genome_fitness(genome.id))?;
-        Ok(Json(json!({ "genome": genome, "ancestors_by_depth": ancestry, "fitness": fitness })))
+        let edges = lineage_edges(&s.hub, &genome, &ancestry).await?;
+        Ok(Json(json!({ "genome": genome, "ancestors_by_depth": ancestry, "fitness": fitness, "edges": edges })))
     }
     .await;
     res.into_response()
+}
+
+/// Most genomes whose parents are looked up for the lineage edges.
+const LINEAGE_MAX_NODES: usize = 500;
+
+/// `ParentOf` edges inside the lineage: `{from, to, from_id, to_id}` with `from` = parent and
+/// `to` = child genome id (business ids; `*_id` = Helix `$id`), for the genome and every
+/// ancestor (at most [`LINEAGE_MAX_NODES`] children), deduplicated.
+async fn lineage_edges(
+    hub: &fa_hub::HubClient,
+    genome: &fa_hub::Genome,
+    ancestry: &[Vec<fa_hub::Genome>],
+) -> Result<Vec<Value>, HubError> {
+    let mut children: Vec<(u64, String)> = vec![(genome.id, genome.genome_id.clone())];
+    let mut seen = std::collections::BTreeSet::from([genome.id]);
+    for g in ancestry.iter().flatten() {
+        if seen.insert(g.id) {
+            children.push((g.id, g.genome_id.clone()));
+        }
+    }
+    children.truncate(LINEAGE_MAX_NODES);
+    let mut parents: Vec<((u64, String), Vec<fa_hub::Genome>)> = Vec::with_capacity(children.len());
+    for chunk in children.chunks(16) {
+        let got = futures::future::try_join_all(chunk.iter().map(|c| hub.genome_parents(c.0))).await?;
+        parents.extend(chunk.iter().cloned().zip(got));
+    }
+    let mut edges = std::collections::BTreeSet::new();
+    for ((child_id, child), ps) in &parents {
+        for p in ps {
+            edges.insert((p.genome_id.clone(), child.clone(), p.id, *child_id));
+        }
+    }
+    Ok(edges
+        .into_iter()
+        .map(|(from, to, from_id, to_id)| json!({ "from": from, "to": to, "from_id": from_id, "to_id": to_id }))
+        .collect())
 }
 
 async fn query_catalog() -> impl IntoResponse {

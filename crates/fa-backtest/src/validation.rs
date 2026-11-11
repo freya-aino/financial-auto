@@ -129,6 +129,26 @@ pub fn effective_trials(returns: &[&[f64]]) -> f64 {
     (n as f64 / (1.0 + (n as f64 - 1.0) * rho)).clamp(1.0, n as f64)
 }
 
+/// Diversification objective (spec 35 §6.2, direction min): the mean correlation of a
+/// candidate's block returns with those of the reference set (the generation's current elite
+/// trials on the same window, [`block_sums`] of equal length). Constant or too short series are
+/// left out; `None` without a usable reference (the objective is then 0, neutral).
+pub fn diversification(candidate: &[f64], reference: &[Vec<f64>]) -> Option<f64> {
+    if candidate.len() < 3 || sample_var(candidate) <= 0.0 {
+        return None;
+    }
+    let cs: Vec<f64> = reference
+        .iter()
+        .filter(|r| r.len() >= 3 && sample_var(r) > 0.0)
+        .map(|r| {
+            let len = r.len().min(candidate.len());
+            stats_corr(&candidate[..len], &r[..len])
+        })
+        .filter(|c| c.is_finite())
+        .collect();
+    (!cs.is_empty()).then(|| cs.iter().sum::<f64>() / cs.len() as f64)
+}
+
 fn stats_corr(a: &[f64], b: &[f64]) -> f64 {
     let (ma, mb) = (stats::mean(a), stats::mean(b));
     let (mut sab, mut saa, mut sbb) = (0.0, 0.0, 0.0);
@@ -187,6 +207,19 @@ pub fn generation_stats(trials: &[Trial], pbo_blocks: usize) -> GenerationStats 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diversification_is_the_mean_correlation_with_the_elites() {
+        let a: Vec<f64> = (0..64).map(|i| (i as f64 * 0.7).sin()).collect();
+        let neg: Vec<f64> = a.iter().map(|x| -x).collect();
+        let other: Vec<f64> = (0..64).map(|i| (i as f64 * 1.9).cos()).collect();
+        assert!((diversification(&a, std::slice::from_ref(&a)).unwrap() - 1.0).abs() < 1e-12, "a copy");
+        assert!((diversification(&a, &[a.clone(), neg.clone()]).unwrap()).abs() < 1e-12, "copy + mirror");
+        assert!(diversification(&a, &[other]).unwrap().abs() < 0.3);
+        assert_eq!(diversification(&a, &[]), None);
+        assert_eq!(diversification(&a, &[vec![0.0; 64]]), None, "constant reference skipped");
+        assert_eq!(diversification(&[0.0; 64], &[a]), None);
+    }
     use fa_core::rng::Rng;
 
     fn trial(name: &str, seed: u64, edge: f64) -> Trial {

@@ -95,6 +95,9 @@ pub struct Pipeline {
     hub: Option<fa_hub::HubClient>,
     /// `strategy id → (status, since_ms)` last mirrored successfully.
     mirrored: Mutex<BTreeMap<String, (String, i64)>>,
+    /// Promotion reviews of shadow strategies: on gate change, else hourly (spec 40 §5).
+    reviews: Mutex<crate::engine::history::ReviewDedup>,
+    review_every_ms: i64,
 }
 
 fn now_ms() -> i64 {
@@ -132,6 +135,8 @@ impl Pipeline {
             rejected_log: Mutex::new(std::collections::VecDeque::new()),
             hub: None,
             mirrored: Mutex::new(BTreeMap::new()),
+            reviews: Mutex::new(Default::default()),
+            review_every_ms: settings.history.review_unchanged_secs as i64 * 1000,
         }
     }
 
@@ -483,6 +488,14 @@ impl Pipeline {
                 let gate = (st.status == StrategyStatus::Shadow).then(|| e.checklist(&id, &ev, now)).flatten();
                 (gate, e.live_evolved().len() < self.policy.max_live_evolved, e.live_consistent(&id))
             };
+            if let Some(g) = gate.as_ref() {
+                let due = self.reviews.lock().await.due(&id, g, now, self.review_every_ms);
+                if let Some(trigger) = due {
+                    let evidence = json!({"deflated_sharpe": ev.deflated_sharpe, "pbo": ev.pbo});
+                    let status = Some(st.status.as_str());
+                    crate::risk_io::review(&self.store, &id, trigger, ACTOR, status, status, g, evidence).await;
+                }
+            }
             let paused = pauses.as_ref().and_then(|p| p.get(&id)).map(String::as_str);
             let obs = Observation {
                 now_ms: now,
@@ -526,6 +539,13 @@ impl Pipeline {
                     match applied {
                         Ok(Some((action, payload))) => {
                             tracing::warn!(strategy = %id, %action, %payload, "pipeline transition");
+                            if matches!(d, Decision::Promote)
+                                && let Some(g) = gate.as_ref()
+                            {
+                                let evidence = json!({"deflated_sharpe": ev.deflated_sharpe, "pbo": ev.pbo});
+                                let after = payload["to"].as_str();
+                                crate::risk_io::review(&self.store, &id, "pipeline", ACTOR, Some(st.status.as_str()), after, g, evidence).await;
+                            }
                             let row = self.engine.lock().await.strategy_row_pub(&id);
                             if let Some((s, book)) = row {
                                 self.store.strategy_state(&s, Some(&book), gate.as_ref()).await;

@@ -358,6 +358,273 @@ pub fn solve(
     (heads, report)
 }
 
+/// **Planted disagreement** (`head_solver: "disagree"`, spec 32 §6.3.1 generalisation fix).
+///
+/// The constrained solve above decorrelates in sample by finding head directions whose
+/// covariance with the *other experts' residuals* is large in the training windows — a
+/// maximised sample covariance, i.e. fitted noise, which does not hold on validation (D-080).
+/// This solver keeps the gated least-squares heads and adds to each expert `k` a disagreement
+/// `d_k = w_k · (μ_k − μ̄_k)` (the same on every target, so the scalarised residual moves by
+/// `d_k`) chosen from **second moments that do not involve the targets' noise**: with the cross
+/// terms `cov(e_i, d_j)` set to their out-of-sample value 0 (a fixed function of the latent is
+/// uncorrelated with future noise), `cov(r_i, r_j) = c_ij + w_iᵀ C_ij w_j`, where `c_ij` is the
+/// least-squares residual covariance (a stable, low-dimensional statistic) and `C_ij` the
+/// cross-covariance of the two experts' latents (no targets at all). Each block update solves
+/// `min w_iᵀ (C_ii + ridge) w_i` (the added MSE) subject to `w_iᵀ C_ij w_j = ρ* sd_i sd_j − c_ij`
+/// for every other expert — a minimum-norm problem in the `C_ii` metric, solved exactly.
+/// The price is the bound of §6.3.1: the experts pay `var(d_k)` in skill. Returns the heads and
+/// the in-sample report (which now includes the cross terms, so it shows the realised value).
+pub fn disagree(
+    mu: &[Vec<Vec<f32>>],
+    gates: &[Vec<f32>],
+    y: &[Vec<f32>],
+    init: Heads,
+    cfg: &HeadSolverCfg,
+) -> (Heads, HeadSolverReport) {
+    // gated least-squares heads first (no constraints, no spread)
+    let ls_cfg = HeadSolverCfg { sweeps: 0, spread: 0.0, ..*cfg };
+    let (mut heads, _) = solve_ls(mu, gates, y, init, &ls_cfg);
+    let n = mu.len();
+    let k = heads.len();
+    if n < 3 || k < 2 {
+        let r = report(mu, gates, y, &heads, cfg.min_shared);
+        return (heads, r);
+    }
+    let t = heads[0].len();
+    let d = heads[0][0].len() - 1;
+    let x: Vec<Vec<Vec<f64>>> = mu.iter().map(|w| w.iter().map(|m| features(m)).collect()).collect();
+    let resid = |e: usize, hd: &Heads| -> Vec<f64> {
+        (0..n)
+            .map(|w| (0..t).map(|tt| dot(&hd[e][tt], &x[w][e]) - f64::from(y[w][tt])).sum::<f64>() / t as f64)
+            .collect()
+    };
+    let e_ls: Vec<Vec<f64>> = (0..k).map(|e| resid(e, &heads)).collect();
+    let sets = pair_sets(gates, k, cfg.min_shared);
+    let set = |i: usize, j: usize| if i < j { &sets[i][j] } else { &sets[j][i] };
+    let mean_x = |e: usize, s: &[usize]| -> Vec<f64> {
+        let m = s.len().max(1) as f64;
+        (0..d).map(|q| s.iter().map(|&w| x[w][e][q]).sum::<f64>() / m).collect()
+    };
+    // C_ij over the pair's window set, C_ii over the expert's routed windows (gate-weighted)
+    let cross = |i: usize, j: usize| -> Vec<Vec<f64>> {
+        let s = set(i, j);
+        let (mi, mj) = (mean_x(i, s), mean_x(j, s));
+        let m = s.len().max(1) as f64;
+        let mut c = vec![vec![0.0; d]; d];
+        for &w in s {
+            for a in 0..d {
+                for b in 0..d {
+                    c[a][b] += (x[w][i][a] - mi[a]) * (x[w][j][b] - mj[b]) / m;
+                }
+            }
+        }
+        c
+    };
+    let own: Vec<Vec<Vec<f64>>> = (0..k)
+        .map(|e| {
+            let gs: f64 = gates.iter().map(|g| f64::from(g[e])).sum::<f64>().max(1e-12);
+            let mut m = vec![0.0; d];
+            for w in 0..n {
+                for q in 0..d {
+                    m[q] += f64::from(gates[w][e]) * x[w][e][q] / gs;
+                }
+            }
+            let mut c = vec![vec![0.0; d]; d];
+            for w in 0..n {
+                let g = f64::from(gates[w][e]) / gs;
+                for a in 0..d {
+                    for b in 0..d {
+                        c[a][b] += g * (x[w][e][a] - m[a]) * (x[w][e][b] - m[b]);
+                    }
+                }
+            }
+            let diag = (0..d).map(|a| c[a][a]).sum::<f64>() / d as f64;
+            for a in 0..d {
+                c[a][a] += cfg.ridge.max(1e-6) * diag.max(1e-9);
+            }
+            c
+        })
+        .collect();
+    let cij: Vec<Vec<Vec<Vec<f64>>>> =
+        (0..k).map(|i| (0..k).map(|j| if i == j { Vec::new() } else { cross(i, j) }).collect()).collect();
+    // target covariance per pair
+    let goal = |i: usize, j: usize| -> f64 {
+        let (c, va, vb) = centred_cov(&e_ls[i], &e_ls[j], set(i, j));
+        let m = set(i, j).len().max(1) as f64;
+        cfg.target_corr * c.signum() * (va * vb).sqrt() / m - c / m
+    };
+    // seeded start: alternating signs along each expert's leading latent direction, scaled to
+    // the bound's size (K − 1)·V
+    let mut rng = fa_core::rng::Rng::seed(cfg.seed);
+    let v = (0..k)
+        .map(|e| {
+            let (_, va, _) = centred_cov(&e_ls[e], &e_ls[e], &(0..n).collect::<Vec<_>>());
+            va / n as f64
+        })
+        .sum::<f64>()
+        / k as f64;
+    let mut w: Vec<Vec<f64>> = (0..k)
+        .map(|e| {
+            let dir: Vec<f64> = (0..d).map(|_| rng.normal()).collect();
+            let q: f64 = (0..d).map(|a| (0..d).map(|b| dir[a] * own[e][a][b] * dir[b]).sum::<f64>()).sum();
+            let scale = (cfg.spread.max(0.1) * (k as f64 - 1.0) * v / q.max(1e-12)).sqrt();
+            let sign = if e % 2 == 0 { 1.0 } else { -1.0 };
+            dir.iter().map(|z| sign * scale * z).collect()
+        })
+        .collect();
+    // joint objective Σ_i w_iᵀ M_i w_i + μ Σ_{i≠j} (w_iᵀ C_ij w_j − goal_ij)², minimised block by
+    // block (each block a ridge regression, so the joint objective never increases and the
+    // cost is shared between the experts) with a rising penalty μ (continuation toward the
+    // exact constraints)
+    let scale = (0..k).map(|e| (0..d).map(|a| own[e][a][a]).sum::<f64>() / d as f64).sum::<f64>() / k as f64;
+    let g_scale = (0..k)
+        .flat_map(|i| (0..k).filter(move |j| *j != i).map(move |j| (i, j)))
+        .map(|(i, j)| goal(i, j).abs())
+        .fold(0.0, f64::max)
+        .max(1e-12);
+    for stage in 0..6 {
+        let mu_pen = 10f64.powi(stage) * scale / (g_scale * g_scale);
+        for _ in 0..cfg.sweeps.max(1) * 2 {
+            for e in 0..k {
+                let mut lhs = own[e].clone();
+                let mut rhs = vec![0.0; d];
+                for j in (0..k).filter(|j| *j != e) {
+                    let a: Vec<f64> = (0..d).map(|p| (0..d).map(|q| cij[e][j][p][q] * w[j][q]).sum()).collect();
+                    let g = goal(e, j);
+                    for p in 0..d {
+                        for q in 0..d {
+                            lhs[p][q] += mu_pen * a[p] * a[q];
+                        }
+                        rhs[p] += mu_pen * g * a[p];
+                    }
+                }
+                if let Some(sol) = solve_dense(lhs, rhs) {
+                    w[e] = sol;
+                }
+            }
+        }
+    }
+    // fold d_k = w_k·(μ_k − μ̄_k) into every target of the head (bias absorbs the centring)
+    for e in 0..k {
+        let m = mean_x(e, &(0..n).collect::<Vec<_>>());
+        let shift = dot(&w[e], &m);
+        for row in heads[e].iter_mut() {
+            for q in 0..d {
+                row[q] += w[e][q];
+            }
+            row[d] -= shift;
+        }
+    }
+    let r = report(mu, gates, y, &heads, cfg.min_shared);
+    (heads, r)
+}
+
+/// Window set per pair `i < j`: shared routed windows, all windows when fewer than `min_shared`.
+fn pair_sets(gates: &[Vec<f32>], k: usize, min_shared: usize) -> Vec<Vec<Vec<usize>>> {
+    let n = gates.len();
+    let active = |w: usize, e: usize| gates[w].get(e).is_some_and(|g| *g > 0.0);
+    let mut pairs = vec![vec![Vec::new(); k]; k];
+    for i in 0..k {
+        for j in i + 1..k {
+            let shared: Vec<usize> = (0..n).filter(|&w| active(w, i) && active(w, j)).collect();
+            pairs[i][j] = if shared.len() >= min_shared { shared } else { (0..n).collect() };
+        }
+    }
+    pairs
+}
+
+/// Gated least-squares heads only.
+fn solve_ls(
+    mu: &[Vec<Vec<f32>>],
+    gates: &[Vec<f32>],
+    y: &[Vec<f32>],
+    init: Heads,
+    cfg: &HeadSolverCfg,
+) -> (Heads, HeadSolverReport) {
+    let mut heads = init;
+    let k = heads.len();
+    if mu.is_empty() || k == 0 {
+        return (heads, HeadSolverReport::default());
+    }
+    let (t, p) = (heads[0].len(), heads[0][0].len());
+    for e in 0..k {
+        let mut h = vec![vec![0.0; p]; p];
+        let mut b = vec![vec![0.0; p]; t];
+        for (w, m) in mu.iter().enumerate() {
+            let g = f64::from(gates[w][e]);
+            if g <= 0.0 {
+                continue;
+            }
+            let xe = features(&m[e]);
+            for a in 0..p {
+                for c in 0..p {
+                    h[a][c] += g * xe[a] * xe[c];
+                }
+                for tt in 0..t {
+                    b[tt][a] += g * f64::from(y[w][tt]) * xe[a];
+                }
+            }
+        }
+        let diag = (0..p).map(|a| h[a][a]).sum::<f64>() / p as f64;
+        for a in 0..p {
+            h[a][a] += cfg.ridge * diag.max(1e-6);
+        }
+        for tt in 0..t {
+            if let Some(th) = solve_dense(h.clone(), b[tt].clone()) {
+                heads[e][tt] = th;
+            }
+        }
+    }
+    let r = report(mu, gates, y, &heads, cfg.min_shared);
+    (heads, r)
+}
+
+/// In-sample residual correlation (health rule) and gated skill of `heads`.
+fn report(
+    mu: &[Vec<Vec<f32>>],
+    gates: &[Vec<f32>],
+    y: &[Vec<f32>],
+    heads: &Heads,
+    min_shared: usize,
+) -> HeadSolverReport {
+    let n = mu.len();
+    let k = heads.len();
+    if n == 0 || k == 0 {
+        return HeadSolverReport::default();
+    }
+    let t = heads[0].len();
+    let x: Vec<Vec<Vec<f64>>> = mu.iter().map(|w| w.iter().map(|m| features(m)).collect()).collect();
+    let resid: Vec<Vec<f64>> = (0..k)
+        .map(|e| {
+            (0..n)
+                .map(|w| (0..t).map(|tt| dot(&heads[e][tt], &x[w][e]) - f64::from(y[w][tt])).sum::<f64>() / t as f64)
+                .collect()
+        })
+        .collect();
+    let sets = pair_sets(gates, k, min_shared);
+    let mut mx = 0.0f64;
+    for i in 0..k {
+        for j in i + 1..k {
+            let (c, va, vb) = centred_cov(&resid[i], &resid[j], &sets[i][j]);
+            if va > 0.0 && vb > 0.0 {
+                mx = mx.max((c / (va * vb).sqrt()).abs());
+            }
+        }
+    }
+    let skill = (0..k)
+        .map(|e| {
+            let (mut num, mut den) = (0.0, 0.0);
+            for w in 0..n {
+                let g = f64::from(gates[w][e]);
+                num += g * (0..t).map(|tt| (dot(&heads[e][tt], &x[w][e]) - f64::from(y[w][tt])).powi(2)).sum::<f64>();
+                den += g * y[w].iter().map(|v| f64::from(*v).powi(2)).sum::<f64>();
+            }
+            if den > 0.0 { 1.0 - num / den } else { 0.0 }
+        })
+        .collect();
+    HeadSolverReport { resid_corr_max: mx, skill, objective: Vec::new(), dropped: 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use fa_core::rng::Rng;
@@ -436,5 +703,28 @@ mod tests {
         let (_, r) = solve(&mu, &gates, &y, init, &HeadSolverCfg::default());
         assert!(r.resid_corr_max < 1e-6, "{r:?}");
         assert!(r.skill.iter().all(|s| *s > 0.1), "skilled on their own windows: {r:?}");
+    }
+
+    /// Planted disagreement: decorrelation that survives on fresh windows of the same process,
+    /// because it is chosen from latent second moments, not from the training noise. The
+    /// constrained solve (exact in sample) is compared on the same split.
+    #[test]
+    fn planted_disagreement_generalises() {
+        let k = 3;
+        let all = |_| vec![1.0f32 / 3.0; 3];
+        let (mu, y, gates) = data(1500, k, 21, all);
+        let (mu_v, y_v, gates_v) = data(1500, k, 22, all);
+        let init: Heads = vec![vec![vec![0.0; 5]; 3]; k];
+        let (hd, rd) = disagree(&mu, &gates, &y, init.clone(), &HeadSolverCfg::default());
+        assert!(rd.resid_corr_max < 0.1, "in sample: {rd:?}");
+        let val = report(&mu_v, &gates_v, &y_v, &hd, 30);
+        assert!(val.resid_corr_max < 0.12, "validation: {val:?}");
+        assert!(val.skill.iter().all(|s| *s > 0.0), "every expert still skilled: {val:?}");
+        let (hc, _) = solve(&mu, &gates, &y, init, &HeadSolverCfg::default());
+        let vc = report(&mu_v, &gates_v, &y_v, &hc, 30);
+        // determinism
+        let (hd2, _) = disagree(&mu, &gates, &y, vec![vec![vec![0.0; 5]; 3]; k], &HeadSolverCfg::default());
+        assert_eq!(hd, hd2);
+        eprintln!("validation corr: disagree {:.3}, constrained {:.3}", val.resid_corr_max, vc.resid_corr_max);
     }
 }

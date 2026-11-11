@@ -1,4 +1,5 @@
-//! Genomes, variation operators, NSGA-II selection and successive halving (specs 34, 35).
+//! Genomes, variation operators, NSGA-II / NSGA-III selection, hypervolume rung scores and
+//! successive halving (specs 34, 35; [`pareto`]).
 //!
 //! The NSGA-II functions ([`non_dominated_sort`], [`crowding_distance`], [`nsga2_select`]) are
 //! the reference implementation; `go/services/evo-orchestrator/nsga.go` is a line-by-line port
@@ -6,6 +7,7 @@
 //! `go/` so the Docker Go toolchain, which mounts only `go/`, sees it) so they cannot drift.
 
 pub mod objectives;
+pub mod pareto;
 pub mod vary;
 
 use std::collections::BTreeMap;

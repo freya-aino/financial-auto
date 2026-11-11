@@ -12,9 +12,15 @@
 //! `(region expert ordinal)` (spec 35 §6.5, bound to the strategy's snapshot) are `Region`,
 //! `(neighbors r n)` is `RegionSet`, `(sample_walk r k n)` is `[Path]`; they are only valid as
 //! arguments of the primitives above (a `Region` where a `Num` is expected is a type error).
+//!
+//! The rest of the §4.2 combinator set: `(clip x lo hi)`, the portfolio primitives
+//! `exposure_gross` and `drawdown`, `Bool`-typed comparisons `(gt a b)` / `(lt a b)` with
+//! `(and p q)`, `(or p q)`, `(not p)`, the conditional `(if p a b)` (a `Bool` condition; a `Bool`
+//! where a `Num` is expected, or a `Num` where a `Bool` is expected, is a type error; a program
+//! must be `Num`), and `(prob_gt P x)` over the `Prob` forms `(fc_dist k)` / `(analog_outcome k)`.
 use std::fmt;
 
-use crate::{DecoderOp, Expr, GraphOp, PathFn, PortfolioOp, RegionFeature, RegionRef, SetRef};
+use crate::{CmpOp, DecoderOp, Expr, GraphOp, PathFn, PortfolioOp, ProbSrc, RegionFeature, RegionRef, SetRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParseError {
@@ -227,6 +233,8 @@ fn atom(a: &str) -> Result<Expr, ParseError> {
         "position" => Expr::Portfolio(PortfolioOp::Position),
         "unrealised_pnl" => Expr::Portfolio(PortfolioOp::UnrealisedPnl),
         "time_in_trade" => Expr::Portfolio(PortfolioOp::TimeInTrade),
+        "exposure_gross" => Expr::Portfolio(PortfolioOp::ExposureGross),
+        "drawdown" => Expr::Portfolio(PortfolioOp::Drawdown),
         "analog_age" => Expr::Decoder(DecoderOp::AnalogAge),
         other => return Err(ParseError::Unknown(other.into())),
     })
@@ -238,9 +246,18 @@ fn form(op: &str, args: Vec<Arg>) -> Result<Expr, ParseError> {
     };
     let b = |a: &Arg| -> Result<Box<Expr>, ParseError> {
         match a {
+            Arg::Expr(e) if e.is_bool() => Err(ParseError::Type(format!("`{op}` expects a Num, got Bool"))),
             Arg::Expr(e) => Ok(Box::new(e.clone())),
             Arg::Word(w) => Err(ParseError::Unknown(w.clone())),
             other => Err(ParseError::Type(format!("`{op}` expects a Num, got {}", type_name(other)))),
+        }
+    };
+    let bl = |a: &Arg| -> Result<Box<Expr>, ParseError> {
+        match a {
+            Arg::Expr(e) if e.is_bool() => Ok(Box::new(e.clone())),
+            Arg::Expr(_) => Err(ParseError::Type(format!("`{op}` expects a Bool, got Num"))),
+            Arg::Word(w) => Err(ParseError::Unknown(w.clone())),
+            other => Err(ParseError::Type(format!("`{op}` expects a Bool, got {}", type_name(other)))),
         }
     };
     let num = |a: &Arg| -> Result<f64, ParseError> {
@@ -272,6 +289,45 @@ fn form(op: &str, args: Vec<Arg>) -> Result<Expr, ParseError> {
         "if_gt" => {
             arity(4)?;
             Expr::IfGt(b(&args[0])?, b(&args[1])?, b(&args[2])?, b(&args[3])?)
+        }
+        "clip" => {
+            arity(3)?;
+            Expr::Clip(b(&args[0])?, b(&args[1])?, b(&args[2])?)
+        }
+        "if" => {
+            arity(3)?;
+            Expr::If(bl(&args[0])?, b(&args[1])?, b(&args[2])?)
+        }
+        "gt" | "lt" => {
+            arity(2)?;
+            let cmp = if op == "gt" { CmpOp::Gt } else { CmpOp::Lt };
+            Expr::Cmp(cmp, b(&args[0])?, b(&args[1])?)
+        }
+        "and" | "or" => {
+            arity(2)?;
+            let (p, q) = (bl(&args[0])?, bl(&args[1])?);
+            if op == "and" { Expr::And(p, q) } else { Expr::Or(p, q) }
+        }
+        "not" => {
+            arity(1)?;
+            Expr::Not(bl(&args[0])?)
+        }
+        "prob_gt" => {
+            arity(2)?;
+            let src = match &args[0] {
+                Arg::Expr(Expr::Decoder(DecoderOp::FcDist(k))) => ProbSrc::Fc(*k),
+                Arg::Expr(Expr::Decoder(DecoderOp::AnalogOutcome(k))) => ProbSrc::Analog(*k),
+                other => {
+                    return Err(ParseError::Type(format!(
+                        "`prob_gt` expects a Prob ((fc_dist k) or (analog_outcome k)), got {}",
+                        match other {
+                            Arg::Expr(e) if e.is_bool() => "Bool",
+                            o => type_name(o),
+                        }
+                    )));
+                }
+            };
+            Expr::ProbGt(src, b(&args[1])?)
         }
         "path_up" => {
             arity(1)?;
@@ -363,6 +419,9 @@ pub fn parse(src: &str) -> Result<Expr, ParseError> {
     if p.pos != toks.len() {
         return Err(ParseError::Trailing(format!("{:?}", &toks[p.pos..])));
     }
+    if e.is_bool() {
+        return Err(ParseError::Type("a program must be Num-typed, got Bool (use it as an `if` condition)".into()));
+    }
     Ok(e)
 }
 
@@ -379,6 +438,15 @@ impl fmt::Display for SetRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SetRef::Neighbors(r, n) => write!(f, "(neighbors {r} {n})"),
+        }
+    }
+}
+
+impl fmt::Display for ProbSrc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProbSrc::Fc(k) => write!(f, "(fc_dist {k})"),
+            ProbSrc::Analog(k) => write!(f, "(analog_outcome {k})"),
         }
     }
 }
@@ -429,6 +497,8 @@ impl fmt::Display for Expr {
             Expr::Portfolio(PortfolioOp::Position) => f.write_str("position"),
             Expr::Portfolio(PortfolioOp::UnrealisedPnl) => f.write_str("unrealised_pnl"),
             Expr::Portfolio(PortfolioOp::TimeInTrade) => f.write_str("time_in_trade"),
+            Expr::Portfolio(PortfolioOp::ExposureGross) => f.write_str("exposure_gross"),
+            Expr::Portfolio(PortfolioOp::Drawdown) => f.write_str("drawdown"),
             Expr::Add(a, b) => write!(f, "(add {a} {b})"),
             Expr::Sub(a, b) => write!(f, "(sub {a} {b})"),
             Expr::Mul(a, b) => write!(f, "(mul {a} {b})"),
@@ -438,6 +508,14 @@ impl fmt::Display for Expr {
             Expr::Neg(a) => write!(f, "(neg {a})"),
             Expr::Tanh(a) => write!(f, "(tanh {a})"),
             Expr::IfGt(a, b, c, d) => write!(f, "(if_gt {a} {b} {c} {d})"),
+            Expr::Clip(x, lo, hi) => write!(f, "(clip {x} {lo} {hi})"),
+            Expr::If(c, a, b) => write!(f, "(if {c} {a} {b})"),
+            Expr::ProbGt(src, x) => write!(f, "(prob_gt {src} {x})"),
+            Expr::Cmp(CmpOp::Gt, a, b) => write!(f, "(gt {a} {b})"),
+            Expr::Cmp(CmpOp::Lt, a, b) => write!(f, "(lt {a} {b})"),
+            Expr::And(a, b) => write!(f, "(and {a} {b})"),
+            Expr::Or(a, b) => write!(f, "(or {a} {b})"),
+            Expr::Not(a) => write!(f, "(not {a})"),
         }
     }
 }
@@ -548,6 +626,31 @@ mod tests {
             parse("(p_to_set (cur_region 0) (neighbors (cur_region 0)) 1)"),
             Err(ParseError::Arity { op: "neighbors".into(), expected: 2, got: 1 })
         );
+    }
+
+    #[test]
+    fn full_combinator_set_parses_types_and_round_trips() {
+        let cases = [
+            "(clip (mul 400 analog_forecast) -0.5 0.5)",
+            "(if (and (gt stay_prob 0.6) (not (lt (fc_quantile 0.25 3) 0))) 1 (neg exposure_gross))",
+            "(mul (sub (prob_gt (fc_dist 3) 0) 0.5) (sub 1 drawdown))",
+            "(if (or (gt drawdown 0.05) (gt exposure_gross 1.5)) 0 (prob_gt (analog_outcome 2) 0.001))",
+        ];
+        for src in cases {
+            let e = parse(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            assert_eq!(e.to_string(), src);
+            assert_eq!(parse(&e.to_string()).unwrap(), e);
+            assert!(!e.is_bool());
+        }
+        // Bool where Num is expected and vice versa
+        assert!(matches!(parse("(gt 1 2)"), Err(ParseError::Type(_))), "a program must be Num");
+        assert!(matches!(parse("(add (gt 1 2) 1)"), Err(ParseError::Type(_))));
+        assert!(matches!(parse("(if 1 2 3)"), Err(ParseError::Type(_))));
+        assert!(matches!(parse("(and (gt 1 2) 1)"), Err(ParseError::Type(_))));
+        assert!(matches!(parse("(if_gt (gt 1 2) 0 1 2)"), Err(ParseError::Type(_))));
+        assert!(matches!(parse("(prob_gt stay_prob 0)"), Err(ParseError::Type(_))), "not a Prob");
+        assert!(matches!(parse("(prob_gt (fc_dist 2) (lt 1 2))"), Err(ParseError::Type(_))));
+        assert_eq!(parse("(clip 1 2)"), Err(ParseError::Arity { op: "clip".into(), expected: 3, got: 2 }));
     }
 
     #[test]

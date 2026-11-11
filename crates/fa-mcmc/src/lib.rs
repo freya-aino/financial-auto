@@ -263,6 +263,81 @@ impl MarkovGraph {
     }
 }
 
+/// Default `prune_min_edge`: an edge whose decayed count fell below 5 % of one observation
+/// is dropped (spec 33 §8 "prune edges below support").
+pub const DEFAULT_PRUNE_MIN_EDGE: f64 = 0.05;
+
+/// What [`MarkovGraph::prune`] removed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PruneReport {
+    /// Successor entries removed (decayed count below the threshold).
+    pub edges: usize,
+    /// Rows removed: empty after edge pruning, or of a retired source nothing points to any more.
+    pub rows: Vec<RegionKey>,
+    /// Rows that lost successors but stay (samplers with per-row caches rebuild them).
+    pub changed: Vec<RegionKey>,
+}
+
+impl PruneReport {
+    pub fn is_empty(&self) -> bool {
+        self.edges == 0 && self.rows.is_empty()
+    }
+}
+
+impl MarkovGraph {
+    /// Support-based pruning (spec 33 §8 graph growth). Removes every successor entry whose
+    /// decayed count is below `min_edge` (its probability falls back to the prior: for a live
+    /// successor the prior mass is still there, a retired one joins `unknown`); then removes
+    /// rows left without counts and rows of **retired** sources (not in the live support, when
+    /// a support is registered) that no remaining edge points to. Posteriors move by at most
+    /// `min_edge` pseudo-observations per edge. Rows stay bounded by the live regions plus the
+    /// retired ones still reachable, instead of growing with every region ever seen.
+    pub fn prune(&mut self, min_edge: f64) -> PruneReport {
+        let mut rep = PruneReport::default();
+        if min_edge <= 0.0 {
+            return rep;
+        }
+        let mut emptied = Vec::new();
+        for (from, row) in &mut self.rows {
+            let before = row.counts.len();
+            row.counts.retain(|_, c| *c >= min_edge);
+            let removed = before - row.counts.len();
+            if removed > 0 {
+                rep.edges += removed;
+                if row.counts.is_empty() {
+                    emptied.push(from.clone());
+                } else {
+                    rep.changed.push(from.clone());
+                }
+            }
+        }
+        for k in &emptied {
+            self.rows.remove(k);
+        }
+        rep.rows = emptied;
+        if !self.support.is_empty() {
+            // a self-loop does not keep a retired row alive
+            let reachable: BTreeSet<&RegionKey> =
+                self.rows.iter().flat_map(|(f, r)| r.counts.keys().filter(move |t| *t != f)).collect();
+            let orphans: Vec<RegionKey> =
+                self.rows.keys().filter(|k| !self.support.contains(*k) && !reachable.contains(k)).cloned().collect();
+            for k in orphans {
+                self.rows.remove(&k);
+                rep.changed.retain(|c| c != &k);
+                rep.rows.push(k);
+            }
+        }
+        rep.rows.sort();
+        rep.changed.sort();
+        rep
+    }
+
+    /// Number of successor entries with counts (graph size for the growth budget).
+    pub fn n_edges(&self) -> usize {
+        self.rows.values().map(|r| r.counts.len()).sum()
+    }
+}
+
 /// One carried region of a kernel transfer (spec 33 §6.6): the new region `new_id` inherits
 /// from the old region `old_id` with match score `score` in `[0, 1]` (the Jaccard overlap of
 /// `fa_patterns::RegionMatch`). Several new regions may inherit from one old region (a split);
@@ -651,6 +726,47 @@ pub fn log_score(g: &MarkovGraph, realised: &[(RegionKey, RegionKey)]) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prune_drops_faded_edges_and_unreachable_retired_rows() {
+        let mut g = MarkovGraph::new(1.0, 0.5);
+        for r in ["a", "b", "old"] {
+            g.register_region(r);
+        }
+        g.observe("old", "old");
+        g.observe("old", "a");
+        g.observe("a", "old");
+        g.observe("a", "b"); // a: old 0.5, b 1
+        for _ in 0..6 {
+            g.observe("a", "b"); // a: old 0.5^7 ≈ 0.008 → below 0.05
+        }
+        g.observe("b", "a");
+        g.retire_region("old");
+        let rep = g.prune(DEFAULT_PRUNE_MIN_EDGE);
+        assert_eq!(rep.edges, 1, "{rep:?}");
+        // `old` keeps only its self-loop and an edge to `a`; nothing points to it now
+        assert_eq!(rep.rows, vec!["old".to_owned()]);
+        assert_eq!(rep.changed, vec!["a".to_owned()]);
+        assert!(g.row("old").is_none() && g.row("a").is_some());
+        assert_eq!(g.n_edges(), 2);
+        // a faded edge to a live successor: the posterior barely moves (its prior slot stays)
+        let mut h = MarkovGraph::new(1.0, 0.5);
+        h.register_region("x");
+        h.register_region("y");
+        h.observe("x", "y");
+        for _ in 0..7 {
+            h.observe("x", "x");
+        }
+        let before = h.posterior_mean("x");
+        assert_eq!(h.prune(DEFAULT_PRUNE_MIN_EDGE).edges, 1);
+        let after = h.posterior_mean("x");
+        for ((k, p), (k2, q)) in before.iter().zip(&after) {
+            assert_eq!(k, k2);
+            assert!((p - q).abs() < 0.01, "{k}: {p} vs {q}");
+        }
+        assert!(g.prune(DEFAULT_PRUNE_MIN_EDGE).is_empty(), "idempotent");
+        assert!(g.prune(0.0).is_empty());
+    }
+
     use super::*;
 
     fn graph() -> MarkovGraph {

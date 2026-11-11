@@ -2,6 +2,7 @@
 	// Genome inspector (spec 51 §6.4): `GET /api/evolution/genomes/{id}` + `/outputs`
 	// (presigned eval reports open in a new tab; decoder outputs via QuantileStrip / Histogram).
 	import Histogram from './Histogram.svelte';
+	import LineageTree from './LineageTree.svelte';
 	import Modal from './Modal.svelte';
 	import QuantileStrip from './QuantileStrip.svelte';
 	import { ago, live, short, type GenomeDetail, type GenomeOutputs } from './api';
@@ -10,8 +11,10 @@
 	interface Props {
 		genomeId: string | null;
 		onclose: () => void;
+		/** Open another genome (lineage tree click); the drawer shows it in place. */
+		onopen?: (id: string) => void;
 	}
-	let { genomeId, onclose }: Props = $props();
+	let { genomeId, onclose, onopen }: Props = $props();
 
 	let detail = $state<GenomeDetail | null>(null);
 	let outputs = $state<GenomeOutputs | null>(null);
@@ -138,6 +141,7 @@
 			{/if}
 		</section>
 	{/if}
+	{#if genomeId && !busy}<LineageTree {genomeId} {onopen} />{/if}
 </Modal>
 
 <style>

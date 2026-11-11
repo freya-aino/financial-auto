@@ -57,6 +57,9 @@ func TestWriterFlushesAndCounts(t *testing.T) {
 	var got atomic.Int32
 	var fail atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" { // series-budget poll (budget.go)
+			return
+		}
 		if r.URL.Path != "/api/v1/import" {
 			t.Errorf("path %s", r.URL.Path)
 		}
@@ -168,6 +171,9 @@ func TestTradeVWAPAggregation(t *testing.T) {
 	var mu sync.Mutex
 	got := map[string][]sample{} // "<metric>|<src>" → samples
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" { // series-budget poll (budget.go)
+			return
+		}
 		b, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		defer mu.Unlock()

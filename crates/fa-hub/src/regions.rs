@@ -29,6 +29,7 @@ pub mod labels {
     pub const REGION_SET: &str = "RegionSet";
     pub const KERNEL_MODEL: &str = "KernelModel";
     pub const CROSS_PRIOR: &str = "CrossPrior";
+    pub const REGION_EPISODE: &str = "RegionEpisode";
     pub const DESCENDS_FROM: &str = "DescendsFrom";
     pub const HAS_REGION_SET: &str = "HasRegionSet";
     pub const HAS_KERNEL: &str = "HasKernel";
@@ -128,6 +129,30 @@ pub struct NewCrossPrior {
 impl NewCrossPrior {
     pub fn pair_id(&self) -> String {
         format!("{}:{}:{}", self.timescale, self.source_instrument_id, self.target_instrument_id)
+    }
+}
+
+/// One region episode (spec 30 §5): an instrument's stay in a region of one expert space, from
+/// the closed bar it entered (`t_enter_ms`) to the closed bar it left (`t_exit_ms`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewRegionEpisode {
+    pub region_id: String,
+    pub expert_space_id: String,
+    pub timescale: String,
+    pub instrument_id: String,
+    pub t_enter_ms: i64,
+    pub t_exit_ms: i64,
+    /// Closed bars spent in the region.
+    pub bars: u32,
+    /// Largest / mean soft-membership weight of the region during the stay.
+    pub max_weight: f64,
+    pub mean_weight: f64,
+}
+
+impl NewRegionEpisode {
+    /// `<region_id>:<instrument_id>:<t_enter_ms>` (idempotent upserts, e.g. on replay).
+    pub fn episode_id(&self) -> String {
+        format!("{}:{}:{}", self.region_id, self.instrument_id, self.t_enter_ms)
     }
 }
 
@@ -485,6 +510,74 @@ impl HubClient {
             .value_map(None);
         let mut resp = self.batch(&Batch::read().named("cross_priors").ret("rows", op)).await?;
         resp.take("rows")
+    }
+
+    /// `RegionEpisode` upserts by `episode_id`; one batch per row.
+    pub async fn upsert_region_episodes(&self, rows: &[NewRegionEpisode]) -> Result<()> {
+        for e in rows {
+            let props = vec![
+                ("region_id", s(&e.region_id)),
+                ("expert_space_id", s(&e.expert_space_id)),
+                ("timescale", s(&e.timescale)),
+                ("instrument_id", s(&e.instrument_id)),
+                ("t_enter", Input::Lit(Val::DateTime(e.t_enter_ms))),
+                ("t_exit", Input::Lit(Val::DateTime(e.t_exit_ms))),
+                ("bars", e.bars.into()),
+                ("max_weight", finite(e.max_weight).into()),
+                ("mean_weight", finite(e.mean_weight).into()),
+            ];
+            let b = node_upsert(
+                Batch::write().named("upsert_region_episode"),
+                labels::REGION_EPISODE,
+                "episode_id",
+                &e.episode_id(),
+                props,
+                None,
+            );
+            self.batch(&b.returning(Vec::<String>::new())).await?;
+        }
+        Ok(())
+    }
+
+    /// Episodes of a region, latest exit first (retrieval decoders, spec 34).
+    pub async fn region_episodes(&self, region_id: &str, limit: usize) -> Result<Vec<NodeRow>> {
+        let op = by_key(labels::REGION_EPISODE, "region_id", region_id)
+            .order_by("t_exit", true)
+            .limit(limit.max(1))
+            .value_map(None);
+        let mut resp = self.batch(&Batch::read().named("region_episodes").ret("rows", op)).await?;
+        resp.take("rows")
+    }
+
+    /// Drops the episodes of `timescale` that ended before `cutoff_ms` (spec 30 §10 q6: same
+    /// horizon as the observation latents); returns how many were dropped.
+    pub async fn prune_region_episodes(&self, timescale: &str, cutoff_ms: i64) -> Result<u64> {
+        #[derive(Deserialize)]
+        struct Id {
+            #[serde(rename = "$id")]
+            id: u64,
+        }
+        let mut dropped = 0u64;
+        loop {
+            let op = Op::nodes_with_label_where(
+                labels::REGION_EPISODE,
+                Pred::and([Pred::eq("timescale", timescale), Pred::lt("t_exit", Input::Lit(Val::DateTime(cutoff_ms)))]),
+            )
+            .limit(1_000)
+            .value_map(Some(&["$id"]));
+            let mut resp = self.batch(&Batch::read().named("prune_region_episodes_read").ret("rows", op)).await?;
+            let ids: Vec<u64> = resp.take::<Vec<Id>>("rows")?.into_iter().map(|r| r.id).collect();
+            if ids.is_empty() {
+                return Ok(dropped);
+            }
+            dropped += ids.len() as u64;
+            let n = ids.len();
+            let b = Batch::write().named("prune_region_episodes_drop").var("drop", Op::nodes(NodeRef::Ids(ids)).drop());
+            self.batch(&b).await?;
+            if n < 1_000 {
+                return Ok(dropped);
+            }
+        }
     }
 
     /// `Hier` edges out of every region of a snapshot.

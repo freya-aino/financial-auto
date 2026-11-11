@@ -15,4 +15,4 @@ First-wave connector: lemon.markets market data (quotes, trades, OHLC backfill).
 `lemon_test.go`: key handling (map and env), auth header, URL shape, quotes/trades mapping, unresolved ISIN, de-dup, paged OHLC backfill, API error surfacing.
 
 ## Governing specs
-- [10-ingestion](../../../specs/10-ingestion.md), [11-source-catalog](../../../specs/11-source-catalog.md)
+- [Ingestion reference (ex spec 10)](../../services/ingestor/README.md#ingestion-reference), [Source catalog reference (ex spec 11)](../../pkg/catalog/README.md#source-catalog-reference)

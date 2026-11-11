@@ -89,6 +89,8 @@ type Gap struct {
 	To             time.Time `json:"to"`
 	MissingPeriods int64     `json:"missing_periods"`
 	At             time.Time `json:"at"`
+	// Symbol is the venue symbol (JSON frames only; the gap filler uses it).
+	Symbol string `json:"symbol,omitempty"`
 }
 
 // UnresolvedEvent is one `ingest.unresolved.<source>` payload: either a
@@ -138,6 +140,9 @@ type Tracker struct {
 	Published struct{ Frames, Halts, Resumes int64 }
 	// JSON selects the legacy D-054 JSON payloads instead of fa.v1 protos.
 	JSON bool
+	// OnFrame, when set, sees every published frame (auto-disable). It runs
+	// under the tracker lock and must not call back into the tracker.
+	OnFrame func(f Frame, deliberate bool)
 }
 
 // NewTracker builds a tracker; pub may be nil (frames are still computed).
@@ -311,6 +316,9 @@ func (t *Tracker) Tick(ctx context.Context) {
 		t.Published.Frames++
 		down := f.Status == "down"
 		deliberate := !h.running && h.stopReason == "stopped by operator"
+		if t.OnFrame != nil {
+			t.OnFrame(f, deliberate)
+		}
 		switch {
 		case down && !deliberate && !h.halted:
 			h.halted = true
@@ -436,13 +444,14 @@ type GapDetector struct {
 	emit   func(Gap)
 	clock  func() time.Time
 
-	mu   sync.Mutex
-	last map[string]time.Time // inst|tf → last bar close
+	mu      sync.Mutex
+	last    map[string]time.Time // inst|tf → last bar close
+	symbols map[string]string    // inst → venue symbol (for gap fill)
 }
 
 // NewGapDetector seeds the detector with persisted watermarks (inst|tf → cursor).
 func NewGapDetector(source string, seed map[string]time.Time, emit func(Gap)) *GapDetector {
-	d := &GapDetector{source: source, emit: emit, clock: func() time.Time { return time.Now().UTC() }, last: map[string]time.Time{}}
+	d := &GapDetector{source: source, emit: emit, clock: func() time.Time { return time.Now().UTC() }, last: map[string]time.Time{}, symbols: map[string]string{}}
 	for k, v := range seed {
 		d.last[k] = v
 	}
@@ -485,6 +494,12 @@ func Period(tf string) (time.Duration, bool) {
 // Observe records a bar close and emits a Gap when it is more than one
 // period after the previous one. Bars arriving out of order are ignored.
 func (d *GapDetector) Observe(instrumentID, tf string, closeAt time.Time) {
+	d.ObserveSymbol(instrumentID, "", tf, closeAt)
+}
+
+// ObserveSymbol is Observe that also remembers the venue symbol of the
+// instrument, so emitted gaps can be filled (spec 10 §6.3).
+func (d *GapDetector) ObserveSymbol(instrumentID, symbol, tf string, closeAt time.Time) {
 	period, ok := Period(tf)
 	if !ok || instrumentID == "" {
 		return
@@ -492,6 +507,9 @@ func (d *GapDetector) Observe(instrumentID, tf string, closeAt time.Time) {
 	key := GapKey(instrumentID, tf)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if symbol != "" {
+		d.symbols[instrumentID] = symbol
+	}
 	prev, seen := d.last[key]
 	if seen && !closeAt.After(prev) {
 		return
@@ -503,7 +521,7 @@ func (d *GapDetector) Observe(instrumentID, tf string, closeAt time.Time) {
 	if delta := closeAt.Sub(prev); delta > period+period/2 {
 		missing := int64(delta/period) - 1
 		if d.emit != nil {
-			d.emit(Gap{Source: d.source, InstrumentID: instrumentID, Timeframe: tf, From: prev, To: closeAt, MissingPeriods: missing, At: d.clock()})
+			d.emit(Gap{Source: d.source, InstrumentID: instrumentID, Timeframe: tf, From: prev, To: closeAt, MissingPeriods: missing, At: d.clock(), Symbol: d.symbols[instrumentID]})
 		}
 	}
 }

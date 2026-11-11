@@ -84,7 +84,7 @@ const SHORT: usize = 5;
 impl EncoderInput {
     /// Builds the market block from bars (oldest first).
     pub fn from_bars(as_of_ms: i64, bars: &[MarketBar]) -> Self {
-        Self { as_of_ms, market: bars.iter().map(MarketBar::to_row).collect(), media: Vec::new() }
+        Self { as_of_ms, market: bars.iter().map(MarketBar::to_row).collect(), media: Vec::new(), instrument: None }
     }
 }
 
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn rejects_malformed_rows() {
         let enc = StatisticalEncoder::new(Timescale::Day);
-        let bad = EncoderInput { as_of_ms: 0, market: vec![vec![1.0, 2.0]], media: vec![] };
+        let bad = EncoderInput { as_of_ms: 0, market: vec![vec![1.0, 2.0]], media: vec![], instrument: None };
         assert!(matches!(enc.encode(&bad), Err(EncoderError::Shape(_))));
     }
 }

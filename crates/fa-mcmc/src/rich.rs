@@ -105,6 +105,16 @@ macro_rules! base_impl {
     };
 }
 
+/// Prunes decayed context rows (keys `<prev|asset>\u{1f}<from>`) alongside the shared evidence:
+/// entries below `min_edge`, rows left empty and rows whose `from` row was removed.
+fn prune_ctx_rows(rows: &mut HashMap<String, BTreeMap<RegionKey, f64>>, min_edge: f64, removed: &[RegionKey]) {
+    rows.retain(|key, row| {
+        row.retain(|_, c| *c >= min_edge);
+        let from = key.rsplit('\u{1f}').next().unwrap_or(key);
+        !row.is_empty() && !removed.iter().any(|r| r == from)
+    });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Higher order
 
@@ -151,6 +161,11 @@ impl KernelSampler for SecondOrder {
         "second_order"
     }
     base_impl!();
+    fn prune(&mut self, min_edge: f64) -> crate::PruneReport {
+        let rep = self.base.prune(min_edge);
+        prune_ctx_rows(&mut self.rows, min_edge, &rep.rows);
+        rep
+    }
     fn replace_graph(&mut self, g: MarkovGraph) {
         self.base = g;
         self.rows.clear();
@@ -258,6 +273,13 @@ impl KernelSampler for SemiMarkov {
     fn replace_graph(&mut self, g: MarkovGraph) {
         self.base = g;
         self.hazard.clear();
+    }
+    fn prune(&mut self, min_edge: f64) -> crate::PruneReport {
+        let rep = self.base.prune(min_edge);
+        for k in &rep.rows {
+            self.hazard.remove(k);
+        }
+        rep
     }
     fn observe_ctx(&mut self, from: &str, to: &str, ctx: &KernelCtx) {
         self.base.observe(from, to);
@@ -394,6 +416,14 @@ impl KernelSampler for HierAsset {
         self.assets.clear();
         self.beta.clear();
     }
+    fn prune(&mut self, min_edge: f64) -> crate::PruneReport {
+        let rep = self.base.prune(min_edge);
+        prune_ctx_rows(&mut self.assets, min_edge, &rep.rows);
+        for k in &rep.rows {
+            self.beta.remove(k);
+        }
+        rep
+    }
     fn observe_ctx(&mut self, from: &str, to: &str, ctx: &KernelCtx) {
         self.base.observe(from, to);
         if !ctx.instrument.is_empty() {
@@ -523,6 +553,13 @@ impl KernelSampler for LogitCov {
         "logit_cov"
     }
     base_impl!();
+    fn prune(&mut self, min_edge: f64) -> crate::PruneReport {
+        let rep = self.base.prune(min_edge);
+        for k in &rep.rows {
+            self.rows.remove(k);
+        }
+        rep
+    }
     fn replace_graph(&mut self, g: MarkovGraph) {
         self.base = g;
         self.rows.clear();

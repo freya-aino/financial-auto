@@ -122,16 +122,26 @@ pub fn pareto_ranks(objs: &[Vec<f64>]) -> Vec<usize> {
     rank
 }
 
+/// Smallest family score of an elite: a reconstruction decoder that kept its baseline start
+/// (early stopping at step 0) scores ±1e-7 from float noise, which must not count as beating
+/// the naive baseline.
+pub const MIN_ELITE_SCORE: f64 = 1e-3;
+
 /// Top-`k` cards per output family: Pareto rank over [`OBJECTIVE_DIRECTIONS`] within the family,
 /// then family score (`crps_skill` / `recon_skill`), newest first on ties. Only decoders that beat
-/// their naive baseline (`score > 0`) and use the current latent normaliser
+/// their naive baseline (`score >` [`MIN_ELITE_SCORE`]) and whose latest re-evaluation (if any)
+/// still does (`transfer_factor > 0`) and use the current latent normaliser
 /// ([`super::NORM_VERSION`]) qualify; with `latent_dim`, only latent-conditioned decoders whose
 /// **full** (pre-mask) latent has exactly that dimension and that read the step's own instrument
 /// (no cross-asset `src`), as the feedback path needs. Result is grouped by family.
 pub fn select_top_k(cards: &[EliteCard], k: usize, latent_dim: Option<usize>) -> Vec<EliteCard> {
     let mut by_family: BTreeMap<&str, Vec<&EliteCard>> = BTreeMap::new();
     for c in cards {
-        if !(c.meta.score.is_finite() && c.meta.score > 0.0) || !c.meta.is_current() {
+        if !(c.meta.score.is_finite() && c.meta.score > MIN_ELITE_SCORE) || !c.meta.is_current() {
+            continue;
+        }
+        // failed transfer: the re-evaluated decoder no longer beats its naive baseline
+        if c.meta.transfer_factor() <= 0.0 {
             continue;
         }
         if let Some(d) = latent_dim
@@ -174,8 +184,11 @@ pub fn stale_cards(cards: &[EliteCard]) -> Vec<EliteCard> {
     v
 }
 
-/// Feedback weights `w_d` ∝ family quota × rank (§6.6): every family present gets an equal share,
-/// split inside the family by `1/(1 + position)` (best first, as ordered by [`select_top_k`]).
+/// Feedback weights `w_d` ∝ family quota × rank × transfer (§6.6, §8): every family present gets
+/// an equal share, split inside the family by `1/(1 + position)` (best first, as ordered by
+/// [`select_top_k`]); each weight is then multiplied by the decoder's
+/// [`BundleMeta::transfer_factor`] (re-evaluated elites that lost skill on later data / a new
+/// snapshot decay) and the set renormalised to Σ w = 1 (undecayed when every factor is 0).
 pub fn quota_weights(elites: &[EliteCard]) -> Vec<(EliteCard, f64)> {
     let mut by_family: BTreeMap<String, Vec<&EliteCard>> = BTreeMap::new();
     for c in elites {
@@ -187,6 +200,55 @@ pub fn quota_weights(elites: &[EliteCard]) -> Vec<(EliteCard, f64)> {
         let raw: Vec<f64> = (0..fam.len()).map(|i| 1.0 / (1.0 + i as f64)).collect();
         let s: f64 = raw.iter().sum();
         out.extend(fam.into_iter().zip(raw).map(|(c, r)| (c.clone(), r / s / nf)));
+    }
+    let decayed: Vec<f64> = out.iter().map(|(c, w)| w * c.meta.transfer_factor()).collect();
+    let total: f64 = decayed.iter().sum();
+    if total > 0.0 {
+        for ((_, w), d) in out.iter_mut().zip(decayed) {
+            *w = d / total;
+        }
+    }
+    out
+}
+
+/// The elites to re-evaluate: [`select_top_k`] (`k` per family, no latent filter) as if no
+/// re-evaluation had happened yet (a decayed elite can recover), returned as the stored cards.
+pub fn reeval_candidates(cards: &[EliteCard], k: usize) -> Vec<EliteCard> {
+    let base: Vec<EliteCard> = cards
+        .iter()
+        .cloned()
+        .map(|mut c| {
+            c.meta.transfer.clear();
+            c
+        })
+        .collect();
+    select_top_k(&base, k, None)
+        .into_iter()
+        .filter_map(|p| cards.iter().find(|c| c.key == p.key).cloned())
+        .collect()
+}
+
+/// Spec 36 §6.4 item 5 over the cards: how many elites (as [`select_top_k`] picks them, `k` per
+/// family, ignoring transfer) were re-evaluated on `snapshot_id`, and how many lost at most `tol`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct TransferCheck {
+    pub elites: usize,
+    pub evaluated: usize,
+    pub passed: usize,
+    /// Smallest ratio among the evaluated (NaN when none).
+    pub worst_ratio: f64,
+}
+
+pub fn transfer_check(cards: &[EliteCard], k: usize, snapshot_id: &str, tol: f64) -> TransferCheck {
+    let picked = reeval_candidates(cards, k);
+    let mut out = TransferCheck { elites: picked.len(), worst_ratio: f64::NAN, ..Default::default() };
+    for c in &picked {
+        let Some(t) = c.meta.transfer.iter().rev().find(|t| t.snapshot_id == snapshot_id) else { continue };
+        out.evaluated += 1;
+        if t.ratio >= 1.0 - tol {
+            out.passed += 1;
+        }
+        out.worst_ratio = if out.worst_ratio.is_nan() { t.ratio } else { out.worst_ratio.min(t.ratio) };
     }
     out
 }
@@ -373,7 +435,14 @@ impl FeedbackSet {
                 BaselineFamily::NnChart | BaselineFamily::NnFuture => {
                     net::raster_ce(&net::raster_logp(&raw, g.nn.res)?, &p.target, g.nn.res)?
                 }
-                BaselineFamily::NnNews | BaselineFamily::NnNarrative => net::cosine_loss(&raw, &p.target)?,
+                BaselineFamily::NnNews | BaselineFamily::NnNarrative | BaselineFamily::NnFrame => {
+                    net::cosine_loss(&raw, &p.target)?
+                }
+                BaselineFamily::NnSummary => net::slots_ce(
+                    &net::slots_logp(&raw, &crate::summary::slot_sizes())?,
+                    &p.target,
+                    crate::summary::SLOTS.len(),
+                )?,
                 BaselineFamily::NnRetrieval => {
                     // in-batch analogs, same leakage gap as training
                     let gap_ms = (g.min_gap.max(g.horizon) as i64) * d.meta.step_ms;

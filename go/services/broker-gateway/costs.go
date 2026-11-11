@@ -45,7 +45,8 @@ type ClassCosts struct {
 	SpreadBps float64 `yaml:"spread_bps" json:"spread_bps"`
 	// Overrides `default_k` when set.
 	ImpactK *float64 `yaml:"impact_k" json:"impact_k,omitempty"`
-	// Placeholders (spec 41 §6.3): carried in the model, not yet charged per fill.
+	// Carry per day of the held notional (spec 41 §6.3): funding on any open position, borrow
+	// on shorts; charged by the paper venue per carry period (carry.go) and by the backtest.
 	FundingBpsDay float64 `yaml:"funding_bps_day" json:"funding_bps_day"`
 	BorrowBpsDay  float64 `yaml:"borrow_bps_day" json:"borrow_bps_day"`
 }

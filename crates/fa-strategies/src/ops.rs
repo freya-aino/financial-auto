@@ -1,14 +1,16 @@
 //! GP variation operators (spec 35 §6.3): subtree crossover, point / subtree / hoist mutation
 //! and constant jitter over the typed DSL, plus the spec-gene mutations of a
-//! [`StrategyGenome`] (horizon, lookback). All operators are type-safe by construction — every
-//! `Expr` node is `Num`-typed and literal arguments are jittered inside their own domains — so
-//! the result always parses back through `sexpr`. Deterministic in the `Rng`.
+//! [`StrategyGenome`] (horizon, lookback, asset set). All operators are type-safe by
+//! construction (strongly-typed GP): a subtree is only exchanged or regrown with one of the same
+//! type (`Num` or `Bool`), a point mutation keeps the node's signature, a hoist keeps the root
+//! `Num`, and literal arguments are jittered inside their own domains — so the result always
+//! parses back through `sexpr`. Deterministic in the `Rng`.
 
 use fa_core::rng::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DecoderOp, Expr, GraphOp,
+    CmpOp, DecoderOp, Expr, GraphOp, ProbSrc,
     genome::StrategyGenome,
     random::{self, LEVELS, RandomSpec, round_sig},
 };
@@ -20,8 +22,10 @@ pub fn children(e: &Expr) -> Vec<&Expr> {
     use Expr::*;
     match e {
         Const(_) | Graph(_) | Decoder(_) | Portfolio(_) => vec![],
-        Neg(a) | Tanh(a) => vec![a],
-        Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Min(a, b) | Max(a, b) => vec![a, b],
+        Neg(a) | Tanh(a) | Not(a) | ProbGt(_, a) => vec![a],
+        Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Min(a, b) | Max(a, b) | Cmp(_, a, b) | And(a, b)
+        | Or(a, b) => vec![a, b],
+        Clip(a, b, c) | If(a, b, c) => vec![a, b, c],
         IfGt(a, b, c, d) => vec![a, b, c, d],
     }
 }
@@ -42,6 +46,13 @@ pub fn rebuild(e: &Expr, kids: Vec<Expr>) -> Expr {
         Min(..) => Min(n(), n()),
         Max(..) => Max(n(), n()),
         IfGt(..) => IfGt(n(), n(), n(), n()),
+        Clip(..) => Clip(n(), n(), n()),
+        If(..) => If(n(), n(), n()),
+        ProbGt(src, _) => ProbGt(*src, n()),
+        Cmp(op, ..) => Cmp(*op, n(), n()),
+        And(..) => And(n(), n()),
+        Or(..) => Or(n(), n()),
+        Not(_) => Not(n()),
     }
 }
 
@@ -151,12 +162,23 @@ impl OpKind {
     }
 }
 
-/// Subtree crossover: a random subtree of `a` is replaced by a random subtree of `b`, retrying
-/// a few times when the child would exceed `max_nodes`; falls back to `a`.
+/// Pre-order indices of the subtrees of `e` with the given type (`Bool` when `bool`).
+pub fn typed_indices(e: &Expr, bool: bool) -> Vec<usize> {
+    (0..e.size()).filter(|&i| subtree(e, i).is_some_and(|n| n.is_bool() == bool)).collect()
+}
+
+/// Subtree crossover: a random subtree of `a` is replaced by a random subtree of `b` of the
+/// same type, retrying a few times when the child would exceed `max_nodes` (or `b` has no
+/// subtree of that type); falls back to `a`.
 pub fn subtree_crossover(a: &Expr, b: &Expr, rng: &mut Rng, max_nodes: usize) -> Expr {
     for _ in 0..8 {
         let i = rng.below(a.size());
-        let j = rng.below(b.size());
+        let want_bool = subtree(a, i).expect("index in range").is_bool();
+        let donors = typed_indices(b, want_bool);
+        if donors.is_empty() {
+            continue;
+        }
+        let j = donors[rng.below(donors.len())];
         let donor = subtree(b, j).expect("index in range").clone();
         let child = replace(a, i, donor);
         if child.size() <= max_nodes.max(1) {
@@ -166,31 +188,73 @@ pub fn subtree_crossover(a: &Expr, b: &Expr, rng: &mut Rng, max_nodes: usize) ->
     a.clone()
 }
 
-/// Point mutation: one node is swapped for a random node of the same arity (terminal →
-/// terminal, function → function with the same children).
+/// A node with the same signature (child types and result type) as `node` over `kids`.
+fn swap_function(rng: &mut Rng, node: &Expr, kids: Vec<Expr>) -> Expr {
+    use Expr::*;
+    let mut it = kids.into_iter();
+    let mut n = || Box::new(it.next().expect("arity"));
+    match node {
+        Add(..) | Sub(..) | Mul(..) | Div(..) | Min(..) | Max(..) => {
+            let (a, b) = (n(), n());
+            random::binary_num(rng, a, b)
+        }
+        Neg(_) | Tanh(_) => {
+            if rng.uniform() < 0.5 {
+                Neg(n())
+            } else {
+                Tanh(n())
+            }
+        }
+        Cmp(..) => Cmp(if rng.uniform() < 0.5 { CmpOp::Gt } else { CmpOp::Lt }, n(), n()),
+        And(..) | Or(..) => {
+            if rng.uniform() < 0.5 {
+                And(n(), n())
+            } else {
+                Or(n(), n())
+            }
+        }
+        ProbGt(src, _) => {
+            let k = match src {
+                ProbSrc::Fc(k) | ProbSrc::Analog(k) => *k,
+            };
+            ProbGt(if rng.uniform() < 0.5 { ProbSrc::Fc(k) } else { ProbSrc::Analog(k) }, n())
+        }
+        // unique signatures: IfGt (4 Num), Clip (3 Num), If (Bool, Num, Num), Not (Bool)
+        other => rebuild(other, it.by_ref().collect()),
+    }
+}
+
+/// Point mutation: one node is swapped for a random node of the same signature (terminal →
+/// terminal, function → function with the same child and result types).
 pub fn point_mutation(e: &Expr, rng: &mut Rng, spec: &RandomSpec) -> Expr {
     let i = rng.below(e.size());
     let node = subtree(e, i).expect("index in range");
     let kids: Vec<Expr> = children(node).into_iter().cloned().collect();
-    let new = if kids.is_empty() { random::random_terminal(rng, spec) } else { random::random_function(rng, kids) };
+    let new = if kids.is_empty() { random::random_terminal(rng, spec) } else { swap_function(rng, node, kids) };
     replace(e, i, new)
 }
 
-/// Subtree mutation: a random subtree is replaced by a fresh random tree (depth ≤ 3), within
-/// `max_nodes`.
+/// Subtree mutation: a random subtree is replaced by a fresh random tree of the same type
+/// (depth ≤ 3), within `max_nodes`.
 pub fn subtree_mutation(e: &Expr, rng: &mut Rng, spec: &RandomSpec) -> Expr {
     let i = rng.below(e.size());
-    let fresh = random::random_expr(rng, 3.min(spec.max_depth.max(1)), spec);
+    let depth = 3.min(spec.max_depth.max(1));
+    let fresh = if subtree(e, i).expect("index in range").is_bool() {
+        random::random_bool(rng, depth, spec)
+    } else {
+        random::random_expr(rng, depth, spec)
+    };
     let child = replace(e, i, fresh);
     if child.size() <= spec.max_nodes.max(1) { child } else { e.clone() }
 }
 
-/// Hoist (shrink) mutation: the tree becomes one of its own subtrees.
+/// Hoist (shrink) mutation: the tree becomes one of its own `Num` subtrees.
 pub fn hoist_mutation(e: &Expr, rng: &mut Rng) -> Expr {
-    if e.size() <= 1 {
+    let nums: Vec<usize> = typed_indices(e, false).into_iter().filter(|&i| i > 0).collect();
+    if nums.is_empty() {
         return e.clone();
     }
-    let i = 1 + rng.below(e.size() - 1);
+    let i = nums[rng.below(nums.len())];
     subtree(e, i).expect("index in range").clone()
 }
 
@@ -230,6 +294,13 @@ pub fn constant_jitter(e: &Expr, rng: &mut Rng, sigma: f64) -> Expr {
         }
         Expr::Decoder(DecoderOp::FcDist(k)) => Expr::Decoder(DecoderOp::FcDist(step(rng, *k))),
         Expr::Decoder(DecoderOp::AnalogOutcome(k)) => Expr::Decoder(DecoderOp::AnalogOutcome(step(rng, *k))),
+        Expr::ProbGt(src, _) => {
+            let src = match src {
+                ProbSrc::Fc(k) => ProbSrc::Fc(step(rng, *k)),
+                ProbSrc::Analog(k) => ProbSrc::Analog(step(rng, *k)),
+            };
+            Expr::ProbGt(src, Box::new(kids.into_iter().next().expect("arity")))
+        }
         other if kids.is_empty() => other.clone(),
         other => rebuild(other, kids),
     }

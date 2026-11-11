@@ -24,7 +24,9 @@ const pages = {
 	decoders: () => import('../routes/evolution/decoders/+page.svelte'),
 	pipeline: () => import('../routes/trading/pipeline/+page.svelte'),
 	risk: () => import('../routes/trading/risk/+page.svelte'),
-	ledger: () => import('../routes/trading/ledger/+page.svelte')
+	ledger: () => import('../routes/trading/ledger/+page.svelte'),
+	history: () => import('../routes/history/+page.svelte'),
+	validation: () => import('../routes/trading/validation/+page.svelte')
 };
 
 describe('views render at their empty state', () => {
@@ -87,5 +89,26 @@ describe('panels render with live-shaped props', () => {
 		});
 		expect(body).toContain('E0');
 		expect(body).toContain('1.00');
+	});
+
+	it('PointCloud renders its canvas and HUD for a 3-D cloud', async () => {
+		const { default: C } = await import('./PointCloud.svelte');
+		const { normalise, categorical } = await import('./pointcloud');
+		const cloud = normalise([[0, 0, 0], [1, 1, 1]], 3);
+		const { body } = ssr(C, { cloud, coloring: categorical(['a', 'b'], new Map([['a', '#111111']])), describe: (i: number) => `p${i}` });
+		expect(body).toContain('<canvas');
+		expect(body).toContain('2 pts');
+		expect(body).toContain('orbit');
+	});
+
+	it('Projection, LineageTree, Services and BusTap render at their initial state', async () => {
+		const P = (await import('./Projection.svelte')).default;
+		expect(ssr(P, { snapshot: 's', experts: [0, 1], states: [] }).body).toContain('3-D');
+		const L = (await import('./LineageTree.svelte')).default;
+		expect(ssr(L, { genomeId: 'g1' }).body).toContain('Lineage');
+		const S = (await import('./Services.svelte')).default;
+		expect(ssr(S).body).toContain('control off');
+		const B = (await import('./BusTap.svelte')).default;
+		expect(ssr(B).body).toContain('msg/s per subject');
 	});
 });

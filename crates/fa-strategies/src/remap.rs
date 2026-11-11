@@ -197,35 +197,9 @@ pub fn map_regions(e: &Expr, f: &mut impl FnMut(RegionRef) -> RegionRef) -> Expr
             other => other,
         }),
         Const(_) | Decoder(_) | Portfolio(_) => e.clone(),
-        Add(a, b) => {
-            let a = m(a);
-            Add(a, m(b))
-        }
-        Sub(a, b) => {
-            let a = m(a);
-            Sub(a, m(b))
-        }
-        Mul(a, b) => {
-            let a = m(a);
-            Mul(a, m(b))
-        }
-        Div(a, b) => {
-            let a = m(a);
-            Div(a, m(b))
-        }
-        Min(a, b) => {
-            let a = m(a);
-            Min(a, m(b))
-        }
-        Max(a, b) => {
-            let a = m(a);
-            Max(a, m(b))
-        }
-        Neg(a) => Neg(m(a)),
-        Tanh(a) => Tanh(m(a)),
-        IfGt(a, b, c, d) => {
-            let (a, b, c) = (m(a), m(b), m(c));
-            IfGt(a, b, c, m(d))
+        other => {
+            let kids: Vec<Expr> = crate::ops::children(other).into_iter().map(|c| *m(c)).collect();
+            crate::ops::rebuild(other, kids)
         }
     }
 }
@@ -417,6 +391,8 @@ mod tests {
             signal: signal.into(),
             uncertainty: "region_entropy".into(),
             snapshot: snapshot.map(Into::into),
+            assets: Vec::new(),
+            policy: None,
         }
     }
 

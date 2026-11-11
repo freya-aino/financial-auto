@@ -3,6 +3,7 @@
 //! run and is deleted at the end.
 use chrono::{Duration, NaiveDate, TimeZone, Utc};
 use fa_warehouse::{
+    adjusted,
     asof::{self, Resolved},
     calendar::{self, CalendarRule, SessionState},
     corpactions::{self, AdjustMode, BarPoint, NewCorporateAction},
@@ -44,6 +45,7 @@ async fn fixture(pool: &PgPool) -> Fixture {
 
 async fn cleanup(pool: &PgPool, f: &Fixture) {
     for q in [
+        "DELETE FROM wh.adjusted_bar_1d WHERE instrument_id IN ($1, $2)",
         "DELETE FROM ref.corporate_action WHERE instrument_id IN ($1, $2)",
         "DELETE FROM ref.contract_spec WHERE instrument_id IN ($1, $2)",
         "DELETE FROM ref.identifier WHERE instrument_id IN ($1, $2)",
@@ -83,13 +85,15 @@ async fn as_of_listing_symbol_change_and_ticker_recycling() {
     assert!(acts.iter().any(|a| a.kind == "symbol_change" && a.new_symbol.as_deref() == Some("NEW")));
 
     // OLD is recycled for another instrument from 2026-03-20 (spec 12 §8)
-    sqlx::query("INSERT INTO ref.listing (instrument_id, venue_id, venue_symbol, valid_from) VALUES ($1, $2, 'OLD', $3)")
-        .bind(f.other)
-        .bind(f.venue)
-        .bind(t(20))
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO ref.listing (instrument_id, venue_id, venue_symbol, valid_from) VALUES ($1, $2, 'OLD', $3)",
+    )
+    .bind(f.other)
+    .bind(f.venue)
+    .bind(t(20))
+    .execute(&pool)
+    .await
+    .unwrap();
     assert_eq!(asof::resolve(&pool, &f.tag, "OLD", t(9), None).await.unwrap().one(), Some(f.inst));
     assert_eq!(asof::resolve(&pool, &f.tag, "OLD", t(21), None).await.unwrap().one(), Some(f.other));
     // a change onto a symbol another instrument holds is refused
@@ -97,13 +101,15 @@ async fn as_of_listing_symbol_change_and_ticker_recycling() {
     assert!(err.to_string().starts_with("invalid:"), "{err}");
 
     // an overlapping second listing makes the mapping ambiguous, never silently picked
-    sqlx::query("INSERT INTO ref.listing (instrument_id, venue_id, venue_symbol, valid_from) VALUES ($1, $2, 'NEW', $3)")
-        .bind(f.other)
-        .bind(f.venue)
-        .bind(t(12))
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO ref.listing (instrument_id, venue_id, venue_symbol, valid_from) VALUES ($1, $2, 'NEW', $3)",
+    )
+    .bind(f.other)
+    .bind(f.venue)
+    .bind(t(12))
+    .execute(&pool)
+    .await
+    .unwrap();
     assert!(matches!(asof::resolve(&pool, &f.tag, "NEW", t(13), None).await.unwrap(), Resolved::Ambiguous { .. }));
 
     // instrument view as of a time
@@ -161,7 +167,11 @@ async fn corporate_actions_contract_specs_and_identifiers() {
         ..Default::default()
     };
     assert!(asof::upsert_contract_spec(&pool, &spec).await.unwrap());
-    let v2 = asof::NewContractSpec { tick_size: Some(0.005), valid_from: Some(Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap()), ..spec };
+    let v2 = asof::NewContractSpec {
+        tick_size: Some(0.005),
+        valid_from: Some(Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap()),
+        ..spec
+    };
     assert!(asof::upsert_contract_spec(&pool, &v2).await.unwrap());
     let at = |m| Utc.with_ymd_and_hms(2026, m, 15, 0, 0, 0).unwrap();
     let s1 = asof::contract_specs(&pool, f.inst, Some(&f.tag), at(3), None).await.unwrap();
@@ -173,7 +183,10 @@ async fn corporate_actions_contract_specs_and_identifiers() {
     let isin = format!("XX{}", &f.tag[1..]);
     assert!(asof::add_identifier(&pool, f.inst, "isin", &isin, None).await.unwrap());
     assert!(!asof::add_identifier(&pool, f.other, "isin", &isin, None).await.unwrap());
-    assert_eq!(asof::resolve_identifier(&pool, "isin", &isin, Utc::now() + Duration::seconds(1), None).await.unwrap().one(), Some(f.inst));
+    assert_eq!(
+        asof::resolve_identifier(&pool, "isin", &isin, Utc::now() + Duration::seconds(1), None).await.unwrap().one(),
+        Some(f.inst)
+    );
 
     // EUR converts to itself
     assert_eq!(asof::fx_to_eur(&pool, "EUR", Utc::now(), None).await.unwrap().unwrap().0, 1.0);
@@ -187,7 +200,11 @@ async fn calendar_materialize_and_session_state() {
     let from = NaiveDate::from_ymd_opt(2026, 12, 21).unwrap();
     let to = NaiveDate::from_ymd_opt(2026, 12, 27).unwrap();
     assert_eq!(calendar::materialize(&pool, &f.tag, CalendarRule::Us, from, to).await.unwrap(), 7);
-    assert_eq!(calendar::materialize(&pool, &f.tag, CalendarRule::Us, from, to).await.unwrap(), 7, "re-run updates in place");
+    assert_eq!(
+        calendar::materialize(&pool, &f.tag, CalendarRule::Us, from, to).await.unwrap(),
+        0,
+        "re-run leaves unchanged sessions (and their recorded_at) alone"
+    );
     let at = |d, h| Utc.with_ymd_and_hms(2026, 12, d, h, 0, 0).unwrap();
     let open = calendar::session_state_at(&pool, &f.tag, at(22, 15)).await.unwrap();
     assert_eq!((open.state, open.basis), (SessionState::Open, "table"));
@@ -199,5 +216,67 @@ async fn calendar_materialize_and_session_state() {
     assert_eq!((missing.state, missing.basis), (SessionState::Closed, "missing_calendar"));
     // seeded crypto venue is 24/7
     assert_eq!(calendar::session_state_at(&pool, "crypto", at(25, 3)).await.unwrap().state, SessionState::AlwaysOpen);
+    cleanup(&pool, &f).await;
+}
+
+#[tokio::test]
+async fn calendar_refresh_is_idempotent() {
+    let Some(pool) = pool().await else { return };
+    let today = Utc::now().date_naive();
+    let first = calendar::refresh(&pool, today, 30).await.unwrap();
+    assert!(first.iter().any(|v| v.venue == "xnys"), "seeded US venue refreshed: {first:?}");
+    assert!(first.iter().all(|v| v.rule != CalendarRule::AlwaysOpen), "24/7 venues need no rows");
+    let again = calendar::refresh(&pool, today, 30).await.unwrap();
+    assert!(again.iter().all(|v| v.rows == 0), "unchanged sessions are not rewritten: {again:?}");
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM ref.calendar_session s JOIN ref.venue v ON v.id = s.venue_id \
+         WHERE v.code = 'xnys' AND s.date BETWEEN $1 AND $2",
+    )
+    .bind(today)
+    .bind(today + Duration::days(30))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(n, 31);
+}
+
+#[tokio::test]
+async fn adjusted_daily_materialisation_follows_actions() {
+    let Some(pool) = pool().await else { return };
+    let f = fixture(&pool).await;
+    let day = |d| Utc.with_ymd_and_hms(2026, 3, d, 0, 0, 0).unwrap();
+    let raw: Vec<BarPoint> = [(2, 400.0), (3, 404.0), (4, 101.5), (5, 102.0)]
+        .iter()
+        .map(|&(d, c)| BarPoint { ts: day(d), open: c, high: c, low: c, close: c, volume: 10.0 })
+        .collect();
+    // no actions yet: the instrument is not a materialisation candidate
+    assert!(!adjusted::instruments_with_actions(&pool).await.unwrap().contains(&f.inst));
+    let split = NewCorporateAction {
+        instrument_id: f.inst,
+        kind: "split".into(),
+        ex_date: NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(),
+        ratio: Some(4.0),
+        ..Default::default()
+    };
+    let (id, _) = corpactions::record(&pool, &split).await.unwrap();
+    let raw_x = raw.clone();
+    let rep = adjusted::refresh(&pool, |inst| {
+        let raw = raw_x.clone();
+        async move { Ok(if inst == f.inst { raw } else { Vec::new() }) }
+    })
+    .await
+    .unwrap();
+    assert!(rep.series >= 2 && rep.errors.is_empty(), "{rep:?}");
+    let (from, to) = (NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(), NaiveDate::from_ymd_opt(2026, 3, 31).unwrap());
+    let rows = adjusted::read_daily(&pool, f.inst, AdjustMode::SplitsOnly, from, to).await.unwrap();
+    assert_eq!(rows.iter().map(|r| r.close).collect::<Vec<_>>(), vec![100.0, 101.0, 101.5, 102.0]);
+    assert_eq!((rows[0].raw_close, rows[0].factor), (400.0, 0.25));
+    let d1 = adjusted::stored_digest(&pool, f.inst, AdjustMode::SplitsOnly).await.unwrap().unwrap();
+    // cancelling the split changes the digest; a refresh brings the series back to raw
+    assert!(corpactions::cancel(&pool, id).await.unwrap());
+    adjusted::materialize_daily(&pool, f.inst, AdjustMode::SplitsOnly, &raw).await.unwrap();
+    let rows = adjusted::read_daily(&pool, f.inst, AdjustMode::SplitsOnly, from, to).await.unwrap();
+    assert_eq!(rows[0].close, 400.0);
+    assert_ne!(adjusted::stored_digest(&pool, f.inst, AdjustMode::SplitsOnly).await.unwrap().unwrap(), d1);
     cleanup(&pool, &f).await;
 }

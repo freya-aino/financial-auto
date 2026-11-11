@@ -5,6 +5,7 @@
 //! breakdown (realised / unrealised / FX / fees / funding / borrow) per book and per strategy
 //! from the event stream; [`statement`] builds book statements; `pg_accounting` adds the
 //! Postgres reads, the lot cache, orphan fills and payout booking to [`pg::PgLedger`].
+//! [`tax`] builds the jurisdiction-neutral realised-gains report (per tax year, per instrument).
 
 pub mod accounting;
 pub mod money;
@@ -14,6 +15,7 @@ pub mod pg_accounting;
 pub mod restate;
 pub mod settlement;
 pub mod statement;
+pub mod tax;
 
 pub use accounting::{BookPosition, BookState, LotMethod, Marks, PnlBreakdown};
 pub use money::{Decimal, dec};

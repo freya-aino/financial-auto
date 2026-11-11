@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="de">
+<title>Atom Wire</title>
+<entry><title>Erster</title><id>urn:x:1</id><link rel="alternate" href="https://example.org/1"/><published>2026-11-10T12:00:00+01:00</published></entry>
+<entry><title>Zweiter</title><id>urn:x:2</id><link href="https://example.org/2"/><updated>2026-11-10T13:00:00Z</updated></entry>
+</feed>

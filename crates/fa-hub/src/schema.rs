@@ -13,6 +13,8 @@ pub mod node {
     pub const INSTRUMENT: &str = "Instrument";
     pub const ENTITY: &str = "Entity";
     pub const VENUE: &str = "Venue";
+    /// Sector of an issuer (`ref.entity.sector`, spec 12 §5 `IN_SECTOR`).
+    pub const SECTOR: &str = "Sector";
     pub const SNAPSHOT: &str = "Snapshot";
     /// Online-adapter version of a snapshot (spec 36 §5 `AdapterState`): written by the
     /// trainer's `adapter` job next to the Garage artifact.
@@ -37,6 +39,8 @@ pub mod edge {
     pub const ISSUED_BY: &str = "IssuedBy";
     pub const LISTED_ON: &str = "ListedOn";
     pub const SAME_EXPOSURE: &str = "SameExposure";
+    /// Entity → Sector (spec 12 §5 `IN_SECTOR`).
+    pub const IN_SECTOR: &str = "InSector";
     pub const HAS_SPACE: &str = "HasSpace";
     /// Snapshot lineage (spec 36 §5): parent snapshot → child snapshot, `op` = the job kind that
     /// produced the child (`pretrain | generation | adapter`).
@@ -85,6 +89,7 @@ pub fn static_indexes() -> Vec<IndexSpec> {
         I::node_equality(node::INSTRUMENT, "instrument_id", true),
         I::node_equality(node::ENTITY, "entity_id", true),
         I::node_equality(node::VENUE, "venue_id", true),
+        I::node_equality(node::SECTOR, "sector_id", true),
         I::node_equality(node::SNAPSHOT, "snapshot_id", true),
         I::node_equality(node::SNAPSHOT, "timescale", false),
         I::node_equality(node::ADAPTER_STATE, "adapter_id", true),
@@ -108,6 +113,11 @@ pub fn static_indexes() -> Vec<IndexSpec> {
         I::node_equality(crate::regions::labels::KERNEL_MODEL, "snapshot_id", false),
         I::node_equality(crate::regions::labels::CROSS_PRIOR, "pair_id", true),
         I::node_equality(crate::regions::labels::CROSS_PRIOR, "timescale", false),
+        I::node_equality(crate::regions::labels::REGION_EPISODE, "episode_id", true),
+        I::node_equality(crate::regions::labels::REGION_EPISODE, "region_id", false),
+        I::node_equality(crate::regions::labels::REGION_EPISODE, "timescale", false),
+        I::node_equality(crate::evolution::labels::PARETO_FRONT, "front_id", true),
+        I::node_equality(crate::evolution::labels::PARETO_FRONT, "generation_id", false),
         I::node_equality(crate::experts::labels::EXPERT, "expert_uid", true),
         I::node_equality(crate::experts::labels::EXPERT, "snapshot_id", false),
         I::edge_equality(edge::TRANSITION, "sampler_id"),

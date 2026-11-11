@@ -239,6 +239,9 @@ message ExpertView {
   // denoising score); has_prior_score = false for families without one.
   double prior_score = 9;
   bool has_prior_score = 10;
+  // Cross-asset attention of the window (spec 31 §6.4, encoders with the asset_attn gene):
+  // peer instrument → weight; the remaining mass is the null token's (no peer read).
+  map<string, float> asset_attn = 11;
 }
 
 // latent.expert.health (spec 32 §4.3, §6.4): per-expert usage, skill and the residual

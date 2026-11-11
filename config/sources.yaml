@@ -1,6 +1,9 @@
-# Source catalog seed data — see specs/11-source-catalog.md
+# Source catalog seed data — see go/pkg/catalog/README.md#source-catalog-reference (spec 11, retired)
 # Per-source facts (transport, auth, asset classes) are UNVERIFIED first guesses.
+# Postgres (catalog.source) wins for status and for runtime rate_limit/config overrides
+# (PATCH /api/sources/{id}); the ingestor reloads this file on change (30 s poll).
 # status: planned | stub | live | disabled
+# adapter (optional): rss | sdmx — generic connector for an entry without its own
 # capabilities: data | execution
 # transport: rest | websocket | fix | grpc | graphql | sse | socket | file | sdk | stream
 # auth: none | api_key | oauth2 | hmac | session | wallet | gateway

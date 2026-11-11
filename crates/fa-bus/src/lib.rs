@@ -1,11 +1,15 @@
 //! NATS JetStream access: subject taxonomy, typed protobuf pub/sub and the JetStream
 //! stream table (spec 21).
 
+pub mod consume;
+pub mod contract;
 pub mod dlq;
 pub mod ingest;
+pub mod jobs;
 pub mod replay;
 pub mod streams;
 pub mod subjects;
+pub mod trace;
 
 use bytes::Bytes;
 use fa_proto::Message;
@@ -54,7 +58,13 @@ impl Bus {
         if subject.starts_with(subjects::HEARTBEAT_PREFIX) {
             mirror_heartbeat(&bytes);
         }
-        self.client.publish(subject, Bytes::from(bytes)).await?;
+        if trace::traced(&subject) {
+            // `traceparent` continuing the task's trace, or a new one (spec 60 §6.5)
+            let h = trace::headers(&trace::outgoing());
+            self.client.publish_with_headers(subject, h, Bytes::from(bytes)).await?;
+        } else {
+            self.client.publish(subject, Bytes::from(bytes)).await?;
+        }
         Ok(())
     }
 
@@ -67,8 +77,34 @@ impl Bus {
         let sub = self.client.subscribe(subject).await?;
         // `future::ready` keeps the stream `Unpin`, so callers can use `.next()` directly.
         Ok(sub.filter_map(|m| {
+            log_consume(&m);
+            if !contract::accept(&m.subject, m.headers.as_ref()) {
+                return futures::future::ready(None);
+            }
             futures::future::ready(match M::decode(m.payload.as_ref()) {
                 Ok(v) => Some((m.subject.to_string(), v)),
+                Err(e) => {
+                    tracing::warn!(subject = %m.subject, error = %e, "dropping undecodable message");
+                    None
+                }
+            })
+        }))
+    }
+
+    /// Like [`subscribe`](Self::subscribe), but also yields the message's trace context, so
+    /// the consumer can run its handler under [`trace::scope`] and continue the trace.
+    pub async fn subscribe_traced<M: Message + Default>(
+        &self,
+        subject: String,
+    ) -> Result<impl Stream<Item = (String, M, Option<trace::TraceContext>)> + Unpin + use<M>, BusError> {
+        let sub = self.client.subscribe(subject).await?;
+        Ok(sub.filter_map(|m| {
+            let ctx = log_consume(&m);
+            if !contract::accept(&m.subject, m.headers.as_ref()) {
+                return futures::future::ready(None);
+            }
+            futures::future::ready(match M::decode(m.payload.as_ref()) {
+                Ok(v) => Some((m.subject.to_string(), v, ctx)),
                 Err(e) => {
                     tracing::warn!(subject = %m.subject, error = %e, "dropping undecodable message");
                     None
@@ -81,6 +117,15 @@ impl Bus {
     pub async fn subscribe_raw(&self, subject: String) -> Result<async_nats::Subscriber, BusError> {
         Ok(self.client.subscribe(subject).await?)
     }
+}
+
+/// Logs a consumed message's trace id at `debug` (spec 60 §6.5) and returns its context.
+fn log_consume(m: &async_nats::Message) -> Option<trace::TraceContext> {
+    let ctx = trace::from_headers(m.headers.as_ref());
+    if let Some(c) = &ctx {
+        tracing::debug!(subject = %m.subject, trace_id = %c.trace_id_hex(), "consume");
+    }
+    ctx
 }
 
 /// Decodes an encoded `Heartbeat` and records its counters as metrics gauges.

@@ -42,7 +42,7 @@ func TestStreamTableMatchesSpec21(t *testing.T) {
 	if safeMaxBytes(-1, 100, 50) != 100 || safeMaxBytes(-1, 100, 150) != -1 || safeMaxBytes(200, -1, 150) != -1 {
 		t.Error("safeMaxBytes must never purge")
 	}
-	if tb.WorkQueue != (WorkQueueSpec{AckWaitSecs: 60, MaxDeliver: 5}) {
+	if tb.WorkQueue != (WorkQueueSpec{AckWaitSecs: 60, MaxDeliver: 5, MaxAckPending: 64}) {
 		t.Errorf("work queue: %+v", tb.WorkQueue)
 	}
 	if c := by["MD"].Config(); c.MaxAge != 24*time.Hour || c.Retention != jetstream.LimitsPolicy {
@@ -51,7 +51,7 @@ func TestStreamTableMatchesSpec21(t *testing.T) {
 	if WorkQueueName("evo") != "JOBS_EVO" || WorkQueueSubject("evo") != "jobs.evo.>" || WorkQueueName("media.asr") != "JOBS_MEDIA_ASR" {
 		t.Error("work queue naming")
 	}
-	if c := WorkQueueConsumer("evo-worker"); c.AckWait != 60*time.Second || c.MaxDeliver != 5 {
+	if c := WorkQueueConsumer("evo-worker"); c.AckWait != 60*time.Second || c.MaxDeliver != 5 || c.MaxAckPending != 64 {
 		t.Errorf("consumer: %+v", c)
 	}
 }

@@ -67,6 +67,24 @@ E::ListedOn {
     }
 }
 
+// Spec 12 §5 IN_SECTOR: one node per distinct ref.entity.sector (sector_id = lowercase slug of the
+// name, e.g. "information_technology"); issuers point at it, instruments reach it via IssuedBy.
+N::Sector {
+    UNIQUE INDEX sector_id: String,
+    name: String,
+    mirrored_at: Date,
+}
+
+E::InSector {
+    From: Entity,
+    To: Sector,
+    Properties: {
+        entity_id: String,
+        sector_id: String,   // upsert key
+        mirrored_at: Date,
+    }
+}
+
 // From ref.instrument_relation rows of kind same_economic_exposure (directional as stored).
 E::SameExposure {
     From: Instrument,
@@ -346,6 +364,21 @@ N::CrossPrior {
     updated_at: Date,
 }
 
+// One instrument's stay in a region (spec 30 §5 "Region episode"); model-runtime, timescales
+// 1m and slower, pruned with the observation latents' horizon (spec 30 §10 q6).
+N::RegionEpisode {
+    UNIQUE INDEX episode_id: String, // <region_id>:<instrument_id>:<t_enter ms>
+    INDEX region_id: String,
+    INDEX timescale: String,
+    expert_space_id: String,
+    instrument_id: String,
+    t_enter: Date,
+    t_exit: Date,
+    bars: U32,
+    max_weight: F64,
+    mean_weight: F64,
+}
+
 // Latent vectors: region centroids, sampled state observations, retrieval windows.
 V::LatentVec {
     INDEX expert_space_id: String,
@@ -417,6 +450,64 @@ E::TrainedOn {
         snapshot_id: String,
         generation: U32,
         updated_at: Date,
+    }
+}
+
+// Decoder genome → encoder snapshot an evaluation read (spec 34 §5; evo-worker, latest
+// evaluation per pair). Upsert key: snapshot_id.
+E::EvaluatedOn {
+    From: Genome,
+    To: Snapshot,
+    Properties: {
+        genome_id: String,
+        snapshot_id: String,
+        generation: String,
+        gen_index: I64,
+        rung: I64,
+        score: F64,
+        objectives: String, // JSON
+        job_id: String,
+        updated_at: Date,
+    }
+}
+
+// Decoder genome → each expert its expert mask selects in the snapshot it was evaluated on
+// (spec 34 §5 READS; mask 0 = every expert). Upsert key: snapshot_id.
+E::Reads {
+    From: Genome,
+    To: Expert,
+    Properties: {
+        snapshot_id: String,
+        expert_id: U32,
+        updated_at: Date,
+    }
+}
+
+// Pareto front of one loop of a generation (spec 34 §5; evo-worker `evo.front.decoder`, sent by
+// the orchestrator at every loop end).
+N::ParetoFront {
+    UNIQUE INDEX front_id: String, // <generation_id>/<loop>
+    INDEX generation_id: String,
+    gen_index: I64,
+    kind: String,
+    snapshot_id: String,
+    keys: String,    // JSON: ranked objective names
+    members: String, // JSON: [{genome_id, rank, hv, crowding, score}]
+    front_size: I64,
+    hypervolume: F64, // Σ exclusive HV of the rank-0 members (normalised objectives)
+    final: Boolean,
+    updated_at: Date,
+}
+
+E::InFront {
+    From: ParetoFront,
+    To: Genome,
+    Properties: {
+        genome_id: String,
+        rank: I64,
+        hv: F64,
+        crowding: F64,
+        score: F64,
     }
 }
 

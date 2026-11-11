@@ -10,11 +10,18 @@
 //!   `latent.state.>` / `latent.region.>` / `latent.transition.>` over `fa_mcmc::MarkovGraph`.
 //! - [`decoders`]: [`decoders::DecoderOutputs`], the recency cache of `decoder.output.<family>`.
 //! - [`population`]: `strategies.toml` definitions and the hand-written baseline set.
+//! - [`neural`]: neural policies ([`neural::PolicyNet`], [`neural::NeuralStrategy`]), their
+//!   text form and variation; SGD fine-tuning on candle behind the `train` feature.
+//! - [`genome`], [`random`], [`ops`]: strategy genomes (GP or neural, asset set, snapshot
+//!   binding), random programs and the typed GP operators; [`assets`]: asset-set mutation over
+//!   the MCMC pair proposals; [`remap`]: region literals across snapshot changes.
 
+pub mod assets;
 pub mod decoders;
 pub mod features;
 pub mod genome;
 pub mod graph;
+pub mod neural;
 pub mod ops;
 pub mod population;
 pub mod random;
@@ -110,6 +117,59 @@ pub enum PathFn {
     Feature(RegionFeature),
 }
 
+/// Comparison of a `Bool` node (`(gt a b)`, `(lt a b)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CmpOp {
+    Gt,
+    Lt,
+}
+
+/// A `Prob`-typed distribution `prob_gt` reads (spec 35 §4.2 `prob_gt(Prob, Num)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ProbSrc {
+    /// `(fc_dist k)`: the elite forecast distribution `k` bars ahead (its quantile vector).
+    Fc(u32),
+    /// `(analog_outcome k)`: the retrieval analogs' realised `k`-bar outcome, as a normal around
+    /// its similarity-weighted mean with the forecast's inter-quartile spread.
+    Analog(u32),
+}
+
+/// Forecast quantile levels the default `prob_gt` CDF is interpolated over.
+pub const PROB_LEVELS: [f64; 5] = [0.05, 0.25, 0.5, 0.75, 0.95];
+
+/// Standard normal CDF (Abramowitz–Stegun 7.1.26 erf, |err| < 1.5e-7).
+pub fn norm_cdf(x: f64) -> f64 {
+    let z = x.abs() / std::f64::consts::SQRT_2;
+    let t = 1.0 / (1.0 + 0.327_591_1 * z);
+    let poly = t * (0.254_829_592 + t * (-0.284_496_736 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    let erf = 1.0 - poly * (-z * z).exp();
+    if x >= 0.0 { 0.5 * (1.0 + erf) } else { 0.5 * (1.0 - erf) }
+}
+
+/// `P(X > x)` of a distribution given by quantile values at [`PROB_LEVELS`]: piecewise-linear
+/// CDF between the quantiles, linear tails to 0 / 1 one inter-quantile step beyond the outer
+/// ones. Unsorted inputs are sorted (crossing quantiles); a degenerate distribution is a step.
+pub fn prob_gt_from_quantiles(q: &[f64; 5], x: f64) -> f64 {
+    let mut v = *q;
+    if v.iter().any(|a| !a.is_finite()) || !x.is_finite() {
+        return 0.5;
+    }
+    v.sort_by(f64::total_cmp);
+    let l = PROB_LEVELS;
+    let cdf = if x <= v[0] {
+        let w = (v[1] - v[0]).max(1e-12) * (l[0] / (l[1] - l[0]));
+        (l[0] * (1.0 - (v[0] - x) / w)).max(0.0)
+    } else if x >= v[4] {
+        let w = (v[4] - v[3]).max(1e-12) * ((1.0 - l[4]) / (l[4] - l[3]));
+        (l[4] + (1.0 - l[4]) * ((x - v[4]) / w)).min(1.0)
+    } else {
+        let i = (0..4).find(|&i| x <= v[i + 1]).unwrap_or(3);
+        let span = v[i + 1] - v[i];
+        if span <= 1e-15 { l[i + 1] } else { l[i] + (l[i + 1] - l[i]) * (x - v[i]) / span }
+    };
+    (1.0 - cdf).clamp(0.0, 1.0)
+}
+
 /// Read-only view a strategy sees at a decision step for one asset.
 ///
 /// The spec 35 §4.2 primitives (`cur_region`, `neighbors`, `p_trans`, …) have default
@@ -196,10 +256,46 @@ pub trait StrategyContext {
     fn visual_score(&self, _kind: &str) -> f64 {
         0.0
     }
+    /// `prob_gt(P, x)`: probability that the distribution `P` exceeds `x` (see [`ProbSrc`]).
+    fn prob_gt(&self, src: ProbSrc, x: f64) -> f64 {
+        match src {
+            ProbSrc::Fc(k) => {
+                let q = PROB_LEVELS.map(|l| self.fc_quantile(l, k));
+                prob_gt_from_quantiles(&q, x)
+            }
+            ProbSrc::Analog(k) => {
+                let mean = self.analog_outcome(k);
+                let iqr = (self.fc_quantile(0.75, k) - self.fc_quantile(0.25, k)).abs();
+                let sd = iqr / 1.349;
+                if sd > 1e-15 && sd.is_finite() && mean.is_finite() {
+                    1.0 - norm_cdf((x - mean) / sd)
+                } else if mean > x {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+    /// Latent mean of this asset in expert space `expert` (spec 35 §4.3 policy input), as of
+    /// the step; `None` without a latent state.
+    fn latent(&self, _expert: u32) -> Option<Vec<f32>> {
+        None
+    }
     // portfolio state
     fn position(&self) -> f64;
     fn unrealised_pnl(&self) -> f64;
     fn time_in_trade(&self) -> f64;
+    /// `exposure_gross()`: Σ |exposure| over the strategy's whole asset set (fraction of its
+    /// sleeve); contexts without the strategy-level book answer this asset's `|position|`.
+    fn exposure_gross(&self) -> f64 {
+        self.position().abs()
+    }
+    /// `drawdown()`: the strategy's virtual-book drawdown from its peak, in sleeve-return units
+    /// (≥ 0); 0 where the strategy-level book is unknown.
+    fn drawdown(&self) -> f64 {
+        0.0
+    }
 }
 
 /// Walk horizon (steps) used by `hitting_time`; walks that never hit count as this.
@@ -250,6 +346,10 @@ pub enum PortfolioOp {
     Position,
     UnrealisedPnl,
     TimeInTrade,
+    /// `exposure_gross`
+    ExposureGross,
+    /// `drawdown`
+    Drawdown,
 }
 
 /// GP DSL expression tree.
@@ -270,6 +370,21 @@ pub enum Expr {
     Max(Box<Expr>, Box<Expr>),
     /// `if a > b then c else d`
     IfGt(Box<Expr>, Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `(clip x lo hi)`: `x` limited to `[min(lo, hi), max(lo, hi)]`.
+    Clip(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `(if c a b)` with a `Bool`-typed condition `c`.
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `(prob_gt P x)` → probability (a `Num` in [0, 1]).
+    ProbGt(ProbSrc, Box<Expr>),
+    // ── Bool-typed nodes (only valid as conditions / operands of Bool nodes) ──
+    /// `(gt a b)` / `(lt a b)`
+    Cmp(CmpOp, Box<Expr>, Box<Expr>),
+    /// `(and p q)`
+    And(Box<Expr>, Box<Expr>),
+    /// `(or p q)`
+    Or(Box<Expr>, Box<Expr>),
+    /// `(not p)`
+    Not(Box<Expr>),
 }
 
 thread_local! {
@@ -310,6 +425,8 @@ impl Expr {
             Portfolio(PortfolioOp::Position) => ctx.position(),
             Portfolio(PortfolioOp::UnrealisedPnl) => ctx.unrealised_pnl(),
             Portfolio(PortfolioOp::TimeInTrade) => ctx.time_in_trade(),
+            Portfolio(PortfolioOp::ExposureGross) => ctx.exposure_gross(),
+            Portfolio(PortfolioOp::Drawdown) => ctx.drawdown(),
             Add(a, b) => a.eval(ctx) + b.eval(ctx),
             Sub(a, b) => a.eval(ctx) - b.eval(ctx),
             Mul(a, b) => a.eval(ctx) * b.eval(ctx),
@@ -328,6 +445,19 @@ impl Expr {
                     d.eval(ctx)
                 }
             }
+            Clip(x, lo, hi) => {
+                let (lo, hi) = (lo.eval(ctx), hi.eval(ctx));
+                x.eval(ctx).clamp(lo.min(hi), lo.max(hi))
+            }
+            If(c, a, b) => {
+                if c.truth(ctx) {
+                    a.eval(ctx)
+                } else {
+                    b.eval(ctx)
+                }
+            }
+            ProbGt(src, x) => ctx.prob_gt(*src, x.eval(ctx)),
+            Cmp(..) | And(..) | Or(..) | Not(_) => f64::from(u8::from(self.truth(ctx))),
         };
         if v.is_finite() {
             v
@@ -337,14 +467,67 @@ impl Expr {
         }
     }
 
+    /// Truth value of a `Bool` node (a `Num` node is true when > 0). Comparisons with a
+    /// non-finite operand are false.
+    pub fn truth(&self, ctx: &dyn StrategyContext) -> bool {
+        use Expr::*;
+        match self {
+            Cmp(op, a, b) => {
+                let (x, y) = (a.eval(ctx), b.eval(ctx));
+                match op {
+                    CmpOp::Gt => x > y,
+                    CmpOp::Lt => x < y,
+                }
+            }
+            And(p, q) => p.truth(ctx) && q.truth(ctx),
+            Or(p, q) => p.truth(ctx) || q.truth(ctx),
+            Not(p) => !p.truth(ctx),
+            other => other.eval(ctx) > 0.0,
+        }
+    }
+
+    /// Whether this node is `Bool`-typed (spec 35 §4.2 STGP types; everything else is `Num`).
+    pub fn is_bool(&self) -> bool {
+        matches!(self, Expr::Cmp(..) | Expr::And(..) | Expr::Or(..) | Expr::Not(_))
+    }
+
     pub fn size(&self) -> usize {
         use Expr::*;
         match self {
             Const(_) | Graph(_) | Decoder(_) | Portfolio(_) => 1,
-            Neg(a) | Tanh(a) => 1 + a.size(),
-            Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Min(a, b) | Max(a, b) => 1 + a.size() + b.size(),
+            Neg(a) | Tanh(a) | Not(a) | ProbGt(_, a) => 1 + a.size(),
+            Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Min(a, b) | Max(a, b) | Cmp(_, a, b) | And(a, b)
+            | Or(a, b) => 1 + a.size() + b.size(),
+            Clip(a, b, c) | If(a, b, c) => 1 + a.size() + b.size() + c.size(),
             IfGt(a, b, c, d) => 1 + a.size() + b.size() + c.size() + d.size(),
         }
+    }
+}
+
+/// Estimated floating-point operations of one evaluation of `e` for one asset: the
+/// representation-independent compute unit of the `compute_cost` objective (spec 35 §6.2, §10
+/// Q3). Arithmetic and combinators 1, constants 0.5, a primitive read 10, a `k`-step kernel query
+/// `10·k`, sampled walks `10·k·n`, the forecast-CDF `prob_gt` 50.
+pub fn op_cost(e: &Expr) -> f64 {
+    use Expr::*;
+    let own = match e {
+        Const(_) => 0.5,
+        Graph(GraphOp::PTrans(_, _, k)) | Graph(GraphOp::PToSet(_, _, k)) => 10.0 * f64::from((*k).max(1)),
+        Graph(GraphOp::PathUpProb(k)) => 10.0 * f64::from((*k).max(1)),
+        Graph(GraphOp::PathValue(_, k, n, _)) => 10.0 * f64::from((*k).max(1)) * f64::from((*n).max(1)),
+        Graph(GraphOp::HittingTime(..)) => 10.0 * f64::from(HITTING_HORIZON) * 8.0,
+        Decoder(DecoderOp::AnalogOutcome(k)) => 10.0 * f64::from((*k).max(1)),
+        Graph(_) | Decoder(_) | Portfolio(_) => 10.0,
+        ProbGt(..) => 50.0,
+        _ => 1.0,
+    };
+    own + match e {
+        Const(_) | Graph(_) | Decoder(_) | Portfolio(_) => 0.0,
+        Neg(a) | Tanh(a) | Not(a) | ProbGt(_, a) => op_cost(a),
+        Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Min(a, b) | Max(a, b) | Cmp(_, a, b) | And(a, b)
+        | Or(a, b) => op_cost(a) + op_cost(b),
+        Clip(a, b, c) | If(a, b, c) => op_cost(a) + op_cost(b) + op_cost(c),
+        IfGt(a, b, c, d) => op_cost(a) + op_cost(b) + op_cost(c) + op_cost(d),
     }
 }
 
@@ -353,6 +536,15 @@ pub trait Strategy: Send {
     fn id(&self) -> &str;
     fn horizon(&self) -> Horizon;
     fn step(&mut self, as_of_ms: i64, assets: &[(InstrumentId, &dyn StrategyContext)]) -> ExposureDistribution;
+    /// Estimated operations per asset and step ([`op_cost`] units), for the `compute_cost`
+    /// objective shared by both representations.
+    fn ops_per_asset(&self) -> f64 {
+        1.0
+    }
+    /// Genome id carried by the emitted distributions.
+    fn genome_id(&self) -> &str {
+        self.id()
+    }
 }
 
 /// GP strategy: `mean = tanh(signal)`, `stddev = sigmoid(uncertainty)`.
@@ -372,6 +564,14 @@ impl Strategy for GpStrategy {
 
     fn horizon(&self) -> Horizon {
         self.horizon
+    }
+
+    fn ops_per_asset(&self) -> f64 {
+        op_cost(&self.signal) + op_cost(&self.uncertainty)
+    }
+
+    fn genome_id(&self) -> &str {
+        &self.genome_id
     }
 
     fn step(&mut self, as_of_ms: i64, assets: &[(InstrumentId, &dyn StrategyContext)]) -> ExposureDistribution {
@@ -394,9 +594,16 @@ impl Strategy for GpStrategy {
 }
 
 /// Neural policy: maps a feature vector built from the same primitives to (mean, stddev).
-/// Implementations live behind ML backend features (D-004).
+/// Implemented by [`neural::PolicyNet`] (a small MLP, run as [`neural::NeuralStrategy`]).
 pub trait NeuralPolicy: Send {
     fn forward(&self, features: &[f32]) -> (f64, f64);
+}
+
+impl NeuralPolicy for neural::PolicyNet {
+    fn forward(&self, features: &[f32]) -> (f64, f64) {
+        let o = neural::PolicyNet::forward(self, features);
+        (o.mean, o.std)
+    }
 }
 
 #[cfg(test)]

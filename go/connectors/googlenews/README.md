@@ -14,4 +14,4 @@ First-wave connector: Google News RSS search (text), catalog id `google_news`.
 `googlenews_test.go` on `testdata/search_apple_stock.xml` (live feed trimmed to 3 items): URL building, parsing, de-dup, cursor, restart, malformed XML.
 
 ## Governing specs
-- [10-ingestion](../../../specs/10-ingestion.md), [11-source-catalog](../../../specs/11-source-catalog.md)
+- [Ingestion reference (ex spec 10)](../../services/ingestor/README.md#ingestion-reference), [Source catalog reference (ex spec 11)](../../pkg/catalog/README.md#source-catalog-reference)

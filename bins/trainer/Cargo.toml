@@ -10,25 +10,33 @@ anyhow.workspace = true
 candle-core.workspace = true
 chrono.workspace = true
 clap.workspace = true
+fa-backtest.workspace = true
 fa-blob.workspace = true
 fa-bus.workspace = true
 fa-core.workspace = true
 fa-decoders.workspace = true
 fa-encoders.workspace = true
+fa-evolution.workspace = true
 fa-expert-space.workspace = true
 fa-hub.workspace = true
 fa-mcmc.workspace = true
 fa-patterns.workspace = true
 fa-proto.workspace = true
+fa-strategies.workspace = true
 fa-tsdb.workspace = true
 futures.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ulid.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
 
 [lints]
 workspace = true

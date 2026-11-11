@@ -335,8 +335,57 @@ pub fn net_targets_shrunk(
     out
 }
 
+/// Fill attribution weights of a netted order (spec 40 §6.3, §10 Q3 — the causal pro-rata
+/// rule). `parts` holds per contributing strategy its signed EUR contribution to the
+/// instrument's netted target and the signed EUR value its virtual sub-book already holds in
+/// it; `delta` is the order (target − position). A strategy's weight is how far its own
+/// sub-target is from its sub-book **in the order's direction** — `max(0, sign(Δ)·(c − h))` —
+/// so the fill (and its fees and slippage) goes to the strategies whose targets caused the
+/// trade, in proportion, and each sub-book converges to its own contribution; a strategy whose
+/// target moved against the order gets none of it. When no strategy wants the order's
+/// direction (e.g. sub-books not built yet) the weights are `|c|`, the contribution shares;
+/// when those are zero too, empty (= even split, the D-047 rule).
+pub fn attribution_weights(delta: f64, parts: &[(f64, f64)]) -> Vec<f64> {
+    let dir = delta.signum();
+    let ok = |x: f64| if x.is_finite() && x > 0.0 { x } else { 0.0 };
+    let causal: Vec<f64> = parts.iter().map(|(c, h)| ok(dir * (c - h))).collect();
+    if delta != 0.0 && causal.iter().sum::<f64>() > 0.0 {
+        return causal;
+    }
+    let share: Vec<f64> = parts.iter().map(|(c, _)| ok(c.abs())).collect();
+    if share.iter().sum::<f64>() > 0.0 { share } else { Vec::new() }
+}
+
+/// Normalised shares (summing to 1) for `n` contributors from [`attribution_weights`]; an even
+/// split when the weights are missing, of another length or sum to nothing.
+pub fn attribution_shares(n: usize, weights: &[f64]) -> Vec<f64> {
+    let total: f64 = weights.iter().filter(|w| w.is_finite() && **w > 0.0).sum();
+    if n == 0 {
+        return Vec::new();
+    }
+    if weights.len() != n || total <= 0.0 || !total.is_finite() {
+        return vec![1.0 / n as f64; n];
+    }
+    weights.iter().map(|w| if w.is_finite() && *w > 0.0 { w / total } else { 0.0 }).collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attribution_follows_the_strategies_that_caused_the_trade() {
+        use super::{attribution_shares, attribution_weights};
+        // A wants +1 000 (holds 0), B wants −800 (holds −800): the +200 order is A's alone
+        assert_eq!(attribution_weights(200.0, &[(1_000.0, 0.0), (-800.0, -800.0)]), vec![1_000.0, 0.0]);
+        // both moved up: pro rata to how far each is from its sub-book
+        let w = attribution_weights(300.0, &[(500.0, 300.0), (400.0, 300.0)]);
+        assert_eq!(attribution_shares(2, &w), vec![200.0 / 300.0, 100.0 / 300.0]);
+        // no sub-books in the order's direction: contribution shares; nothing at all: even
+        assert_eq!(attribution_weights(-50.0, &[(100.0, 0.0), (300.0, 0.0)]), vec![100.0, 300.0]);
+        assert!(attribution_weights(10.0, &[(0.0, 0.0), (0.0, 0.0)]).is_empty());
+        assert_eq!(attribution_shares(2, &[]), vec![0.5, 0.5]);
+        assert_eq!(attribution_shares(3, &[1.0]), vec![1.0 / 3.0; 3]);
+    }
+
     use super::*;
     use fa_core::{Horizon, Timescale};
     use fa_strategies::AssetExposure;

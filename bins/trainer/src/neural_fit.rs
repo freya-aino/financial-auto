@@ -79,12 +79,8 @@ pub fn config_for(family: NeuralFamily, ts: Timescale, overrides: Option<&Value>
     if !family.allows(ts) {
         anyhow::bail!("{} is only enabled at the day/week timescales (D-010), not {ts}", family.as_str());
     }
-    let mut cfg = NeuralConfig::new(family);
-    cfg.context_steps = match ts {
-        Timescale::Second | Timescale::Minute => 64,
-        Timescale::Hour => 48,
-        Timescale::Day | Timescale::Week => 32,
-    };
+    // spec 31 §6.1: context, width, depth and expert capacity per timescale
+    let cfg = NeuralConfig::for_timescale(family, ts);
     let Some(o) = overrides.filter(|o| o.is_object()) else { return Ok(cfg) };
     let mut base = serde_json::to_value(&cfg)?;
     merge(&mut base, o);
@@ -307,21 +303,24 @@ pub async fn run(
     let (history, mut meta, mut tr, resumed_from) = match resumed {
         Some((m, w)) => {
             tracing::info!(job = %ctl.job_id, step = m.step, "resuming neural fit from checkpoint");
-            let h = data::load_set(svc.tsdb, ts, None, None, m.start_ms, m.end_ms, Some(&m.pins)).await?;
+            let h =
+                crate::holdout::load_fit_set(svc, ts, None, None, m.start_ms, m.end_ms, Some(&m.pins), cfg.horizon())
+                    .await?;
             let tr = NeuralTrainer::from_checkpoint(&w, &dev)?;
             let key = artifact::checkpoint_key(&ctl.job_id).key;
             (h, m, tr, Some(key))
         }
         None => {
-            let (start_ms, end_ms) = data::window(ts, spec.window_hours, now);
-            let h = data::load_set(
-                svc.tsdb,
+            let (start_ms, end_ms) = crate::holdout::fit_window(&spec, now);
+            let h = crate::holdout::load_fit_set(
+                svc,
                 ts,
                 spec.instruments.as_ref(),
                 spec.instrument.as_deref(),
                 start_ms,
                 end_ms,
                 None,
+                cfg.horizon(),
             )
             .await?;
             let ds = dataset(&h, &cfg);
@@ -334,7 +333,10 @@ pub async fn run(
                     cfg.horizon()
                 );
             }
-            let tr = NeuralTrainer::new(cfg.clone(), &ds, spec.seed, &dev)?;
+            // spec 31 §6.4: the asset vocabulary / candidate sets of `asset_attn` genomes
+            let mut fit_cfg = cfg.clone();
+            crate::expert_health::asset_setup(&mut fit_cfg, &h, ts);
+            let tr = NeuralTrainer::new(fit_cfg, &ds, spec.seed, &dev)?;
             let m = NeuralCheckpointMeta {
                 job_id: ctl.job_id.clone(),
                 kind: kind.job_kind(),
@@ -354,6 +356,8 @@ pub async fn run(
     };
     let ds = dataset(&history, &tr.model.cfg);
     let cfg = tr.model.cfg.clone();
+    // spec 31 §8: a memory budget per step; out-of-memory halves the batch (recorded)
+    tr.mem_limit_mb = mem_budget_mb();
 
     // parent-derived terms: warm start (fresh runs only), anchors, frozen-probe feedback
     let parent = load_neural_parent(svc, parent_graph.as_ref(), &dev).await;
@@ -449,7 +453,7 @@ pub async fn run(
         }
         let n = CHUNK_STEPS.min(cfg.steps - tr.step as usize);
         // CPU-bound steps off the async executor
-        let log = tokio::task::block_in_place(|| tr.train_steps(&ds, n))?;
+        let log = tokio::task::block_in_place(|| tr.train_steps_oom_safe(&ds, n, OOM_MAX_RETRIES))?;
         let frac = 0.05 + 0.8 * tr.step as f32 / cfg.steps.max(1) as f32;
         (ctl.progress)(
             frac,
@@ -478,13 +482,30 @@ pub async fn run(
         (ctl.progress)(0.85, head_refit_label(&cfg));
         tokio::task::block_in_place(|| tr.refit_heads(&ds, cfg.head_refit_steps, 4096))?;
     }
-    // 4. validation, pruning, parent regression
+    // spec 32 §6.4: each expert's next-step spread, calibrated on the training windows
+    tokio::task::block_in_place(|| tr.calibrate_pred_sd(&ds, 4096))?;
+    // 4. validation, pruning, split, parent regression
     (ctl.progress)(0.86, "validation and expert pruning".into());
     let val = if ds.val.is_empty() { ds.train.clone() } else { ds.val.clone() };
     let pre = tokio::task::block_in_place(|| tr.evaluate(&ds, &val))?;
     let before = tr.model.moe.active.clone();
-    let kept = tr.prune(&pre.health.usage, 2);
-    let post = tokio::task::block_in_place(|| tr.evaluate(&ds, &val))?;
+    tr.prune(&pre.health.usage, 2);
+    // spec 32 §6.1: experts with high routed residual variance and a multimodal latent split
+    // into the freed slots and train `split_steps` more steps
+    let split = tokio::task::block_in_place(|| -> anyhow::Result<Vec<(usize, usize)>> {
+        let s = tr.split_experts(&ds, 2000)?;
+        if !s.is_empty() {
+            let target = tr.step + cfg.split_steps as u64;
+            tr.model.cfg.steps = tr.model.cfg.steps.max(target as usize);
+            tr.train_steps_oom_safe(&ds, cfg.split_steps, OOM_MAX_RETRIES)?;
+            tr.calibrate_pred_sd(&ds, 4096)?;
+        }
+        Ok(s)
+    })?;
+    let kept = tr.model.moe.active.clone();
+    let mut post = tokio::task::block_in_place(|| tr.evaluate(&ds, &val))?;
+    post.health.decodability =
+        tokio::task::block_in_place(|| crate::expert_health::decodability(&tr, &ds, 2048, 1024))?;
     let parent_eval = match &parent {
         Some(p) => {
             let pt = NeuralTrainer::from_model(p.encoder.model().clone(), 0);
@@ -616,6 +637,14 @@ pub async fn run(
         metrics.insert(format!("usage_e{pos}"), h.usage.get(src).copied().unwrap_or(0.0));
         metrics.insert(format!("regions_e{pos}"), regions.get(pos).map_or(0, Vec::len) as f64);
     }
+    // spec 32 §6.4 calibration / decodability, spec 31 §8 collapse and OOM, spec 31 §6.4 assets
+    metrics.extend(crate::expert_health::extra_metrics(h, &pos_of));
+    metrics.insert("oom_retries".into(), tr.oom_retries as f64);
+    metrics.insert("experts_split".into(), split.len() as f64);
+    if tr.model.cfg.asset_attn {
+        metrics.insert("asset_null_attn".into(), post.asset_null);
+        metrics.insert("asset_vocab".into(), tr.model.cfg.asset_vocab.len() as f64);
+    }
     if let Some(pe) = &parent_eval {
         metrics.insert("parent_mix_skill".into(), pe.mix_skill);
         metrics.insert("ssl_regression".into(), pe.mix_skill - post.mix_skill);
@@ -623,6 +652,9 @@ pub async fn run(
     if let Some(a) = alignment.get("matches").and_then(Value::as_array) {
         metrics.insert("experts_matched".into(), a.iter().filter(|m| !m["parent_expert"].is_null()).count() as f64);
     }
+    // spec 36 §6.4 items 4 (MCMC ECE) and 5 (elite transfer), [`crate::promotion`]
+    crate::promotion::ece_metrics(&mut metrics, &probe_keys, &latents, &regions, &parent_assign);
+    crate::promotion::transfer_metrics(&mut metrics, &tr, parent.as_ref().map(|p| p.encoder.model()), &ds, &val);
 
     let decoder_stats = match (kind, svc.pg_url) {
         (Kind::Generation, Some(url)) => crate::feedback::latest_generation_stats(url).await,
@@ -647,6 +679,12 @@ pub async fn run(
     params["max_regions"] = json!(spec.max_regions);
     params["region_discovery"] = json!(child.descriptor().region_discovery);
     params["health"] = serde_json::to_value(h)?;
+    params["collapse"] = json!(crate::expert_health::collapse_reasons(h));
+    params["split"] = json!(split);
+    params["oom"] = json!({ "retries": tr.oom_retries, "batch": tr.model.cfg.batch, "mem_limit_mb": tr.mem_limit_mb });
+    if tr.model.cfg.asset_attn {
+        params["asset_attn"] = json!({ "mean": post.asset_attn, "null": post.asset_null });
+    }
     params["loss_log"] = serde_json::to_value(&tr.log)?;
     spec.adapter_guard.clone().unwrap_or_default().write_params(&mut params);
 
@@ -697,6 +735,9 @@ pub async fn run(
     }
     (ctl.progress)(0.95, "writing snapshot".into());
     let written = artifact::write_bundle(svc.stores, &bundle, parent_graph.as_ref(), kind.as_str()).await?;
+    // spec 32 §5: validation health as VictoriaMetrics series + the full matrices in Garage
+    let expert_ids: Vec<u32> = (0..tr.model.moe.n_active() as u32).collect();
+    let health_series = crate::expert_health::persist(svc, ts, &meta.snapshot_id, &expert_ids, h, data::now_ms()).await;
     // spec 32 §5: Expert nodes, ExpertOf, AlignedTo (identity across generations)
     let expert_nodes = match hub {
         Some(h) if written.helix => {
@@ -748,6 +789,7 @@ pub async fn run(
             },
             "feedback": m.feedback,
             "experts": expert_nodes,
+            "health_series": health_series,
             "resumed_from": resumed_from,
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }),
@@ -756,6 +798,22 @@ pub async fn run(
         error: String::new(),
         snapshot_id: Some(m.snapshot_id.clone()),
     })
+}
+
+/// Windows `ends` of `history[inst]`, with the cross-asset context of the other series for
+/// `asset_attn` encoders (spec 31 §6.4: probes and regions see what serving sees).
+fn encode_hist(
+    enc: &NeuralEncoder,
+    history: &[BarHistory],
+    inst: usize,
+    ends: &[usize],
+) -> Result<Vec<fa_encoders::neural::Encoded>, fa_encoders::EncoderError> {
+    if !enc.model().cfg.asset_attn {
+        return enc.encode_windows(&history[inst].bars, ends);
+    }
+    let peers: Vec<Series> =
+        history.iter().map(|h| Series::with_times(h.instrument.clone(), h.bars.clone(), h.ends_ms.clone())).collect();
+    enc.encode_series_windows(&peers, inst, ends)
 }
 
 /// Gate mass per instrument of every expert (output position) on the probe windows: the
@@ -773,7 +831,7 @@ fn specialisation(
         let inst = probes[i].0;
         let j = probes[i..].iter().position(|p| p.0 != inst).map_or(probes.len(), |d| i + d);
         let win_ends: Vec<usize> = probes[i..j].iter().map(|&(s, p)| ends[s][p]).collect();
-        for e in tokio::task::block_in_place(|| enc.encode_windows(&history[inst].bars, &win_ends))? {
+        for e in tokio::task::block_in_place(|| encode_hist(enc, history, inst, &win_ends))? {
             for (pos, g) in e.gates.iter().enumerate().take(k) {
                 *mass[pos].entry(history[inst].instrument.clone()).or_default() += f64::from(*g);
             }
@@ -861,8 +919,17 @@ async fn write_expert_nodes(
     json!({ "written": written, "aligned_to": edges, "parent_experts_retired": retired, "errors": errors })
 }
 
+/// Batch halvings a fit tolerates after out-of-memory errors (spec 31 §8).
+const OOM_MAX_RETRIES: usize = 3;
+
+/// Memory budget of one training step (`FA_TRAIN_MEM_LIMIT_MB`, unset = none).
+fn mem_budget_mb() -> Option<f64> {
+    std::env::var("FA_TRAIN_MEM_LIMIT_MB").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0)
+}
+
 fn dataset(history: &[BarHistory], cfg: &NeuralConfig) -> Dataset {
-    let series = history.iter().map(|h| Series::new(h.instrument.clone(), h.bars.clone())).collect();
+    let series =
+        history.iter().map(|h| Series::with_times(h.instrument.clone(), h.bars.clone(), h.ends_ms.clone())).collect();
     Dataset::build(series, cfg.min_window, cfg.horizon(), cfg.val_fraction)
 }
 
@@ -895,7 +962,7 @@ fn encode_probes_with_residuals(
         let inst = probes[i].0;
         let j = probes[i..].iter().position(|p| p.0 != inst).map_or(probes.len(), |d| i + d);
         let win_ends: Vec<usize> = probes[i..j].iter().map(|&(s, p)| ends[s][p]).collect();
-        let enc_w = tokio::task::block_in_place(|| enc.encode_windows(&history[inst].bars, &win_ends))?;
+        let enc_w = tokio::task::block_in_place(|| encode_hist(enc, history, inst, &win_ends))?;
         let feats = fa_encoders::neural::data::bar_features(&history[inst].bars);
         for (e, end) in enc_w.into_iter().zip(&win_ends) {
             let target = fa_encoders::neural::data::targets_at(&feats, *end).map(|t| norm.target(0, t[0]));
@@ -969,17 +1036,25 @@ pub fn sweep(
     let mut out = Vec::with_capacity(grid.len());
     for (i, over) in grid.iter().enumerate() {
         let started = Instant::now();
-        let cfg = config_for(family, ts, Some(over))?;
+        let mut cfg = config_for(family, ts, Some(over))?;
+        crate::expert_health::asset_setup(&mut cfg, history, ts);
         let ds = dataset(history, &cfg);
         if ds.train.is_empty() {
             anyhow::bail!("no training windows");
         }
         let mut tr = NeuralTrainer::new(cfg.clone(), &ds, seed, dev)?;
-        tr.train_steps(&ds, cfg.steps)?;
+        tr.mem_limit_mb = mem_budget_mb();
+        tr.train_steps_oom_safe(&ds, cfg.steps, OOM_MAX_RETRIES)?;
         tr.refit_heads(&ds, cfg.head_refit_steps, 4096)?;
+        tr.calibrate_pred_sd(&ds, 4096)?;
         let val = if ds.val.is_empty() { ds.train.clone() } else { ds.val.clone() };
         let pre = tr.evaluate(&ds, &val)?;
         tr.prune(&pre.health.usage, 2);
+        let split = tr.split_experts(&ds, 2000)?;
+        if !split.is_empty() {
+            tr.train_steps_oom_safe(&ds, cfg.split_steps, OOM_MAX_RETRIES)?;
+            tr.calibrate_pred_sd(&ds, 4096)?;
+        }
         let post = tr.evaluate(&ds, &val)?;
         let h = &post.health;
         let pass = h.k_eff >= 2.0 && h.resid_corr_max <= 0.1 && h.skill_min() >= 0.02;
@@ -1002,6 +1077,12 @@ pub fn sweep(
             "feasibility_margin": feasibility_margin(post.mix_skill, post.mix_resid_var, 0.02, 0.1),
             "pre_prune": { "k_eff": pre.health.k_eff, "resid_corr_max": pre.health.resid_corr_max, "skill": pre.health.skill },
             "n_experts": tr.model.moe.n_active(),
+            "split": split,
+            "crpss": h.crpss,
+            "pit_ks": h.pit_ks,
+            "collapsed": h.collapsed,
+            "oom_retries": tr.oom_retries,
+            "asset_null": post.asset_null,
             "train_health": {
                 "k_eff": tr_eval.health.k_eff, "resid_corr_max": tr_eval.health.resid_corr_max,
                 "skill": tr_eval.health.skill, "mix_skill": tr_eval.mix_skill,
@@ -1058,7 +1139,15 @@ pub async fn run_adapter(
     let max_drift = spec.max_drift.unwrap_or(guard.max_drift);
     (ctl.progress)(0.1, format!("adapting {snapshot_id} (input normalisation) on the last {:.2} h", spec.window_hours));
     let (start_ms, end_ms) = data::window(ts, spec.window_hours, data::now_ms());
-    let history = data::load_one(svc.tsdb, ts, spec.instrument.as_deref(), start_ms, end_ms, None).await?;
+    let history = crate::holdout::load_adapter_window(
+        svc,
+        ts,
+        spec.instrument.as_deref(),
+        start_ms,
+        end_ms,
+        enc.model().cfg.horizon(),
+    )
+    .await?;
     match ctl.stop.load(Ordering::Relaxed) {
         CANCEL => {
             return Ok(stop_outcome(Kind::Adapter, &snapshot_id, Status::Cancelled, "cancelled", None, 0, started));
@@ -1096,8 +1185,17 @@ pub async fn run_adapter(
             0.0,
         );
         (ctl.progress)(0.3, format!("LoRA rank {} on {} windows ({} steps)", lcfg.rank, ads.train.len(), lcfg.steps));
+        // continuous adapters (spec 36 §6.5): resume the newest served LoRA of this snapshot
+        let previous = crate::adapters::previous_lora(svc, &snapshot_id, &dev).await;
         let fitted = tokio::task::block_in_place(|| {
-            fa_encoders::neural::adapter::train_lora(&model, &ads, &lcfg, now as u64, &dev)
+            fa_encoders::neural::adapter::train_lora_from(
+                &model,
+                &ads,
+                &lcfg,
+                now as u64,
+                &dev,
+                previous.as_ref().map(|p| &p.0),
+            )
         });
         lora = match fitted {
             Ok((set, rep)) => {
@@ -1123,6 +1221,7 @@ pub async fn run_adapter(
                     "key": if stored { Value::String(key.key) } else { Value::Null },
                     "rank": set.rank, "alpha": set.alpha, "config": lcfg, "seed": now, "report": rep,
                     "frozen": lora_frozen,
+                    "resumed_from": previous.as_ref().map(|p| p.1.clone()),
                     "guard": { "max_delta_norm": guard.max_delta_norm, "max_latent_shift": guard.max_latent_shift },
                 })
             }

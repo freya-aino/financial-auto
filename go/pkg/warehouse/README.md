@@ -16,4 +16,4 @@ The ingestor's Postgres write path for slow canonical records (spec 20 §6.1 (b)
 - `Stats{Inserted, Duplicates, Invalid, Errors}` are cumulative. The ingestor reports a failed batch as a connector error.
 
 ## Governing specs
-- [20-storage](../../../specs/20-storage.md) §6.1, [10-ingestion](../../../specs/10-ingestion.md) §6.2, §6.4
+- [20-storage](../../../specs/20-storage.md) §6.1, [Ingestion reference (ex spec 10)](../../services/ingestor/README.md#ingestion-reference) §6.2, §6.4

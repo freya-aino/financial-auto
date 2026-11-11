@@ -32,6 +32,13 @@ use crate::{
 /// Actor written to `audit.log` by ledger-side actions without a caller-supplied actor.
 pub const LEDGER_ACTOR: &str = "system:fa-ledger";
 
+/// FX source policy (fa-ledger README §6): every rate the *ledger* reads from `ref.fx_rate`
+/// (valuation marks for statements / equity / P&L, orphan booking, restatements) is the ECB
+/// daily reference rate, so the book of record and its reports are reproducible and do not
+/// depend on intraday rows. Fills keep the rate the risk-engine booked them at (intraday
+/// allowed, stored on the fill with its source; `ledger.fill_valued` joins on that source).
+pub const ACCOUNTING_FX_SOURCE: &str = "ecb_daily";
+
 /// Exclusive cutoff equivalent to "as of `at` inclusive" at Postgres' microsecond resolution.
 fn inclusive(at: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
     at.map(|t| t + Duration::microseconds(1))
@@ -45,6 +52,10 @@ pub struct FillEvent {
     pub filled_at: DateTime<Utc>,
     #[serde(default)]
     pub strategy_ids: Vec<String>,
+    /// Attribution weights aligned with `strategy_ids` (spec 40 §10 Q3, causal pro-rata);
+    /// empty = even split.
+    #[serde(default)]
+    pub strategy_weights: Vec<f64>,
     #[serde(default)]
     pub details: FillDetails,
     /// Book the venue account belongs to, when known (recorded on an orphan).
@@ -361,7 +372,7 @@ impl PgLedger {
 
     // ---------------------------------------------------------------- valuation
 
-    /// Latest `ref.fx_rate.rate_to_eur` per currency with `ts ≤ at` (any source). EUR is omitted.
+    /// Latest [`ACCOUNTING_FX_SOURCE`] rate per currency with `ts ≤ at`. EUR is omitted.
     pub async fn fx_rates_at(&self, ccys: &[String], at: DateTime<Utc>) -> Result<BTreeMap<String, Decimal>, PgError> {
         let ccys: Vec<String> =
             ccys.iter().map(|c| c.to_ascii_uppercase()).filter(|c| c != fa_core::BASE_CURRENCY).collect();
@@ -370,10 +381,11 @@ impl PgLedger {
         }
         let rows = sqlx::query(
             "SELECT DISTINCT ON (ccy) ccy, rate_to_eur AS rate FROM ref.fx_rate \
-             WHERE ccy = ANY($1) AND ts <= $2 ORDER BY ccy, ts DESC",
+             WHERE ccy = ANY($1) AND ts <= $2 AND source_id = $3 ORDER BY ccy, ts DESC",
         )
         .bind(&ccys)
         .bind(at)
+        .bind(ACCOUNTING_FX_SOURCE)
         .fetch_all(self.pool())
         .await?;
         Ok(rows.iter().map(|r| (r.get::<String, _>("ccy"), money::round(r.get::<Decimal, _>("rate")))).collect())
@@ -739,7 +751,7 @@ impl PgLedger {
     /// (and audited) instead of failing (spec 42 §8). Booking a fill that was parked earlier
     /// marks the orphan `booked`.
     pub async fn record_fill_event(&self, e: &FillEvent) -> Result<Recorded, PgError> {
-        match self.record_fill_with(&e.fill, e.filled_at, &e.strategy_ids, &e.details).await {
+        match self.record_fill_weighted(&e.fill, e.filled_at, &e.strategy_ids, &e.strategy_weights, &e.details).await {
             Ok(true) => {
                 sqlx::query(
                     "UPDATE ledger.orphan_fill SET status = 'booked', resolved_at = now(), resolved_by = $3, \
@@ -797,18 +809,20 @@ impl PgLedger {
         Ok(row.and_then(|r| r.0).map(|c| c.trim().to_ascii_uppercase()).filter(|c| !c.is_empty()))
     }
 
-    /// EUR per unit of `ccy` at `at`: 1 for EUR, else the latest `ref.fx_rate` at or before `at`
-    /// (any source) with its source id.
+    /// EUR per unit of `ccy` at `at`: 1 for EUR, else the latest [`ACCOUNTING_FX_SOURCE`] rate at or before `at`
+    /// with its source id (fill-time conversions, orphan booking).
     pub async fn rate_to_eur(&self, ccy: &str, at: DateTime<Utc>) -> Result<Option<(Decimal, String)>, PgError> {
         let ccy = ccy.trim().to_ascii_uppercase();
         if ccy == fa_core::BASE_CURRENCY {
             return Ok(Some((Decimal::ONE, "eur".to_owned())));
         }
         let row: Option<(Decimal, String)> = sqlx::query_as(
-            "SELECT rate_to_eur, source_id FROM ref.fx_rate WHERE ccy = $1 AND ts <= $2 ORDER BY ts DESC LIMIT 1",
+            "SELECT rate_to_eur, source_id FROM ref.fx_rate WHERE ccy = $1 AND ts <= $2 AND source_id = $3 \
+             ORDER BY ts DESC LIMIT 1",
         )
         .bind(&ccy)
         .bind(at)
+        .bind(ACCOUNTING_FX_SOURCE)
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(|(r, s)| (money::round(r), s)))
@@ -1168,6 +1182,7 @@ mod tests {
             },
             filled_at: at,
             strategy_ids: s.iter().map(|x| x.to_string()).collect(),
+            strategy_weights: Vec::new(),
             details: FillDetails {
                 ccy: ccy.into(),
                 fx_source: if ccy == "EUR" { "eur".into() } else { "ecb_daily".into() },

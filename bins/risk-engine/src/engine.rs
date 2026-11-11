@@ -18,9 +18,11 @@
 //! source per instrument) drives the per-class / per-venue caps and the stricter cap for
 //! `provisional` instruments; unknown instruments fall back to `default_asset_class` and are
 //! counted. Marks and fills are converted from the instrument's quote currency to EUR as of the
-//! event time through an [`FxTable`] (ECB daily reference rates); a rate older than
-//! `fx.max_age_hours` is flagged stale and, with `fx.halt_on_stale`, raises the reduce-only
-//! halt scope `fx`. Sub-books are serialisable ([`Engine::strategy_rows`]) and restored at
+//! event time through an [`FxTable`] (ECB daily reference rates, plus intraday rates from the
+//! market data of EUR FX pairs such as Yahoo `EURUSD=X` when `fx.intraday`, spec 42 §6); a rate
+//! older than `fx.max_age_hours` is flagged stale, blocks risk-increasing orders in that currency
+//! (`fx.block_stale_ccy`, spec 42 §8) and, with `fx.halt_on_stale`, raises the book-wide
+//! reduce-only halt scope `fx`. Sub-books are serialisable ([`Engine::strategy_rows`]) and restored at
 //! start, so the per-strategy drawdown tracker survives restarts.
 //!
 //! Since the strategy pipeline (spec 35 §6.4): evolved strategies carry a
@@ -67,6 +69,17 @@ use uuid::Uuid;
 
 use crate::settings::Settings;
 
+mod carry;
+mod days;
+mod dryrun;
+pub mod history;
+#[cfg(test)]
+mod spec40_tests;
+
+pub use carry::CarryCharge;
+pub use days::load_calendars;
+pub use dryrun::{PretradeReply, PretradeRequest};
+
 const MAX_INTENTS: usize = 5_000;
 const MS_PER_DAY: i64 = 86_400_000;
 const MS_PER_HOUR: i64 = 3_600_000;
@@ -105,6 +118,9 @@ struct IntentInfo {
     signed_quantity: f64,
     ours: bool,
     strategy_ids: Vec<String>,
+    /// Attribution weight per entry of `strategy_ids` (spec 40 §10 Q3: the causal pro-rata
+    /// rule, [`causal_weights`]); empty = even split (foreign / recovered intents).
+    weights: Vec<f64>,
 }
 
 /// A fill booked into the paper ledger, queued for persistence (drained by the I/O layer).
@@ -112,6 +128,8 @@ struct IntentInfo {
 pub struct BookedFill {
     pub fill: Fill,
     pub strategy_ids: Vec<String>,
+    /// Attribution weights aligned with `strategy_ids` (empty = even split; spec 40 §10 Q3).
+    pub strategy_weights: Vec<f64>,
     pub at_ms: i64,
     /// Currency, FX source, arrival price and slippage for `ledger.fill`.
     pub details: FillDetails,
@@ -153,6 +171,9 @@ pub struct RiskRecord {
     /// Snapshot-scoped model-drift halts (`model:<snapshot_id>`).
     #[serde(default)]
     model_halts: BTreeMap<String, ActiveHalt>,
+    /// Day keys per calendar group and the session instruments' day P&L (spec 40 §10 Q4).
+    #[serde(default)]
+    session_days: fa_risk::session::SessionDays,
 }
 
 impl RiskRecord {
@@ -274,7 +295,18 @@ pub struct FxStatus {
     pub stale: Vec<String>,
     pub halted: bool,
     pub max_age_hours: f64,
+    /// Currencies whose risk-increasing orders are blocked (stale and `fx.block_stale_ccy`).
+    #[serde(default)]
+    pub blocked: Vec<String>,
+    /// Intraday EUR pairs feeding the table (`ccy` → source).
+    #[serde(default)]
+    pub intraday: BTreeMap<String, String>,
 }
+
+/// Intraday FX rates kept in memory (older ones are pruned; the daily rates stay).
+const INTRADAY_FX_KEEP_HOURS: i64 = 48;
+/// Cap on intraday rates waiting to be written to `ref.fx_rate`.
+const MAX_FX_PENDING: usize = 10_000;
 
 /// Bare `source` halts (no qualifier) are keyed by this in the per-source table.
 const ANY_SOURCE: &str = "*";
@@ -336,6 +368,10 @@ pub struct Engine {
     fx: FxTable,
     /// Currencies whose latest usable rate was stale at the last conversion.
     fx_stale: BTreeSet<String>,
+    /// EUR FX pairs whose trades are intraday rates (`fx.intraday`, spec 42 §6).
+    fx_crosses: BTreeMap<InstrumentId, fa_warehouse::fx::EurCross>,
+    /// Intraday rates not yet written to `ref.fx_rate` ([`Engine::take_fx_pending`]).
+    fx_pending: Vec<fa_warehouse::fx::FxRate>,
     /// Latest venue → gross EUR exposure computed by the tick (state views).
     exposure_by_venue: BTreeMap<String, f64>,
     exposure_by_class: BTreeMap<String, f64>,
@@ -361,6 +397,13 @@ pub struct Engine {
     last_dists: BTreeMap<String, ExposureDistribution>,
     last_tick_ms: Option<i64>,
     pub counters: BTreeMap<&'static str, f64>,
+    // daily-loss day per trading calendar (spec 40 §10 Q4, `days`)
+    calendars: BTreeMap<InstrumentId, fa_warehouse::calendar::CalendarRule>,
+    /// Group → (trading-day key, valid until ms).
+    day_keys: BTreeMap<String, (i64, i64)>,
+    session_days: fa_risk::session::SessionDays,
+    // risk-chain history (spec 40 §5, `history`)
+    history: history::HistoryState,
 }
 
 fn parse_horizon(s: &str) -> Horizon {
@@ -443,6 +486,8 @@ impl Engine {
             unknown_refs: BTreeSet::new(),
             fx: FxTable::default(),
             fx_stale: BTreeSet::new(),
+            fx_crosses: BTreeMap::new(),
+            fx_pending: Vec::new(),
             exposure_by_venue: BTreeMap::new(),
             exposure_by_class: BTreeMap::new(),
             feed: FeedGuard::new(settings_feed),
@@ -458,6 +503,10 @@ impl Engine {
             last_dists: BTreeMap::new(),
             last_tick_ms: None,
             counters: BTreeMap::new(),
+            calendars: BTreeMap::new(),
+            day_keys: BTreeMap::new(),
+            session_days: fa_risk::session::SessionDays::default(),
+            history: history::HistoryState::default(),
         }
     }
 
@@ -549,6 +598,12 @@ impl Engine {
     /// Replaces the FX table (startup, after each ECB refresh). Returns a halt/resume to publish
     /// when the stale-FX halt state changed.
     pub fn set_fx(&mut self, fx: FxTable, now_ms: i64) -> Vec<Out> {
+        let mut fx = fx;
+        // intraday rates live in memory between reloads (the reload reads the daily source)
+        let intraday: BTreeSet<&str> = self.fx_crosses.values().map(|x| x.source.as_str()).collect();
+        for r in self.fx.rates().filter(|r| intraday.contains(r.source.as_str())) {
+            fx.insert(r.clone());
+        }
         self.counters.insert("fx.rates", fx.len() as f64);
         self.fx = fx;
         // re-evaluate every currency in use with the new table
@@ -565,6 +620,49 @@ impl Engine {
     #[cfg(test)]
     pub fn fx_table(&self) -> &FxTable {
         &self.fx
+    }
+
+    /// EUR FX pairs whose trades update the FX table intraday (`fa_warehouse::fx::load_eur_crosses`).
+    pub fn set_fx_crosses(&mut self, crosses: Vec<fa_warehouse::fx::EurCross>) {
+        self.counters.insert("fx.intraday_pairs", crosses.len() as f64);
+        self.fx_crosses = crosses.into_iter().map(|x| (x.instrument, x)).collect();
+    }
+
+    /// Intraday rates to persist into `ref.fx_rate` (drained).
+    pub fn take_fx_pending(&mut self) -> Vec<fa_warehouse::fx::FxRate> {
+        std::mem::take(&mut self.fx_pending)
+    }
+
+    /// A trade of an EUR FX pair as an intraday rate (spec 42 §6): inserted into the as-of table
+    /// unless it deviates more than `fx.intraday_max_dev` from the latest daily rate (bad tick).
+    fn on_fx_cross_trade(&mut self, inst: &InstrumentId, at_ms: i64, price: f64) {
+        if !self.settings.fx.intraday {
+            return;
+        }
+        let Some(rate) = self.fx_crosses.get(inst).and_then(|x| x.rate(price, at(at_ms))) else { return };
+        if let Some(daily) = self.fx.newest_of(&rate.ccy, &self.settings.fx.source)
+            && (rate.rate_to_eur / daily.rate_to_eur - 1.0).abs() > self.settings.fx.intraday_max_dev
+        {
+            self.bump("fx.intraday_rejected");
+            return;
+        }
+        let keep = at(at_ms) - chrono::Duration::hours(INTRADAY_FX_KEEP_HOURS);
+        self.fx.prune(&rate.source, keep);
+        if self.fx_pending.len() < MAX_FX_PENDING {
+            self.fx_pending.push(rate.clone());
+        }
+        let ccy = rate.ccy.clone();
+        self.fx.insert(rate);
+        self.bump("fx.intraday_rates");
+        if self.fx_stale.contains(&ccy) && !self.fx.convert(&ccy, at(at_ms), self.settings.fx.max_age()).stale {
+            self.fx_stale.remove(&ccy);
+        }
+    }
+
+    /// The instrument's quote currency is stale and `fx.block_stale_ccy` is on (spec 42 §8:
+    /// risk-increasing orders in that currency are blocked; reductions pass).
+    fn fx_blocked(&mut self, inst: &InstrumentId, now_ms: i64) -> bool {
+        self.settings.fx.block_stale_ccy && self.fx_for(inst, now_ms).stale
     }
 
     /// Quote currency of an instrument per reference data (`None` = unknown, treated as EUR).
@@ -628,6 +726,12 @@ impl Engine {
             stale: self.fx_stale.iter().cloned().collect(),
             halted: self.halts.contains_key(&HaltScope::Fx),
             max_age_hours: self.settings.fx.max_age_hours,
+            blocked: if self.settings.fx.block_stale_ccy {
+                self.fx_stale.iter().cloned().collect()
+            } else {
+                Vec::new()
+            },
+            intraday: self.fx_crosses.values().map(|x| (x.ccy.clone(), x.source.clone())).collect(),
         }
     }
 
@@ -789,6 +893,7 @@ impl Engine {
         self.risk.rearm(eq);
         self.risk.start_day(eq);
         self.day_start_equity = eq;
+        self.session_days.reset();
     }
 
     /// Fills booked since the last call, oldest first.
@@ -923,6 +1028,7 @@ impl Engine {
         if price <= 0.0 || !price.is_finite() {
             return Vec::new();
         }
+        self.on_fx_cross_trade(&inst, at_ms, price);
         let fx = self.fx_for(&inst, at_ms).rate_to_eur;
         let price_eur = price * fx;
         // bad-tick filter (spec 40 §8): a jump is held back until confirmed, the instrument is
@@ -985,6 +1091,7 @@ impl Engine {
                     signed_quantity: signed,
                     ours: false,
                     strategy_ids: m.strategy_ids.clone(),
+                    weights: Vec::new(),
                 },
             );
             self.bump("intents.foreign");
@@ -1076,7 +1183,8 @@ impl Engine {
         let mark = self.marks.get(&inst).copied();
         let current = self.current_eur();
         let position_eur = current.get(&inst).copied().unwrap_or(0.0);
-        let fx_to_eur = self.fx_for(&inst, now_ms).rate_to_eur;
+        let fx = self.fx_for(&inst, now_ms);
+        let fx_to_eur = fx.rate_to_eur;
         let market = self.marks.contains_key(&inst).then(|| self.market_info(inst, now_ms));
         let (mut class_gross, mut venue_gross, mut gross) = (0.0, 0.0, 0.0);
         for (i, v) in &current {
@@ -1122,6 +1230,13 @@ impl Engine {
         let state = self.feed.state(&inst, now_ms, Some(bar));
         if state != FeedState::Fresh && !reducing {
             return Err(format!("pre-trade: feed {state:?} for the instrument (stale or unconfirmed price jump)"));
+        }
+        if fx.stale && self.settings.fx.block_stale_ccy && !reducing {
+            let ccy = self.quote_ccy(&inst).unwrap_or_default().to_owned();
+            return Err(format!(
+                "pre-trade: FX rate for {ccy} is stale (older than {} h): only reductions in {ccy}",
+                self.settings.fx.max_age_hours
+            ));
         }
         Ok(())
     }
@@ -1205,20 +1320,34 @@ impl Engine {
             fx_to_eur: fx.rate_to_eur,
             fee_eur: m.fee * fee_fx,
         };
+        let value_before = self
+            .ledger
+            .positions
+            .get(&info.instrument)
+            .map_or(0.0, |p| p.quantity * self.marks.get(&info.instrument).copied().unwrap_or(p.avg_cost_eur));
         let applied = self.ledger.apply_fill(&fill);
         let mut out = Vec::new();
         if applied {
+            // the fill's cash flow on its instrument's exchange day (spec 40 §10 Q4)
+            let cash_flow = fa_ledger::money::f(fa_ledger::ExactFill::of(&fill).cash_flow());
+            self.note_session_fill(info.instrument, value_before, cash_flow, now_ms);
             self.bump("fills");
             self.marks.entry(info.instrument).or_insert(m.fill_price * fx.rate_to_eur);
             let slippage = (m.arrival_price > 0.0).then_some(m.slippage_bps);
-            self.attribute(&fill, &info.strategy_ids, slippage);
+            self.attribute(&fill, &info.strategy_ids, &info.weights, slippage);
             let details = FillDetails {
                 ccy,
                 fx_source: fx.source.clone(),
                 arrival_price: (m.arrival_price > 0.0).then_some(m.arrival_price),
                 slippage_bps: slippage,
             };
-            let booked = BookedFill { fill, strategy_ids: info.strategy_ids.clone(), at_ms, details };
+            let booked = BookedFill {
+                fill,
+                strategy_ids: info.strategy_ids.clone(),
+                strategy_weights: info.weights.clone(),
+                at_ms,
+                details,
+            };
             self.unconfirmed.insert(booked.fill.fill_id.clone(), (booked.clone(), now_ms, now_ms));
             self.booked.push(booked);
             out.extend(self.update_fx_halt(now_ms));
@@ -1227,16 +1356,18 @@ impl Engine {
         out
     }
 
-    /// Splits a fill evenly across its contributing strategies' virtual books (spec 40 §6.3,
-    /// D-047). Flatten intents have no contributors and touch no book.
-    fn attribute(&mut self, fill: &Fill, strategy_ids: &[String], slippage_bps: Option<f64>) {
-        let ids: Vec<&String> = strategy_ids.iter().filter(|id| self.strategies.contains_key(*id)).collect();
+    /// Splits a fill across its contributing strategies' virtual books (spec 40 §6.3): by the
+    /// intent's causal pro-rata weights (§10 Q3, [`fa_allocator::attribution_weights`]), evenly
+    /// when it has none (D-047). Flatten intents have no contributors and touch no book.
+    fn attribute(&mut self, fill: &Fill, strategy_ids: &[String], weights: &[f64], slippage_bps: Option<f64>) {
+        let shares = fa_allocator::attribution_shares(strategy_ids.len(), weights);
+        let ids: Vec<(&String, f64)> =
+            strategy_ids.iter().zip(shares).filter(|(id, w)| *w > 0.0 && self.strategies.contains_key(*id)).collect();
         if ids.is_empty() {
             return;
         }
-        let n = ids.len() as f64;
-        let share = Fill { quantity: fill.quantity / n, fee_eur: fill.fee_eur / n, ..fill.clone() };
-        for id in ids {
+        for (id, w) in ids {
+            let share = Fill { quantity: fill.quantity * w, fee_eur: fill.fee_eur * w, ..fill.clone() };
             let b =
                 self.books.entry(id.clone()).or_insert_with(|| VirtualBook { primed: true, ..VirtualBook::default() });
             b.apply(&share);
@@ -1684,19 +1815,6 @@ impl Engine {
         out
     }
 
-    fn roll_day(&mut self, now_ms: i64) {
-        let day = now_ms.div_euclid(MS_PER_DAY);
-        if self.day != Some(day) {
-            if self.day.is_some() {
-                let eq = self.equity();
-                self.risk.start_day(eq);
-                self.day_start_equity = eq;
-                self.halts.remove(&HaltScope::DailyLoss);
-            }
-            self.day = Some(day);
-        }
-    }
-
     fn horizon_volume_eur(&self, inst: InstrumentId, now_ms: i64) -> f64 {
         let Some(v) = self.volume.get(&inst) else {
             return 0.0;
@@ -1842,7 +1960,7 @@ impl Engine {
 
     /// One decision tick. Returns intents/approvals/rejections/halts to publish, in order.
     pub fn tick(&mut self, now_ms: i64) -> Vec<Out> {
-        self.roll_day(now_ms);
+        self.roll_days(now_ms);
         let mut out = self.check_equity(now_ms);
         let equity = self.equity();
         let deployable = self.risk.deployable(equity);
@@ -1892,7 +2010,9 @@ impl Engine {
         let mut alloc = self.allocator.allocate(&stats);
         // spec 40 §8: NaN / negative / over-allocated weights → previous allocation + risk event
         let total: f64 = alloc.values().sum();
-        if alloc.values().any(|w| !w.is_finite() || *w < 0.0) || !total.is_finite() || total > 1.0 + 1e-9 {
+        let fallback =
+            alloc.values().any(|w| !w.is_finite() || *w < 0.0) || !total.is_finite() || total > 1.0 + 1e-9;
+        if fallback {
             let bad = alloc.clone();
             alloc = self
                 .last_alloc
@@ -1936,6 +2056,8 @@ impl Engine {
             edges.insert(d.strategy_id.as_str(), (edge, hold));
         }
         let mut contributions: BTreeMap<InstrumentId, Vec<(f64, f64, f64)>> = BTreeMap::new();
+        // signed EUR contribution per (instrument, strategy): history and fill attribution
+        let mut contrib_by: BTreeMap<InstrumentId, BTreeMap<String, f64>> = BTreeMap::new();
         for d in &dists {
             let w = alloc.get(&d.strategy_id).copied().unwrap_or(0.0);
             let (edge, hold) = edges.get(d.strategy_id.as_str()).copied().unwrap_or((0.0, 0.0));
@@ -1946,6 +2068,7 @@ impl Engine {
             for e in &d.exposures {
                 let c = per_asset * e.mean.clamp(-1.0, 1.0) / (1.0 + e.stddev.max(0.0));
                 contributions.entry(e.instrument).or_default().push((c, edge, hold));
+                *contrib_by.entry(e.instrument).or_default().entry(d.strategy_id.clone()).or_insert(0.0) += c;
             }
         }
         let sleeves: BTreeMap<String, f64> = self.strategies.iter().map(|(id, s)| (id.clone(), s.sleeve_eur)).collect();
@@ -1979,6 +2102,7 @@ impl Engine {
         }
         let current = self.current_eur();
         // instruments we hold but no longer target are flattened
+        let capped_eur = capped.clone();
         let mut targets = capped;
         for i in current.keys() {
             targets.entry(*i).or_insert(0.0);
@@ -2008,8 +2132,21 @@ impl Engine {
             }
         }
         let mut frozen = 0usize;
+        let mut fx_held = 0usize;
         let insts: Vec<InstrumentId> = gated.keys().copied().collect();
         for i in insts {
+            // stale FX for the quote currency (spec 42 §8): reduce-only in that currency
+            if self.fx_blocked(&i, now_ms) {
+                let c = current.get(&i).copied().unwrap_or(0.0);
+                let t = gated.get(&i).copied().unwrap_or(0.0);
+                let held = if c == 0.0 || t.signum() != c.signum() { 0.0 } else { t.abs().min(c.abs()) * c.signum() };
+                if (held - t).abs() > 1e-9 {
+                    fx_held += 1;
+                    let ccy = self.quote_ccy(&i).unwrap_or_default().to_owned();
+                    events.extend(self.event(now_ms, "fx.stale_block", &i.to_string(), json!({"action": "reduce-only: FX rate of the quote currency is stale", "ccy": ccy, "target_eur": t, "held_eur": held})));
+                }
+                gated.insert(i, held);
+            }
             match self.feed.state(&i, now_ms, bar_ms.get(&i).copied()) {
                 FeedState::Fresh => {}
                 FeedState::Frozen => {
@@ -2036,6 +2173,7 @@ impl Engine {
             }
         }
         self.counters.insert("feed.frozen", frozen as f64);
+        self.counters.insert("fx.blocked", fx_held as f64);
         self.counters.insert("feed.jump_pending", self.feed.held() as f64);
         self.exposure_by_venue = market.iter().fold(BTreeMap::new(), |mut m, (i, info)| {
             let venue = if info.venue.is_empty() { "unknown".to_owned() } else { info.venue.clone() };
@@ -2073,8 +2211,11 @@ impl Engine {
                 book.into_iter().chain(sig)
             })
             .collect();
+        let gated_eur = gated.clone();
+        let mut decisions: BTreeMap<InstrumentId, (String, Option<String>)> = BTreeMap::new();
         for (inst, target) in gated {
             let Some(mark) = self.marks.get(&inst).copied() else {
+                decisions.insert(inst, ("none".into(), None));
                 continue;
             };
             let cur = current.get(&inst).copied().unwrap_or(0.0);
@@ -2109,9 +2250,10 @@ impl Engine {
                 contributors: contributors(inst),
                 cost: self.cost_quote(inst, now_ms),
             };
-            if let Verdict::Skip { .. } =
+            if let Verdict::Skip { reason, .. } =
                 self.rebalancer.decide(&candidate, band, self.settings.min_order_eur, &sleeves, now_ms)
             {
+                decisions.insert(inst, (format!("skip:{}", reason.as_str()), None));
                 continue;
             }
             let intent_id = ulid::Ulid::generate().to_string();
@@ -2146,6 +2288,23 @@ impl Engine {
                 created_at: Some(ts_of(now_ms)),
             };
             let _ = self.ledger.register_intent(&intent_id);
+            // causal pro-rata attribution (spec 40 §10 Q3): each contributor's sub-target vs
+            // what its sub-book already holds, in the order's direction
+            let parts: Vec<(f64, f64)> = intent
+                .strategy_ids
+                .iter()
+                .map(|s| {
+                    let c = contrib_by.get(&inst).and_then(|m| m.get(s)).copied().unwrap_or(0.0);
+                    let held = self
+                        .books
+                        .get(s)
+                        .and_then(|b| b.positions.get(&inst))
+                        .map_or(0.0, |p| p.quantity * mark);
+                    (c, held)
+                })
+                .collect();
+            let weights = fa_allocator::attribution_weights(delta, &parts);
+            decisions.insert(inst, ("trade".into(), Some(intent_id.clone())));
             self.remember(
                 intent_id.clone(),
                 IntentInfo {
@@ -2153,6 +2312,7 @@ impl Engine {
                     signed_quantity: delta.signum() * intent.quantity,
                     ours: true,
                     strategy_ids: intent.strategy_ids.clone(),
+                    weights,
                 },
             );
             self.pending.insert(
@@ -2204,6 +2364,33 @@ impl Engine {
             });
         }
         out.extend(events);
+        // risk-chain history (spec 40 §5): allocation snapshot + netted targets through the chain
+        let targets: Vec<history::TargetRow> = gated_eur
+            .iter()
+            .map(|(i, g)| {
+                let (decision, intent_id) = decisions.remove(i).unwrap_or_else(|| ("none".into(), None));
+                history::TargetRow {
+                    instrument: *i,
+                    raw_eur: raw.get(i).copied().unwrap_or(0.0),
+                    capped_eur: capped_eur.get(i).copied().unwrap_or(0.0),
+                    gated_eur: *g,
+                    current_eur: current.get(i).copied().unwrap_or(0.0),
+                    contributors: contrib_by.remove(i).unwrap_or_default(),
+                    decision,
+                    intent_id,
+                }
+            })
+            .collect();
+        self.record_tick(history::TickRecord {
+            at_ms: now_ms,
+            allocator: self.allocator.id().to_owned(),
+            spec: self.allocator_spec.clone(),
+            weights: alloc,
+            equity_eur: equity,
+            deployable_eur: deployable,
+            fallback,
+            targets,
+        });
         out
     }
 
@@ -2544,6 +2731,7 @@ impl Engine {
             equity_history: self.equity_history.clone(),
             tournament: self.tournament.records(),
             model_halts: self.model_halts.clone(),
+            session_days: self.session_days.clone(),
         }
     }
 
@@ -2557,6 +2745,7 @@ impl Engine {
         self.halts = r.halts.into_iter().filter_map(|(k, v)| HaltScope::parse(&k).map(|s| (s, v))).collect();
         self.source_halts = r.source_halts;
         self.model_halts = r.model_halts;
+        self.session_days = r.session_days;
         self.day = r.day;
         self.day_start_equity = r.day_start_equity;
         self.equity_history = r.equity_history;
@@ -2598,7 +2787,10 @@ impl Engine {
         signed_quantity: f64,
         strategy_ids: Vec<String>,
     ) {
-        self.remember(id.to_owned(), IntentInfo { instrument, signed_quantity, ours: false, strategy_ids });
+        self.remember(
+            id.to_owned(),
+            IntentInfo { instrument, signed_quantity, ours: false, strategy_ids, weights: Vec::new() },
+        );
         self.bump("intents.recovered");
     }
 
@@ -3489,6 +3681,124 @@ mod tests {
         assert!(e2.on_trade(inst, T0, 100.0, 1.0).is_empty());
         assert!(!e2.halted());
         assert_eq!(e2.fx_status().stale, vec!["USD"]);
+    }
+
+    /// spec 42 §8: a stale currency is reduce-only for its own instruments; the EUR instrument
+    /// keeps trading, and the block lifts when a fresh (here intraday) rate arrives.
+    #[test]
+    fn stale_fx_blocks_risk_increasing_orders_in_that_currency_only() {
+        let (usd_i, eur_i, pair) = (InstrumentId::new(), InstrumentId::new(), InstrumentId::new());
+        let mut e = warm_many(&[usd_i, eur_i], settings());
+        e.set_refdata(RefTable::from_refs([
+            iref(usd_i, fa_core::AssetClass::Equity, "yahoo", "USD", "active", "yahoo"),
+            iref(eur_i, fa_core::AssetClass::Equity, "yahoo", "EUR", "active", "yahoo"),
+        ]));
+        e.set_fx(FxTable::from_rates([usd(5, 1.0)]), T0); // 5 days old > 72 h
+        e.on_signal(&multi_signal("s", &[usd_i, eur_i], 0.5), T0);
+        let out = e.tick(T0 + 1000);
+        let buys = approved(&out);
+        assert!(buys.iter().any(|b| b.instrument_id == eur_i.to_string()), "EUR trades on: {out:?}");
+        assert!(buys.iter().all(|b| b.instrument_id != usd_i.to_string()), "USD is blocked: {buys:?}");
+        assert!(!e.halted(), "no book-wide halt");
+        assert_eq!(e.counters["fx.blocked"], 1.0);
+        assert_eq!(e.fx_status().blocked, vec!["USD"]);
+        // a foreign order adding USD risk is refused; one in EUR passes
+        let foreign = |id: &str, inst: InstrumentId| OrderIntent {
+            intent_id: id.into(),
+            account_id: "manual".into(),
+            instrument_id: inst.to_string(),
+            side: Side::Buy as i32,
+            quantity: 1.0,
+            mode: TradingMode::Paper as i32,
+            ..Default::default()
+        };
+        let r = e.on_intent_seen(&foreign("m-usd", usd_i), false, T0 + 1500);
+        assert!(
+            matches!(&r[0], Out::Rejected { event, .. } if event.reason.contains("FX rate for USD is stale")),
+            "{r:?}"
+        );
+        // (the EUR one may still meet its position cap: the tick's buy is pending, but never the FX block)
+        let r = e.on_intent_seen(&foreign("m-eur", eur_i), false, T0 + 1500);
+        assert!(
+            !r.iter().any(|o| matches!(o, Out::Rejected { event, .. } if event.reason.contains("FX rate"))),
+            "{r:?}"
+        );
+        // an intraday EUR/USD trade refreshes USD: the block lifts on the next tick
+        e.set_fx_crosses(vec![fa_warehouse::fx::EurCross {
+            instrument: pair,
+            ccy: "USD".into(),
+            eur_is_base: true,
+            source: "yahoo".into(),
+        }]);
+        e.on_trade(pair, T0 + 1800, 1.02, 1.0);
+        assert_eq!(e.take_fx_pending().len(), 1);
+        let out = e.tick(T0 + 2000);
+        assert!(approved(&out).iter().any(|b| b.instrument_id == usd_i.to_string()), "{out:?}");
+        assert_eq!(e.counters["fx.blocked"], 0.0);
+        assert!(e.fx_status().stale.is_empty());
+        // with the block off only the flag remains (the earlier behaviour)
+        let mut st = settings();
+        st.fx.block_stale_ccy = false;
+        let mut e2 = warm_many(&[usd_i], st);
+        e2.set_refdata(RefTable::from_refs([iref(
+            usd_i,
+            fa_core::AssetClass::Equity,
+            "yahoo",
+            "USD",
+            "active",
+            "yahoo",
+        )]));
+        e2.set_fx(FxTable::from_rates([usd(5, 1.0)]), T0);
+        e2.on_signal(&signal("s", usd_i, 0.5), T0);
+        assert!(!approved(&e2.tick(T0 + 1000)).is_empty());
+    }
+
+    /// spec 42 §6: trades of an EUR FX pair are intraday rates; bad ticks are dropped, the
+    /// intraday rows survive a daily-table reload and are queued for `ref.fx_rate`.
+    #[test]
+    fn intraday_fx_from_an_eur_pair_marks_and_survives_reloads() {
+        let (inst, pair) = (InstrumentId::new(), InstrumentId::new());
+        let mut e = Engine::new(settings());
+        e.set_refdata(RefTable::from_refs([iref(
+            inst,
+            fa_core::AssetClass::Equity,
+            "yahoo",
+            "USD",
+            "active",
+            "yahoo",
+        )]));
+        e.set_fx(FxTable::from_rates([usd(1, 0.90)]), T0);
+        e.set_fx_crosses(vec![fa_warehouse::fx::EurCross {
+            instrument: pair,
+            ccy: "USD".into(),
+            eur_is_base: true,
+            source: "yahoo".into(),
+        }]);
+        e.on_trade(pair, T0 + 10, 1.0 / 0.92, 1.0); // EUR/USD 1.0870 → 0.92 EUR per USD
+        e.on_trade(inst, T0 + 20, 100.0, 1.0);
+        assert!((e.marks[&inst] - 92.0).abs() < 1e-9, "{}", e.marks[&inst]);
+        e.on_trade(pair, T0 + 30, 2.0, 1.0); // 0.5: 44 % off the daily rate → dropped
+        assert_eq!(e.counters["fx.intraday_rejected"], 1.0);
+        let pending = e.take_fx_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!((pending[0].source.as_str(), pending[0].ccy.as_str()), ("yahoo", "USD"));
+        e.set_fx(FxTable::from_rates([usd(1, 0.90)]), T0 + 40);
+        assert_eq!(e.fx_table().len(), 2, "the intraday row survives the reload");
+        e.on_trade(inst, T0 + 50, 100.0, 1.0);
+        assert!((e.marks[&inst] - 92.0).abs() < 1e-9);
+        assert_eq!(e.fx_status().intraday.get("USD").map(String::as_str), Some("yahoo"));
+        // off: pair trades are ordinary marks only
+        let mut st = settings();
+        st.fx.intraday = false;
+        let mut e2 = Engine::new(st);
+        e2.set_fx_crosses(vec![fa_warehouse::fx::EurCross {
+            instrument: pair,
+            ccy: "USD".into(),
+            eur_is_base: true,
+            source: "yahoo".into(),
+        }]);
+        e2.on_trade(pair, T0, 1.08, 1.0);
+        assert!(e2.take_fx_pending().is_empty());
     }
 
     #[test]

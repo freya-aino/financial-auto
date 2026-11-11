@@ -1,5 +1,6 @@
 //! Reference mirror (spec 12 §5, spec 20 §5.1): the Postgres `ref` graph copied into Helix as
-//! `Instrument`, `Entity` and `Venue` nodes with `IssuedBy`, `ListedOn` and `SameExposure` edges.
+//! `Instrument`, `Entity`, `Venue` and `Sector` nodes with `IssuedBy`, `ListedOn`,
+//! `SameExposure` and `InSector` (entity → sector, from `ref.entity.sector`) edges.
 //! Postgres stays the source of truth; control-api (`ref_mirror.rs`) runs a full sync at start
 //! and periodically, and an incremental sync on `ref.changed.*`.
 //!
@@ -39,6 +40,16 @@ pub struct RefEntity {
     pub name: String,
     pub country: String,
     pub sector: String,
+}
+
+/// `Sector.sector_id` of a sector name: lowercase ASCII alphanumerics joined by `_`
+/// ("Information Technology" → `information_technology`); empty for an empty name.
+pub fn sector_id(name: &str) -> String {
+    name.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 /// `ref.venue` row (`venue_id` = UUID, `code` = the subject token).
@@ -107,6 +118,11 @@ pub struct RefSyncReport {
     pub issued_by: usize,
     pub listed_on: usize,
     pub same_exposure: usize,
+    /// Distinct `Sector` nodes and `InSector` edges written.
+    #[serde(default)]
+    pub sectors: usize,
+    #[serde(default)]
+    pub in_sector: usize,
     /// Instruments marked `inactive` (absent from Postgres).
     pub retired: usize,
     pub batches: usize,
@@ -121,6 +137,9 @@ pub struct InstrumentReference {
     pub listings: Vec<EdgeRow>,
     pub venues: Vec<Json>,
     pub exposures: Vec<EdgeRow>,
+    /// The issuer's sector (`IssuedBy` → `InSector`).
+    #[serde(default)]
+    pub sectors: Vec<Json>,
 }
 
 fn s(v: &str) -> Input {
@@ -212,6 +231,51 @@ pub fn instrument_batch(rows: &[RefInstrument]) -> Batch {
     })
 }
 
+/// The distinct sectors of a set of entities as `(sector_id, name)`, first name per id wins.
+pub fn sectors_of(rows: &[RefEntity]) -> Vec<(String, String)> {
+    let mut seen = std::collections::BTreeMap::new();
+    for e in rows {
+        let id = sector_id(&e.sector);
+        if !id.is_empty() {
+            seen.entry(id).or_insert_with(|| e.sector.trim().to_owned());
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// The node-upsert batch of one chunk of sectors `(sector_id, name)`.
+pub fn sector_batch(rows: &[(String, String)]) -> Batch {
+    rows.iter().enumerate().fold(Batch::write().named("upsert_ref_sectors"), |b, (i, (id, name))| {
+        node_upsert_i(b, "s", i, node::SECTOR, "sector_id", id, vec![("name", s(name))])
+    })
+}
+
+/// The `InSector` edge batch of one chunk of entities: each entity's out-edge made equal to its
+/// current sector (none when the sector is empty).
+pub fn entity_edge_batch(rows: &[RefEntity]) -> Batch {
+    let mut b = Batch::write().named("sync_ref_sector_edges");
+    for (i, e) in rows.iter().enumerate() {
+        let ent = format!("ent{i}");
+        b = b.var(&ent, by_key(node::ENTITY, "entity_id", &e.entity_id));
+        let sid = sector_id(&e.sector);
+        let keep: Vec<String> = if sid.is_empty() { Vec::new() } else { vec![sid.clone()] };
+        b = prune_out_edges(b, &format!("px_sec{i}"), &ent, edge::IN_SECTOR, "sector_id", &keep);
+        if !sid.is_empty() {
+            b = edge_upsert(
+                b,
+                i,
+                edge::IN_SECTOR,
+                Op::nodes(NodeRef::var(&ent)),
+                by_key(node::SECTOR, "sector_id", &sid),
+                Pred::eq("sector_id", sid.as_str()),
+                vec![("entity_id", s(&e.entity_id)), ("sector_id", s(&sid))],
+                vec![("mirrored_at", Input::Now)],
+            );
+        }
+    }
+    b.returning(Vec::<String>::new())
+}
+
 /// The edge batch of one chunk of instruments: prune stale out-edges, upsert the current ones.
 pub fn instrument_edge_batch(rows: &[RefInstrument]) -> Batch {
     let mut b = Batch::write().named("sync_ref_edges");
@@ -298,10 +362,18 @@ pub fn retire_batch(instrument_ids: &[String]) -> Batch {
 }
 
 impl HubClient {
-    /// `upsertRefEntities`: `Entity` nodes by `entity_id`, [`CHUNK`] per batch.
+    /// `upsertRefEntities`: `Entity` nodes by `entity_id`, [`CHUNK`] per batch, then the
+    /// `Sector` nodes of their sectors and each entity's `InSector` edge (made equal to its
+    /// current sector).
     pub async fn upsert_ref_entities(&self, rows: &[RefEntity]) -> Result<usize> {
         for c in rows.chunks(CHUNK) {
             self.batch(&entity_batch(c).returning(Vec::<String>::new())).await?;
+        }
+        for c in sectors_of(rows).chunks(CHUNK) {
+            self.batch(&sector_batch(c).returning(Vec::<String>::new())).await?;
+        }
+        for c in rows.chunks(CHUNK) {
+            self.batch(&entity_edge_batch(c)).await?;
         }
         Ok(rows.len())
     }
@@ -370,6 +442,8 @@ impl HubClient {
         let mut rep = self.upsert_ref_instruments(instruments).await?;
         rep.entities = entities.len();
         rep.venues = venues.len();
+        rep.sectors = sectors_of(entities).len();
+        rep.in_sector = entities.iter().filter(|e| !sector_id(&e.sector).is_empty()).count();
         rep.batches += entities.len().div_ceil(CHUNK) + venues.len().div_ceil(CHUNK);
         if full {
             let current: std::collections::HashSet<&str> =
@@ -396,7 +470,11 @@ impl HubClient {
             .ret("issuer", Op::nodes(NodeRef::var("i")).out(Some(edge::ISSUED_BY)).value_map(None))
             .ret("listings", Op::nodes(NodeRef::var("i")).out_e(Some(edge::LISTED_ON)).edge_properties())
             .ret("venues", Op::nodes(NodeRef::var("i")).out(Some(edge::LISTED_ON)).value_map(None))
-            .ret("exposures", Op::nodes(NodeRef::var("i")).out_e(Some(edge::SAME_EXPOSURE)).edge_properties());
+            .ret("exposures", Op::nodes(NodeRef::var("i")).out_e(Some(edge::SAME_EXPOSURE)).edge_properties())
+            .ret(
+                "sectors",
+                Op::nodes(NodeRef::var("i")).out(Some(edge::ISSUED_BY)).out(Some(edge::IN_SECTOR)).value_map(None),
+            );
         let mut resp = self.batch(&b).await?;
         let Some(instrument) = resp.take_opt::<Json>("instrument")? else { return Ok(None) };
         Ok(Some(InstrumentReference {
@@ -405,6 +483,7 @@ impl HubClient {
             listings: resp.take("listings")?,
             venues: resp.take("venues")?,
             exposures: resp.take("exposures")?,
+            sectors: resp.take("sectors")?,
         }))
     }
 }
@@ -429,6 +508,25 @@ mod tests {
             }],
             exposures: vec![RefExposure { to_instrument_id: "i2".into(), relation: "crypto_spot-perp".into() }],
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sectors_are_slugged_deduplicated_and_linked() {
+        assert_eq!(sector_id(" Information Technology "), "information_technology");
+        assert_eq!(sector_id("Banks & Insurance"), "banks_insurance");
+        assert_eq!(sector_id(""), "");
+        let ents = [
+            RefEntity { entity_id: "e1".into(), sector: "Information Technology".into(), ..Default::default() },
+            RefEntity { entity_id: "e2".into(), sector: "information technology".into(), ..Default::default() },
+            RefEntity { entity_id: "e3".into(), ..Default::default() },
+        ];
+        assert_eq!(sectors_of(&ents), vec![("information_technology".into(), "Information Technology".into())]);
+        let n = sector_batch(&sectors_of(&ents)).to_json().to_string();
+        assert!(n.contains("\"Sector\"") && n.contains("information_technology"));
+        let j = entity_edge_batch(&ents).to_json().to_string();
+        for want in ["\"px_sec0\"", "\"px_sec2\"", "InSector", "\"Sector\""] {
+            assert!(j.contains(want), "{want} missing in {j}");
         }
     }
 

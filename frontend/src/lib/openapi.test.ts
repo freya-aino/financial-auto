@@ -27,6 +27,13 @@ export function match(path: string, method: Method = 'any'): string | null {
 	return hits.find((p) => method === 'any' || paths[p][method]) ?? hits[0] ?? null;
 }
 
+/**
+ * Routes the UI already calls but control-api does not serve yet (backend work listed in spec 51
+ * / frontend/README). The UI treats 404/501 from them as "unavailable". Remove an entry once the
+ * route is in the regenerated `openapi.json` (the test below fails on a stale entry).
+ */
+export const PENDING_ROUTES: Record<string, string> = {};
+
 // every source of the app, raw (Vite glob; tests excluded below)
 const SOURCES = import.meta.glob(['/src/**/*.ts', '/src/**/*.svelte', '!/src/**/*.test.ts'], { query: '?raw', import: 'default', eager: true }) as Record<string, string>;
 
@@ -72,6 +79,7 @@ describe('frontend ↔ OpenAPI contract', () => {
 			// prose mentions (`Resolve via POST /api/…`) inside markup are not calls
 			if (c.lit.includes(' ') || c.lit.includes('&#123;')) continue;
 			const p = match(c.path, c.method);
+			if (!p && PENDING_ROUTES[`${c.method.toUpperCase()} ${c.path}`]) continue;
 			if (!p) {
 				problems.push(`${c.file}: ${c.lit} → no documented path`);
 				continue;
@@ -79,5 +87,13 @@ describe('frontend ↔ OpenAPI contract', () => {
 			if (c.method !== 'any' && !paths[p][c.method]) problems.push(`${c.file}: ${c.method.toUpperCase()} ${c.lit} → ${p} has ${Object.keys(paths[p]).join(', ')}`);
 		}
 		expect(problems).toEqual([]);
+	});
+
+	it('pending routes are still missing from the document (else drop them from PENDING_ROUTES)', () => {
+		for (const key of Object.keys(PENDING_ROUTES)) {
+			const [method, path] = key.split(' ');
+			const p = match(path, method.toLowerCase() as Method);
+			expect(p && paths[p][method.toLowerCase()] ? key : null).toBeNull();
+		}
 	});
 });

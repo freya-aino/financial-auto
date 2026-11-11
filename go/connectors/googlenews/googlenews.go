@@ -18,7 +18,6 @@ package googlenews
 
 import (
 	"context"
-	"encoding/xml"
 	"fmt"
 	"html"
 	"net/url"
@@ -29,6 +28,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/fey/financial-auto/go/connectors/rss"
 	fav1 "github.com/fey/financial-auto/go/pkg/bus/pb/fa/v1"
 	"github.com/fey/financial-auto/go/pkg/connector"
 )
@@ -134,31 +134,13 @@ func (c *Connector) Poll(ctx context.Context, _ connector.PollRequest) ([]connec
 	return out, nil
 }
 
-type rss struct {
-	Channel struct {
-		Title    string `xml:"title"`
-		Language string `xml:"language"`
-		Items    []struct {
-			Title       string `xml:"title"`
-			Link        string `xml:"link"`
-			GUID        string `xml:"guid"`
-			PubDate     string `xml:"pubDate"`
-			Description string `xml:"description"`
-			Source      struct {
-				URL  string `xml:"url,attr"`
-				Name string `xml:",chardata"`
-			} `xml:"source"`
-		} `xml:"item"`
-	} `xml:"channel"`
-}
-
 // Normalize maps a feed to NewsItems, skipping guids already published.
 func (c *Connector) Normalize(raw connector.RawMessage) ([]*fav1.Envelope, []connector.Unresolved, error) {
-	var feed rss
-	if err := xml.Unmarshal(raw.Bytes, &feed); err != nil {
-		return nil, nil, fmt.Errorf("googlenews: decode: %w", err)
+	feed, err := rss.Parse(raw.Bytes) // shared RSS/Atom parser (spec 11 §6.3)
+	if err != nil {
+		return nil, nil, fmt.Errorf("googlenews: %w", err)
 	}
-	lang := strings.ToLower(strings.SplitN(feed.Channel.Language, "-", 2)[0])
+	lang := strings.ToLower(strings.SplitN(feed.Language, "-", 2)[0])
 	if lang == "" {
 		lang = "en"
 	}
@@ -167,13 +149,10 @@ func (c *Connector) Normalize(raw connector.RawMessage) ([]*fav1.Envelope, []con
 	defer c.mu.Unlock()
 	newest := c.cursor
 	var envs []*fav1.Envelope
-	for _, it := range feed.Channel.Items {
-		key := it.GUID
-		if key == "" {
-			key = it.Link
-		}
-		at, err := parseDate(it.PubDate)
-		if err != nil {
+	for _, it := range feed.Items {
+		key := it.Key()
+		at := it.Published
+		if at.IsZero() {
 			at = raw.ReceivedAt
 		}
 		if !c.floor.IsZero() && !at.After(c.floor) {
@@ -183,7 +162,7 @@ func (c *Connector) Normalize(raw connector.RawMessage) ([]*fav1.Envelope, []con
 		if !c.seen.Add(key) {
 			continue
 		}
-		title, outlet := splitOutlet(html.UnescapeString(it.Title), it.Source.Name)
+		title, outlet := splitOutlet(html.UnescapeString(it.Title), it.Source)
 		var ents []string
 		if query != "" {
 			ents = []string{"query:" + query}
@@ -226,13 +205,4 @@ func splitOutlet(title, source string) (string, string) {
 		return title[:i], title[i+3:]
 	}
 	return title, ""
-}
-
-func parseDate(s string) (time.Time, error) {
-	for _, layout := range []string{time.RFC1123, time.RFC1123Z, time.RFC822, time.RFC822Z, time.RFC3339} {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t.UTC(), nil
-		}
-	}
-	return time.Time{}, fmt.Errorf("unparsed date %q", s)
 }

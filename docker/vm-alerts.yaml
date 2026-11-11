@@ -174,6 +174,22 @@ groups:
         for: 30m
         labels: { severity: warning }
         annotations: { summary: "risk-engine FX rates stale for 30 min (EUR conversion uses old rates)" }
+      - alert: CostModelStale
+        # Spec 41 §8: realised slippage (EWMA of fills vs arrival) diverges from the cost model's prediction for a
+        # (venue, class) by > 5 bps and > 50 % for an hour, with >= 30 fills since the gateway started.
+        expr: |
+          (
+            abs(label_replace(fa_heartbeat_counter{service="broker-gateway",key=~"slippage\\..+\\.bps_mean"}, "pair", "$1", "key", "slippage\\.(.+)\\.bps_mean")
+              - on(pair) label_replace(fa_heartbeat_counter{service="broker-gateway",key=~"slippage\\..+\\.model_bps_mean"}, "pair", "$1", "key", "slippage\\.(.+)\\.model_bps_mean")) > 5
+            and on(pair)
+            abs(label_replace(fa_heartbeat_counter{service="broker-gateway",key=~"slippage\\..+\\.bps_mean"}, "pair", "$1", "key", "slippage\\.(.+)\\.bps_mean")
+              - on(pair) label_replace(fa_heartbeat_counter{service="broker-gateway",key=~"slippage\\..+\\.model_bps_mean"}, "pair", "$1", "key", "slippage\\.(.+)\\.model_bps_mean"))
+              > on(pair) 0.5 * abs(label_replace(fa_heartbeat_counter{service="broker-gateway",key=~"slippage\\..+\\.model_bps_mean"}, "pair", "$1", "key", "slippage\\.(.+)\\.model_bps_mean"))
+          )
+          and on(pair) label_replace(fa_heartbeat_counter{service="broker-gateway",key=~"slippage\\..+\\.n"}, "pair", "$1", "key", "slippage\\.(.+)\\.n") >= 30
+        for: 1h
+        labels: { severity: warning }
+        annotations: { summary: "cost model stale for {{ $labels.pair }}: realised slippage differs from the model by {{ $value }} bps for 1 h (gateway recalibrates k every 15 min; check costs.yaml)" }
 
   - name: fa-ingestion
     interval: 30s
@@ -188,11 +204,59 @@ groups:
         expr: increase(fa_heartbeat_counter{service="ingestor",key=~"tsdb.(errors|dropped)"}[10m]) > 0
         labels: { severity: warning }
         annotations: { summary: "ingestor {{ $labels.key }} rising: market data not reaching VictoriaMetrics" }
+      - alert: TsdbSeriesBudget
+        # Spec 20 §5.3/§8: the ingestor's writer demotes instruments to bars-only (tsdb.demoted) or rejects new
+        # bar series (tsdb.rejected_bars) beyond vm.max_active_series (5 M); the VM-native count warns at 80 %.
+        expr: increase(fa_heartbeat_counter{service="ingestor",key=~"tsdb.(demoted|rejected_bars)"}[15m]) > 0 or vm_cache_entries{type="storage/hour_metric_ids"} > 0.8 * 5e6
+        labels: { severity: warning }
+        annotations: { summary: "VictoriaMetrics series budget reached ({{ $labels.key }}{{ $value }}): instruments kept at bar resolution" }
       - alert: RawArchiveErrors
         expr: increase(fa_heartbeat_counter{service="ingestor",key="archive.errors"}[15m]) > 0
         labels: { severity: warning }
         annotations: { summary: "ingestor raw archive (Garage) writes failing" }
+      # Spec 10 §8 clock skew: live trades/quotes/bars stamped > 2 s after their ingest time mean the host
+      # (or the source) clock is off; ingest_lag_ratio = median live lag / catalog knowledge_delay_secs (D-079).
+      - alert: IngestClockSkew
+        expr: increase(fa_heartbeat_counter{service="ingestor",key=~"clock\\.future_events\\..+"}[10m]) > 0
+        labels: { severity: warning }
+        annotations: { summary: "ingestor {{ $labels.key }}: events stamped in the future (clock skew between host and source)" }
+      - alert: IngestLagOverBudget
+        expr: fa_heartbeat_counter{service="ingestor",key=~"ingest_lag_ratio\\..+"} > 1
+        for: 15m
+        labels: { severity: warning }
+        annotations: { summary: "ingestor {{ $labels.key }} = {{ $value }}: median ingest lag above the measured knowledge delay" }
+      # Spec 10 §8 NATS outage: envelopes are spooled to disk; a full buffer stops connectors.
+      - alert: IngestBusBuffering
+        expr: fa_heartbeat_counter{service="ingestor",key="natsbuf.records"} > 0
+        for: 2m
+        labels: { severity: warning }
+        annotations: { summary: "ingestor buffering {{ $value }} envelopes on disk: NATS unreachable" }
+      - alert: IngestBusBufferFull
+        expr: increase(fa_heartbeat_counter{service="ingestor",key="natsbuf.full"}[10m]) > 0
+        labels: { severity: critical }
+        annotations: { summary: "ingestor envelope disk buffer full: connectors stopped until NATS is back" }
+      # Spec 11 §6.1: a source down for catalog.auto_disable_after_failures_h was set to disabled.
+      - alert: SourceAutoDisabled
+        expr: increase(fa_heartbeat_counter{service="ingestor",key="catalog.auto_disabled"}[1h]) > 0
+        labels: { severity: warning }
+        annotations: { summary: "a catalog source was auto-disabled after persistent failure (see catalog.source.status_note)" }
       - alert: HubWriteErrors
         expr: increase(fa_heartbeat_counter{service="model-runtime",key="hub.errors"}[15m]) > 0
         labels: { severity: warning }
         annotations: { summary: "model-runtime HelixDB writes failing" }
+      - alert: HubBacklogLost
+        # observation log full / unwritable, or the sink queue overflowed: Helix writes are being lost (spec 30 §8, spec 33 §8)
+        expr: increase(fa_heartbeat_counter{service="model-runtime",key=~"hub.(log_full|log_errors|dropped)"}[15m]) > 0
+        labels: { severity: warning }
+        annotations: { summary: "model-runtime {{ $labels.key }} rising: Helix writes lost" }
+      - alert: HubBacklog
+        expr: fa_heartbeat_counter{service="model-runtime",key="hub.backlog"} > 0
+        for: 30m
+        labels: { severity: warning }
+        annotations: { summary: "model-runtime Helix writes deferred to the observation log for 30 min (Helix down or slow)" }
+      - alert: RegionSetInvalid
+        # spec 30 §8: a region set collapsed into one region or hit max_regions_per_set
+        expr: fa_heartbeat_counter{service="model-runtime",key=~"regions_invalid\\..*"} > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "model-runtime {{ $labels.key }}: region set collapsed (one region or at the cap)" }

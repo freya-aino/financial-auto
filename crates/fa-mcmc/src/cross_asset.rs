@@ -49,12 +49,32 @@ pub struct CrossAssetCfg {
     pub min_obs: usize,
     /// `cross_prior_top_n`.
     pub top_n: usize,
+    /// Up to this many instruments every ordered pair is evaluated; above it pairs go through
+    /// the candidate screen ([`CrossAssetPriors::candidates`], spec 33 §10 q5).
+    pub exhaustive_max: usize,
+    /// Screened sources kept per target (top-k by lagged correlation).
+    pub per_target: usize,
+    /// Extra sources per target drawn pseudo-randomly per round (exploration).
+    pub explore: usize,
 }
 
 impl Default for CrossAssetCfg {
     fn default() -> Self {
-        Self { window: 500, max_lag: 5, min_obs: 60, top_n: 50 }
+        Self { window: 500, max_lag: 5, min_obs: 60, top_n: 50, exhaustive_max: 48, per_target: 8, explore: 2 }
     }
+}
+
+/// Result of [`CrossAssetPriors::rank`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Ranked {
+    /// Top-N proposals (positive gain, ranked by evidence-weighted score).
+    pub proposals: Vec<CrossPrior>,
+    /// Candidate pairs considered.
+    pub candidates: usize,
+    /// Candidate pairs that were evaluable (enough joint observations).
+    pub evaluated: usize,
+    /// The candidate screen ran (more than `exhaustive_max` instruments).
+    pub screened: bool,
 }
 
 /// One directed pair: `source` (a) → `target` (b).
@@ -129,6 +149,13 @@ pub struct CrossAssetPriors {
 
 /// Real observations each side needs inside the overlap (the rest may be filled with 0).
 const MIN_OWN_OBS: usize = 20;
+
+fn splitmix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
 
 fn mean(x: &[f64]) -> f64 {
     x.iter().sum::<f64>() / x.len().max(1) as f64
@@ -368,11 +395,120 @@ impl CrossAssetPriors {
         self.proposals_with_evidence(&BTreeMap::new())
     }
 
-    /// Top-N proposals with the evolution evidence of `(source, target)` pairs folded in:
-    /// `score = raw_score · evidence.weight()`, ranked by it (spec 33 §6.5 feedback).
-    pub fn proposals_with_evidence(&self, evidence: &BTreeMap<(String, String), PairEvidence>) -> Vec<CrossPrior> {
-        let mut v: Vec<CrossPrior> = self
-            .all_pairs()
+    /// Candidate pairs `(source, target)` to evaluate (spec 33 §10 q5, universe scale).
+    ///
+    /// With at most `exhaustive_max` instruments: every ordered pair. Above it, the union of
+    /// - the **screen**: per target, the `per_target` sources with the largest
+    ///   `max_ℓ |corr(a_{t−ℓ}, b_t)|`, `ℓ ∈ 1..=max_lag`, on one common grid (the last `window`
+    ///   bar closes of any instrument; a missing close is a 0 return as in [`Self::pair`];
+    ///   residuals where an instrument has them, else returns; standardised). This is the
+    ///   statistic the exact evaluation maximises, so a pair that would rank high passes it;
+    ///   cost `n²·max_lag·window` multiply-adds without allocation, versus `n²` full pair
+    ///   evaluations (timeline merge, two OLS fits) before;
+    /// - every pair with **evolution evidence** (a pair evolution keeps testing stays scored);
+    /// - `explore` **random** sources per target, rotating with `round` (pairs the screen misses,
+    ///   e.g. non-linear lead, still get evaluated now and then).
+    ///
+    /// Exact evaluation then costs `O(n · (per_target + explore) + |evidence|)` pairs.
+    pub fn candidates(&self, evidence: &BTreeMap<(String, String), PairEvidence>, round: u64) -> Vec<(String, String)> {
+        let names: Vec<&String> = self.series.keys().collect();
+        let n = names.len();
+        if n <= self.cfg.exhaustive_max.max(2) {
+            return names
+                .iter()
+                .flat_map(|a| names.iter().filter(move |b| a != *b).map(move |b| ((*a).clone(), (*b).clone())))
+                .collect();
+        }
+        let grid = self.screen_grid();
+        let g = grid.first().map_or(0, Vec::len);
+        let lags = self.cfg.max_lag.max(1).min(g / 4).max(1);
+        let mut out: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+        for (j, b) in grid.iter().enumerate() {
+            if b.is_empty() {
+                continue;
+            }
+            let mut scores: Vec<(f64, usize)> = grid
+                .iter()
+                .enumerate()
+                .filter(|(i, a)| *i != j && !a.is_empty())
+                .map(|(i, a)| {
+                    let best = (1..=lags)
+                        .map(|l| {
+                            let dot: f64 = a[..g - l].iter().zip(&b[l..]).map(|(x, y)| x * y).sum();
+                            (dot / (g - l) as f64).abs()
+                        })
+                        .fold(0.0, f64::max);
+                    (best, i)
+                })
+                .collect();
+            let k = self.cfg.per_target.min(scores.len());
+            if k > 0 {
+                scores.select_nth_unstable_by(k - 1, |p, q| q.0.total_cmp(&p.0).then(p.1.cmp(&q.1)));
+                for (_, i) in &scores[..k] {
+                    out.insert((names[*i].clone(), names[j].clone()));
+                }
+            }
+            for e in 0..self.cfg.explore {
+                let h = splitmix(round.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ((j as u64) << 20) ^ e as u64);
+                let i = (h % n as u64) as usize;
+                if i != j {
+                    out.insert((names[i].clone(), names[j].clone()));
+                }
+            }
+        }
+        for (a, b) in evidence.keys() {
+            if a != b && self.series.contains_key(a) && self.series.contains_key(b) {
+                out.insert((a.clone(), b.clone()));
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Standardised screening vectors on a common grid, in `series` key order (empty for an
+    /// instrument without variance on the grid).
+    fn screen_grid(&self) -> Vec<Vec<f64>> {
+        let mut times: Vec<i64> = self.series.values().flat_map(|s| s.iter().map(|x| x.0)).collect();
+        times.sort_unstable();
+        times.dedup();
+        let keep = self.cfg.window.max(self.cfg.min_obs).min(times.len());
+        let times = &times[times.len() - keep..];
+        self.series
+            .iter()
+            .map(|(name, s)| {
+                let src = match self.resid.get(name) {
+                    Some(r) if r.len() >= MIN_OWN_OBS => r,
+                    _ => s,
+                };
+                let mut v = vec![0.0; times.len()];
+                let mut own = 0;
+                for (t, x) in src {
+                    if let Ok(i) = times.binary_search(t) {
+                        v[i] = *x;
+                        own += 1;
+                    }
+                }
+                if own < MIN_OWN_OBS {
+                    return Vec::new();
+                }
+                let m = mean(&v);
+                let sd = (v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / v.len() as f64).sqrt();
+                if sd <= 1e-15 || !sd.is_finite() {
+                    return Vec::new();
+                }
+                v.iter_mut().for_each(|x| *x = (*x - m) / sd);
+                v
+            })
+            .collect()
+    }
+
+    /// Ranked proposals over the [`Self::candidates`] of `round`, with the evolution evidence
+    /// folded in (`score = raw_score · evidence.weight()`), top `top_n`.
+    pub fn rank(&self, evidence: &BTreeMap<(String, String), PairEvidence>, round: u64) -> Ranked {
+        let cands = self.candidates(evidence, round);
+        let screened = self.series.len() > self.cfg.exhaustive_max.max(2);
+        let evaluated: Vec<CrossPrior> = cands.iter().filter_map(|(a, b)| self.pair(a, b)).collect();
+        let n_eval = evaluated.len();
+        let mut v: Vec<CrossPrior> = evaluated
             .into_iter()
             .filter(|p| p.predictive_gain > 0.0)
             .map(|mut p| {
@@ -385,7 +521,14 @@ impl CrossAssetPriors {
             .collect();
         v.sort_by(|p, q| q.score.total_cmp(&p.score).then_with(|| (&p.source, &p.target).cmp(&(&q.source, &q.target))));
         v.truncate(self.cfg.top_n);
-        v
+        Ranked { proposals: v, candidates: cands.len(), evaluated: n_eval, screened }
+    }
+
+    /// Top-N proposals with the evolution evidence of `(source, target)` pairs folded in:
+    /// `score = raw_score · evidence.weight()`, ranked by it (spec 33 §6.5 feedback); the
+    /// candidates of round 0 ([`Self::rank`]).
+    pub fn proposals_with_evidence(&self, evidence: &BTreeMap<(String, String), PairEvidence>) -> Vec<CrossPrior> {
+        self.rank(evidence, 0).proposals
     }
 }
 
@@ -394,6 +537,46 @@ mod tests {
     use fa_core::rng::Rng;
 
     use super::*;
+
+    #[test]
+    fn the_candidate_screen_finds_the_leader_in_a_large_universe() {
+        // 120 instruments (> exhaustive_max): one lead → follow pair, the rest noise.
+        let mut rng = Rng::seed(11);
+        let cfg = CrossAssetCfg { window: 300, ..CrossAssetCfg::default() };
+        let mut cp = CrossAssetPriors::new(cfg);
+        let mut lead_hist = vec![0.0; 2];
+        for t in 0..300i64 {
+            let l = 0.01 * rng.normal();
+            lead_hist.push(l);
+            cp.push("lead", t * 60_000, l);
+            cp.push("follow", t * 60_000, 0.7 * lead_hist[lead_hist.len() - 2] + 0.005 * rng.normal());
+            for i in 0..118 {
+                cp.push(&format!("n{i:03}"), t * 60_000, 0.01 * rng.normal());
+            }
+        }
+        let mut ev = BTreeMap::new();
+        ev.insert(("n000".to_owned(), "n001".to_owned()), PairEvidence { wins: 3.0, losses: 0.0 });
+        let r = cp.rank(&ev, 7);
+        assert!(r.screened);
+        // per target ≤ per_target + explore sources, plus the evidence pair; far below n(n−1)
+        assert!(r.candidates <= 120 * 10 + 1 && r.candidates >= 120 * 8, "{}", r.candidates);
+        assert!(r.evaluated <= r.candidates);
+        let top = &r.proposals[0];
+        assert_eq!((top.source.as_str(), top.target.as_str(), top.lead_lag), ("lead", "follow", 1));
+        let c = cp.candidates(&ev, 7);
+        assert!(c.contains(&("n000".to_owned(), "n001".to_owned())), "evidence pairs stay candidates");
+        assert_eq!(c, cp.candidates(&ev, 7), "deterministic per round");
+        assert_ne!(c, cp.candidates(&ev, 8), "exploration rotates");
+        // small universes keep the exhaustive set
+        let mut small = CrossAssetPriors::new(cfg);
+        for t in 0..100i64 {
+            for i in 0..5 {
+                small.push(&format!("s{i}"), t, rng.normal());
+            }
+        }
+        assert_eq!(small.candidates(&BTreeMap::new(), 0).len(), 20);
+        assert!(!small.rank(&BTreeMap::new(), 0).screened);
+    }
 
     #[test]
     fn a_leading_asset_is_proposed_and_independent_noise_is_not() {

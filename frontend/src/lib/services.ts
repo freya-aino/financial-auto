@@ -59,3 +59,64 @@ export function primitiveShares(counters: Record<string, number>): { graph: numb
 }
 
 export const fmtCounter = (v: number) => (Number.isInteger(v) ? String(v) : Math.abs(v) < 10 ? v.toFixed(3) : v.toFixed(1));
+
+// ---------------------------------------------------------------- service control (D-060)
+
+export type ServiceAction = 'start' | 'stop' | 'restart';
+export const SERVICE_ACTIONS: ServiceAction[] = ['start', 'stop', 'restart'];
+
+/** Mirrors control-api `services_routes::REFUSED` / `CONFIRM` (the API stays the authority:
+ *  a refusal is still answered 409 and shown). */
+export const REFUSED_SERVICES = ['control-api', 'nats', 'postgres', 'helix', 'victoriametrics', 'garage'];
+export const CONFIRM_SERVICES = ['risk-engine'];
+
+export interface ContainerSummary {
+	name: string;
+	id: string;
+	image: string;
+	/** Docker state: running | exited | restarting | paused | created | dead. */
+	state: string;
+	status: string;
+}
+
+export interface Supervisor {
+	available: boolean;
+	project?: string;
+	socket?: string;
+	services?: string[];
+	detail?: string;
+}
+
+/** Whether an action button is enabled, with the reason when it is not. */
+export function actionGate(service: string, action: ServiceAction, container: ContainerSummary | null | undefined, supervisor: Supervisor | null): { enabled: boolean; why: string } {
+	if (REFUSED_SERVICES.includes(service))
+		return { enabled: false, why: service === 'control-api' ? 'control-api cannot supervise itself' : 'infrastructure: use docker compose' };
+	if (!supervisor?.available) return { enabled: false, why: `no Docker socket in control-api${supervisor?.detail ? `: ${supervisor.detail}` : ''}` };
+	if (!container) return { enabled: false, why: 'no container for this service in the compose project' };
+	const running = container.state === 'running';
+	if (action === 'start' && running) return { enabled: false, why: 'already running' };
+	if (action === 'stop' && !running) return { enabled: false, why: 'already stopped' };
+	return { enabled: true, why: '' };
+}
+
+/** Confirmation text; risk-engine stop/restart names the trading halt (sent with `confirm: true`). */
+export function confirmText(service: string, action: ServiceAction): string {
+	const base = `${action[0].toUpperCase()}${action.slice(1)} ${service}? Audited as service.${action}.`;
+	if (CONFIRM_SERVICES.includes(service) && action !== 'start')
+		return `${base}\n\n${action} of ${service} halts trading (spec 40): no orders pass the risk chain until it is back.`;
+	return action === 'stop' ? `${base} Its heartbeat and bus output stop until started again.` : base;
+}
+
+/** Body of `POST /api/services/{name}/{action}`. */
+export const actionBody = (service: string, action: ServiceAction) => (CONFIRM_SERVICES.includes(service) && action !== 'start' ? { confirm: true } : {});
+
+/** Operator text for the API's answer (`{ok, state, noop, audited}`) or its error body. */
+export function describeResult(service: string, action: ServiceAction, r: { ok?: boolean; state?: string; noop?: boolean; audited?: boolean } | null, err?: { status: number; body: unknown; message: string }): string {
+	if (err) {
+		const b = (err.body ?? {}) as { error?: string; message?: string; detail?: string; hint?: string };
+		const what = b.message ?? b.detail ?? b.error ?? err.message;
+		return `${service} ${action} failed (${err.status}): ${what}${b.hint ? ` — ${b.hint}` : ''}`;
+	}
+	if (!r) return '';
+	return `${service} ${action}: ${r.noop ? 'no change, ' : ''}state ${r.state ?? '?'}${r.audited ? ' · audited' : ' · NOT audited'}`;
+}

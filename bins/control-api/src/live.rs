@@ -59,6 +59,10 @@ pub struct ExpertStateView {
     pub norm: f64,
     /// Mean posterior std (exp(log_var / 2)).
     pub uncertainty: f64,
+    /// Raw latent mean (`ExpertLatent.mean`), so a client can project live positions with the
+    /// `pca{mean, components}` of `/api/latent/{snapshot}/projection`; omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mean: Vec<f32>,
 }
 
 /// Online mean / covariance of a vector of per-expert features (Welford), growing with the
@@ -588,6 +592,7 @@ impl Live {
                     dims: e.mean.len(),
                     norm,
                     uncertainty,
+                    mean: e.mean.clone(),
                 }
             })
             .collect();

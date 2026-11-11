@@ -58,6 +58,12 @@ type Stats struct {
 	Dropped    uint64 // samples dropped because the buffer was full
 	Aggregated uint64 // trades folded into an earlier trade of the same series and millisecond (VWAP)
 	Late       uint64 // trades older than their series' newest emitted millisecond, written unaggregated
+	// Series budget (budget.go, spec 20 §5.3): series counted active, instruments demoted to
+	// bars only, tick points dropped for demoted instruments, new bar series rejected.
+	ActiveSeries uint64
+	Demoted      uint64
+	OverBudget   uint64
+	RejectedBars uint64
 }
 
 // tradeBucket accumulates the trades of one series within one millisecond:
@@ -94,6 +100,10 @@ type Writer struct {
 	holdFor time.Duration
 	now     func() time.Time
 
+	budget    *seriesBudget
+	pollEvery time.Duration
+	lastPoll  time.Time
+
 	mu      sync.Mutex
 	buf     []Point
 	trades  map[string]*tradeBucket // open (newest-millisecond) bucket per trade series
@@ -113,6 +123,14 @@ type Options struct {
 	// A newer millisecond on the same series closes it at once.
 	TradeHold time.Duration
 	Now       func() time.Time // clock for TradeHold (tests); default time.Now
+	// MaxActiveSeries is the series budget (spec 20 §7 vm.max_active_series; default
+	// DefaultMaxActiveSeries, negative disables). See budget.go.
+	MaxActiveSeries int
+	// ActiveWindow is how long an idle series still counts as active (default 1 h, VM's hour).
+	ActiveWindow time.Duration
+	// BudgetPoll is how often VM's own active-series count is read from /metrics
+	// (default 1 min, negative: never, count only this writer's series).
+	BudgetPoll time.Duration
 }
 
 // New creates a writer for a VictoriaMetrics base URL such as http://127.0.0.1:8428.
@@ -135,7 +153,17 @@ func New(url string, o Options) *Writer {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
+	if o.MaxActiveSeries == 0 {
+		o.MaxActiveSeries = DefaultMaxActiveSeries
+	}
+	if o.ActiveWindow <= 0 {
+		o.ActiveWindow = time.Hour
+	}
+	if o.BudgetPoll == 0 {
+		o.BudgetPoll = time.Minute
+	}
 	return &Writer{
+		budget: newSeriesBudget(o.MaxActiveSeries, o.ActiveWindow), pollEvery: o.BudgetPoll,
 		url: strings.TrimRight(url, "/"), client: o.Client, batch: o.BatchSize, every: o.FlushInterval,
 		maxBuffer: o.MaxBuffer, holdFor: o.TradeHold, now: o.Now, wake: make(chan struct{}, 1),
 		trades: map[string]*tradeBucket{}, emitted: map[string]int64{},
@@ -157,6 +185,18 @@ func (w *Writer) bufferLocked(pts []Point) {
 	for _, p := range pts {
 		if len(w.buf) >= w.maxBuffer {
 			w.stats.Dropped++
+			continue
+		}
+		switch w.budget.admit(p, w.now()) {
+		case droppedNewDemotion:
+			w.stats.Demoted++
+			w.stats.OverBudget++
+			continue
+		case droppedDemoted:
+			w.stats.OverBudget++
+			continue
+		case rejectedBar:
+			w.stats.RejectedBars++
 			continue
 		}
 		w.buf = append(w.buf, p)
@@ -351,7 +391,9 @@ func BookPoints(e *fav1.Envelope, venue string) []Point {
 func (w *Writer) Stats() Stats {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.stats
+	st := w.stats
+	st.ActiveSeries = uint64(w.budget.active())
+	return st
 }
 
 // Run flushes on a timer, when a batch fills, and once more on ctx done.
@@ -384,6 +426,7 @@ func (w *Writer) Flush(ctx context.Context) error {
 }
 
 func (w *Writer) flush(ctx context.Context, onErr func(error)) {
+	w.refreshBudget(ctx)
 	w.mu.Lock()
 	w.closeTradesLocked(false)
 	pts := w.buf

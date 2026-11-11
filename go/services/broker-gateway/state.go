@@ -56,6 +56,8 @@ type GatewayState struct {
 	Seen      []string           `json:"seen"`
 	Positions map[string]float64 `json:"positions"`
 	FillSeq   uint64             `json:"fill_seq"`
+	// Carry accruals and recently charged periods (carry.go); absent in older files.
+	Carry *carryState `json:"carry,omitempty"`
 }
 
 func posKey(account, instrument string) string { return account + "|" + instrument }
@@ -105,6 +107,12 @@ func (p *PaperEngine) Snapshot() (*GatewayState, error) {
 		st.Resting = append(st.Resting, persistedResting{Intent: b, Arrival: r.arrival, Token: r.token})
 	}
 	st.Seen = append(st.Seen, p.seenOrder...)
+	if b, err := json.Marshal(p.carry); err == nil { // deep copy: the engine keeps mutating its own
+		var c carryState
+		if json.Unmarshal(b, &c) == nil {
+			st.Carry = &c
+		}
+	}
 	for k, v := range p.positions {
 		if v != 0 {
 			st.Positions[k] = v
@@ -149,6 +157,12 @@ func (p *PaperEngine) Restore(st *GatewayState) error {
 	}
 	if st.FillSeq > p.fillSeq {
 		p.fillSeq = st.FillSeq
+	}
+	if st.Carry != nil {
+		p.carry = st.Carry
+		if p.carry.Accruals == nil {
+			p.carry.Accruals = map[string]*carryAccrual{}
+		}
 	}
 	return nil
 }

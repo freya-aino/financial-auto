@@ -83,7 +83,11 @@ impl Layout {
                 Self { seq: if latent > 0 { 0 } else { lb }, extra: 0, latent, out: res * res, target: res * res }
             }
             BaselineFamily::NnFuture => Self { seq: lb, extra: 0, latent, out: res * res, target: res * res },
-            BaselineFamily::NnNews => Self { seq: lb, extra: 0, latent, out: tdim, target: tdim },
+            BaselineFamily::NnNews | BaselineFamily::NnFrame => Self { seq: lb, extra: 0, latent, out: tdim, target: tdim },
+            BaselineFamily::NnSummary => {
+                let w = crate::summary::width();
+                Self { seq: if latent > 0 { 0 } else { lb }, extra: 0, latent, out: w, target: w }
+            }
             BaselineFamily::NnNarrative => Self { seq: lb, extra: tdim, latent, out: tdim, target: tdim },
             // nn_forecast (and the baselines, which never train)
             _ => Self { seq: lb, extra: 0, latent, out: k, target: 1 },
@@ -158,11 +162,24 @@ type Doc = (i64, Vec<(u32, f32)>, Vec<String>);
 pub struct TextTimeline {
     docs: Vec<Doc>,
     sorted: bool,
+    /// A media-frame timeline ([`Self::frames`], `visual.frame`) rather than news.
+    frames: bool,
 }
 
 impl TextTimeline {
     pub fn new() -> Self {
-        Self { docs: Vec::new(), sorted: true }
+        Self { docs: Vec::new(), sorted: true, frames: false }
+    }
+
+    /// An empty **frame** timeline (items pushed with [`Self::push_features`] from
+    /// [`frame_features`]). Only `nn_frame` reads targets from it; the news families read none
+    /// from it, and `nn_frame` reads none from a news timeline.
+    pub fn frames() -> Self {
+        Self { docs: Vec::new(), sorted: true, frames: true }
+    }
+
+    pub fn is_frames(&self) -> bool {
+        self.frames
     }
 
     /// Adds one item (title + body) known at `ts_ms`. Items without content tokens are skipped.
@@ -191,6 +208,21 @@ impl TextTimeline {
         tags.sort();
         tags.dedup();
         self.docs.push((ts_ms, v, tags));
+    }
+
+    /// Adds one item of precomputed sparse hashed features (`(bucket, weight)`, e.g. the frame
+    /// features of [`frame_features`]); items without features are skipped.
+    pub fn push_features(&mut self, ts_ms: i64, features: Vec<(u32, f32)>, instruments: &[String]) {
+        if features.is_empty() {
+            return;
+        }
+        if self.docs.last().is_some_and(|(t, _, _)| *t > ts_ms) {
+            self.sorted = false;
+        }
+        let mut tags: Vec<String> = instruments.iter().map(|i| crate::instrument_token(i)).collect();
+        tags.sort();
+        tags.dedup();
+        self.docs.push((ts_ms, features, tags));
     }
 
     /// Items tagged with at least one instrument.
@@ -268,6 +300,35 @@ impl TextTimeline {
         let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         (any && n > 0.0).then(|| v.into_iter().map(|x| x / n).collect())
     }
+}
+
+/// Byte n-gram length of [`frame_features`].
+pub const FRAME_NGRAM: usize = 4;
+/// At most this many n-grams are hashed per frame (evenly strided over the bytes).
+pub const FRAME_MAX_GRAMS: usize = 65_536;
+
+/// Frozen front-end of the `visual.frame` family: signed-free feature hashing of the frame's byte
+/// 4-grams (FNV-1a buckets, `1 + ln count`), the always-available stand-in of spec 31 §6.3's
+/// hashed tower — no pretrained vision weights are fetched (D-010). It carries byte-level, not
+/// semantic, similarity; a pretrained tower would replace it behind the same timeline.
+pub fn frame_features(bytes: &[u8]) -> Vec<(u32, f32)> {
+    if bytes.len() < FRAME_NGRAM {
+        return Vec::new();
+    }
+    let n = bytes.len() - FRAME_NGRAM + 1;
+    let stride = n.div_ceil(FRAME_MAX_GRAMS).max(1);
+    let mut tf: HashMap<u32, f32> = HashMap::new();
+    for i in (0..n).step_by(stride) {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in &bytes[i..i + FRAME_NGRAM] {
+            h ^= u32::from(*b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        *tf.entry(h).or_default() += 1.0;
+    }
+    let mut v: Vec<(u32, f32)> = tf.into_iter().map(|(b, c)| (b, 1.0 + c.ln())).collect();
+    v.sort_by_key(|(b, _)| *b);
+    v
 }
 
 /// Instrument whose news a genome reads (`ninst=1`: the series' own; else market-wide).
@@ -372,11 +433,25 @@ pub fn target_at(g: &DecoderGenome, s: &Series, t: usize, sigma: f64, text: &Tex
             let scale = g.nn.band * sigma * (h as f64).sqrt();
             Some((render::future_raster(&cum, scale, g.nn.res)?, s.ts_ms[t + h]))
         }
-        BaselineFamily::NnNews => {
+        BaselineFamily::NnSummary => {
+            // the news slot needs a news timeline (an empty one = no news source: sit out)
+            if text.is_frames() || text.is_empty() {
+                return None;
+            }
+            let y = crate::summary::target(s, t, g.lookback, text, text_scope(g, s), text_window_ms(g))?;
+            Some((y, s.ts_ms[t]))
+        }
+        BaselineFamily::NnNews | BaselineFamily::NnFrame => {
+            if text.is_frames() != (g.family == BaselineFamily::NnFrame) {
+                return None;
+            }
             let now = *s.ts_ms.get(t)?;
             Some((text.embedding_for(text_scope(g, s), now - text_window_ms(g), now, g.nn.tdim)?, now))
         }
         BaselineFamily::NnNarrative => {
+            if text.is_frames() {
+                return None;
+            }
             let now = *s.ts_ms.get(t)?;
             let end = now + text_window_ms(g);
             // the leading window must be fully observed

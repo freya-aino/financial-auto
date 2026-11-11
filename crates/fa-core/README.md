@@ -9,5 +9,5 @@ Core Rust types used by every crate.
 
 ## Governing specs
 - [01-architecture](../../specs/01-architecture.md)
-- [10-ingestion](../../specs/10-ingestion.md)
-- [12-reference-data](../../specs/12-reference-data.md)
+- [Ingestion reference (ex spec 10)](../../go/services/ingestor/README.md#ingestion-reference)
+- [Reference data reference (ex spec 12)](../fa-warehouse/README.md#reference-data-reference)

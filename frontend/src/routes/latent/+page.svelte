@@ -283,7 +283,7 @@
 	</section>
 
 	<Experts view={experts} error={expertsError} {now} />
-	<Projection {snapshot} experts={expertIndices} {selected} onselect={(id) => (selected = id)} />
+	<Projection {snapshot} experts={expertIndices} {selected} {states} onselect={(id) => (selected = id)} />
 	<GraphExplorer node={selected ?? snapshot} />
 
 	<section class="panel">
