@@ -1,15 +1,16 @@
-//! trainer: encoder training lifecycle (spec 36) with the statistical family standing in for a
-//! neural model (D-004): `pretrain` fits a gen-0 snapshot from VictoriaMetrics history,
-//! `generation` fits gen N+1 from a parent snapshot (recording the latest decoder-feedback
-//! summary), `adapter` re-fits statistics on the last hour, and `serve` runs the `JOBS_TRAIN`
-//! work-queue worker. Every fit writes `manifest.json`, `weights.bin`, `regions.json` and
+//! trainer: encoder training lifecycle (spec 36) for the statistical family and the four neural
+//! families of spec 31 (candle, [`neural_fit`]; D-058, D-065, D-070, D-073): `pretrain` fits a
+//! gen-0 snapshot from VictoriaMetrics history, `generation` fits gen N+1 from a parent snapshot
+//! (statistical: feedback search; neural: warm start, D-007 anchor, D-009 elite-decoder feedback),
+//! `adapter` re-fits statistics (neural: input normalisation + LoRA) on the last hour, `sweep`
+//! compares neural genomes without writing, and `serve` runs the `JOBS_TRAIN` work-queue worker. Every fit writes `manifest.json`, `weights.bin`, `regions.json` and
 //! `region_map.json` to `fa-models/snapshots/<snapshot_id>/` (and/or `--out`), mirrors the
 //! snapshot in Helix as a `candidate` with `SnapshotParent` / `RegionMatch` edges, and the
 //! region lineage is carried over by probe-set alignment against the parent (D-007).
 //! Promotion is control-api's `POST /api/latent/snapshots/{id}/promote`, which checks the
-//! spec 36 §6.4 checklist (carried mass, shadow serving) and reloads model-runtime
+//! spec 36 §6.4 checklist (carried mass, shadow serving, neural health metrics) and reloads model-runtime
 //! (`ctl.model.reload`). Fits read connector bars (`fa_bar_*`) and fall back to trade prices
-//! per instrument; `generation` runs the feedback search of [`search`]; `adapter` writes an
+//! per instrument; a statistical `generation` runs the feedback search of [`search`]; `adapter` writes an
 //! `AdapterState` node; `serve` can plan adapter / generation jobs periodically.
 
 mod artifact;
@@ -89,7 +90,8 @@ struct FitArgs {
     carry_threshold: f64,
     #[arg(long, default_value_t = 512)]
     probe_max: usize,
-    /// Encoder family: `statistical` (default), `fsq_hybrid` or `jepa_vae` (neural, candle).
+    /// Encoder family: `statistical` (default) or a neural family (candle): `fsq_hybrid`,
+    /// `hier_vae_flow`, `jepa_vae`, `latent_diffusion` (day/week only, D-010).
     #[arg(long, default_value = "statistical")]
     family: String,
     /// Neural genome overrides as JSON, e.g. `{"steps":300,"backbone":"gru","moe":{"max_experts":6}}`.
@@ -135,11 +137,11 @@ impl FitArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Gen 0: fit the statistical snapshot of a timescale from history (candidate).
+    /// Gen 0: fit a snapshot of a timescale (statistical or `--family`) from history (candidate).
     Pretrain(FitArgs),
     /// Gen N+1 from the parent (active) snapshot, recording the latest decoder feedback.
     Generation(FitArgs),
-    /// Online adapter: re-fit statistics on the last hour of a snapshot.
+    /// Online adapter: re-fit statistics (neural: input normalisation + LoRA) on the last hour of a snapshot.
     Adapter {
         /// Snapshot to adapt (default: the active snapshot of `--timescale`).
         #[arg(long)]

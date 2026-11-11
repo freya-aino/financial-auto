@@ -1,6 +1,6 @@
 # scripts
 
-Operational shell scripts for spec 60 (D-056). All of them drive the compose stack from the repo root. The scheduled side (nightly backup, WAL status, weekly Postgres drill) lives in the `backup` compose sidecar (`docker/backup/`), not in host cron.
+Operational shell scripts for spec 60 (D-056, D-066). All of them drive the compose stack from the repo root. The scheduled side (nightly backup, WAL status, weekly Postgres drill) lives in the `backup` compose sidecar (`docker/backup/`), not in host cron.
 
 | Script | Purpose |
 |---|---|
@@ -8,7 +8,7 @@ Operational shell scripts for spec 60 (D-056). All of them drive the compose sta
 | `restore.sh DIR [--yes] [--only parts] [--postgres-db NAME] [--pitr [--target T]] [--pg-volume NAME]` | Restore in the §6.4 recovery order, with confirmation. `--postgres-db` restores the dump into a scratch database; `--pitr` does point-in-time recovery from a scheduled backup's base backup + the `pg-wal-archive` volume (saves the current data directory to `backups/pre-restore-<ts>/` first); `--pg-volume` runs the PITR into a scratch volume and checks it in a throwaway container (live untouched); `--only raw` copies the `backups/raw-mirror/` fa-raw mirror back. `just restore DIR`. |
 | `restore-drill.sh [DIR] [--only parts] [--target T] [--switch-wal]` | Restore drill without touching live data: manifest checksums; Postgres logical + PITR restore in a throwaway backup-image container (WAL archive mounted read-only); HelixDB boot check on the restored volume in a scratch container (`--network none`, anonymous volume); Garage object counts. Pushes `fa_restore_drill_*` to VictoriaMetrics. `just restore-drill`. |
 | `alert-drill.sh [--timeout S] [--no-resolve]` | End-to-end alerting test: writes `fa_alert_drill{drill_id}` into VictoriaMetrics, waits for the firing `ops.alert` message on NATS (rule `AlertDrill` → vmalert → control-api), checks `GET /api/alerts` and the `ops.alert.firing` audit row, then waits for the resolved message. `just alert-drill`. |
-| `healthwait.sh [timeout]` | Waits infra → control-api `/api/health` → risk-engine heartbeat, printing the §6.4 steps; called by `just app-up`. |
+| `healthwait.sh [timeout]` | Waits infra → control-api `/api/health` → risk-engine heartbeat (default 180 s; `FA_CONTROL_API`), printing the §6.4 steps and reporting ingestor / broker-gateway / model-runtime as they appear; called by `just app-up`, standalone `just healthwait [timeout]`. |
 | `lib.sh` | Shared helpers (compose wrapper, volume/network names, Garage credentials, rclone runner, `verify_manifest`, `latest_backup`). |
 
 ## PITR runbook (spec 60 §6.6)

@@ -21,3 +21,6 @@ The user chose pure Rust for all ML, including training of encoders (four compet
 - **Python (PyTorch) train, Rust serve (ONNX/ort):** fastest research loop; rejected by user.
 - **tch-rs (libtorch bindings):** strong coverage but drags in libtorch (C++), not "pure Rust".
 - **candle only:** good inference, weaker training ergonomics than burn.
+
+## Implementation note (2026-11-11, D-068, D-070)
+The implementation departs from the burn/candle split above: **candle is used for both training and inference**, burn is not used. The workspace pins `candle-core` / `candle-nn` 0.10.x and `safetensors` 0.7; `fa-encoders` and `fa-decoders` depend on candle unconditionally (CPU, opt-in `cuda` feature; the D-004 `burn` / `candle` features are now no-op markers). Weights are safetensors (`fa-neural-v1` encoder snapshots, decoder bundles with embedded metadata) in Garage. The two-framework consequence above therefore no longer applies; the feasibility risk remains open, now for candle, because the development host has no GPU (spec 31 §6.6, [D-070](../DECISIONS.md)). The decision to use pure-Rust ML stands.

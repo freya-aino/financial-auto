@@ -14,7 +14,9 @@ Kraken public market data (keyless REST): 1m bars, trades and L1 quotes.
 - **Backfill:** one `OHLC ... &since=<from-1>` request; rows with open time in `[From, To)` and already closed are emitted (`backfill=1`). **Limit:** Kraken returns only the latest 720 intervals (12 h of 1m, 30 d of 1h, ~2 y of 1d); older ranges come back empty. Deeper history would need the Trades endpoint paged by `since` (not implemented).
 - **Errors:** a non-empty `error` array (e.g. `EQuery:Unknown asset pair`, answered with HTTP 200) is returned as a normalize error.
 - **Resolution:** `Resolver.Resolve("kraken", pair)`; misses are reported as `Unresolved` (with Postgres they are provisioned, `go/pkg/refdata`).
-- Rate limit from the catalog (3 requests per pair per minute; public limit ≈ 1 req/s).
+- Rate limit from the catalog (`0.5/s, burst 2`; 3 requests per pair per minute; public limit ≈ 1 req/s). Catalog symbols: `XBTEUR`, `ETHEUR`, `SOLEUR`.
+- **Knowledge delay:** per-minute polling behind the limiter makes trades reach the bus late (measured 2026-11-11 on the MD stream: p50 43 s, p99 87 s, max 117 s); the catalog's `backfill.knowledge_delay_secs: 120` is what `fa_backtest::knowledge` shifts Kraken series by in event-time replays (D-079).
+- The paper broker-gateway prices Kraken instruments as crypto with Kraken's 40 bp taker fee (`go/services/broker-gateway/costs.yaml`).
 
 ## Tests
 `kraken_test.go` on `testdata/` (live responses trimmed: 5 OHLC rows, 5 trades, one ticker, the unknown-pair error): poll → 4 bars + 5 trades + 1 quote, payload values, trade `since` cursor, de-dup on re-normalize, restart from persisted cursors, deterministic payloads, unresolved pair, error payload, backfill range filtering and unsupported timeframe.

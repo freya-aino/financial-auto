@@ -1,6 +1,6 @@
 # ADR 0005 — Protobuf as the Rust↔Go contract
 
-**Status:** proposed · **Date:** 2026-11-06
+**Status:** accepted (D-001) · **Date:** 2026-11-06
 
 ## Context
 Every cross-process message (canonical events, latent states, orders, jobs) is produced in one language and consumed in another. Contracts must be typed, versioned, compact and generated for both Rust and Go.

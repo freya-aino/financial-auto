@@ -10,11 +10,12 @@
 //! `decoder.output.<family>` ([`decoders`]); a candidate snapshot can run in shadow
 //! ([`shadow`]); online adapters are applied on `ctl.model.adapter` / adapter job results.
 //!
-//! Neural encoders are off (D-004): the "snapshot" is the versioned statistical baseline
-//! (`stat-v1-<ts>`) or a **trained statistical snapshot** from Garage (spec 36, [`snapshot`]):
-//! the active Helix `Snapshot` of each timescale is loaded at start and hot-swapped on
-//! `ctl.model.reload` (promote / rollback). Every stage sits behind a trait so trained
-//! models can replace the baselines without touching the bus contract.
+//! The serving "snapshot" is the versioned statistical baseline (`stat-v1-<ts>`), a trained
+//! statistical snapshot or a **neural** snapshot (any spec 31 family, candle) from Garage
+//! (spec 36, [`snapshot`]): the active Helix `Snapshot` of each timescale is loaded at start and
+//! hot-swapped on `ctl.model.reload` (promote / rollback). Elite neural decoders are served next
+//! to the baselines ([`neural_serving`]). Every stage sits behind a trait so trained models
+//! replace the baselines without touching the bus contract.
 
 mod bars;
 mod decoders;
@@ -770,7 +771,7 @@ async fn main() -> anyhow::Result<()> {
         region_radius = args.region_radius,
         visual = ?parse_ts(&args.visual_timescales),
         text = ?parse_ts(&args.text_timescales),
-        "model-runtime starting (statistical encoders, baseline text/visual decoders, no neural models)"
+        "model-runtime starting"
     );
 
     let counters: Counters = Arc::default();

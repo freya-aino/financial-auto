@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | draft |
 | **Maturity** | Medium |
-| **Owners (code)** | `config/sources.yaml`, `go/pkg/catalog`, `migrations/` (`catalog` schema), `go/connectors/*` |
+| **Owners (code)** | `config/sources.yaml`, `go/pkg/catalog`, `go/pkg/refdata` (Postgres sync), `migrations/` (`catalog` schema), `go/connectors/*` |
 | **Depends on** | 10-ingestion, 12-reference-data, 40-execution-and-risk |
 
 ## 1. Purpose
@@ -16,7 +16,7 @@ Single inventory of every external API the platform may read from or trade throu
 
 ## 3. Decisions
 - Catalog lives in **`config/sources.yaml`** (seed, versioned in git) and is loaded into **Postgres** (`catalog.source`), which is authoritative at runtime (UI edits, status changes).
-- **First wave:** Yahoo Finance, Lemon.markets, OANDA, Hacker News, Google News (`status: stub`). All others `planned`.
+- **First wave:** Yahoo Finance, Lemon.markets, OANDA, Hacker News, Google News (`status: stub`). All others `planned`. Current state: `yahoo`, `hackernews`, `google_news` are `live`; `lemon`, `oanda` stay `stub` (implemented, no keys, never run live); the keyless second wave `frankfurter`, `ecb`, `gdelt`, `sec_edgar`, `kraken` is `live` (§6.2).
 - Every API the user listed is in the catalog. "yfinance" and "Yahoo Finance" are one entry (`yahoo`). "Alpaca" (trading) and "Alpaca Market Data" are separate entries sharing credentials.
 - ToS/licensing is a **free-text field only**; not enforced (deferred).
 - Media sources (YouTube, earnings webcasts, central-bank pressers) are catalog entries like any other.
@@ -25,6 +25,8 @@ Single inventory of every external API the platform may read from or trade throu
 - `go/pkg/catalog`: `Load(path) (*Catalog, error)`, `Get(id)`, `ByCapability(cap)`, `ByCategory(cat)`; Postgres-backed `Store` with `Upsert`, `SetStatus`.
 - Control API: `GET /api/sources`, `PATCH /api/sources/{id}` (status, enabled, rate limits).
 - NATS: `catalog.changed.<id>`.
+
+**Implemented:** `go/pkg/catalog` has `Load`/`Parse`, `Validate`, `ByID`, `SetStatus`, `ApplyStatuses`, `BackfillDepth` (no capability/category queries); the Postgres side is `go/pkg/refdata.Store` (`SyncCatalog` upsert that keeps an existing row's status, `Statuses`, `SetStatus`). control-api serves `GET /api/sources` (catalog + DB status + live health overlay), `GET /api/sources/{id}` (health, recent gaps and unresolved symbols, cursors) and `POST /api/sources/{id}/enable|disable|backfill` (→ `ctl.ingest.*`, audited) instead of `PATCH`; rate limits and `config` are edited in the YAML only. The ingestor publishes `fa.v1.RefChanged` on `catalog.changed.<id>` after `enable|disable`.
 
 ## 5. Data model
 YAML entry / `catalog.source` row:
@@ -38,12 +40,14 @@ YAML entry / `catalog.source` row:
 | `asset_classes` | list | coarse |
 | `transport` | list | rest, websocket, fix, grpc, graphql, sse, socket, file, sdk, stream |
 | `auth` | enum | none, api_key, oauth2, hmac, session, wallet, gateway |
-| `rate_limits` | list | **(proposal)** `{endpoint, requests, per}`; to be filled per source |
+| `rate_limits` | list | **(proposal)** `{endpoint, requests, per}`; to be filled per source. Implemented as one token bucket per source, `rate_limit: {per_second, burst}` (default 5/s, burst 10), shared by live polling and backfill |
+| `config` | map | connector parameters (D-050): `symbols`, `queries`, `timeframe` (`1m 5m 15m 1h 1d`), `extra` (string map) |
+| `backfill.knowledge_delay_secs` | int | measured delay until an event is on the bus (D-079; kraken 120, yahoo 100), read by `fa_backtest::knowledge` |
 | `status` | enum | planned → stub → live → disabled |
 | `tos_notes` | text | |
 | `notes` | text | platform caveats |
 
-Secrets are **never** in the catalog; they're referenced by `id` in git-ignored `config/secrets.toml` (ADR 0006).
+`rate_limit`, `config` and `backfill` live only in the YAML; `catalog.source` stores the descriptive fields and the status. Secrets are **never** in the catalog; they're referenced by `id` in git-ignored `config/secrets.toml` (ADR 0006).
 
 ## 6. Behaviour & algorithms
 
@@ -136,7 +140,9 @@ marketaux, newsapi (dev-only free tier), gdelt, hackernews (**first wave**), goo
 **Broadcast media**
 youtube (Data API + capture; ToS), earnings_webcasts (IR sites; discovery via earnings calendars), central_bank_pressers (Fed/ECB/BoE…).
 
-**Implemented today (2026-11-11):** `frankfurter`, `ecb`, `gdelt`, `sec_edgar` and `kraken` (public market data only) are `live` keyless connectors with a `rate_limit` and `config:` block in `config/sources.yaml` (frankfurter `extra.{base,currencies}`, ecb `queries` = SDMX `<FLOW>/<KEY>`, gdelt `queries`, sec_edgar `extra.{ciks,user_agent}`, kraken `symbols`). Verified facts: Frankfurter moved to `api.frankfurter.dev/v1` (`.app` answers 301); the ECB portal's firewall answers HTML blocks to bursts and to some user agents (limit 1 request / 10 s); GDELT enforces one request per 5 s per IP with multi-minute 429 penalties (limit 1 / 10 s); EDGAR's `data.sec.gov` needs a declared User-Agent (`financial-auto ingestor` accepted, the generic ingestor UA refused with 403; `www.sec.gov` feeds refuse it); Kraken public REST needs no key and returns at most 720 OHLC intervals. CoinGecko was not added (catalog entry still `api_key`).
+**Implemented (2026-11-10, D-050):** `yahoo` (chart endpoint, 1m bars + synthetic trades), `hackernews` (Firebase + Algolia backfill) and `google_news` (RSS) are `live`; `lemon` and `oanda` are implemented against the public docs but stay `stub` (no keys).
+
+**Implemented today (2026-11-11):** `frankfurter`, `ecb`, `gdelt`, `sec_edgar` and `kraken` (public market data only) are `live` keyless connectors with a `rate_limit` and `config:` block in `config/sources.yaml` (frankfurter `extra.{base,currencies}`, ecb `queries` = SDMX `<FLOW>/<KEY>`, gdelt `queries`, sec_edgar `extra.{ciks,user_agent}`, kraken `symbols`). Verified facts: Frankfurter moved to `api.frankfurter.dev/v1` (`.app` answers 301); the ECB portal's firewall answers HTML blocks to bursts and to some user agents (limit 1 request / 10 s); GDELT enforces one request per 5 s per IP with multi-minute 429 penalties (limit 1 / 10 s); EDGAR's `data.sec.gov` needs a declared User-Agent (`financial-auto ingestor` accepted, the generic ingestor UA refused with 403; `www.sec.gov` feeds refuse it); Kraken public REST needs no key and returns at most 720 OHLC intervals. `sec_edgar` also feeds `wh.fundamental` from XBRL company facts (D-078). Measured knowledge delays (D-079): kraken 120 s, yahoo 100 s (`backfill.knowledge_delay_secs`). CoinGecko was not added (catalog entry still `api_key`). Postgres additionally holds `ecb_daily` (migration `20261110000060`), the risk-engine's accounting FX source (`ref.fx_rate`), which is not in the YAML and has no connector.
 
 ### 6.3 Generic adapters **(proposal)**
 - `ccxt` adapter covers long-tail crypto venues before dedicated connectors.
@@ -144,26 +150,26 @@ youtube (Data API + capture; ToS), earnings_webcasts (IR sites; discovery via ea
 - RSS adapter shared by Google News and outlet feeds.
 
 ### 6.4 Prioritization **(proposal)** after first wave
-1. EUR-relevant execution venues (Bitvavo, Kraken, IBKR) for paper trading breadth.
-2. Macro with vintages (FRED/ALFRED, ECB) for point-in-time macro.
-3. GDELT + Marketaux for news density.
+1. EUR-relevant execution venues (Bitvavo, Kraken, IBKR) for paper trading breadth. (Kraken public market data done; execution not.)
+2. Macro with vintages (FRED/ALFRED, ECB) for point-in-time macro. (ECB done.)
+3. GDELT + Marketaux for news density. (GDELT done.)
 4. Media pipeline (central-bank pressers first: scheduled, high signal).
 
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
 |---|---|---|
-| `catalog.reload_on_change` | true | |
-| `catalog.auto_disable_after_failures_h` | 24 | persistent failure → disabled |
+| `catalog.reload_on_change` | true | not implemented: the YAML is read at ingestor start |
+| `catalog.auto_disable_after_failures_h` | 24 | persistent failure → disabled; not implemented (failures degrade/halt, status changes are manual) |
 
 ## 8. Failure modes
 | Failure | Response |
 |---|---|
 | YAML and Postgres diverge | YAML seeds only new ids; Postgres wins for existing; diff shown in UI |
 | Source deprecated / API changed | status → disabled, note recorded |
-| Missing credentials | connector refuses to start, status shown in ops view |
+| Missing credentials | connector refuses to start (`Init` fails, e.g. lemon/oanda `ErrNoAPIKey`), status shown in ops view |
 
 ## 9. Acceptance criteria
-- `config/sources.yaml` contains every API from the user's list plus first-wave and media sources (checked by a test that compares against a fixed id list).
+- `config/sources.yaml` contains every API from the user's list plus first-wave and media sources (checked by a test that compares against a fixed id list). Implemented check: `TestRepoCatalogIsValid` loads and validates the file, requires ≥ 70 sources and the five first-wave ids with status `stub` or `live`.
 - Catalog loads in Go and is visible at `GET /api/sources`.
 - No secrets in the catalog or git history.
 

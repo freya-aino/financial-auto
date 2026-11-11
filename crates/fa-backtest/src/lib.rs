@@ -6,7 +6,8 @@
 //! [`allocator_replay`], the portfolio replay of recorded strategy signals through one
 //! allocator genome (allocator tournament, spec 40 §6.2), and [`holdout`], the locked-holdout
 //! planner and holdout-aware selection windows (spec 41 §6.4), and [`knowledge`], the per-source
-//! knowledge delays every event-time replay applies (spec 41 §6.2).
+//! knowledge delays every event-time replay applies (spec 41 §6.2), and [`venue`], the paper
+//! venue state ported from the broker-gateway so recorded live fills replay identically.
 
 pub mod allocator_replay;
 pub mod cost;

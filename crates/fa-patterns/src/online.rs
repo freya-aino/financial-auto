@@ -1,7 +1,8 @@
 //! Online region discovery: streaming leader clustering (spec 30 §6.2/§6.3).
 //!
-//! This is the pure-Rust baseline `RegionDiscovery` for continuous latents while the
-//! density/Mapper methods of the neural families are unavailable (D-004). Every point is
+//! This is the live (streaming) region stage of model-runtime for every encoder family; the
+//! batch methods the families declare (HDBSCAN density, Mapper, codebook) live in
+//! [`crate::methods`] and seed it through a snapshot's region map. Every point is
 //! assigned to the nearest live region if it lies within `radius`; otherwise a new region
 //! is born. Centroids track a running mean with a floor on the learning rate so regions
 //! keep adapting. Region lifecycle (spec 30 §6.4 vocabulary, applied online):

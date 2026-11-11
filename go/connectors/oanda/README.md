@@ -2,7 +2,7 @@
 
 First-wave connector: OANDA v20 (pricing stream → quotes, candles → bars).
 
-**Status:** implemented, **unverified against the live API (no key)**. Written against the public v20 reference; fixtures in `testdata/` are the documented example payloads.
+**Status:** implemented, **unverified against the live API (no key; never run live)**. Catalog status `stub`; compose does not start it (add it to the ingestor's `-connectors` once keys are in `config/secrets.toml`). Written against the public v20 reference; fixtures in `testdata/` are the documented example payloads.
 
 ## Behaviour
 - **Secrets:** `api_key` and `account_id` from `FA_OANDA_API_KEY` / `FA_OANDA_ACCOUNT_ID` or `[sources.oanda]` in `config/secrets.toml` (D-020); `Init` fails with `ErrNoAPIKey` / `ErrNoAccount`. `config.extra.env` = `practice` (default, `*-fxpractice.oanda.com`) or `live`.

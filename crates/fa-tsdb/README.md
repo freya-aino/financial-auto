@@ -5,7 +5,7 @@ VictoriaMetrics read/write: series naming, Prometheus-line import, `query_range`
 **Status:** implemented — label-whitelisted import, `query_range`, `trade_prices` (used by `evo-worker` as the primary evaluation data source, spec 41 §5), `health`, `force_flush`. Formatting/parsing unit-tested; **live round trip tested against VictoriaMetrics** with `FA_VM_TEST=1`.
 
 ## Conventions (match `go/pkg/tsdb`, the ingestor's writer)
-- Metrics `fa_trade_price`, `fa_trade_size`, `fa_bar_*`, `fa_feat_<name>`; labels only from `ALLOWED_LABELS` (`inst`, `venue`, `tf`, `src`, `lvl`, `feat_set`).
+- Metrics `fa_trade_price`, `fa_trade_size`, `fa_trade_count` (trades folded into one same-millisecond VWAP sample by the Go writer, D-066), `fa_bar_*`, `fa_feat_<name>`; labels only from `ALLOWED_LABELS` (`inst`, `venue`, `tf`, `src`, `lvl`, `feat_set`).
 - `inst` = instrument UUID as D-017 subject token: lowercase, no dashes — `inst_token()` is `bus.SubjectToken` of `go/pkg/bus`. `trade_prices` accepts a dashed UUID or a token.
 - Timescale step strings via `step_of(Timescale)` (`1s`, `1m`, `1h`, `1d`, `1w`).
 
@@ -16,6 +16,7 @@ VictoriaMetrics read/write: series naming, Prometheus-line import, `query_range`
 | `write(&[Sample])` | `/api/v1/import/prometheus` |
 | `query_range(query, start_s, end_s, step)` | raw matrix result |
 | `trade_prices(inst, start_s, end_s, step)` | `last_over_time(fa_trade_price{inst="…"}[step])` → `TradeSeries { inst, venue, src, points: (ts_ms, price) }`, longest first; buckets without trades are absent (no stale fill) |
+| `trade_prices_ms(inst, start_ms, end_ms, bar)` | `trade_prices` over the buckets containing both ends, merged across venues into one ascending `(ts_ms, price)` series (strategy-runtime analog outcomes, D-063) |
 | `bars(inst, tf, start_s, end_s)` | connector bars: `last_over_time(fa_bar_<x>{inst="…",tf="<tf>"}[tf])` at `tf` resolution for open/high/low/close/volume/vwap, joined per bucket (`join_bar_series`) → `BarSeries { inst, venue, src, tf, points: BarPoint{ts_ms, open, high, low, close, volume, vwap?} }`, longest first; a bucket needs O/H/L/C (volume defaults to 0); `inst = None` reads every instrument (the trainer's `instruments: "all"`) |
 | `health()`, `force_flush()` | `/health`, `/internal/force_flush` (tests) |
 

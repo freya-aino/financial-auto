@@ -22,33 +22,40 @@ A single HTTP + WebSocket surface through which the frontend (51) — and script
 - Every mutating endpoint writes an `audit_log` entry (42).
 
 ## 4. Interfaces
-Conventions: `/api/v1/...` **(proposal: version prefix)**; JSON; time as RFC3339 UTC; ids as UUID strings; list endpoints paginate with `?cursor=&limit=`; OpenAPI served at `/api/openapi.json`. **Implemented (round 3, `bins/control-api/src/openapi.rs`):** OpenAPI 3.1 **generated from the route declarations** instead of `utoipa` annotations — every route module's source is embedded at compile time and its `.route("<path>", get(h).post(h2)…)` calls are parsed (test modules excluded), so no route can exist without an operation; real handlers win over the `routes.rs` 501 placeholders (later `install`ed routers layer in front), path parameters are declared, summaries come from the modules' doc tables (`| \`GET /api/x\` | … |`) or the handler name, tags = module, `x-handler` names the Rust function. Bodies are documented as generic JSON objects (the Rust handler is the schema of record). 113 paths / 121 operations at the time of writing.
+Conventions: `/api/v1/...` **(proposal: version prefix; not adopted — every path is `/api/...`, Q2)**; JSON; time as RFC3339 UTC; ids as UUID strings; list endpoints paginate with `?cursor=&limit=` **(as built: `?limit=` with a server cap, plus `since=` / `range=` windows; no cursors)**; OpenAPI served at `/api/openapi.json`. **Implemented (round 3, `bins/control-api/src/openapi.rs`):** OpenAPI 3.1 **generated from the route declarations** instead of `utoipa` annotations — every route module's source is embedded at compile time and its `.route("<path>", get(h).post(h2)…)` calls are parsed (test modules excluded), so no route can exist without an operation; real handlers win over the `routes.rs` 501 placeholders (later `install`ed routers layer in front), path parameters are declared, summaries come from the modules' doc tables (`| \`GET /api/x\` | … |`) or the handler name, tags = module, `x-handler` names the Rust function. Bodies are documented as generic JSON objects (the Rust handler is the schema of record). 113 paths / 121 operations at the time of writing.
 
 ### 4.1 Ops
 | Method | Path | Description |
 |---|---|---|
 | GET | `/api/health` | control-api + dependency health (NATS, Helix, Postgres, VM, Garage) |
-| GET | `/api/services` | registered services, heartbeat, version, status |
-| POST | `/api/services/{name}/start\|stop\|restart` | via compose/process supervisor **(proposal)** |
-| GET/PUT | `/api/config/{section}` | read config; PUT only for runtime-tunable keys |
-| GET | `/api/jobs` | work-queue jobs (eval, training, backfill) with status |
-| POST | `/api/jobs/{id}/cancel` | |
-| GET | `/api/gpu` | GPU queue: running job, priority classes, utilisation |
+| GET | `/api/services` | registered services, heartbeat, version, status; `container` per row + `supervisor` object (D-060) |
+| POST | `/api/services/{name}/start\|stop\|restart` | via the Docker Engine API on the compose socket (D-060) |
+| GET | `/api/services/{name}/container` | container state, image, started_at, restart count, health, replicas (D-060) |
+| GET/PUT | `/api/config/{section}` | read config; PUT only for runtime-tunable keys (`runtime`) |
+| GET | `/api/config/timescales` | timescale ladder |
+| GET | `/api/jobs` | work-queue jobs (eval, training, backfill) with status (alias of `/api/evolution/jobs`, in-memory from `jobs.>`) |
+| POST | `/api/jobs/{id}/cancel` | `ctl.evo.cancel` |
+| GET | `/api/gpu` | GPU queue: running job, priority classes, utilisation (alias of `/api/evolution/gpu`) |
+| GET | `/api/ops/jobs?kind=&limit=`, `/api/ops/jobs/summary?hours=` | durable job history: every `JobResult` on `jobs.result.>` stored in `ops.job_run` (D-078); counts per kind × status |
+| GET | `/api/ops/config-snapshots?service=&limit=&config=` | redacted config sections + `[runtime]` overlay stored in `ops.config_snapshot` on change (checked every 5 min) |
+| GET | `/api/openapi.json` | generated OpenAPI 3.1 document (§4, §9) |
 
-**Implemented today (D-060):** `POST /api/services/{name}/start|stop|restart` supervises compose services through the Docker Engine API (socket mounted into control-api only, project label filter). Infra services and control-api itself are refused with 409, `risk-engine` stop/restart needs `{"confirm": true}` (428 otherwise), every attempt is audited, and without a socket the routes answer `501 no_supervisor`. This closes open question 1 for compose deployments; spec 50 has no 501 routes left.
+**Implemented today (D-060):** `POST /api/services/{name}/start|stop|restart` supervises compose services through the Docker Engine API (socket mounted into control-api only, project label filter). Infra services and control-api itself are refused with 409, `risk-engine` stop/restart needs `{"confirm": true}` (428 otherwise), every attempt is audited, and without a socket the routes answer `501 no_supervisor`. This closes open question 1 for compose deployments; spec 50 has no 501 routes left (the OpenAPI document marks none `not_implemented`). The SPA does not offer service control yet (spec 51 §6.2).
 
 ### 4.2 Sources & ingestion
 | GET | `/api/sources` | catalog (11) with status, rate-limit usage, last event |
 | GET | `/api/sources/{id}` | detail, recent errors, coverage |
 | POST | `/api/sources/{id}/enable\|disable` | |
 | POST | `/api/sources/{id}/backfill` | body: instruments, timescale, range |
+| POST | `/api/ingest/{source}/start\|stop` | `ctl.ingest.start\|stop` (connector on/off without changing catalog status) |
 | GET | `/api/instruments?q=` | reference data search (12) |
+| GET | `/api/instruments/quarantine?status=`, POST `/api/instruments/quarantine/{id}/resolve` | unresolved-instrument review: activate, merge or ignore (D-054, audited) |
 
 ### 4.3 Bus tap
 | WS | `/ws/bus?subjects=md.>,risk.event` | live tap of NATS subjects (decoded proto → JSON), server-side sampling/rate limit |
 | GET | `/api/bus/streams` | JetStream streams, consumers, lag |
 
-`/api/bus/streams` lists every stream (spec 21 §5 limits streams incl. `DLQ`, the `JOBS_<kind>` work queues incl. `JOBS_MCMC`) with `max_bytes` (the applied cap, `-1` = none), `planned_max_bytes` (the spec 21 §5 `max_mib` from `fa_bus::streams::table()`), `cap_applied` (false when `ensure_streams` kept a larger cap rather than purge) and `used_ratio` (bytes / cap; the UI's Streams panel shows usage against the cap), messages, bytes, sequences and per-consumer lag. control-api also runs the dead-letter forwarder (spec 21 §8): poison messages land on `dlq.<STREAM>.<subject>` and raise a `DeadLetter` alert on `ops.alert` (seen on the bus tap) and `fa_bus_dead_letters_total{stream,consumer,reason}`; `GET /api/alerts` lists vmalert alerts only, so a vmalert rule on that counter is the way to surface dead letters there.
+`/api/bus/streams` lists every stream (spec 21 §5 limits streams incl. `DLQ`, the `JOBS_<kind>` work queues incl. `JOBS_MCMC`) with `max_bytes` (the applied cap, `-1` = none), `planned_max_bytes` (the spec 21 §5 `max_mib` from `fa_bus::streams::table()`), `cap_applied` (false when `ensure_streams` kept a larger cap rather than purge) and `used_ratio` (bytes / cap; the UI's Streams panel shows usage against the cap), messages, bytes, sequences and per-consumer lag. control-api also runs the dead-letter forwarder (spec 21 §8): poison messages land on `dlq.<STREAM>.<subject>` and raise a `DeadLetter` alert on `ops.alert` (seen on the bus tap) and `fa_bus_dead_letters_total{stream,consumer,reason}`; `GET /api/alerts` lists vmalert alerts only, and the vmalert rule `DeadLetters` (`docker/vm-alerts.yaml`, growth of the `DLQ` stream's message count from `nats-exporter` over 15 min) is what surfaces them there.
 
 ### 4.4 Hub / graph
 | GET | `/api/graph/neighborhood?node=&depth=` | Helix subgraph around a node |
@@ -62,25 +69,33 @@ Conventions: `/api/v1/...` **(proposal: version prefix)**; JSON; time as RFC3339
 | GET | `/api/latent/{snapshot}/regions` | regions with occupancy, stats |
 | GET | `/api/mcmc/{snapshot}/graph?timescale=` | region graph with transition posteriors |
 | WS | `/ws/latent?snapshot=&instruments=` | live current state / region per instrument |
-| POST | `/api/latent/snapshots/{id}/promote\|rollback` | |
+| POST | `/api/latent/snapshots/{id}/promote\|rollback` | promote evaluates the spec 36 §6.4 checklist first (409 `promotion_checks_failed` unless `force`), then `ctl.model.reload` |
+| GET | `/api/latent/timescales`, `/api/latent/timescales/{ts}/states\|regions\|transitions` | in-memory live views of the bus traffic (D-032), next to the persisted Helix views above |
 
 ### 4.6 Evolution
 | GET | `/api/evolution/populations` | decoder / strategy / allocator populations, generation |
 | GET | `/api/evolution/populations/{id}/pareto?gen=` | Pareto front points + objectives |
 | GET | `/api/evolution/genomes/{id}` | genome, fitness, eval reports (41) |
 | GET | `/api/evolution/genomes/{id}/outputs` | decoder outputs (image URLs via Garage presign, text, forecasts) |
-| POST | `/api/evolution/runs` | start generation with budget (GPU-hours); body as `POST /api/evolution/generations`: `kind`, `genomes`, `eta`, `min_budget_ms`, `max_budget_ms`, `max_generations`, `total_budget_ms`, `data_window_hours`, `mcmc_pairs` (cross-asset src→target genomes per decoder loop, D-074; absent = orchestrator default 4, 0 disables) forwarded as `ctl.evo.start` args |
+| GET | `/api/evolution/generations` | generation summaries from `jobs.result.evo.generation` (in memory) with status |
+| GET | `/api/evolution/jobs?kind=&limit=`, `/api/evolution/gpu` | jobs by kind with progress / objectives; GPU arbiter counters (D-031) |
+| GET | `/api/decoders/outputs?family=&limit=` | recent `DecoderOutput`s |
+| POST | `/api/evolution/runs` (= `POST /api/evolution/generations`) | start generation with budget (GPU-hours); body as `POST /api/evolution/generations`: `kind`, `genomes`, `eta`, `min_budget_ms`, `max_budget_ms`, `max_generations`, `total_budget_ms`, `data_window_hours`, `mcmc_pairs` (cross-asset src→target genomes per decoder loop, D-074; absent = orchestrator default 4, 0 disables) forwarded as `ctl.evo.start` args |
 | POST | `/api/evolution/runs/{id}/pause\|resume\|stop` | |
 | WS | `/ws/evolution` | generation progress, survivors per halving round |
+| GET/POST | `/api/validation/holdout` | locked holdout periods; POST locks one (immutable, 409 on overlap; D-059) |
+| POST | `/api/validation/holdout/{id}/evaluate` | enqueue the promotion replay `evo.eval.strategy.holdout` (202) |
+| GET | `/api/validation/reports/{candidate}`, `/api/validation/shadow/{strategy}?min_horizons=` | selection trials + holdout evaluations of a candidate; shadow-vs-backtest consistency (spec 40 §6.6) |
 
 ### 4.7 Trading
 | GET | `/api/trading/positions?book=` | |
 | GET | `/api/trading/orders`, `/fills`, `/pnl?range=&strategy=` | |
+| GET | `/api/trading/risk`, `/api/trading/signals` | risk state (reported + paper book) and halts; latest exposure per strategy |
 | GET | `/api/trading/strategies` | status, sleeve, shadow progress, gate status |
-| POST | `/api/trading/strategies/{id}/pause\|resume\|flatten\|promote` | promote rejected unless gate green |
-| POST | `/api/trading/orders` | manual order (goes through risk chain, 40) |
-| POST | `/api/trading/flatten`, `/api/trading/kill-switch`, `/api/trading/kill-switch/rearm` | |
-| GET/PUT | `/api/trading/limits` | PUT may only tighten |
+| POST | `/api/trading/strategies/{id}/pause\|resume\|flatten\|promote\|shadow` | promote rejected unless gate green |
+| POST | `/api/trading/orders` (alias `/api/trading/paper-order`) | manual order (goes through risk chain, 40); always paper (D-029) |
+| POST | `/api/trading/flatten`, `/api/trading/kill-switch` (alias `/halt`), `/api/trading/kill-switch/rearm` (alias `/resume`) | |
+| GET/PUT | `/api/trading/limits` | PUT may only tighten (422 `loosen: <fields>` otherwise) |
 | GET | `/api/trading/reconciliation` | latest runs + diffs |
 | GET | `/api/audit?since=` | audit log |
 | WS | `/ws/trading` | positions, P&L, risk events, fills |
@@ -88,12 +103,13 @@ Conventions: `/api/v1/...` **(proposal: version prefix)**; JSON; time as RFC3339
 ### 4.8 WebSocket protocol
 Envelope: `{ "stream": "...", "seq": n, "ts": "...", "data": {...} }`. Client may send `{ "op": "subscribe" | "unsubscribe", "topics": [...] }`. Server applies backpressure by dropping to latest-value for high-rate topics and signals `{ "op": "lagged", "dropped": n }`.
 
-**Implemented today (D-055):** every route of §4 is implemented except `POST /api/services/{name}/start|stop|restart` (no process supervisor). The four sockets share one loop: `{stream, seq, ts, topic, data}` frames, `{op: subscribe|unsubscribe, topics}` filtering, latest-value coalescing for state streams (10 Hz latent/evolution, 5 Hz trading) and a bounded queue for the bus tap, `{op:"lagged",dropped}` after any drop. `PUT /api/config/runtime` is the only writable config section (bounded, persisted to git-ignored `config/runtime.toml`, audited). Routes are listed with their state in `bins/control-api/README.md`.
+**Implemented today (D-055, D-060):** every route of §4 is implemented (service control since D-060, §4.1). The four sockets share one loop: `{stream, seq, ts, topic, data}` frames, `{op: subscribe|unsubscribe, topics}` filtering, latest-value coalescing for state streams (10 Hz latent/evolution, 5 Hz trading) and a bounded queue for the bus tap, `{op:"lagged",dropped}` after any drop. `PUT /api/config/runtime` is the only writable config section (bounded, persisted to git-ignored `config/runtime.toml`, audited). Routes are listed with their state in `bins/control-api/README.md`.
 
 ### 4.9 Alerts, MCMC queries, neural models, pipeline, halts, reference data (D-066..D-071)
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/alerts?limit=` | active alerts, recent transitions, alert-pipeline health (`pipeline.ok` = Watchdog fresh; false is itself an alert) |
+| GET | `/api/alerts?limit=` | active alerts, recent transitions, alert-pipeline health (`pipeline.ok` = Watchdog fresh; false is itself an alert); restored from `ops.alert_event` after a restart |
+| GET | `/api/alerts/history?since=&alertname=&limit=` | stored transitions (`ops.alert_event`, D-078), newest first |
 | POST | `/api/alerts/vmalert/api/v2/alerts`, `/api/alerts/webhook` | vmalert / Alertmanager receivers → `ops.alert` (JSON) + `audit.log` |
 | GET | `/api/mcmc/{snapshot}/kernels` | kernel per expert space: serving sampler, prequential scores, stationary, relaxation, drift |
 | GET | `/api/mcmc/{snapshot}/transition\|k-step\|neighbors\|paths\|path-prob\|hitting\|stationary` | spec 33 §4.2 queries, each a posterior `{mean, sd, lower, upper, median, level, n}` |
@@ -113,11 +129,12 @@ Envelope: `{ "stream": "...", "seq": n, "ts": "...", "data": {...} }`. Client ma
 | GET | `/api/refdata/venues`, `/api/refdata/calendar/{venue}?from=&to=` | venues with calendar rule and materialised range; sessions per day (`table` row, else built-in `rule`) |
 | GET/POST | `/api/refdata/corporate-actions` (`?instrument_id=&known_at=`), POST `.../{id}/cancel`, `/symbol-change`, `/identifiers`, `/contract-specs`, `/calendar/{venue}/materialize` | corporate actions (as-of when an instrument is given) and audited overrides |
 | GET | `/api/trading/lots`, `/statement?format=json\|csv`, `/pnl/breakdown`, `/orphans`; POST `/orphans/{id}/resolve`, `/payouts` | ledger reports (spec 42) |
+| POST | `/api/trading/restatements/fx` | FX restatement of booked fills (spec 42 §6, D-078): dry run by default (plan with before/after figures); `{"apply": true, "confirm": true, "reason"}` writes it (428 without confirm, audited `ledger.restatement`), after which the risk-engine must be restarted. Not offered in the UI |
 
 The bus tap (`/ws/bus`) decodes `ops.alert` (JSON), `latent.membership.*`, `latent.lifecycle.*`, `latent.mcmc.*`, `latent.hier.*` and `latent.crossprior.*` (proto) and passes any other JSON payload through.
 
 ## 5. Data model
-Stateless except a small cache. Reads: Postgres (catalog, ledger, audit, jobs), Helix (graph, latent, lineage), VictoriaMetrics (series via PromQL/MetricsQL passthrough `/api/metrics/query` **(proposal)**), Garage (presigned URLs for blobs).
+Stateless except a small cache. Reads: Postgres (catalog, ledger, audit, jobs), Helix (graph, latent, lineage), VictoriaMetrics (series via PromQL/MetricsQL passthrough `/api/metrics/query` **(proposal, not implemented; vmui at `127.0.0.1:8428/vmui` instead)**), Garage (presigned URLs for blobs). Writes (round 3): the `ops` schema (`ops.job_run`, `ops.config_snapshot`, `ops.alert_event`; spec 20) and `audit.log`; in-memory live views (D-032) are rebuilt from the bus after a restart.
 
 ## 6. Behaviour & algorithms
 - Requests that mutate state are translated to NATS `ctl.*` requests with timeout; the owning service validates and replies; control-api returns its result verbatim.
@@ -127,10 +144,10 @@ Stateless except a small cache. Reads: Postgres (catalog, ledger, audit, jobs), 
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
 |---|---|---|
-| `api.bind` | 127.0.0.1:8080 | |
-| `api.ctl_timeout` | 5 s | |
-| `api.ws.max_rate_per_topic` | 20 msg/s | then latest-value |
-| `api.projection.max_points` | 50 000 | |
+| `api.bind` | 127.0.0.1:8080 | as built: `control_api.bind` = `127.0.0.1:7700` (D-014) |
+| `api.ctl_timeout` | 5 s | as built: 5 s constant (15 s for `ctl.model.shadow`) |
+| `api.ws.max_rate_per_topic` | 20 msg/s | then latest-value; as built: `runtime.ws.latent_hz` 10, `runtime.ws.trading_hz` 5, `runtime.bus_tap.max_msgs_per_sec` 200 (runtime-tunable) |
+| `api.projection.max_points` | 50 000 | as built: `?n=` default 2 000, max 20 000 |
 
 ## 8. Failure modes
 | Failure | Response |
@@ -144,12 +161,12 @@ Stateless except a small cache. Reads: Postgres (catalog, ledger, audit, jobs), 
 
 **Status (round 3):** generated from the route declarations, so it covers every endpoint by construction (`document_covers_the_known_routes`); the frontend's committed copy `frontend/src/lib/openapi.json` is checked against the generated document (`openapi_snapshot_is_current`; `FA_UPDATE_OPENAPI=1 cargo test -p control-api openapi` rewrites it) and every `/api/…` call of the frontend against it (vitest `openapi.test.ts`). Request/response schemas are generic objects — typed schemas would need annotating ~120 handlers.
 - Every mutating endpoint creates an audit entry.
-- Limit loosening via `PUT /api/trading/limits` returns 409.
+- Limit loosening via `PUT /api/trading/limits` returns 409. *(As built: 422 `loosen: <fields>` — the risk-engine's refusal mapped by reply prefix; 409 is reserved for state conflicts.)*
 - Bus tap streams decoded events for any subject pattern at bounded rate.
 - control-api restart does not affect trading (no business state).
 
 ## 10. Open questions
-1. Service start/stop: via Docker API, a process supervisor, or out of scope (compose only)? — blocks 4.1 service control.
+1. Service start/stop: via Docker API, a process supervisor, or out of scope (compose only)? — blocks 4.1 service control. *Decided (D-060): Docker Engine API over the compose socket; host runs without a socket answer `501 no_supervisor`.*
 2. Version prefix `/api/v1` now or later.
 3. Typed client generation for the frontend (OpenAPI → TS) vs hand-written. *Decided (round 3): hand-written fetch layer (`frontend/src/lib/{api,console}.ts`, typed by hand) checked against the generated OpenAPI document: a vitest scans every `/api/…` literal in the frontend sources and fails on a path or method the document does not have. A generated TS client would only add value once the document carries real body schemas.*
 

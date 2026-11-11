@@ -1,9 +1,9 @@
 //! Expert encoder families and per-timescale sizing (spec 31; D-004, D-010).
 //!
 //! Families compete; each declares its latent type, region-discovery method and prior.
-//! Neural model code lands behind the `burn` / `candle` features. [`baseline`] holds the
-//! deterministic statistical encoder ([`StatisticalEncoder`]) that the live runtime uses
-//! until then; it implements the same [`EncoderFamily`] contract.
+//! The four neural families are implemented on candle in [`neural`] (CPU by default, `cuda`
+//! feature for a GPU; D-070, D-073). [`baseline`] holds the deterministic statistical encoder
+//! ([`StatisticalEncoder`]); every family implements the same [`EncoderFamily`] contract.
 
 pub mod baseline;
 pub mod media;
@@ -37,7 +37,7 @@ impl FamilyId {
     /// The four neural families of spec 31 plus the statistical baseline.
     pub const ALL: [FamilyId; 5] =
         [Self::FsqHybrid, Self::HierVaeFlow, Self::JepaVae, Self::LatentDiffusion, Self::StatBaseline];
-    /// Families that need the `burn` backend.
+    /// The learned families (candle, [`neural`]).
     pub const NEURAL: [FamilyId; 4] = [Self::FsqHybrid, Self::HierVaeFlow, Self::JepaVae, Self::LatentDiffusion];
 
     pub fn as_str(self) -> &'static str {

@@ -43,11 +43,13 @@ Define how components talk: NATS JetStream subjects and streams for live data an
 | `latent.mcmc.<timescale>.<expert>` | `KernelUpdate` | model-runtime → UI, strategies (D-069, spec 33 §4.3) |
 | `latent.hier.<fine>.<coarse>` | `RegionHierarchy` | model-runtime → UI, Helix (D-069, spec 30 §6.5) |
 | `latent.crossprior.<timescale>` | `CrossAssetPriors` | model-runtime → evo-orchestrator, UI (D-069, spec 33 §6.5) |
-| `decoder.output.<family>` | `DecoderOutput` (refs) | evo/runtime → UI, strategies |
+| `latent.expert.<timescale>.<instrument>` / `latent.expert.health` | `ExpertView` / `ExpertHealth` | model-runtime → decoders, UI (D-073, spec 32 §4.3) |
+| `decoder.output.<family>` / `decoder.shadow.<family>` | `DecoderOutput` (refs) | evo/runtime → UI, strategies; shadow candidates on `decoder.shadow.*` (D-068) |
 | `signal.exposure.<strategy>` | `ExposureDistribution` | strategies → allocator |
 | `order.intent.<account>` | `OrderIntent` | allocator → risk |
 | `order.approved.<account>` | `OrderIntent` | risk → broker-gateway |
 | `order.event.<account>` | `OrderEvent` (ack/fill/cancel/reject) | broker-gateway → ledger, risk |
+| `order.cancel.<account>` | `OrderCancel` (legacy `OrderIntent` still decodes) | operator / tools → broker-gateway (D-076; no service publishes it yet) |
 | `risk.state` / `risk.halt.<scope>` | `RiskState` / `Halt` | risk-engine → all; scopes `portfolio`, `daily_loss`, `source`, `model`, `broker` (D-042) |
 | `risk.resume.<scope>` | `Resume` (wire-compatible with `Halt`) | control-api / operator / ingestor → risk-engine; re-arms a halt (D-030) |
 | `filing.fact.<source>` | `Envelope{FundamentalFact}` (field 29; XBRL company facts) | ingestor (`sec_edgar`) → `wh.fundamental` |
@@ -56,27 +58,29 @@ Define how components talk: NATS JetStream subjects and streams for live data an
 | `jobs.result.<kind>` | `JobResult` | workers → orchestrator |
 | `jobs.progress.<job_id>` | `JobProgress` | workers → UI |
 | `ingest.health.<source>` / `ingest.gap.*` / `ingest.unresolved.*` | `IngestHealth` / `IngestGap` / `IngestUnresolved` (legacy JSON accepted) | ingestor → risk, UI |
-| `ctl.<service>.<verb>` | `CtlRequest` / `CtlReply` | control-api ↔ services; today `ctl.ingest.{start,stop,status}` (D-036), `ctl.evo.{start,cancel}` (D-037) |
+| `ctl.<service>.<verb>` | `CtlRequest` / `CtlReply` | control-api ↔ services; today `ctl.ingest.{start,stop,status,enable,disable,backfill,replay}` (D-036, D-054, D-067), `ctl.evo.{start,cancel}` (D-037), `ctl.strategy.{reload,status,…}`, `ctl.train.cancel`, `ctl.model.{reload,shadow,adapter}`, `ctl.risk.{strategy,flatten,limits,pipeline,allocators}` (D-051, D-071), `ctl.decoders.{status,reload,pin,off,retrain}` (D-068, D-074) |
 | `ctl.gpu.{acquire,release}` / `ctl.gpu.{granted,preempt}` | request/reply / notifications | workers, trainer ↔ GPU arbiter in evo-orchestrator (D-006, D-044) |
 | `ref.changed.<entity>`, `catalog.changed.<id>` | `RefChanged` | ingestor, control-api → ingestor resolver, risk-engine RefTable |
 | `svc.heartbeat.<service>` | `Heartbeat` | all → UI |
 | `ops.alert` | JSON `AlertEvent` (`status`, `alertname`, `severity`, `summary`, `fingerprint`, `labels`, `annotations`, `starts_at`, `ends_at`, `at`) | control-api (vmalert receiver, D-066), dead-letter forwarder → UI, audit; core-only, by design not proto (the vmalert/Alertmanager shape) |
 | `dlq.<STREAM>.<original subject>` | the original payload + `Fa-Dlq-*` headers | dead-letter forwarder → `DLQ` stream (§8) |
 
-Tokens (`<inst>`) use the instrument UUID without dashes **(proposal)** to keep subjects safe.
+Tokens (`<inst>`) use the instrument UUID without dashes (D-017; `InstrumentId::subject_token`, Go `bus.SubjectToken`) to keep subjects safe.
 
 ### 4.2 Proto packages
 ```
 proto/fa/v1/
   envelope.proto     # Envelope, times, raw_ref
   market.proto       # Trade, Quote, Bar, BookSnapshot
-  text.proto         # NewsItem, FilingEvent
+  text.proto         # NewsItem, FilingEvent, FundamentalFact
   media.proto        # MediaChunk
   macro.proto        # MacroObservation, OnchainEvent
-  latent.proto       # LatentState, RegionEvent, TransitionUpdate, ExpertSpaceRef
-  decoder.proto      # DecoderOutput
-  strategy.proto     # ExposureDistribution
-  order.proto        # OrderIntent, OrderEvent
+  latent.proto       # LatentState, RegionEvent, TransitionUpdate, ExpertSpaceRef, RegionMembership,
+                     # RegionLifecycleEvent, KernelUpdate, RegionHierarchy, CrossAssetPriors,
+                     # ExpertView, ExpertHealth (+ their parts)
+  decoder.proto      # DecoderOutput, Analog
+  strategy.proto     # ExposureDistribution, AssetExposure
+  order.proto        # OrderIntent, OrderEvent, OrderCancel
   risk.proto         # RiskState, Halt, Resume, RiskEvent
   ingest.proto       # IngestHealth, IngestGap, IngestUnresolved, RefChanged
   jobs.proto         # Job, JobResult, JobProgress
@@ -101,7 +105,8 @@ message Job {
 }
 message JobResult {
   string job_id = 1;
-  enum Status { OK = 0; FAILED = 1; PREEMPTED = 2; BUDGET_EXCEEDED = 3; }
+  enum Status { STATUS_OK = 0; STATUS_FAILED = 1; STATUS_PREEMPTED = 2;
+                STATUS_BUDGET_EXCEEDED = 3; STATUS_CANCELLED = 4; }  // buf STANDARD prefixes
   Status status = 2;
   bytes  result = 3;            // kind-specific (e.g. FitnessRecord)
   repeated string output_refs = 4;
@@ -109,11 +114,13 @@ message JobResult {
   uint64 used_gpu_ms = 6;
   string worker_id = 7;
   string error = 8;
+  map<string, double> objectives = 9;   // multi-objective fitness (spec 34 §6.3)
+  map<string, string> directions = 10;  // "min" | "max" per objective
 }
 ```
 `JobProgress` published on `jobs.progress.<job_id>` for UI.
 
-## 5. Data model — JetStream streams **(proposal)**
+## 5. Data model — JetStream streams
 | Stream | Subjects | Retention | Max age | Notes |
 |---|---|---|---|---|
 | `MD` | `md.>` | limits | 24 h | live + short replay; long history in VM/Garage |
@@ -123,13 +130,13 @@ message JobResult {
 | `LATENT` | `latent.>`, `decoder.>` | limits | 7 d | |
 | `SIGNAL` | `signal.>` | limits | 30 d | |
 | `ORDERS` | `order.>`, `risk.>` | limits | 365 d, file storage, replicas when clustered | ledger is source of truth, stream is audit aid |
-| `JOBS_<kind>` | `jobs.<kind>` | **work-queue** | until acked | one stream per kind/priority class |
+| `JOBS_<kind>` | `jobs.<kind>.>` | **work-queue** | until acked | one stream per kind (`JOBS_EVO`, `JOBS_TRAIN`, `JOBS_MCMC`); `fa_bus::streams::ensure_work_queue` |
 | `JOB_RESULTS` | `jobs.result.>` | limits | 30 d | |
 | `DLQ` | `dlq.>` | limits | 30 d | dead letters of every stream (§8) |
 
 Consumers: durable pull consumers per service; `AckExplicit`; `MaxAckPending` set per consumer for backpressure; work queues use `AckWait` + heartbeat `in-progress` acks for long jobs.
 
-**Implemented today (D-046):** the limits streams above are declared once in `crates/fa-bus/streams.json` (mirrored byte-for-byte in `go/pkg/bus/streams.json`) and ensured idempotently by control-api when NATS connects and by the ingestor at start; `GET /api/bus/streams` lists them. `ctl.*`, `svc.heartbeat.*`, `ingest.*`, `jobs.progress.*` and `ops.alert` stay core-only.
+**Implemented today (D-046):** the limits streams above are declared once in `crates/fa-bus/streams.json` (mirrored byte-for-byte in `go/pkg/bus/streams.json`) and ensured idempotently by control-api when NATS connects and by the ingestor at start; `GET /api/bus/streams` lists them. `ctl.*`, `svc.heartbeat.*`, `ingest.*`, `ref.changed.*`, `catalog.changed.*`, `jobs.progress.*` and `ops.alert` stay core-only.
 
 **Disk budget (`max_mib`, 2026-11-11, closes open question 1):** every stream carries a byte cap in `streams.json` (`max_bytes`, limits discard-old), sized from live `nats stream info` after the 19:48 UTC data reset with ≥ 2× headroom over the projected full-retention volume; the LATENT rate was measured after D-069's soft memberships (≈ 44 MB/h off-hours, roughly double the pre-D-069 average of 10.7 MB/h):
 
@@ -189,7 +196,7 @@ The caps sum to 69 GiB against the server's 202 GB JetStream storage. `ensure_st
 2. Quote coalescing under backpressure acceptable for which consumers?
 3. Typed job specs: `google.protobuf.Any` vs `kind` + bytes (current) — ergonomics vs safety.
 4. One work-queue stream per priority class or NATS consumer priority groups?
-5. Subject tokenization for instruments (UUID vs short ids) — readability in UI vs safety.
+5. ~~Subject tokenization for instruments (UUID vs short ids) — readability in UI vs safety.~~ Decided by D-017: dashless lowercase UUID (§4.1).
 
 ## 11. Deferred
 - NATS clustering / leaf nodes for multi-machine scaling.

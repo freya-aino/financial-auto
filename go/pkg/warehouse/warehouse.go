@@ -163,7 +163,7 @@ type Stats struct {
 	Errors     uint64 // failed batches
 }
 
-// Writer inserts macro observations synchronously, one batch per call.
+// Writer inserts macro observations, filings and XBRL facts synchronously, one batch per call.
 type Writer struct {
 	DB      DB
 	Timeout time.Duration // per batch (default 10 s)
@@ -174,8 +174,8 @@ type Writer struct {
 // NewWriter builds a Writer over a pool (or any DB).
 func NewWriter(db DB) *Writer { return &Writer{DB: db} }
 
-// Write inserts the macro observations among envs and returns how many rows
-// were new. Non-macro envelopes are ignored, so callers may pass everything a
+// Write inserts the macro observations, filings and facts among envs and returns
+// how many rows were new. Other envelopes are ignored, so callers may pass everything a
 // connector produced.
 func (w *Writer) Write(ctx context.Context, envs []*fav1.Envelope) (int, error) {
 	if w == nil || w.DB == nil {

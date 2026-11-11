@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | draft |
 | **Maturity** | Medium-high |
-| **Owners (code)** | `crates/fa-backtest`, `crates/fa-evolution` (fitness corrections), `bins/evo-worker` |
+| **Owners (code)** | `crates/fa-backtest`, `crates/fa-evolution` (fitness corrections), `bins/evo-worker`, `bins/risk-engine` (holdout locking, shadow consistency, decision replay) |
 | **Depends on** | 10 Ingestion, 12 Reference data, 20 Storage, 34 Decoder population, 35 Strategies, 40 Execution & risk |
 
 ## 1. Purpose
@@ -47,7 +47,8 @@ pub trait Evaluator {
 ```
 - Work queue: `jobs.eval.request` / `jobs.eval.result` (21) with `EvalJob { candidate, replay_spec }` → `EvalReport`.
 - **Implemented today (D-044):** `fa_backtest::eval::evaluate` scores a `fa_decoders` series decoder **sequentially point-in-time** (forecast at every step using data `≤ t`, scored against the realised `h`-step log return) and returns the objective set of spec 34 §6.3 (`crps`, `crps_skill`, `coverage`, `coverage_err`, `hit_rate`, `trade_sharpe`, `trade_psr`, `compute_cost`, `n_eval`) with budget/preemption stop hooks and multi-instrument pooling. It is scoring, not walk-forward retraining. The job surface is spec 21's generic `Job` / `JobResult` on `jobs.evo.eval.decoder`, not the dedicated messages above. Evaluation data comes from VictoriaMetrics since D-049 (`fa_tsdb::trade_prices`, in-memory buffer as fallback). Deflated Sharpe and PBO (CSCV) are applied across every generation's trial set since D-052 (§6.5); the full pipeline replay re-runs strategies on recorded latents (§6.1), not the encoders themselves.
-- Control API: `GET /api/validation/holdout`, `GET /api/validation/reports/{candidate}`, `GET /api/validation/shadow/{strategy}`.
+- Control API: `GET /api/validation/holdout`, `GET /api/validation/reports/{candidate}`, `GET /api/validation/shadow/{strategy}`; `POST /api/validation/holdout` (lock) and `POST /api/validation/holdout/{id}/evaluate` (D-059).
+- **Job kinds (implemented):** `evo.eval.decoder`, `evo.eval.strategy`, `evo.eval.strategy.holdout` (Promotion purpose) and `evo.eval.allocator` on `jobs.<kind>` / `jobs.result.<kind>`, envelope `{"genome","generation","rung","data_window"?}`.
 
 ## 5. Data model
 | Entity | Store |
@@ -61,6 +62,8 @@ pub trait Evaluator {
 | Trial registry (all tested candidates) | Postgres `trial(id, generation, candidate, window, sharpe, n_obs, …)` — required for deflated Sharpe & PBO |
 | Shadow tracking | Postgres `shadow_period(strategy_id, started_at, horizons_completed, stats…)` |
 
+**Implemented stores:** `validation.holdout` (immutable by trigger, stable `id`), `validation.trial` (`kind` `evo.eval.decoder` / `evo.eval.strategy` / `holdout` / `allocator`, objectives, 64 block sums, `holdout_id`), `validation.generation_stats` (DSR, PBO, `effective_trials`); shadow tracking lives in risk-engine's `ledger.strategy_state` (`shadow_since`, `horizons_completed`, sub-book with hourly P&L, `gate`); evaluated genomes are Helix `Genome` nodes with `FitnessRecord`s. Equity curves and per-trade logs stay in the job result (not archived to Garage); macro vintages are `wh.macro_observation(…, vintage)`.
+
 ## 6. Behaviour & algorithms
 
 ### 6.1 Replay engine
@@ -69,9 +72,9 @@ pub trait Evaluator {
 - Runs encoders (frozen snapshot), MCMC, decoders, strategies, allocator and **paper venue** exactly as live; online adapters are either frozen or replayed online per spec flag **(proposal)**.
 - Speed: fast-forward mode skips wall-clock waits; heavy encoder inference is cached per (snapshot, window) in Garage to make many strategy evaluations cheap **(proposal)**.
 
-**Implemented today (D-052):** `fa_backtest::replay` replays GP strategy genomes step by step over VictoriaMetrics bars (visible at close, ordered by `(close, instrument)` through the look-ahead guard) with a virtual book per sleeve and the cost model of §6.3; identical spec + seed + data give a byte-identical report. Encoders, MCMC and decoders are not re-run inside the replay yet: the strategy sees the price-only fallback context (feeding recorded latents is the next step).
+**Implemented today (D-052):** `fa_backtest::replay` replays GP strategy genomes step by step over VictoriaMetrics bars (visible at close, ordered by `(close, instrument)` through the look-ahead guard) with a virtual book per sleeve and the cost model of §6.3; identical spec + seed + data give a byte-identical report. Encoders, MCMC and decoders are not re-run inside the replay: their recorded outputs are fed instead (D-059, below).
 
-**Since D-059** replays feed the recorded `latent.*` / `decoder.output.*` messages (read from the `LATENT` JetStream stream by time range) into the same `LatentGraph` / `DecoderOutputs` the live runtime uses, point-in-time, and report `sources{graph, decoder, fallback}`; a replay declares its snapshot and refuses latents of another one unless Diagnostic.
+**Since D-059** replays feed the recorded `latent.*` / `decoder.output.*` messages (read from the `LATENT` JetStream stream by time range) into the same `LatentGraph` / `DecoderOutputs` the live runtime uses, point-in-time, and report `sources{graph, decoder, fallback}`; a replay declares its snapshot and refuses latents of another one unless Diagnostic. Instead of an encoder-inference cache in Garage, recorded `LATENT` / `SIGNAL` windows are cached in memory per worker (`fa_backtest::latents::RecordingCache`: hit / extend / miss, LRU, D-064). Online adapters are not replayed (the recording already contains what the serving snapshot published).
 
 ### 6.2 Point-in-time rules
 - An event is visible at time t iff `knowledge_time ≤ t`, where knowledge_time = `publish_time` if known else `ingest_time` (live) or a conservative per-source delay (backfilled data, catalog field).
@@ -83,7 +86,7 @@ pub trait Evaluator {
 **Per-source knowledge delays (implemented, `fa_backtest::knowledge`).** Measured on the retained `MD` stream on 2026-11-11 (`cargo run -p fa-backtest --example knowledge_delay -- <minutes>`: stream publish time − `Envelope.event_time` per trade, 100 min): Kraken p10 17 s, p50 43 s, p90 76 s, p99 87 s, max 117 s (907 trades; the connector polls Trades per minute behind its rate limit); Yahoo p50 51 s, p99 94 s, max 94 s (202 synthetic trades); `sim` 0 s. The catalog carries them as `sources[].backfill.knowledge_delay_secs` in `config/sources.yaml` — **kraken 120 s**, **yahoo 100 s** (≥ the observed maximum, so an event-time replay never sees a price before the live system could have) — read through `FA_SOURCES` (the runtime image sets it) or `config/sources.yaml`, with `KnowledgeDelays::builtin()` pinned to the same values by a test. Every event-time replay applies them: `ReplaySpec.knowledge_delays` and `AllocatorReplaySpec.knowledge_delays` (default: the catalog) shift each `BarSeries` of a source by its delay before use (`replay::replay`, `allocator_replay::replay_allocator`), so the strategy and allocator replays decide on what was known, not on what had happened. Recordings stamped at receive time (`fa_bus::replay`, the venue and decision fixtures) need no shift.
 
 ### 6.3 Cost model
-Per venue & instrument class: commission schedule, spread (from quotes, or modelled from bar range when quotes unavailable), slippage as function of order notional / volume and volatility (square-root impact **(proposal)**), funding (perps/FX swaps), borrow (shorts). Paper venue (40) uses the same model; realised live slippage recalibrates it periodically.
+Per venue & instrument class: commission schedule, spread (from quotes, or modelled from bar range when quotes unavailable), slippage as function of order notional / volume and volatility (square-root impact), funding (perps/FX swaps), borrow (shorts). Paper venue (40) uses the same model; realised live slippage recalibrates it periodically.
 
 **Implemented today (D-051, D-052):** one model shared by the paper venue (`go/services/broker-gateway/costs.yaml`) and the backtest (`fa_backtest::cost`, pinned to the venue's `testdata/cost_fixture.json`): lookup `venues.<v>.classes.<c>` → `venues.<v>.default` → `default.classes.<c>` → `default.default`; fill = price ± (half spread + `k·σ_day·sqrt(N/ADV)`), commission with floor, funding/borrow carry per day as placeholders.
 
@@ -104,7 +107,7 @@ Per timescale: `[selection window] [embargo gap] [locked holdout] [live]`. The h
 - **Trial registry**: every evaluated candidate is recorded with its selection-window statistics.
 - **Deflated Sharpe Ratio** (Bailey & López de Prado): adjusts observed Sharpe for the number of trials, variance of trial Sharpes, skew and kurtosis; fitness uses DSR (or its probability) instead of raw Sharpe.
 - **PBO** via combinatorially symmetric cross-validation over the selection window's sub-blocks, computed per generation for the elite set; reported and used in the promotion gate. (CSCV is not walk-forward training; it reuses existing evaluations.)
-- Effective number of trials estimated from clustered correlation of trial returns **(proposal)**.
+- Effective number of trials estimated from the correlation of trial returns (implemented as the mean pairwise correlation, below).
 
 **Implemented today (D-052):** every decoder or strategy evaluation writes a `validation.trial` row (generation, loop, rung, candidate, Sharpe, n_obs, objectives, 64 return block sums). After each trial the worker recomputes `validation.generation_stats` (deflated Sharpe of the best trial against the expected maximum of n trials, CSCV PBO with 16 blocks), which the orchestrator publishes in every `generation.summary`. Selection replays intersecting a locked `validation.holdout` row are rejected; holdouts are locked automatically (§6.4).
 

@@ -14,7 +14,8 @@
 #   --pg-volume    with --pitr: restore into this volume instead of the live postgres-data volume and
 #                  verify it in a throwaway container (drills; the live stack is not touched)
 # Order: 1 stop app services (unless --postgres-db) → 2 postgres → 3 helix (stop, replace volume,
-# start) → 4 garage buckets (rclone sync) → 5 print the §6.4 order; `just app-up` then runs
+# start) → 4 garage buckets (rclone sync) → 5 print the §6.4 order; `just app-up` (or `docker compose --profile app up -d &&
+# scripts/healthwait.sh` without just) then runs
 # migrations (control-api), reconciliation (risk-engine) and the health wait (scripts/healthwait.sh).
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -173,5 +174,6 @@ Recovery order (spec 60 §6.4) from here:
   6. model-runtime, evo-orchestrator, evo-worker
   7. control-api, ui
 Run:  just app-up     (starts everything and waits via scripts/healthwait.sh)
+      without just: docker compose --profile app up -d && scripts/healthwait.sh
 MSG
 fi

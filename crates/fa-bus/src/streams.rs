@@ -200,8 +200,8 @@ fn config_matches(have: &stream::Config, want: &stream::Config) -> bool {
 }
 
 /// Ensures the `JOBS_<KIND>` work-queue stream on `jobs.<kind>.>` and a durable pull consumer
-/// with the spec's `ack_wait` 60 s / `max_deliver` 5. Owners of a kind (evo-worker,
-/// evo-orchestrator) can call this instead of hand-rolling the config.
+/// with the spec's `ack_wait` 60 s / `max_deliver` 5. The trainer and model-runtime use it;
+/// `JOBS_EVO` is configured on the Go side (`go/pkg/bus`, `WorkQueueName`).
 pub async fn ensure_work_queue(
     js: &jetstream::Context,
     kind: &str,

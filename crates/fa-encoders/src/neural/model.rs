@@ -173,7 +173,8 @@ pub struct NeuralConfig {
     pub head_refit_steps: usize,
     /// Head refit solver: `""` / `adam` (the penalised full-batch refit above) or `constrained`
     /// ([`super::heads`]: gated least squares with the pairwise residual covariance as an
-    /// equality constraint, solved exactly per expert; runs even with `head_refit_steps` 0).
+    /// equality constraint, solved exactly per expert). `trainer sweep` runs it even with
+    /// `head_refit_steps` 0; a snapshot fit refits the heads only when `head_refit_steps` > 0.
     #[serde(default)]
     pub head_solver: String,
     /// `constrained` solver: target |residual correlation| per expert pair (0 = exact).

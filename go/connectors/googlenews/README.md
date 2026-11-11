@@ -7,7 +7,7 @@ First-wave connector: Google News RSS search (text), catalog id `google_news`.
 ## Behaviour
 - **Poll** (every 5 minutes): one feed per `config.queries` entry (default `"stock market"`), catalog rate limit 0.5/s.
 - **Normalize:** each `<item>` → `NewsItem` on `news.item.google_news` with `title` (outlet suffix stripped), `url` (Google redirect link, kept as-is), `outlet` from `<source>`, `language` from the channel, `entities_raw ["query:<q>"]`, `dedup_key` = `<guid>`. `event_time = publish_time` = `pubDate`.
-- **De-dup:** in-memory guid set plus a persisted cursor (`ingest.backfill_cursor`, timescale `items`) = newest `pubDate` published; items at or before it are skipped after a restart.
+- **De-dup:** in-memory guid set plus a persisted cursor (`ingest.backfill_cursor`, timescale `items`) = newest `pubDate` published; items at or before it are skipped after a restart. The ingestor's cross-source news de-dup (normalized-URL hash, spec 10 §6.5) sees the Google redirect link, so it rarely matches the same story from another source.
 - No backfill: the feed carries no history.
 
 ## Tests

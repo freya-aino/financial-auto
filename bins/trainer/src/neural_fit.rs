@@ -1,4 +1,4 @@
-//! Neural snapshot fits (`family = fsq_hybrid | jepa_vae`, spec 31 §6.2, spec 32 §6.3, spec 36
+//! Neural snapshot fits (`family = fsq_hybrid | hier_vae_flow | jepa_vae | latent_diffusion`, spec 31 §6.2, spec 32 §6.3, spec 36
 //! §6.2–§6.4): the same job kinds, data, Garage layout (D-058) and Helix mirror as the
 //! statistical fit, with a candle model trained end to end on CPU (or CUDA with the `cuda`
 //! feature).
@@ -6,20 +6,25 @@
 //! Steps of a run
 //! 1. **Parent**: explicit, else the active snapshot of the timescale (any family). A neural
 //!    parent of the same family and genome **warm-starts** the child (spec 36 §6.3); its region
-//!    centroids become the **D-007 anchor** of the matching experts; its expert latents fit the
-//!    frozen linear-probe decoders of the **D-009 hook** ([`crate::feedback::FrozenProbeFeedback`]).
+//!    centroids become the **D-007 anchor** of the matching experts. The **D-009 hook** is fed by
+//!    the elite decoders in Garage ([`crate::feedback::EliteFeedback`], D-073) when cards of the
+//!    fit's step and latent width exist, else by frozen linear probes fitted on the parent's expert
+//!    latents ([`crate::feedback::FrozenProbeFeedback`]).
 //! 2. **Train** in chunks of [`CHUNK_STEPS`] SGD steps; between chunks the run honours cancel,
 //!    preemption (checkpoint + `STATUS_PREEMPTED`) and the budget, and checkpoints every
 //!    `checkpoint_every` to `fa-ckpt/<job_id>/neural.safetensors` (+ `state.json` with the data
 //!    pins), so a redelivered job resumes bit for bit.
-//! 3. **Validate**: spec 32 §6.4 health on the validation windows (residual correlation,
+//! 3. **Validate**: optional refit of the next-step heads (`head_refit_steps` > 0; `head_solver`
+//!    picks the penalised or the constrained solver), spec 32 §6.4 health on the validation windows (residual correlation,
 //!    `K_eff`, per-expert skill, usage), then **prune** experts below `prune_usage_below`
 //!    (emergent count, ≥ 2 kept) and evaluate again; a neural parent is evaluated on the same
 //!    windows for the §6.4 item 1 regression check.
 //! 4. **Expert identity** (spec 32 §6.5): linear CKA of child vs parent experts on the probe
 //!    windows, greedy matching, matched experts keep the parent's index.
-//! 5. **Regions + alignment** exactly as the statistical fit (leader clustering per expert on the
-//!    probe latents, Jaccard alignment against the parent's stored observations, D-007 fallback).
+//! 5. **Regions + alignment**: the family's declared discovery per expert on the probe latents
+//!    (`fsq_hybrid` codebook with the residual merge, `jepa_vae` mapper, families 2/4 density;
+//!    D-080), then Jaccard alignment against the parent's stored observations as in the
+//!    statistical fit (D-007 fallback).
 //! 6. **Bundle**: `manifest.json` (genome, device, health and checklist metrics), `weights.bin`
 //!    (safetensors), `regions.json`, `region_map.json` → Garage + Helix `candidate`.
 
@@ -103,7 +108,7 @@ fn merge(base: &mut Value, over: &Value) {
     }
 }
 
-/// Snapshot id: `<fsq|jepa>-v1-<ts>-g<gen>-<unix seconds>`.
+/// Snapshot id: `<fsq|hvf|jepa|ldm>-v1-<ts>-g<gen>-<unix seconds>`.
 pub fn snapshot_id(family: NeuralFamily, ts: Timescale, generation: u32, now_ms: i64) -> String {
     format!("{}-{ts}-g{generation}-{}", family.id_prefix(), now_ms / 1000)
 }

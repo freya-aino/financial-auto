@@ -1,8 +1,8 @@
 # docker
 
-Everything runs through Docker Compose (D-034): `compose.yaml` at the repo root covers the infrastructure (NATS, HelixDB, VictoriaMetrics, PostgreSQL, Garage) and, under profile `app`, every platform service plus the operator UI (D-026, D-033, D-035). This folder holds the Dockerfiles, the Garage config and its init script.
+Everything runs through Docker Compose (D-034): `compose.yaml` at the repo root covers the infrastructure (NATS, HelixDB, VictoriaMetrics, PostgreSQL, Garage) and, under profile `app`, every platform service plus the operator UI (D-026, D-033, D-035). This folder holds the Dockerfiles, the Garage config and its init script, the VictoriaMetrics scrape config and vmalert rules (`vm-scrape.yaml`, `vm-alerts.yaml`), the Postgres WAL-archiving files (`postgres/`) and the `backup` sidecar (`backup/`).
 
-**Status:** compose working (verified 2026-11-06: nats, postgres, victoriametrics healthy; garage up, initialized by `garage-init.sh`).
+**Status:** compose working: infrastructure since 2026-11-06, the full `app` profile, vmalert, exporters and the backup sidecar running on this machine (rootless Docker) as of 2026-11-11 (D-056, D-060, D-066). No GPU on this machine: the images are CPU-only.
 
 ## Services (ports per D-014, bound to 127.0.0.1)
 | Service | Image | Ports | Health |
@@ -17,14 +17,15 @@ Everything runs through Docker Compose (D-034): `compose.yaml` at the repo root 
 | postgres-exporter | `quay.io/prometheuscommunity/postgres-exporter:v0.17.1` | — (9187 in compose) | scraped as job `postgres` |
 | backup | `financial-auto/backup:dev` (`backup/Dockerfile`) | — | crond running; `docker compose logs backup` |
 
-Every service has a healthcheck now: infra natively (garage: `/garage status`), the Rust services `curl` their `/metrics`, the distroless Go images run `healthprobe` (`go/services/healthprobe`) against theirs. Postgres runs with WAL archiving (`docker/postgres/`).
+Every long-running service except `helix` and the two exporters has a healthcheck: infra natively (garage: `/garage status`), the Rust services `curl` their `/metrics`, the distroless Go images run `healthprobe` (`go/services/healthprobe`) against theirs. `helix` is distroless without a probe binary; control-api's `fa_dependency_up{dep="helix"}` and the `DependencyDown` alert cover it. Postgres runs with WAL archiving (`docker/postgres/`).
 
 ## Usage
 ```sh
 just up        # docker compose up -d
-just migrate   # apply migrations/ to postgres
+just migrate   # apply migrations/ to postgres (optional: control-api applies them on start)
 just down
 ```
+`just` is optional (and not installed on this machine): every recipe in the root `justfile` is a one-liner, so run its body directly, e.g. `docker compose up -d`, `docker compose --profile app build`, `docker compose --profile app up -d && scripts/healthwait.sh`, `docker compose --profile app --profile tools down`, `docker compose --profile app logs -f --tail 100 <service>`, `scripts/backup.sh`, `scripts/restore.sh <dir>`, `scripts/restore-drill.sh`, `scripts/alert-drill.sh`, `docker compose exec backup run.sh`. The `just` names below map to those lines.
 
 ## Running the full stack (D-026)
 The application services run in compose under the `app` profile. They use three images built from the repo root:
@@ -48,8 +49,8 @@ just app-down                  # stops everything, keeps volumes
 - **Migrations:** `control-api` applies the Postgres migrations on startup.
 - **Scaling workers:** `just app-scale-workers 4`, or `docker compose --profile app up -d --scale evo-worker=4`. Workers are stateless and pull jobs from a NATS work queue. For more machines later, point more `evo-worker` containers at the same NATS.
 - **Trainer:** a one-off CLI in the `tools` profile, not started by default. Run it with `just trainer pretrain --help` or `docker compose --profile tools run --rm trainer …`.
-- **GPU:** install `nvidia-container-toolkit`, then uncomment the `deploy.resources.reservations.devices` blocks on `model-runtime`, `evo-worker` and `trainer`. GPU time is still arbitrated by `evo-orchestrator` (D-006). The Rust image is CPU-only today because `burn`/`candle` are off by default (D-004); enabling CUDA will need a CUDA base image.
-- **HelixDB:** the `helix` service, reached at `http://helix:8080` inside compose and `127.0.0.1:6969` from the host. The image is distroless, so it has no in-container healthcheck; `control-api` only waits for it to start.
+- **GPU:** install `nvidia-container-toolkit`, then uncomment the `deploy.resources.reservations.devices` blocks on `model-runtime`, `evo-worker` and `trainer`. GPU time is still arbitrated by `evo-orchestrator` (D-006). The Rust image is CPU-only today: the ML crates run on candle's CPU backend and the `cuda` cargo feature is off (D-070); enabling CUDA needs `--features cuda` and a CUDA base / builder image. Untested: this machine has no GPU. Device selection: `FA_ML_DEVICE` (spec 60 §6.2).
+- **HelixDB:** the `helix` service, reached at `http://helix:8080` inside compose and `127.0.0.1:6969` from the host. The image is distroless, so it has no in-container healthcheck; `control-api` only waits for it to start and probes it every 15 s (`fa_dependency_up`).
 - **UI:** the `ui` service is the only thing serving the frontend in compose; the control-api container has no `frontend/build`, so `:7700` is API only. On the host, `cargo run -p control-api` still serves `frontend/build` when it exists.
 - **No host processes:** don't run `cargo run -p control-api` at the same time, because it also binds port 7700.
 - **Service control from the API/UI (D-060):** `POST /api/services/{name}/start|stop|restart` and `GET /api/services/{name}/container` work through the Docker socket, which `compose.yaml` mounts read-write into `control-api` **only** (`${FA_DOCKER_SOCK:-/var/run/docker.sock}` → `/var/run/docker.sock`, `FA_COMPOSE_PROJECT=financial-auto`). Infra services and control-api itself are refused (409); `risk-engine` stop/restart needs `{"confirm": true}`. See `bins/control-api/README.md` → Supervisor.
@@ -120,7 +121,7 @@ G key info fa-local --show-secret   # copy into config/secrets.toml [garage]
 `garage.toml` holds a fixed local-only `rpc_secret` and `admin_token` (ADR 0006). Don't reuse them anywhere else.
 
 ## HelixDB (D-033)
-The standalone server image speaks `POST /v2/query` (operation-tree contract) plus `GET /healthz`, `GET /readyz` and `GET /v2/diagnostics`. `helix/schema.hx` and `helix/queries.hx` are not loaded by the image; `fa-hub` still targets the CLI-compiled `POST /<query_name>` endpoints (D-012), so its query layer has to move to `/v2/query` before Helix-backed routes work. Until then `/api/health` reports Helix reachable and nothing else uses it.
+The standalone server image speaks `POST /v2/query` (operation-tree contract) plus `GET /healthz`, `GET /readyz` and `GET /v2/diagnostics`. `helix/schema.hx` and `helix/queries.hx` are not loaded by the image; `fa-hub` talks to `POST /v2/query` directly (D-033, D-048), so the Helix-backed control-api routes (graph, snapshots, regions, MCMC, lineage), model-runtime's hub sink and the evolution lineage all use it.
 
 ## Data
-All state lives in named volumes (`financial-auto_{nats,helix,postgres,vm,garage-meta,garage-data}-data`, plus `financial-auto_pg-wal-archive`). `docker compose down -v` wipes everything — take `just backup` first.
+All state lives in named volumes: `financial-auto_{nats-data,helix-data,postgres-data,vm-data,garage-meta,garage-data}`, `financial-auto_pg-wal-archive` (archived WAL) and `financial-auto_broker-gateway-state` (calibrated costs, persisted working orders / positions `orders.json`; D-076, D-079); backups go to the `./backups` bind mount. `docker compose down -v` wipes everything — take `just backup` first.

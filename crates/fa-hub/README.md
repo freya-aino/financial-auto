@@ -18,7 +18,8 @@ integration tests, see below). Supersedes the D-012 assumption of CLI-compiled
   `ensure_expert_space` (get-or-create), `upsert_region`, `mark_region_status`,
   `upsert_transition(s)` (edge keyed by `from_region_id, to_region_id, sampler_id`),
   `snapshot_graph`, `resolve_node`; business-id variants for evo-worker: `upsert_genome`,
-  `link_parent`, `add_fitness_record`. Trainer (spec 36): `set_snapshot_manifest` (manifest JSON +
+  `link_parent`, `add_fitness_record`, and `set_genome_status` (risk-engine's lifecycle mirror,
+  D-076). Trainer (spec 36): `set_snapshot_manifest` (manifest JSON +
   `carried_mass` on the `Snapshot` node, read by control-api's promotion checklist),
   `add_adapter_state` / `snapshot_adapters` / `latest_adapter` (`AdapterState` node,
   `adapter_id = <snapshot_id>@<version>`, `HasAdapter` edge from the snapshot).
@@ -36,9 +37,24 @@ integration tests, see below). Supersedes the D-012 assumption of CLI-compiled
 - `meta` – `SCHEMA_VERSION`, `MIGRATIONS`, `SchemaMeta` marker: `schema_marker`, `migrate_schema`
   (run by `ensure_schema_ready`; `SchemaTooNew` when Helix is ahead), `stamp_schema_version`.
 - `asof` – spec 20 §6.3 variants: `list_snapshots_as_of`, `space_regions_as_of`,
-  `snapshot_graph_as_of`, `space_latents_as_of`.
+  `snapshot_graph_as_of`, `space_latents_as_of`; `Transition` posteriors and region `status`
+  are overlaid with their event-time versions (below).
+- `versions` (D-078) – every `upsert_transitions` row and every region lifecycle mark appends a
+  `TransitionVersion` / `RegionStatusVersion` node in the same write batch (`ts` = record time);
+  `transition_versions`, `region_status_versions`, `transitions_as_of`, `regions_as_of`,
+  `prune_space_versions`.
+- `regions` (D-069) – `update_region_stats`, `mark_region_died`, `upsert_centroid`
+  (`LatentVec kind=centroid`), `upsert_descents` (`DescendsFrom{carry|split|merge|partial}`),
+  `upsert_hier_edges` (`Hier`), `upsert_region_set` / `region_set` (serialised online region set +
+  kernel, restored on restart), `upsert_kernel_model` / `snapshot_kernels`, `upsert_cross_priors` /
+  `cross_priors`, `snapshot_hierarchy`, `lineage_members`, `region_lineage`.
+- `experts` (D-073) – `Expert` nodes (`expert_uid = <snapshot>/e<id>`), `ExpertOf`,
+  `AlignedTo{cka}`: `upsert_expert`, `align_expert`, `retire_expert` (`died_gen`),
+  `snapshot_experts`, `expert_parents`, `expert_alignments`.
 - `retention` – `prune_space_observations`, `prune_snapshot_observations`, `prune_observations`
-  with a `RetentionPolicy` (old `observation` latents folded into `kind=aggregate` rows per region).
+  with a `RetentionPolicy` (old `observation` latents folded into `kind=aggregate` rows per region;
+  version rows older than the cut-off thinned to the one in force). model-runtime runs it on a
+  schedule (`hub_retention.rs`, `--hub-prune-secs`).
 - `buffer` – `WriteBuffer`: bounded drop-oldest queue of write batches with `flush` /
   `send_or_queue` and `BufferStats{queued, sent, dropped, rejected}` (spec 20 §8).
 
@@ -171,10 +187,11 @@ Also available but unused: `GET /healthz`, `GET /readyz` (503 while indexes catc
 ## Who writes what (D-048)
 | Writer | Rows |
 |---|---|
-| `bins/model-runtime` (`hub_sink`) | `Snapshot stat-v1-<ts>`, `ExpertSpace <snapshot>-e<k>`, `LatentRegion` (+ `status`), `Transition` (coalesced), `LatentVec kind=observation` for 1m and slower |
-| `bins/evo-worker` (pending; functions ready) | `Genome` via `upsert_genome`, `ParentOf` via `link_parent`, `FitnessRecord`+`Scored` via `add_fitness_record` |
-| `bins/trainer` | `Snapshot` candidates (+ `manifest`, `carried_mass`), `ExpertSpace`, `LatentRegion`, `SnapshotParent`, `RegionMatch`, `AdapterState` + `HasAdapter` |
-| `bins/control-api` (`graph_routes`) | reads only: `list_snapshots`, `snapshot_graph`, `resolve_node` + `neighborhood`, `genome_ancestry`, `run_named` |
+| `bins/model-runtime` (`hub_sink`, `hub_retention`) | `Snapshot stat-v1-<ts>`, `ExpertSpace <snapshot>-e<k>`, `LatentRegion` (+ `status`, statistics, death marks), `Transition` (coalesced) + `TransitionVersion`, `RegionStatusVersion`, `LatentVec kind=observation` for 1m and slower and `kind=centroid`, `DescendsFrom`, `Hier`, `RegionSet`, `KernelModel`, `CrossPrior`; prunes observations and versions every 6 h |
+| `bins/evo-worker` (`vary`, `vary_strategy`, `allocator`) | `Genome` via `upsert_genome`, `ParentOf` via `link_parent`, `FitnessRecord`+`Scored` via `add_fitness_record` |
+| `bins/risk-engine` (`pipeline`) | `Genome` lifecycle status via `set_genome_status` (mirrors `ledger.strategy_state`) |
+| `bins/trainer` | `Snapshot` candidates (+ `manifest`, `carried_mass`), `ExpertSpace`, `LatentRegion`, `SnapshotParent`, `RegionMatch`, `AdapterState` + `HasAdapter`, `Expert` + `ExpertOf`/`AlignedTo` for neural snapshots |
+| `bins/control-api` (`graph_routes`, `latent_routes`, `mcmc_routes`, `evolution_routes`) | reads (`list_snapshots`, `snapshot_graph`, `resolve_node` + `neighborhood`, `genome_ancestry`, `run_named`, region lineage, kernels, hierarchy, cross priors) plus `set_snapshot_status` / `set_snapshot_previous_active` on promote / rollback |
 
 ## Tests
 ```sh
@@ -190,5 +207,5 @@ named-query catalog, the evo-worker business-id writers and the `AdapterState` r
 (`adapter_state_round_trip_and_snapshot_manifest`).
 
 ## Governing specs
-- [20-storage](../../specs/20-storage.md) §5.2, [ADR 0002](../../specs/adr/0002-helixdb-hub.md), D-012, D-033, D-043, D-048
+- [20-storage](../../specs/20-storage.md) §5.2, [ADR 0002](../../specs/adr/0002-helixdb-hub.md), D-012, D-033, D-043, D-048, D-067, D-069, D-073, D-078
 - [helix/](../../helix/README.md) – the readable catalog this crate mirrors

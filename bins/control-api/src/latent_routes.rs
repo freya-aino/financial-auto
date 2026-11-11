@@ -423,9 +423,13 @@ pub struct Check {
     pub detail: String,
 }
 
-/// The spec 36 §6.4 promotion checklist as enforced today. Items 1 (SSL regression), 2 (expert
-/// health), 4 (ECE) and 5 (elite transfer) have no producer yet and are reported as
-/// `not_evaluated` entries in the route body, not as checks.
+/// The spec 36 §6.4 promotion checklist as enforced today: item 3 (carried mass) and the shadow
+/// checks for every snapshot; items 1 (`ssl_regression`) and 2 (`expert_k_eff`,
+/// `expert_resid_corr`, `expert_min_skill`) are added when the manifest carries the neural
+/// metrics ([`manifest_health_checks`]; item 1 is an `n/a` pass without a neural parent;
+/// statistical snapshots report both as `not_evaluated`). Items 4 (ECE) and 5 (elite
+/// transfer) have no producer yet and are reported as `not_evaluated` entries in the route body,
+/// not as checks.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Checklist {
     pub snapshot_id: String,

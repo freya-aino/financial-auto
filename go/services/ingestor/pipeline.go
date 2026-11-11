@@ -28,7 +28,8 @@ type Pipeline struct {
 	// NewsSeen de-duplicates news across sources and restarts of a connector by
 	// the normalized-URL key (spec 10 §6.5); nil disables.
 	NewsSeen *connector.Seen
-	// Warehouse writes macro observations to wh.macro_observation (spec 20 §6.1 (b)); nil without -postgres.
+	// Warehouse writes macro observations, filings and XBRL facts to wh.macro_observation, wh.filing
+	// and wh.fundamental (spec 20 §6.1 (b)); nil without -postgres.
 	Warehouse *warehouse.Writer
 }
 

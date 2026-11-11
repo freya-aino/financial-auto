@@ -23,8 +23,8 @@ var (
 	Timeframes = []string{"1m", "5m", "15m", "1h", "1d"}
 )
 
-// RateLimit is an optional per-source token bucket. Not yet present in
-// sources.yaml; connectors fall back to DefaultRateLimit.
+// RateLimit is an optional per-source token bucket (`rate_limit:` in
+// sources.yaml); sources without one fall back to DefaultRateLimit.
 type RateLimit struct {
 	PerSecond float64 `yaml:"per_second"`
 	Burst     int     `yaml:"burst"`

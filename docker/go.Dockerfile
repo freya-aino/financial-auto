@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.7
-# Go services image (D-026): ingestor, broker-gateway, evo-orchestrator.
+# Go services image (D-026): ingestor, broker-gateway, evo-orchestrator, and healthprobe (the
+# compose healthcheck of these distroless containers, D-066).
 # Build context = repo root.
 
 FROM golang:1.25-alpine AS builder

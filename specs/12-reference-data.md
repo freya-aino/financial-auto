@@ -24,7 +24,7 @@ Give every tradeable or observable thing a single stable identity and the static
 - Postgres is the warehouse for all static records.
 
 ## 4. Interfaces
-- Rust: `fa-warehouse::refdata` —
+- Rust: the `RefData` contract below (implemented as free functions over a `PgPool` in `fa-warehouse::{asof, calendar, corpactions}`, see §6; `refdata` holds search and quarantine review) —
   ```rust
   trait RefData {
       fn resolve(&self, venue: VenueId, symbol: &str, at: Timestamp) -> Option<InstrumentId>;
@@ -36,7 +36,7 @@ Give every tradeable or observable thing a single stable identity and the static
   }
   ```
 - Go: `pkg/catalog` + `SymbolResolver` (10) backed by Postgres with in-memory cache.
-- NATS: `ref.changed.<entity>` events on any reference update (cache invalidation, Helix sync).
+- NATS: `ref.changed.<entity>` (`fa.v1.RefChanged`) on any reference update (cache invalidation; Helix sync not yet implemented), `catalog.changed.<source>` on catalog enable/disable.
 - Control API: CRUD for manual overrides/mappings (51 ops view).
 
 ## 5. Data model (Postgres, schema `ref`)
@@ -54,27 +54,27 @@ Give every tradeable or observable thing a single stable identity and the static
 
 All tables are **bitemporal-lite**: `valid_from/valid_to` (real-world validity) + `recorded_at` (when we learned it) so as-of queries in backtests are correct.
 
-Helix mirror: nodes `Instrument`, `Entity`, `Venue`; edges `ISSUED_BY`, `LISTED_ON`, `SAME_ECONOMIC_EXPOSURE` (e.g., BTC spot ↔ BTC perp), `IN_SECTOR`.
+Helix mirror: nodes `Instrument`, `Entity`, `Venue`; edges `ISSUED_BY`, `LISTED_ON`, `SAME_ECONOMIC_EXPOSURE` (e.g., BTC spot ↔ BTC perp), `IN_SECTOR`. Declared in `helix/schema.hx` (`IssuedBy`, `ListedOn`, `SameExposure`; no `IN_SECTOR` yet) but not populated: no service writes the mirror.
 
 ## 6. Behaviour & algorithms
-- **Resolution:** connector symbol + venue + time → `listing` → instrument. On miss: OpenFIGI lookup (equities), CoinGecko id (crypto), manual queue otherwise. **(proposal)** auto-create instrument only when ≥1 global identifier (FIGI/ISIN/contract address) matches; else quarantine.
-- **Adjusted series:** stored raw in VM; adjusted series computed on read (factor from `corporate_action`) **(proposal)**, with option to materialize adjusted daily bars.
-- **Calendars:** **(proposal)** seed from venue publications and broker APIs; holidays refreshed yearly; session state is consulted by risk (no orders into closed sessions), backtests and model timescale alignment.
+- **Resolution:** connector symbol + venue + time → `listing` → instrument. On miss: OpenFIGI lookup (equities), CoinGecko id (crypto), manual queue otherwise. Auto-create only when ≥1 global identifier (FIGI/ISIN/contract address) matches, else quarantine — **superseded for now by provisional provisioning (D-050, below)**; OpenFIGI/CoinGecko lookups are not wired.
+- **Adjusted series:** stored raw in VM; adjusted series computed on read (factor from `corporate_action`; implemented, `fa-warehouse::corpactions`), with option to materialize adjusted daily bars (not implemented).
+- **Calendars:** built-in rules materialized into `ref.calendar_session` (implemented, below); seeding from venue publications and broker APIs is not (such rows would carry a `source_id` and win over the rules); holidays refreshed yearly; session state is consulted by risk (no orders into closed sessions), backtests and model timescale alignment.
 - **FX:** ECB daily reference rate as official EUR conversion for accounting (42); intraday FX mid from FX feeds for live risk; source of each conversion recorded.
-- **Change propagation:** update → `ref.changed.*` → caches invalidated, Helix edges synced.
+- **Change propagation:** update → `ref.changed.*` → caches invalidated (the ingestor's resolver flushes, else 1 h TTL; risk-engine reloads its `RefTable`, debounced). Helix edges synced — **not yet**: nothing writes the Helix reference mirror (`Instrument`/`Entity`/`Venue`) today.
 
 **Implemented today (D-050):** `go/pkg/refdata` resolves `(source, symbol)` through `ref.listing`/`ref.identifier`. Unknown pairs are **provisioned** as `status='provisional'` instruments (`uuid5(namespace, source\0symbol)`) with venue, listing and identifier rows plus an open `ingest.quarantine` row for manual review. This relaxes the "global identifier only" rule above so keyless sources can flow before FIGI/ISIN enrichment exists; `resolver.auto_create` is effectively `provisional`.
 
-**Since 2026-11-11:** migration `20261111000010_refdata_asof` makes every `ref` table bitemporal-lite (`recorded_at` on venue/calendar/fx, validity on entity/venue), extends `corporate_action` (`status announced|confirmed|cancelled`, `cancelled_at`, `venue_id`, `old_symbol`/`new_symbol`, natural-key unique index), adds `ref.instrument_relation` (Postgres side of `SAME_ECONOMIC_EXPOSURE`), as-of indexes, `wh.fundamental` (vintaged) and seeds the reference venues `xnys`, `xnas`, `xetr`, `fx_otc`, `crypto`, `kraken`. Provisioning classifies by symbol syntax (`go/pkg/refdata.Classify`: Yahoo `XXXYYY=X` fx pair, `XXX-YYY` crypto, `^…` index, `…=F` future, exchange suffixes → listing currency; OANDA `EUR_USD`; `BASE/QUOTE` on crypto venues), and the migration repaired the earlier rows (BTC-USD and EURUSD=X were provisioned as equities). The `RefData` interface of §4 is `fa-warehouse`: `asof::{resolve, resolve_source_symbol, resolve_identifier}` return `none | one | ambiguous` (never picked silently), `asof::instrument` / `contract_specs` / `fx_to_eur` filter `valid_from ≤ at < valid_to` and `recorded_at ≤ known_at`; `calendar` has built-in rules (US equities with holidays, early closes and DST; Xetra; FX 24/5; 24/7 crypto), `materialize` into `ref.calendar_session` (rows with a `source_id` are never overwritten) and `session_state_at` (table → rule → `missing_calendar` = closed); `corpactions` records actions idempotently, `adjustment_factor` / `adjust_bars` compute split-adjusted or total-return series on read (raw unchanged), `symbol_change` closes the old listing and symbol identifiers at the effective time and opens the new ones (ticker recycling via validity). control-api `refdata_routes` exposes the as-of reads (`GET /api/refdata/{instruments/{id},resolve,session,fx}`) and the override CRUD (`POST /api/refdata/{corporate-actions,corporate-actions/{id}/cancel,symbol-change,identifiers,contract-specs,calendar/{venue}/materialize}`), each audited and announced as `fa.v1.RefChanged` on `ref.changed.<entity>`; quarantine resolution announces too. Calendars for `xnys`, `xnas`, `xetr` are materialized through 2027 on the live stack.
+**Since 2026-11-11:** migration `20261111000010_refdata_asof` makes every `ref` table bitemporal-lite (`recorded_at` on venue/calendar/fx, validity on entity/venue), extends `corporate_action` (`status announced|confirmed|cancelled`, `cancelled_at`, `venue_id`, `old_symbol`/`new_symbol`, natural-key unique index), adds `ref.instrument_relation` (Postgres side of `SAME_ECONOMIC_EXPOSURE`), as-of indexes, `wh.fundamental` (vintaged) and seeds the reference venues `xnys`, `xnas`, `xetr`, `fx_otc`, `crypto`, `kraken`. Provisioning classifies by symbol syntax (`go/pkg/refdata.Classify`: Yahoo `XXXYYY=X` fx pair, `XXX-YYY` crypto, `^…` index, `…=F` future, exchange suffixes → listing currency; OANDA `EUR_USD`; `BASE/QUOTE` on crypto venues), and the migration repaired the earlier rows (BTC-USD and EURUSD=X were provisioned as equities). The `RefData` interface of §4 is `fa-warehouse`: `asof::{resolve, resolve_source_symbol, resolve_identifier}` return `none | one | ambiguous` (never picked silently), `asof::instrument` / `contract_specs` / `fx_to_eur` filter `valid_from ≤ at < valid_to` and `recorded_at ≤ known_at`; `calendar` has built-in rules (US equities with holidays, early closes and DST; Xetra; FX 24/5; 24/7 crypto), `materialize` into `ref.calendar_session` (rows with a `source_id` are never overwritten) and `session_state_at` (table → rule → `missing_calendar` = closed); `corpactions` records actions idempotently, `adjustment_factor` / `adjust_bars` compute split-adjusted or total-return series on read (raw unchanged), `symbol_change` closes the old listing and symbol identifiers at the effective time and opens the new ones (ticker recycling via validity). control-api `refdata_routes` exposes the as-of reads (`GET /api/refdata/{instruments/{id},resolve,session,fx}`; the console adds `GET /api/refdata/{venues,calendar/{venue},corporate-actions}`, D-077) and the override CRUD (`POST /api/refdata/{corporate-actions,corporate-actions/{id}/cancel,symbol-change,identifiers,contract-specs,calendar/{venue}/materialize}`), each audited and announced as `fa.v1.RefChanged` on `ref.changed.<entity>`; quarantine resolution announces too. Calendars for `xnys`, `xnas`, `xetr` are materialized through 2027 on the live stack.
 
 **Round 3 (2026-11-11):** reference data now also backs the ledger's orphan handling and FX restatement (spec 42): an orphan fill's venue symbol is resolved through `ref.listing` as of the fill time (`none | one | ambiguous`, never picked silently), its currency from `ref.instrument.quote_ccy`, its rate and fee value from `ref.fx_rate` valid at the fill time (missing → left NULL, booking refused, never assumed EUR); `fa_ledger::restate` re-labels fills booked before an instrument's quote currency was known with the valid-time `ref.fx_rate` (the rate's `recorded_at` may be later; the restatement is an accounting correction, not an as-of replay). SEC XBRL facts in `wh.fundamental` are keyed by issuer CIK and link to an instrument only through a unique `ref.identifier` (`scheme = 'cik'`); no instrument carries a CIK yet (operator entry via `POST /api/refdata/identifiers`).
 
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
 |---|---|---|
-| `resolver.auto_create` | `global_id_only` | see §6 |
-| `fx.accounting_source` | `ecb_daily` | |
-| `fx.live_source` | `oanda_mid` | |
+| `resolver.auto_create` | `global_id_only` | see §6; effectively `provisional` today (D-050), not configurable |
+| `fx.accounting_source` | `ecb_daily` | risk-engine `risk.toml [fx] source` |
+| `fx.live_source` | `oanda_mid` | not implemented: live risk also converts with `ecb_daily` |
 | `calendar.refresh` | monthly | |
 | `adjustment.materialize_daily` | false | |
 

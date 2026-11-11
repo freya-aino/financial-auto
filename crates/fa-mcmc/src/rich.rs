@@ -10,7 +10,7 @@
 //! | [`SecondOrder`] | `second_order` | state = (previous, current) region; Dirichlet rows per pair with the first-order posterior as prior (`α = s·p₁ + n₂`), so sparse pairs back off to first order | closed form, online |
 //! | [`SemiMarkov`] | `semi_markov` | explicit dwell: per region and dwell bin a Beta hazard of leaving (prior centred on the first-order self-transition), exits by the first-order row without self | closed form, online |
 //! | [`HierAsset`] | `hier_asset` | per-asset rows `θ_{a,i} ~ Dir(c·β_i)` sharing a global `β_i` (hierarchical Dirichlet) | online predictive `(n_{a,ij} + c·β_ij)/(n_{a,i} + c)`; `β`, `c` by **Gibbs** on `jobs.mcmc.refit` ([`crate::refit`]) |
-//! | [`LogitCov`] | `logit_cov` | logistic-normal transitions on covariates (ln dwell, volatility ratio, novelty, router weight): `p(j | i, x) = softmax(W_i x)` | **NUTS** on `jobs.mcmc.refit`; online = Monte Carlo average over the posterior draws, first-order fallback for rows without a fit |
+//! | [`LogitCov`] | `logit_cov` | logistic-normal transitions on the six covariates of [`crate::refit::COVARIATES`] (ln dwell, volatility ratio, novelty, router weight, `peer_switch`, `coarse_ln_dwell`; D-080): `p(j | i, x) = softmax(W_i x)` | **NUTS** on `jobs.mcmc.refit`; online = Monte Carlo average over the posterior draws, first-order fallback for rows without a fit |
 //!
 //! Intervals are central quantiles over posterior draws of each kernel's own parameters.
 

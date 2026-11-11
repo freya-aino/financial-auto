@@ -30,7 +30,7 @@ Build a locally operated, largely autonomous trading platform. It learns a share
 - **Base currency:** EUR for P&L, risk and fitness.
 - **Path to money:** paper first; promotion requires minimum shadow calendar time plus statistical criteria ([40](40-execution-and-risk.md), [41](41-backtest-and-validation.md)).
 - **Languages:** Rust for most of the system including ML; Go for parallel/scalable services ([ADR 0001](adr/0001-rust-go-split.md)).
-- **Compute:** one GPU workstation today. Everything must scale horizontally later without redesign ([60](60-ops.md)).
+- **Compute:** one GPU workstation as the target. The current development host has no GPU: the neural families train and serve on CPU through candle, with an opt-in `cuda` feature (D-068, D-070). Everything must scale horizontally later without redesign ([60](60-ops.md)).
 
 ## 4. Interfaces
 Not applicable: see [01](01-architecture.md).
@@ -52,7 +52,7 @@ System loop, end to end:
 | Name | Default (placeholder) | Notes |
 |---|---|---|
 | `base_currency` | EUR | fixed |
-| `timescale_ladder` | 1s, 1m, 1h, 1d, 1w | see [31](31-expert-encoders.md) |
+| `timescale_ladder` | 1s, 1m, 1h, 1d, 1w | `timescales` in `config/platform.toml` (D-011); see [31](31-expert-encoders.md) |
 | `initial_live_capital` | TBD | open question |
 
 ## 8. Failure modes
@@ -60,11 +60,11 @@ System-level halts are owned by [40](40-execution-and-risk.md) and [60](60-ops.m
 
 ## 9. Acceptance criteria
 - Every decision above is traceable to a component spec (checklist in [README](README.md)).
-- The system can run end to end in paper mode on a single GPU workstation.
+- The system can run end to end in paper mode on a single GPU workstation. *Met in paper mode on a CPU-only host: every service runs in compose on live keyless feeds with statistical baselines behind every stage and the neural families on CPU; no live trading.*
 
 ## 10. Open questions
 1. **Success metrics:** target return, max acceptable drawdown, starting capital. Blocks the tunables in 40.
-2. **Latency budget per timescale.** Blocks the process split in 01.
+2. **Latency budget per timescale.** No longer blocks the process split in 01 (one `model-runtime` for all timescales, D-005); measured so far: the MCMC 1m step at p99 1.3–3.6 ms against a 5 ms budget (D-075).
 
 ## 11. Deferred
 - Scaling beyond one workstation (the design stays open for it).

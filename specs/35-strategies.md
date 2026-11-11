@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | draft |
 | **Maturity** | Medium-low |
-| **Owners (code)** | `crates/fa-strategies`, `crates/fa-evolution`, `crates/fa-backtest`, `bins/evo-worker`, `bins/model-runtime`, `go/services/evo-orchestrator` |
+| **Owners (code)** | `crates/fa-strategies`, `crates/fa-evolution`, `crates/fa-backtest`, `bins/strategy-runtime`, `bins/evo-worker`, `bins/risk-engine` (lifecycle pipeline, `fa_risk::pipeline`), `bins/model-runtime`, `go/services/evo-orchestrator` |
 | **Depends on** | 32 Expert spaces, 33 MCMC graph, 34 Decoder population, 40 Execution & risk, 41 Backtest & validation, 42 Ledger |
 
 ## 1. Purpose
@@ -79,6 +79,8 @@ pub struct ExposureDist {
 ```
 Published on `signal.exposure.<strategy_id>` as `fa.v1.ExposureIntent` (spec 21), consumed by the meta-allocator (spec 40).
 
+**Implemented form:** `fa_strategies::Strategy { id, horizon, step(as_of_ms, assets: &[(InstrumentId, &dyn StrategyContext)]) -> ExposureDistribution }` with `GpStrategy` (`mean = tanh(signal)`, `stddev = sigmoid(uncertainty)`) as the only implementation; the spec genes (`timescale`, `steps`, `lookback_bars`, `step_secs`, optional `snapshot`) live in `population::StrategyDef` / `genome::StrategyGenome`, there is no asset-set gene (a strategy is evaluated on every instrument it sees), and the bus message is `fa.v1.ExposureDistribution` (`proto/fa/v1/strategy.proto`). `NeuralPolicy` is a trait without an implementation (§4.3).
+
 ### 4.2 GP DSL (proposal)
 Typed, strongly-typed GP (STGP) over expression trees. Programs evaluate once per step and return `(mean, std)` per asset.
 
@@ -121,9 +123,9 @@ Constraints: max depth, max nodes, evaluation-time budget per step (cost objecti
 
 **Baseline population:** `crates/fa-strategies/baselines.toml` holds hand-written programs (`genome_id = "baseline"`, **not evolved**) so the signal → allocation → risk → paper-order chain runs before evolution promotes anything (§6.4). `bins/strategy-runtime` runs them live.
 
-**Fallback observation:** until regions, transitions and decoder outputs are consumed, `features::FallbackContext` maps the primitive surface onto empirical price statistics of the strategy's own bar window: `analog_forecast` = mean log return per bar; `(quantile q)` = normal-approximation quantile of lookback returns; `(path_up k)` = share of positive k-bar windows; `stay_prob` = sign persistence (or latent region dwell when `latent.state.>` is present); `region_entropy` = latent posterior std if known, else `std / (|mean| + std)`; transition and decoder-score primitives return 0. This is a placeholder, not the semantics above. Portfolio primitives read the strategy's virtual book (last emitted exposure).
+**Fallback observation:** where no graph or decoder data exists for the step, `features::FallbackContext` maps the primitive surface onto empirical price statistics of the strategy's own bar window: `analog_forecast` = mean log return per bar; `(quantile q)` = normal-approximation quantile of lookback returns; `(path_up k)` = share of positive k-bar windows; `stay_prob` = sign persistence (or latent region dwell when `latent.state.>` is present); `region_entropy` = latent posterior std if known, else `std / (|mean| + std)`; transition and decoder-score primitives return 0. This is a placeholder, not the semantics above; since D-053 it answers only where real data is missing. Portfolio primitives read the strategy's virtual book (last emitted exposure).
 
-**Since D-053** the primitives read real inputs: `fa_strategies::graph::LatentGraph` (from `latent.state|region|transition.>`, point-in-time, rebuilt per expert space on `fa_mcmc::MarkovGraph`) and `fa_strategies::decoders::DecoderOutputs` (from `decoder.output.<family>`), behind `features::LiveContext`, which falls back to the D-040 price statistics only where data is missing and counts the source per call (`primitives.graph|decoder|fallback` in the runtime heartbeat). The typed spec primitives (`cur_region`, `neighbors`, `p_trans`, `p_to_set`, `hitting_time`, `dwell`, `novelty`, `region_feature`, `path_value`, `fc_quantile`, `fc_dist`, `analog_outcome`, `analog_age`, `text_score`, `visual_score`) are parsed and type-checked by `sexpr`; `text_score`/`visual_score` answer 0 until a producer exists. **Since D-052** a strategy genome (`fa_strategies::genome`, one-line TOML inline table, id = phenotype hash) can be generated at random (`random`), varied (`ops`: typed subtree crossover, point/subtree/hoist mutation, constant jitter) and evaluated by `evo.eval.strategy`.
+**Since D-053** the primitives read real inputs: `fa_strategies::graph::LatentGraph` (from `latent.state|region|transition.>`, point-in-time, rebuilt per expert space on `fa_mcmc::MarkovGraph`) and `fa_strategies::decoders::DecoderOutputs` (from `decoder.output.<family>`), behind `features::LiveContext`, which falls back to the D-040 price statistics only where data is missing and counts the source per call (`primitives.graph|decoder|fallback` in the runtime heartbeat). The typed spec primitives (`cur_region`, `neighbors`, `p_trans`, `p_to_set`, `hitting_time`, `dwell`, `novelty`, `region_feature`, `path_value`, `fc_quantile`, `fc_dist`, `analog_outcome`, `analog_age`, `text_score`, `visual_score`) are parsed and type-checked by `sexpr`; `text_score`/`visual_score` read model-runtime's `text.*` / `visual.*` decoders since D-063 (0 when nothing fresh). The portfolio primitives are `position`, `unrealised_pnl`, `time_in_trade` (no `exposure_gross` / `drawdown`), the combinators the D-040 operator set (no `clip`, `Bool` comparisons or `prob_gt`; `if_gt` is the only conditional). **Since D-052** a strategy genome (`fa_strategies::genome`, one-line TOML inline table, id = phenotype hash) can be generated at random (`random`), varied (`ops`: typed subtree crossover, point/subtree/hoist mutation, constant jitter) and evaluated by `evo.eval.strategy`.
 
 ### 4.3 Neural policy (proposal)
 - **Input:** concatenation of expert latents (masked by genome), region membership embeddings, a graph summary vector (k-step predictive region distribution embedded via region embeddings), cached elite decoder outputs (quantiles, analog stats), portfolio state.
@@ -135,12 +137,14 @@ Constraints: max depth, max nodes, evaluation-time budget per step (cost objecti
 | Entity | Store | Fields |
 |---|---|---|
 | `StrategyGenome` | Helix node | representation, program tree (GP) or topology (neural), spec, generation, status (candidate / holdout-passed / shadow / paper / live / retired), objectives |
-
-**Implemented (Helix status mirror):** evolved strategies are Helix `Genome{kind: strategy, family: gp}` nodes (written by the evo-worker); the risk-engine pipeline mirrors each one's lifecycle status from `ledger.strategy_state` onto it at the end of every round (`fa_hub::set_genome_status`: properties `status` = `candidate|holdout_passed|shadow|active|paused|flattening|retired`, `strategy_id`, `status_reason`, `status_since_ms`, `status_updated_at`; a genome the worker never wrote is created with the genome text as `params`). Postgres stays the source of truth: the mirror is best-effort, reconciles every evolved row against the last successful write each round (operator actions and drawdown pauses included, within one `interval_secs`), stops trying for the round once Helix is unreachable and is reported in `ctl.risk.pipeline` status (`helix_mirror`) and the heartbeat (`helix.mirror_written|failed`, `helix.mirrored`). Hand-written baselines are not genomes (D-040) and get no node. Paper/live map onto `shadow`/`active` (D-029).
 | `CHILD_OF`, `READS` (Expert), `USES` (DecoderGenome), `TRADES` (Asset) | Helix edges | |
 | Weights (neural) | Garage | |
 | Exposure intents | NATS stream `signal.exposure.*`; archived to Garage for replay | |
 | Strategy virtual books, P&L series | Postgres ledger (spec 42) + VictoriaMetrics series | |
+
+**Implemented (Helix status mirror):** evolved strategies are Helix `Genome{kind: strategy, family: gp}` nodes (written by the evo-worker); the risk-engine pipeline mirrors each one's lifecycle status from `ledger.strategy_state` onto it at the end of every round (`fa_hub::set_genome_status`: properties `status` = `candidate|holdout_passed|shadow|active|paused|flattening|retired`, `strategy_id`, `status_reason`, `status_since_ms`, `status_updated_at`; a genome the worker never wrote is created with the genome text as `params`). Postgres stays the source of truth: the mirror is best-effort, reconciles every evolved row against the last successful write each round (operator actions and drawdown pauses included, within one `interval_secs`), stops trying for the round once Helix is unreachable and is reported in `ctl.risk.pipeline` status (`helix_mirror`) and the heartbeat (`helix.mirror_written|failed`, `helix.mirrored`). Hand-written baselines are not genomes (D-040) and get no node. Paper/live map onto `shadow`/`active` (D-029).
+
+**Implemented (exposure intents):** replays read them from the retained `SIGNAL` JetStream stream (`fa_bus::replay`, the allocator replay and the decision replay); they are not archived to Garage.
 
 ## 6. Behaviour & algorithms
 
@@ -148,7 +152,7 @@ Constraints: max depth, max nodes, evaluation-time budget per step (cost objecti
 - Strategies are evaluated by `fa-backtest` replaying point-in-time inputs (expert views, graph state, decoder outputs) of the **same snapshot** over the evaluation window, at the strategy's timescale.
 - **Execution simulation:** exposure intent → target position (strategy capital) → simulated fills with the spread + slippage model, fees, funding/borrow (cost model per venue/asset class from spec 41/42).
 - Deterministic given seed + snapshot + data window.
-- **Live execution of strategy signals is cost-aware (spec 40 §6.1):** a strategy's exposure changes reach the venue only when the edge it has earned (tracked step returns, shrunk toward a 20 bp prior) pays for the full trade cost, its orders are at least the fee-minimum notional, and its traded notional stays within 20 × its sleeve per UTC day (over budget its last distribution is held). A 1 s strategy whose targets jitter by a few hundred EUR therefore holds its position instead of paying 30–50 bp per rebalance; replays and the live book see the same rule (`TradeRule::CostAware`). Event-time replays shift late-publishing sources by their catalog knowledge delay (spec 41 §6.2), so fitness is not computed on prices the live strategy could not yet see; strategy decisions → intents are reproducible from the retained streams (spec 41 §9).
+- **Live execution of strategy signals is cost-aware (spec 40 §6.1):** a strategy's exposure changes reach the venue only when the edge it has earned (tracked step returns, shrunk toward a 20 bp prior) pays for the full trade cost, its orders are at least the fee-minimum notional, and its traded notional stays within 20 × its sleeve per UTC day (over budget its last distribution is held). A 1 s strategy whose targets jitter by a few hundred EUR therefore holds its position instead of paying 30–50 bp per rebalance. The allocator replay can run the same `Rebalancer` (`TradeRule::CostAware`, used by `examples/replay_rebalance`); the per-genome strategy replay behind `evo.eval.strategy` and the allocator tournament still trade every move above `min_trade_fraction` of the sleeve, so strategy fitness does not yet see the live rule. Event-time replays shift late-publishing sources by their catalog knowledge delay (spec 41 §6.2), so fitness is not computed on prices the live strategy could not yet see; strategy decisions → intents are reproducible from the retained streams (spec 41 §9).
 - **Implemented (D-052, D-059):** `evo.eval.strategy` replays a genome through `fa_backtest::replay` with the recorded latent graph and decoder outputs and the shared cost model; every evaluation is a `validation.trial` row. Strategies run live in `bins/strategy-runtime`: the hand-written baselines plus the managed live set of evolved strategies that passed the locked holdout (§6.4).
 
 ### 6.2 Fitness (shared Pareto, proposal)
@@ -162,12 +166,16 @@ Constraints: max depth, max nodes, evaluation-time budget per step (cost objecti
 | Diversification | Correlation of strategy returns with the current elite/live set | min |
 Both representations share these objectives, so they compete directly. **PBO** is estimated per generation over the candidate set (combinatorially symmetric cross-validation on evaluation sub-periods). A generation with PBO > `pbo_max` doesn't promote anyone.
 
+**Implemented (GP, `fa_backtest::replay::DIRECTIONS`):** `deflated_sharpe` (max), `sharpe` (max), `max_drawdown` (min), `turnover` (min), `cost_sensitivity` = Sharpe − Sharpe under 2× costs (min), `compute_cost` = log10 program nodes per step (min); calibration is reported but informational, CVaR and diversification are not computed.
+
 ### 6.3 Evolution
 - Same engine as spec 34 (`fa-evolution`, NSGA-II/III, successive halving by evaluation length, budget-driven).
 - GP variation: subtree crossover, point mutation, hoist/shrink mutation, constant perturbation, type-safe.
 - Neural variation: topology mutation, weight warm-start + SGD fine-tune, expert-mask flips.
 - Cross-representation: populations are separate breeding pools sharing one selection front (no crossover between GP and neural). Quotas keep both alive (`min_share_per_repr`).
 - Asset-set genes: mutate by add/remove/swap using MCMC pair proposals as the mutation distribution.
+
+**Implemented (GP only, D-052):** `evo.vary.strategy` breeds through `fa_evolution::vary::vary_with` with `fa_strategies::ops` (typed subtree crossover, point / subtree / hoist mutation, constant jitter, spec-gene mutation) plus random immigrants (`random`, defaults depth 5 / 48 nodes); the orchestrator's NSGA-II loop with rungs is shared with decoders and allocators. No neural representation, no `min_share_per_repr`, no asset-set genes.
 
 ### 6.4 Lifecycle and promotion hand-off
 `candidate → holdout-passed → shadow → paper → live → retired`
@@ -207,9 +215,9 @@ Live strategies keep running on their snapshot until the replacement passes shad
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
 |---|---|---|
-| `gp_max_depth` | 8 | |
-| `gp_max_nodes` | 64 | |
-| `step_eval_budget` | 1 ms | per strategy per step |
+| `gp_max_depth` | 8 | code default 5 (`fa_strategies::random::RandomSpec`) |
+| `gp_max_nodes` | 64 | code default 48 (`RandomSpec`) |
+| `step_eval_budget` | 1 ms | per strategy per step; running value `--step-budget-ms` 50 (debug builds, many instruments) |
 | `min_share_per_repr` | 0.3 | Population share floor for GP / neural |
 | `pbo_max` | 0.2 | `risk.toml [pipeline]` |
 | `dsr_min_candidate` | 0.95 (prob. Sharpe > 0) | for holdout eligibility, `risk.toml [pipeline]` |
@@ -225,17 +233,17 @@ Live strategies keep running on their snapshot until the replacement passes shad
 |---|---|
 | Overfitting (huge population) | Deflated Sharpe, PBO gate, locked holdout used once per strategy, live shadow |
 | Look-ahead via decoder outputs or graph state | All inputs pulled through point-in-time replay. Decoder outputs cached at publish time. Leak tests in spec 41 |
-| Strategy emits NaN / out-of-range exposure | Clipped to 0 exposure; strategy flagged; repeated → retired |
-| Step time exceeds budget live | Strategy skipped for that step (exposure unchanged); flagged |
+| Strategy emits NaN / out-of-range exposure | Clipped to 0 exposure; strategy flagged; repeated → auto-paused by strategy-runtime (`--nan-limit`); the pipeline demotes an active evolved strategy and retires a shadow one (§6.4.1) |
+| Step time exceeds budget live | Strategy skipped for that step (exposure unchanged); flagged; `--breach-limit` consecutive breaches → auto-pause, handled like NaN |
 | Snapshot or region lineage breaks | Strategy suspended to shadow until revalidated |
 
 ## 9. Acceptance criteria
-1. GP DSL interpreter evaluates programs type-safely; random program generation and all variation operators produce valid typed programs (property tests).
+1. GP DSL interpreter evaluates programs type-safely; random program generation and all variation operators produce valid typed programs (property tests). **Met for GP** (`programs_respect_limits_and_round_trip_through_sexpr`, `operators_are_type_safe_bounded_and_deterministic`).
 2. Neural policies and GP programs both implement `Strategy` and emit `ExposureIntent` with mean and std.
-3. Backtest of a strategy is deterministic and reproduces identical P&L given snapshot, window and seed.
+3. Backtest of a strategy is deterministic and reproduces identical P&L given snapshot, window and seed. **Met** (`replay_is_deterministic_and_pays_costs`, recorded-latent fixture).
 4. Fitness computation includes costs, and the deflated Sharpe implementation matches reference values on known test vectors.
 5. PBO computation runs per generation and blocks promotion when above `pbo_max`. **Met:** a generation with PBO > `pbo_max` (or unknown) yields no candidate, and PBO is a blocking gate item.
-6. The lifecycle states and transitions are persisted in Helix and visible in the evolution lab and trading desk UI. **Partly met:** persisted and audited in Postgres (`ledger.strategy_state`, `audit.log`), served by `GET /api/trading/strategies` and mirrored onto the Helix `Genome` nodes of evolved strategies every pipeline round (§5); the UI does not render the pipeline fields.
+6. The lifecycle states and transitions are persisted in Helix and visible in the evolution lab and trading desk UI. **Partly met:** persisted and audited in Postgres (`ledger.strategy_state`, `audit.log`), served by `GET /api/trading/strategies` and mirrored onto the Helix `Genome` nodes of evolved strategies every pipeline round (§5); the console's `/trading/pipeline` page shows the pipeline state per strategy (D-077); the evolution lab does not show the lifecycle.
 
 ## 10. Open questions
 1. GP program semantics: should programs be stateful (memory registers across steps) or purely functional on the current observation?

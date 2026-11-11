@@ -33,16 +33,20 @@ Turn the exposure distributions produced by promoted strategies into real (or pa
 ## 4. Interfaces
 
 ### 4.1 Inputs
-- `signal.exposure.<strategy_id>` (NATS, proto `fa.v1.ExposureSignal`): per instrument, mean target exposure in [-1, 1] of the strategy's sleeve plus uncertainty (std or quantiles), timescale, horizon, snapshot id.
+- `signal.exposure.<strategy_id>` (NATS, proto `fa.v1.ExposureDistribution`): per instrument, mean target exposure in [-1, 1] of the strategy's sleeve plus uncertainty (std or quantiles), timescale, horizon, snapshot id.
 - Strategy registry (Helix + Postgres): status (`paper`, `shadow`, `live`, `paused`, `retired`), sleeve, asset set, horizon.
 - Market state (VictoriaMetrics / bus): last prices, rolling traded volume per horizon, spreads.
 - Ledger (42): positions, cash, equity, realised/unrealised P&L, payout quota.
 - Health signals: `ops.health.*` (feed staleness, model drift, broker status).
 
+**Implemented inputs (risk-engine):** `signal.exposure.>`; lifecycle status from `ledger.strategy_state` (`active|paused|flattening|shadow|candidate|holdout_passed|retired`, §6.6); `md.trade.>` (marks, traded volume, σ, per-instrument feed guard); `order.*.<account>` of its own account only (D-072); reference data and FX from Postgres (D-061); `exec.costs.calibrated` (impact `k` for the rebalance rule); health from `ingest.health.<source>`, `risk.halt.>` / `risk.resume.>` and the drift of `latent.mcmc.*` kernel updates.
+
 ### 4.2 Outputs
 - `order.intent.<venue>` (proto `fa.v1.OrderIntent`): instrument, side, quantity, exec algo + params, parent portfolio target id, idempotency key.
 - `order.event.<venue>` (from broker-gateway): acknowledgements, fills, cancels, rejects → ledger (42).
 - `risk.event` (proto `fa.v1.RiskEvent`): limit breaches, halts, kill-switch activations.
+
+**Implemented outputs:** `order.intent.<account>` + `order.approved.<account>` (account `paper`; venue routing is the gateway's, by instrument), `order.event.<account>` from the gateway, `risk.event.<account>` (`fa.v1.RiskEvent`, §6.5), `risk.halt.<scope>` / `risk.resume.<scope>`, `risk.state`.
 
 ### 4.3 Traits (Rust, sketch)
 ```rust
@@ -91,6 +95,8 @@ type Venue interface {
 | Slippage measurements | VictoriaMetrics (`exec_slippage_bps{venue,algo,instrument}`) + Postgres per fill | feeds fitness |
 | Promotion gate results | Postgres (`promotion_review`) | inputs, statistics, pass/fail |
 
+**Implemented stores:** strategy status, sleeve, shadow progress, sub-book, gate checklist and pipeline evidence in `ledger.strategy_state` (one row per strategy; `gate` JSONB instead of a `promotion_review` history, transitions in `audit.log`); halts, drawdown peak, day-start equity, hourly equity and the live allocator tournament in `ledger.risk_state`; intents / fills / attribution in `ledger.*` (42) with `arrival_price` and `slippage_bps` per fill; slippage gauges in the gateway heartbeat (`exec_slippage_bps.<algo>`, `slippage.<venue>.<class>.*`); risk events in `audit.log` + `risk.event.paper`. Allocation snapshots and netted portfolio targets are not persisted (the intent carries its contributing `strategy_ids`).
+
 ## 6. Behaviour & algorithms
 
 ### 6.1 Pipeline per decision tick
@@ -118,12 +124,12 @@ Urgent orders (any halt, strategy flatten, stale-feed flatten) and **limit-bound
 - **Equal-risk baseline**: always running in paper as a control.
 All allocators run in parallel in paper ("allocator tournament"); their portfolio P&L is compared on the same strategy signals.
 
-**Implemented today (D-061, D-064):** `equal_weight`, `risk_parity`, `fractional_kelly`, the parametric `weighted_blend` and the Bayesian bandit `thompson_rp` (`fa_allocator::ThompsonRiskParity`: one Thompson draw per strategy from `N(mean, vol²/n)`, positive draws share capital by inverse volatility, capped; deterministic per seed and call sequence), all expressible as an `AllocatorGenome` (`alloc:name=…;cap=…;…`). Allocators compete in a tournament (`evo.eval.allocator` replays recorded signals through allocation, netting and the cost model); the winning front is written to `fa-artifacts/allocators/<generation>.toml`, and risk-engine switches allocator at runtime via `ctl.risk.limits {set: {allocator: {name, params}}}` (audited, not persisted). Caps and concentration limits use per-instrument reference data (class, venue, provisional status).
+**Implemented today (D-061, D-064, D-071):** `equal_weight` (the configured default in `risk.toml`), `risk_parity`, `fractional_kelly`, the parametric `weighted_blend` and the Bayesian bandit `thompson_rp` (`fa_allocator::ThompsonRiskParity`: one Thompson draw per strategy from `N(mean, vol²/n)`, positive draws share capital by inverse volatility, capped; deterministic per seed and call sequence), all expressible as an `AllocatorGenome` (`alloc:name=…;cap=…;…`). Allocators compete in a tournament (`evo.eval.allocator` replays recorded signals through allocation, netting and the cost model); the winning front is written to `fa-artifacts/allocators/<generation>.toml`, and risk-engine switches allocator at runtime via `ctl.risk.limits {set: {allocator: {name, params}}}` (audited, not persisted). Caps and concentration limits use per-instrument reference data (class, venue, provisional status).
 
 **Live paper tournament (implemented):** risk-engine runs `equal_weight` (control), `risk_parity`, `fractional_kelly`, `thompson_rp` and the active allocator side by side every tick (`fa_allocator::tournament`): each allocates on the same strategy posteriors, its weights earn the same per-tick strategy sleeve returns, weight turnover is charged `tournament_cost_bps` (5). Reported per entry (cumulative return, Sharpe, max drawdown, turnover, costs, weights) by `ctl.risk.allocators`, in `GET /api/trading/strategies` (`allocator_tournament`) and as heartbeat counters `allocator.<name>.return`; records persist with the risk state. The offline tournament (`evo.eval.allocator`) remains the exact one (netting and the venue cost model). **Allocator failure:** NaN / negative weights or a sum > 1 fall back to the previous allocation and raise a risk event (§8).
 
 ### 6.3 Netting
-Exposures are converted to signed EUR notionals and summed per instrument. Attribution is kept: every portfolio position carries per-strategy virtual sub-positions so strategy P&L and fitness remain computable even though orders are netted. Fees/slippage of netted orders are attributed pro-rata to the strategies whose deltas caused the trade **(proposal)**.
+Exposures are converted to signed EUR notionals and summed per instrument. Attribution is kept: every portfolio position carries per-strategy virtual sub-positions so strategy P&L and fitness remain computable even though orders are netted. Fees/slippage of netted orders are attributed pro-rata to the strategies whose deltas caused the trade **(proposal)**. **Implemented:** every fill is split **evenly** across the intent's contributing strategies (`ledger.fill_attribution`, D-047; exact decimal shares, D-078) and booked into their sub-books; a pro-rata or causal rule is still open (§10 Q3).
 
 ### 6.4 Execution algorithms
 | Algo | Use when (proposal) |
@@ -137,7 +143,7 @@ Selection inputs: strategy horizon, order notional / horizon volume, spread, ven
 
 **Crypto pricing:** `costs.yaml` maps the Kraken XBTEUR / ETHEUR / SOLEUR and Yahoo BTC-USD instruments to class `crypto` (they fell back to `equity` and its 1 EUR minimum before) and has a `kraken` venue (Kraken Pro lowest tier: 40 bp taker, no minimum, 2 bp modelled spread, `default` = crypto for unmapped pairs).
 
-**Implemented today (D-051):** the paper venue (`go/services/broker-gateway`) prices every fill with `costs.yaml` (commission bps + minimum, half spread from `md.quote.>` or a modelled `spread_bps`, square-root impact `k·σ_day·sqrt(notional/ADV)` estimated from the tape); `OrderEvent` carries `arrival_price` and signed `slippage_bps`. Limit orders rest as `ACK` until crossed and fill passively at the limit; cancellation uses a provisional `order.cancel.<account>` payload. Since then every §6.4 algorithm exists (below).
+**Implemented today (D-051):** the paper venue (`go/services/broker-gateway`) prices every fill with `costs.yaml` (commission bps + minimum, half spread from `md.quote.>` or a modelled `spread_bps`, square-root impact `k·σ_day·sqrt(notional/ADV)` estimated from the tape); `OrderEvent` carries `arrival_price` and signed `slippage_bps`. Limit orders rest as `ACK` until crossed and fill passively at the limit; cancellation used a provisional `order.cancel.<account>` `OrderIntent` payload (now `fa.v1.OrderCancel`, below). Since then every §6.4 algorithm exists (below).
 
 **Execution algorithms (implemented, paper venue):** `OrderIntent.exec_algo` is `name` or `name:k=v,…` — `market`, `limit`, `smart_limit` (`timeout_s` 30, `offset_bps` 0: passive at the touch, crossed at the timeout), `twap` (`dur_s` 300, `slices` 10), `vwap` (same, child sizes from the instrument's time-of-day volume profile learned from the tape, uniform when unknown), `pov` (`rate` 0.1 of observed traded size, remainder crossed at `max_dur_s` 900) and `auto` (gateway fallback: participation = notional / ADV ≤ 0.1 % and spread ≤ 10 bps → market, wider spread → smart_limit, ≤ 1 % → twap, else pov); unknown names or parameters are `REJECTED`. Algo orders are `ACK`ed, children go out as `PARTIAL_FILL` (`venue_order_id = paper-<intent>-<n>`), the last as `FILL`; every child carries the **parent** arrival price and its implementation shortfall in `slippage_bps`. Cancellation is the proto `fa.v1.OrderCancel{intent_id, account_id, reason, at, actor}` on `order.cancel.<account>` (a legacy `OrderIntent` payload still decodes by intent id) and cancels a resting limit or the remainder of a working algo order. **Live slippage recalibration:** per (venue, class) the gateway regresses realised-minus-half-spread bps on `1e4·σ·sqrt(N/ADV)` over a rolling window of informative taker fills, shrinks `k̂` toward the `costs.yaml` prior (`n/(n+50)`), clamps to `[0.5, 2] ×` prior, and every 15 min (≥ 30 samples) writes `costs.calibrated.yaml` + report (state volume), applies it in memory and publishes the report on `exec.costs.calibrated`. In paper, fills priced at the arrival itself are the model echoing itself and are excluded; only algo children (market drift over the schedule) inform the fit, so paper calibration measures drift, not true impact — live fills would use the same path. Gauges `slippage.<venue>.<class>.bps_mean|model_bps_mean|n`, `exec_slippage_bps.<algo>`, `costs.k.<venue>.<class>`, `algo.<name>.working|done|cancelled` (spec 60 §6.5). Details: `go/services/broker-gateway/README.md`.
 
@@ -151,9 +157,9 @@ Selection inputs: strategy horizon, order notional / horizon volume, spread, ven
 - **Health halts**: feed stale > threshold for an instrument → strategies using it frozen (no new orders, existing positions kept unless stale exceeds second threshold); model drift alarm on a snapshot → strategies depending on that snapshot paused; broker gateway errors / disconnected → venue halted, intents queued then dropped after TTL.
 - **Shorts** (paper answer to §10 Q5): a short needs borrow — the instrument's class must be in `limits.short_margin` and `ref.contract_spec.shortable` must not be false — and margin room: Σ |short| × class margin ≤ `short_margin_budget_frac` × deployable.
 - **Liquidity cap net of payouts**: `|position_i| ≤ k × volume_i(horizon)`, and `Σ capital deployed ≤ equity − payout_quota_reserved_today` (payout quota from ledger 42).
-Limits are loaded from `config/risk.toml` at startup and can only be tightened at runtime from the UI; loosening requires config change + restart **(proposal)**.
+Limits are loaded from `bins/risk-engine/risk.toml` at startup and can only be tightened at runtime from the UI; loosening requires config change + restart (implemented, `RiskConfig::check_tightens`).
 
-**Implemented today (D-041, D-051):** position, liquidity and leverage caps, concentration caps per asset class and venue, a portfolio gross cap, per-strategy drawdown (attributed sub-books, auto-pause at `strategy_max_drawdown` of the sleeve), payout-quota netting, and the halt state machine with scopes `portfolio`, `daily_loss`, `source:<id>`, `model`, `broker` (raised on a reconciliation diff). Runtime limit changes go through `ctl.risk.limits` and may only tighten (`RiskConfig::check_tightens`).
+**Implemented today (D-041, D-051):** position, liquidity and leverage caps, concentration caps per asset class and venue, a portfolio gross cap, per-strategy drawdown (attributed sub-books, auto-pause at `strategy_max_drawdown` of the sleeve), payout-quota netting, and the halt state machine with scopes `portfolio`, `daily_loss`, `source:<id>`, `model` (and `model:<snapshot>`, below), `broker` (raised on a reconciliation diff or an open paper orphan fill, D-072) and the reduce-only `fx` (stale accounting FX, D-061). Runtime limit changes go through `ctl.risk.limits` and may only tighten (`RiskConfig::check_tightens`).
 
 **Added (implemented):**
 - **Restart-safe halts:** the halt state machine (peak and day-start equity, every active halt with reason / since / manual, the UTC day) is persisted in `ledger.risk_state` (migration `20261111000051`) on every change, every `snapshot_secs` and at shutdown, and restored after the book at start — the kill switch survives a restart until manually re-armed (§8). Limits are never restored from it; they always come from `risk.toml`.
@@ -219,20 +225,20 @@ Promotion is executed manually from the UI (gate must be green); initial live sl
 | Failure | Response |
 |---|---|
 | Broker disconnect mid-execution | cancel-on-disconnect where supported; on reconnect reconcile (42) before any new intent |
-| Duplicate intent delivery (NATS redelivery) | idempotency key dedup in gateway and ledger |
-| Fill for unknown order | ledger flags anomaly, venue halted, manual review |
+| Duplicate intent delivery (NATS redelivery) | idempotency key dedup in gateway and ledger. **Implemented:** the gateway remembers the last 50 000 intent ids across restarts; ledger writes are idempotent on intent / fill id |
+| Fill for unknown order | ledger flags anomaly, venue halted, manual review. **Implemented (D-072):** risk-engine recovers the intent from `ledger.order_intent`, else parks the fill in `ledger.orphan_fill`; an open paper orphan raises `broker` until resolved (`POST /api/trading/orphans/{id}/resolve`) and resumed |
 | Risk service crash | broker-gateway rejects all new risk-increasing intents if no risk heartbeat within T (fail-closed). **Implemented:** the gateway tracks `svc.heartbeat.risk-engine`; while the last one is older than `-risk-heartbeat-timeout` (15 s, risk-engine beats every 2 s) or none was seen since the gateway started, an intent that moves the account's projected position in the instrument (filled + working + resting remainders, per account, persisted) away from zero or through it is `REJECTED` (`fail-closed: …`, counter `failclosed.rejected`, gauges `risk_heartbeat_age_s` / `risk_heartbeat_alive`); reductions and closes execute, working algo children continue. |
 | Gateway restart mid-execution | **Implemented:** working algo orders (schedule, filled quantity, children, parent arrival), resting limits, the last 50 000 intent ids and per-account positions persist in `$FA_STATE_DIR/orders.json` (atomic, ≤ 1/s on change, at shutdown) and are restored before any subscription; a TWAP resumes its schedule (slices due during the downtime go out with the first trade after restart, never blind), a resting limit keeps resting, a redelivered intent stays a duplicate; an unreadable file stops the gateway instead of forgetting orders. A calibrated cost file contributes only its fitted `impact_k`s (`MergeCalibrated`); schedules and classes come from the current `costs.yaml`. |
-| Price feed spike / bad tick | health check: price-jump sanity filter freezes instrument |
-| Allocator produces NaN / empty weights | fall back to previous allocation, raise risk event |
-| Kill switch triggered | flatten all live, halt all, persistent until manual re-arm (survives restart) |
+| Price feed spike / bad tick | health check: price-jump sanity filter freezes instrument (implemented, §6.5 feed guard) |
+| Allocator produces NaN / empty weights | fall back to previous allocation, raise risk event (implemented, `allocator.fallbacks`) |
+| Kill switch triggered | flatten all live, halt all, persistent until manual re-arm (survives restart; implemented, `ledger.risk_state`) |
 
 ## 9. Acceptance criteria
 - No order can reach a live venue without passing the full risk chain; tested by property tests injecting random targets.
 - Kill switch flattens all live positions and state survives a restart of every service. **Met for the risk-engine** (`ledger.risk_state`).
 - Loosening a limit at runtime via API is rejected; tightening succeeds and is audited.
 - Paper and live code paths differ only in the `Venue` implementation (verified by shared integration tests).
-- Every fill has attribution to originating strategies and a recorded slippage vs arrival price.
+- Every fill has attribution to originating strategies and a recorded slippage vs arrival price. **Met in paper** (`ledger.fill_attribution`; `ledger.fill.arrival_price` / `slippage_bps`).
 - Promotion endpoint refuses a strategy whose gate is not green. **Met.**
 - Allocator tournament reports comparable paper P&L for all allocators on identical signals. **Met** (live: `ctl.risk.allocators`; offline: `evo.eval.allocator`).
 

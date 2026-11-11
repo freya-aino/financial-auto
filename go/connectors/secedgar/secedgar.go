@@ -18,8 +18,9 @@
 // Filings carry no instrument_id (spec 10 §5.1). XBRL company facts
 // (wh.fundamental) are polled from the same host, see facts.go.
 //
-// CIKs come from `config.extra.ciks` (comma list) — not `config.symbols`,
-// which the backfill job would try to resolve as instruments. SEC fair access
+// CIKs come from `config.extra.ciks` (comma list). A backfill job may name a
+// CIK as its instrument; the source has no venue, so the ingestor does not
+// resolve it into a ref instrument (cursor scope `<tf>|<cik>`). SEC fair access
 // requires a declared User-Agent: `config.extra.user_agent` or the secret
 // `[sources.sec_edgar] user_agent` (FA_SEC_EDGAR_USER_AGENT), default
 // "financial-auto ingestor"; the ingestor's generic UA is answered with 403.

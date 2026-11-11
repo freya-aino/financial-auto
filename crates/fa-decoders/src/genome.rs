@@ -1,4 +1,5 @@
-//! Concrete genome encoding for the **baseline decoder families** (spec 34 §4.2, provisional).
+//! Concrete genome encoding of every decoder family — the two CPU baselines and the six neural
+//! families of [`crate::neural`] (spec 34 §4.2, D-044, D-068, D-074).
 //!
 //! The evo-orchestrator forwards whatever the UI/API sent as `Job.genome_id`; this module
 //! turns that string into a deterministic [`DecoderGenome`]. Three forms are accepted:
@@ -13,11 +14,13 @@
 //!    contains commas, so it only survives in `Job.spec`, not in the `genomes` list.
 //! 3. **Bare id** — anything else (`g1`, `abc-123`, a ULID). The genome is *derived* from a
 //!    stable hash of the id: the family alternates with the hash parity and every numeric
-//!    gene is jittered around its default. This keeps plain ids from the Evolution Lab
+//!    gene is jittered around its default (baseline families only). This keeps plain ids from the Evolution Lab
 //!    form usable and reproducible.
 //!
 //! Families (aliases in parentheses): `forecast` (`quantile`, `rnn_prior`) → empirical
-//! quantile forecaster; `retrieval` (`analog`) → time-discounted analog retrieval.
+//! quantile forecaster; `retrieval` (`analog`) → time-discounted analog retrieval; neural
+//! `nn_forecast`, `nn_retrieval`, `nn_chart`, `nn_future`, `nn_news`, `nn_narrative` (genes in
+//! [`NEURAL_GENES`]).
 //!
 //! Common genes: `ts` timescale of the resampled series (default `1s`, the only live feed),
 //! `h` forecast horizon in steps, `lb` lookback in steps, `levels` quantile levels, `inst`
@@ -27,6 +30,8 @@
 //! Retrieval genes: `k` (analogs kept), `tau` (time-decay in days), `gap` (leakage guard in
 //! steps, ≥ `h`), `metric` (`cos` | `euclid`), `lat` (weight of the latent-similarity term in
 //! [0, 1], used only when a [`crate::DecodeCtx`] carries latents for the instrument).
+//! Structural genes, printed only when set: `mask` (expert bitmask of the latent the decoder
+//! reads), `src` (cross-asset source instrument), `ninst` (instrument-scoped news).
 //!
 //! [`DecoderGenome`] implements `Display`: the canonical kv form, which [`DecoderGenome::parse`]
 //! reads back to an equal genome (round-trip tested). [`DecoderGenome::params`] /

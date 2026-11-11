@@ -2,7 +2,7 @@
 
 First-wave connector: lemon.markets market data (quotes, trades, OHLC backfill). Execution stays in broker-gateway.
 
-**Status:** implemented, **unverified against the live API (no key)**. Written against the public API reference; fixtures in `testdata/` are the documented example payloads.
+**Status:** implemented, **unverified against the live API (no key; never run live)**. Catalog status `stub`; compose does not start it (add it to the ingestor's `-connectors` once keys are in `config/secrets.toml`). Written against the public API reference; fixtures in `testdata/` are the documented example payloads.
 
 ## Behaviour
 - **Secrets:** `api_key` from `FA_LEMON_API_KEY` or `[sources.lemon]` in `config/secrets.toml` (D-020); `Init` fails with `ErrNoAPIKey` without it. Sent as `Authorization: Bearer`.

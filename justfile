@@ -182,7 +182,7 @@ fe-build: (pnpm "check") (pnpm "build")
 control-api:
     cargo run -p control-api
 
-# Fake heartbeats + trades for UI work before ingestor/model-runtime exist
+# Fake heartbeats + trades for UI work without the ingestor or model-runtime running
 fake-publisher:
     cargo run -p control-api --example fake_publisher
 

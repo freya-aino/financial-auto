@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | draft |
 | **Maturity** | High (implemented on the baselines; see §12) |
-| **Owners (code)** | `crates/fa-patterns`, `bins/model-runtime`, `bins/trainer` |
+| **Owners (code)** | `crates/fa-patterns`, `crates/fa-encoders` (`neural::regions`), `bins/model-runtime`, `bins/trainer` |
 | **Depends on** | 31 Expert encoders, 32 Expert spaces, 20 Storage, 36 Training lifecycle |
 
 ## 1. Purpose
@@ -86,6 +86,7 @@ pub struct Membership { pub weights: SmallVec<[(RegionId, f32); 4]>, pub novelty
 | `REFINES` | Helix edge (fine-timescale Region → coarse-timescale Region) | conditional co-occurrence P(coarse ∣ fine), support; **implemented** as `Hier` (`p_coarse_given_fine`, `p_fine_given_coarse`, `support`, `pmi_bits`, `mi_bits`) |
 | `NEIGHBOR` | Helix edge (Region ↔ Region, same set) | latent distance, boundary density; *not stored*: neighbours are answered from the kernel (spec 33 `neighbors`) and the centroids |
 | `Occupancy` | VictoriaMetrics series | `region_weight{ts,expert,region,instrument}` sampled at the timescale's step |
+| Region status history | Helix node | **implemented** (D-078) as `RegionStatusVersion{region_id, status, related_region_id, reason, ts}`, appended in the same batch as each status mark; as-of reads (`spaceRegionsAsOf`, `snapshotGraphAsOf`) overlay the newest version at or before `t` (spec 33 §6.6); pruned by model-runtime every 6 h |
 | Region episode | Helix node (optional) | region, instrument, t_enter, t_exit, max weight. Used by retrieval |
 
 ## 6. Behaviour & algorithms
@@ -168,7 +169,7 @@ Regions must keep identity across retraining, otherwise the MCMC graph, strategy
 | `split_distance` / `min_split_mass` | 1.5 radii / 30 points | Online split |
 | `membership_k` | 4 | Regions in a soft membership |
 
-Implemented defaults: `min_mass` → `min_support` 0.002, `max_regions_per_set` → `--max-regions` 64 (online cap), `novelty_threshold` 3.0, `carry_threshold` 0.5 (trainer `carry_threshold`), `split_threshold` 0.2, `hier_mi_min` 0.05 bits, `drift_refit_kl` 0.1. `coherence_alpha` and `probe_set_size` (trainer: the fit's window ends) are not used by the baseline.
+Implemented defaults: `min_mass` → `min_support` 0.002, `max_regions_per_set` → `--max-regions` 64 (online cap), `novelty_threshold` 3.0, `carry_threshold` 0.5 (trainer `carry_threshold`), `split_threshold` 0.2, `hier_mi_min` 0.05 bits, `drift_refit_kl` 0.1. `coherence_alpha` and `probe_set_size` (trainer: the fit's window ends) are not used as such; predictive coherence (§6.1 point 3) enters only through the codebook merge test (`CodebookRegions.merge_alpha` 0.05, `min_residuals` 20, §6.2).
 
 ## 8. Failure modes
 | Failure | Response |
@@ -195,7 +196,7 @@ Implemented defaults: `min_mass` → `min_support` 0.002, `max_regions_per_set` 
    - (c) **Region ids defined in outcome space**: identify regions by their predictive signature (residual distribution, forward-return profile) instead of geometry, and match on signature.
    - (d) Accept discontinuity: every snapshot has a fresh graph and downstream components retrain each generation.
    - Likely answer: (b) + (a) as fallback.
-   - **Resolved for the baselines (D-007):** (a) is implemented end to end (Hungarian alignment, lineage ids, split/merge/death, regime break, kernel transfer). (b) needs a trainable family and lives with the neural encoders (spec 31/36).
+   - **Resolved (D-007, D-069, D-070):** (a) is implemented end to end (Hungarian alignment, lineage ids, split/merge/death, regime break, kernel transfer) for every family. (b) is implemented for the neural families: a `generation` warm-started from a neural parent adds the anchor loss `L_anchor` (soft-min distance of each expert's latents to the parent's region centroids per expert position, λ 0.1; `fa_encoders::neural::train`, recorded in `manifest.feedback.anchors`), so (a) then mostly confirms identity that training preserved.
 2. Is predictive coherence (§6.1, point 3) mandatory, or a soft score? Affects cost and region count.
 3. Soft or hard membership for MCMC transitions? Soft keeps information but complicates count-based kernels (spec 33). *Both exist:* memberships are published soft; the serving kernel observes hard transitions; `MarkovGraph::observe_soft` implements the soft update for a kernel that wants it.
 4. Rust availability of HDBSCAN / Mapper / persistent homology. Write our own in `fa-patterns`, or restrict v1 to codebook and k-means/GMM-style methods? *Resolved: our own HDBSCAN, Mapper and codebook discovery in `fa_patterns::methods` (§6.2); persistent homology stays deferred (§11).*

@@ -33,7 +33,7 @@ history_days = 60           # rates loaded into memory at start (older fills use
 # Strategy lifecycle (spec 40 §3, §6.6; D-051). A strategy first seen on signal.exposure.<id> gets
 # `new_strategy_status`: "active" allocates paper capital at once (baseline behaviour), "shadow"
 # tracks a virtual book only until `promote` passes the gate. Status is persisted in
-# ledger.strategy_state and controlled through ctl.risk.strategy (pause|resume|flatten|promote|shadow).
+# ledger.strategy_state and controlled through ctl.risk.strategy (pause|resume|flatten|promote|shadow|retire|admit).
 new_strategy_status = "active"
 shadow_sleeve_eur = 10000   # virtual capital behind a shadow strategy's book (spec 41 §6.6)
 

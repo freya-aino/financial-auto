@@ -1,5 +1,6 @@
 //! One training run, shared by the CLI and the job worker: `pretrain` / `generation` fit a
-//! snapshot ([`crate::fit`]), `adapter` re-fits statistics on the last hour. The caller passes
+//! snapshot ([`crate::fit`], neural families via [`crate::neural_fit`]), `adapter` re-fits statistics
+//! (neural: input normalisation + LoRA) on the last hour. The caller passes
 //! the control surface a job needs — a stop flag (preemption / cancel), a budget, a checkpoint
 //! interval and a progress callback — and gets an [`Outcome`] in `JobResult` terms.
 
@@ -70,7 +71,7 @@ impl Kind {
 /// `Job.spec` of an `adapter` job.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdapterSpec {
-    /// Snapshot to adapt; default: the active statistical snapshot of `timescale`.
+    /// Snapshot to adapt; default: the active snapshot (any family) of `timescale`.
     #[serde(default)]
     pub snapshot_id: Option<String>,
     #[serde(default)]
@@ -88,7 +89,7 @@ pub struct AdapterSpec {
     /// Neural snapshots: skip the weight-level LoRA adapter (input normalisation only).
     #[serde(default)]
     pub no_lora: bool,
-    /// Neural snapshots: LoRA hyper-parameters (default rank 8, 150 steps).
+    /// Neural snapshots: LoRA hyper-parameters (default rank 8, 100 steps).
     #[serde(default)]
     pub lora: Option<fa_encoders::neural::adapter::LoraConfig>,
 }

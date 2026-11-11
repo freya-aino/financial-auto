@@ -21,21 +21,29 @@ JSON operation tree). The executable counterpart of these files is
 When changing the model, edit the `.hx` file first (it is the review surface), then mirror the
 change in `fa-hub::schema` / `fa-hub::queries` and run the live tests.
 
-**Who writes (D-048):** `bins/model-runtime` (`hub_sink.rs`) persists its snapshot
+**Who writes (D-048, D-069, D-073, D-076, D-078):** `bins/model-runtime` (`hub_sink.rs`) persists its snapshot
 (`stat-v1-<ts>`), expert spaces (`<snapshot>-e<k>`), regions with lifecycle `status`,
-coalesced `Transition` posteriors and closed-bar `LatentVec` observations (1m and slower);
-`bins/control-api` (`graph_routes.rs`) serves spec 50 §4.4/§4.5 from these rows, including the
-named-query whitelist of `fa-hub::catalog` behind `POST /api/graph/query`. evo-worker writes
-genomes/lineage/fitness through `upsert_genome` / `link_parent` / `add_fitness_record` (pending).
+statistics, centroids and `DescendsFrom` lineage, coalesced `Transition` posteriors with their
+`TransitionVersion`/`RegionStatusVersion` history, `Hier` edges, `RegionSet`/`KernelModel`
+state, `CrossPrior` rows and closed-bar `LatentVec` observations (1m and slower), and prunes
+observations and versions every 6 h (`hub_retention.rs`); the trainer writes candidate
+snapshots, `RegionMatch`, `AdapterState` and neural `Expert` nodes with `ExpertOf`/`AlignedTo`;
+evo-worker writes genomes/lineage/fitness through `upsert_genome` / `link_parent` /
+`add_fitness_record`; risk-engine mirrors `ledger.strategy_state` onto `Genome` via
+`setGenomeStatus`. `bins/control-api` (`graph_routes.rs`, `latent_routes.rs`, `mcmc_routes.rs`)
+serves spec 50 §4.4/§4.5 from these rows, including the named-query whitelist of
+`fa-hub::catalog` behind `POST /api/graph/query`.
 
 ## Contents
 | Area | Nodes / vectors | Edges |
 |---|---|---|
 | Reference (mirror of Postgres `ref`) | Instrument, Entity, Venue | IssuedBy, ListedOn, SameExposure |
-| Snapshots | Snapshot, ExpertSpace, AdapterState | HasSpace, SnapshotParent, HasAdapter |
-| Regions / Markov graph | LatentRegion, Window, `V::LatentVec` | InSpace, Transition, Hier, RegionMatch, Contains |
+| Snapshots / experts | Snapshot, ExpertSpace, Expert, AdapterState | HasSpace, SnapshotParent, HasAdapter, ExpertOf, AlignedTo |
+| Regions / Markov graph | LatentRegion, Window, `V::LatentVec`, RegionSet, KernelModel, CrossPrior | InSpace, Transition, Hier, RegionMatch, DescendsFrom, HasRegionSet, HasKernel, Contains |
+| Versions (as-of overlay) | TransitionVersion, RegionStatusVersion | – |
 | Evolution | Genome, FitnessRecord | ParentOf, Scored, TrainedOn, FeedbackFrom |
 | Text / media | `V::NewsDoc`, `V::MediaSegment` | Mentions |
+| Meta | SchemaMeta | – |
 
 ## Design notes
 - **Mixed-dimension latents** (previously an open gap): a vector index is keyed by
@@ -56,6 +64,9 @@ genomes/lineage/fitness through `upsert_genome` / `link_parent` / `add_fitness_r
   `search_news_docs` / `search_media_segments`); no ingestor writes them yet.
 - **Dimensions:** `ExpertSpace.dim` is authoritative; `add_latents_checked` / `knn` reject other
   vector lengths. Index ensures are cached per client.
+- **Event-time versions:** `Transition` posteriors and region `status` are updated in place, so
+  each such write also appends a `TransitionVersion` / `RegionStatusVersion` row in the same
+  batch; the as-of reads (`fa-hub::asof`) overlay them (`fa-hub::versions`, spec 20 §6.3).
 - **Version marker:** `N::SchemaMeta` (`meta_id = "fa-hub"`) holds the data-model version and an
   index-set fingerprint, stamped by `ensure_schema_ready` (`fa-hub::meta`, spec 20 §8).
 - **Coverage:** `crates/fa-hub/tests/coverage.rs` fails when a `QUERY` here has no same-named

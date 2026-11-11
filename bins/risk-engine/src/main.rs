@@ -4,7 +4,7 @@
 //! `ingest.health.>` and `md.trade.>`; publishes `order.intent.paper` → `order.approved.paper`
 //! (or a rejection on `order.event.paper`), `risk.state`, `risk.halt.<scope>` and
 //! `svc.heartbeat.risk-engine`. Answers request/reply on `ctl.risk.strategy`
-//! (`{strategy_id, action: pause|resume|flatten|promote|shadow}` or `{action: list}`),
+//! (`{strategy_id, action: pause|resume|flatten|promote|shadow|retire|admit}` or `{action: list}`),
 //! `ctl.risk.limits` (`{}` → current limits; `{set: <json>}` → tighten-only change) and
 //! `ctl.risk.flatten` with a `CtlReply` whose message is JSON (D-051).
 //! Only paper trading exists: settings with any other mode are refused and non-paper intents

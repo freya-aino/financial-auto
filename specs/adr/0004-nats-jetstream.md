@@ -1,6 +1,6 @@
 # ADR 0004 — NATS JetStream as message bus and job queue
 
-**Status:** proposed · **Date:** 2026-11-06
+**Status:** accepted (D-001) · **Date:** 2026-11-06
 
 ## Context
 Rust and Go services need a low-latency pub/sub bus for market data and signals, durable streams for replay and audit, request/reply for control, and work queues so evolution/training/media jobs can scale horizontally (single GPU now, more machines later).

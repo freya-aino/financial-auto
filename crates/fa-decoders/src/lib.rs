@@ -1,12 +1,17 @@
 //! Decoder population members: families, trait, and scoring functions (spec 34).
 //!
-//! - [`genome`]: the concrete, deterministic genome encoding of the baseline families.
+//! - [`decoder`]: the unified object-safe [`Decoder`] interface every baseline and neural family
+//!   implements (D-074).
+//! - [`genome`]: the concrete, deterministic genome encoding of every family (baselines and
+//!   neural).
 //! - [`baseline`]: CPU-only point-in-time series decoders (quantile forecaster, analog
 //!   retrieval) built from a genome; used by `evo-worker` for `evo.eval.decoder` jobs.
 //! - [`neural`]: trainable candle decoder families (quantile / GRU prior, learned retrieval
 //!   metric, chart and future-chart rasters, news and narrative embeddings), safetensors bundles,
 //!   and the D-009 frozen-elite feedback API ([`neural::feedback`]).
 //! - [`render`]: deterministic chart rasters (visual targets).
+//! - [`text_baseline`] / [`visual_baseline`]: the lexicon text and chart-shape scorers served by
+//!   model-runtime (D-062).
 //! - Scoring primitives: CRPS (ensemble + quantile), pinball loss, time-discounted analog
 //!   weighting.
 

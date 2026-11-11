@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | draft |
 | **Maturity** | Medium-high |
-| **Owners (code)** | `go/pkg/connector`, `go/pkg/catalog`, `go/pkg/bus`, `go/connectors/*`, `go/services/ingestor` |
+| **Owners (code)** | `go/pkg/connector`, `go/pkg/catalog`, `go/pkg/bus`, `go/pkg/archive`, `go/pkg/refdata`, `go/pkg/tsdb`, `go/pkg/warehouse`, `go/connectors/*`, `go/services/ingestor` |
 | **Depends on** | 11-source-catalog, 12-reference-data, 20-storage, 21-bus-and-contracts |
 
 ## 1. Purpose
@@ -17,7 +17,7 @@ Pull every reachable data source (market data, broker feeds, FX, macro, on-chain
 ## 3. Decisions
 - Connectors are written in **Go** and run inside the `ingestor` service (one goroutine group per connector instance); scalable horizontally by sharding connector instances across ingestor replicas.
 - Three connector modes: **Stream** (WebSocket/FIX/SSE), **Poll** (REST on schedule), **Backfill** (bounded historical range).
-- **Canonical events** (protobuf, `fa.v1`): `Trade`, `Quote`, `Bar`, `BookSnapshot`, `NewsItem`, `MediaChunk`, `MacroObservation`, `OnchainEvent`, `FilingEvent`.
+- **Canonical events** (protobuf, `fa.v1`): `Trade`, `Quote`, `Bar`, `BookSnapshot`, `NewsItem`, `MediaChunk`, `MacroObservation`, `OnchainEvent`, `FilingEvent`, `FundamentalFact` (D-078).
 - Every event carries **`event_time`, `publish_time`, `ingest_time`** (see §6.2) — point-in-time correctness is non-negotiable.
 - **Raw payloads archived to Garage** before/alongside normalization; replay (41) re-normalizes from raw.
 - Instrument identity resolved to the **internal instrument UUID** (12) at ingestion; unresolved symbols are quarantined, not dropped.
@@ -55,16 +55,17 @@ type Deps struct {
     Resolver SymbolResolver  // venue symbol -> instrument UUID (12)
     Archive  RawArchive      // Garage writer
     Clock    Clock           // monotonic + wall, injectable for tests
+    Cursors  CursorStore     // persisted live progress (ingest.backfill_cursor); nil = start from now
 }
 ```
 `RawMessage` = `{source_id, received_at, transport_meta, bytes, content_type}`.
 
 ### 4.2 Outputs
 - NATS subjects per 21 (`md.*`, `news.*`, `media.*`, `macro.*`, `onchain.*`, `filing.*`, `ingest.health.*`).
-- Garage: `raw/<source_id>/<yyyy>/<mm>/<dd>/<hh>/<ulid>.<ext>` (+ zstd).
+- Garage: `raw/<source_id>/<yyyy>/<mm>/<dd>/<hh>/<ulid>.<ext>` (+ zstd). Implemented: one gzip object per (source, UTC minute) `…/<ulid>.raw.gz` plus an index sidecar `<ulid>.idx.jsonl.gz` (gzip instead of zstd, D-050/D-067).
 - Garage: `media/<source_id>/<media_id>/{video|audio|frames}/…`.
-- Postgres: connector run log, backfill progress cursors, quarantine table.
-- VictoriaMetrics: ingestion metrics (lag, msgs/s, error rates).
+- Postgres: connector run log, backfill progress cursors, quarantine table; slow canonical records in `wh.macro_observation`, `wh.filing`, `wh.fundamental` (`go/pkg/warehouse`, idempotent per vintage / accession).
+- VictoriaMetrics: market-data samples (`fa_trade_*`, `fa_quote_*`, `fa_bar_*`, `fa_book_*`, spec 20 §5.3) and ingestion metrics (heartbeat counters scraped from the ingestor's `/metrics`).
 
 ### 4.3 Control
 - `jobs.ingest.backfill` work queue (21) for backfill requests from the control API / trainer.
@@ -102,39 +103,39 @@ type Deps struct {
 - `FilingEvent`: issuer (LEI/CIK), form type, filing time, accession, document refs.
 
 ### 5.3 Quarantine
-Postgres `ingest_quarantine(source_id, venue_symbol, first_seen, last_seen, count, sample_raw_ref, status)`.
+Postgres `ingest.quarantine(source_id, venue_symbol, first_seen, last_seen, count, sample_raw_ref, status, instrument_id)`. Implemented variant (D-050, D-054): unknown `(source, symbol)` pairs of market-data sources are provisioned as `status='provisional'` instruments and recorded here as `open` with the provisional `instrument_id`; control-api resolves them (activate, merge, ignore).
 
 ## 6. Behaviour & algorithms
 
 ### 6.1 Pipeline per message
 1. Receive raw → assign `ingest_time` (UTC, ns) → write to Garage raw archive (batched, async, at-least-once).
-2. Normalize → canonical envelopes; resolve symbols via `SymbolResolver` (cached; misses go to quarantine and emit `ingest.unresolved.<source>`).
-3. Validate (schema, monotonic sequence where applicable, sane prices — **(proposal)** reject price jumps > X σ only with flag, never silently drop).
+2. Normalize → canonical envelopes; resolve symbols via `SymbolResolver` (cached; misses are provisioned + quarantined and emit `ingest.unresolved.<source>`).
+3. Validate (schema, monotonic sequence where applicable, sane prices — **(proposal)** reject price jumps > X σ only with flag, never silently drop). Not implemented in the ingestor; the risk-engine's per-instrument feed guard holds unconfirmed jumps (D-071).
 4. Publish to NATS with `Nats-Msg-Id = event_id` (JetStream dedup).
-5. Emit metrics.
+5. Emit metrics; market data → VictoriaMetrics, macro/filings/facts → `wh.*`.
 
 ### 6.2 Time semantics
 - All times UTC, nanosecond precision in proto, millisecond in VictoriaMetrics.
-- Downstream models may only use an event at time *t* if `publish_time ≤ t` (and `ingest_time ≤ t` in live). Backtests use `publish_time`; where a source provides no publish time, `publish_time := ingest_time` in live and **(proposal)** `event_time + source_latency_estimate` in backfill, flagged `publish_time_estimated`.
+- Downstream models may only use an event at time *t* if `publish_time ≤ t` (and `ingest_time ≤ t` in live). Backtests use `publish_time`; where a source provides no publish time, `publish_time := ingest_time` in live and **(proposal)** `event_time + source_latency_estimate` in backfill, flagged `publish_time_estimated`. Implemented: connectors with a known release schedule estimate it and set `publish_time_estimated` (frankfurter and history-less ECB flows: 16:00 Europe/Berlin; SEC XBRL facts: filing date 22:00 ET); for market data the measured per-source knowledge delay is a catalog field (`backfill.knowledge_delay_secs`: kraken 120 s, yahoo 100 s) applied by `fa_backtest::knowledge` in replays, not by the ingestor (D-079).
 - Macro and fundamentals: one event per **vintage** (revisions are new events, never overwrites).
 
 ### 6.3 Rate limiting & retry
 - Token bucket per source (and per endpoint where catalog specifies), limits from `sources.yaml`.
 - Exponential backoff with jitter; circuit breaker opens after N consecutive failures → health event `degraded`/`down` → consumed by risk health halts (40).
-- Streams: auto-reconnect; on reconnect, gap-fill via REST/backfill where the source allows, marking gap-filled events.
+- Streams: auto-reconnect; on reconnect, gap-fill via REST/backfill where the source allows, marking gap-filled events. Implemented: reconnect only (`oanda`, the one real stream connector, never run live); the Envelope `gap_filled` flag exists but nothing sets it yet, bar gaps are reported on `ingest.gap.<source>`.
 
 ### 6.4 Backfill
 - Requests carry `(source_id, instruments | query, timeframe, from, to)`; split into chunks; cursors persisted in Postgres so backfill is resumable and idempotent.
 - Default depth per timescale per §3; scheduler runs backfill in low-priority lanes so live streams are never rate-starved.
 
-**Implemented today (D-050):** `yahoo`, `hackernews` and `google_news` run live without keys; `lemon` and `oanda` are implemented against the public docs but unverified. Yahoo bars are stamped at bar close and also emit a synthetic `Trade` per completed bar so `md.trade.>` consumers see keyless data. Each connector implements `Backfill` with cursors in `ingest.backfill_cursor`; the job queue that triggers it (`jobs.ingest.backfill`) is the next step.
+**Implemented today (D-050):** `yahoo`, `hackernews` and `google_news` run live without keys; `lemon` and `oanda` are implemented against the public docs but unverified. Yahoo bars are stamped at bar close and also emit a synthetic `Trade` per completed bar so `md.trade.>` consumers see keyless data. Each connector implements `Backfill` with cursors in `ingest.backfill_cursor`; the `jobs.ingest.backfill` work queue drives it since D-054 (§4.3). Low-priority lanes are not implemented: one backfill job runs at a time and shares the source's token bucket with the live connector.
 
 **Since 2026-11-11 (§6.1, §6.3, §6.5, §8):** the pipeline finalizes every envelope the same way for live, backfill and replay (`Finalize`): `event_id` is a **stable ULID** (`connector.StableEventID`: time part = event time, entropy = sha256 of source, instrument and the deterministic payload encoding, or the news dedup key), `schema_version = 1`, new flags `raw_missing` (archive configured but the payload could not be archived), `backfill`, `publish_time_estimated`, `gap_filled` (Envelope fields 9–12), and it publishes with `Nats-Msg-Id = event_id`, so JetStream drops re-polled duplicates within the stream duplicate window. News is additionally de-duplicated across sources by `NewsDedupKey` (sha256 of the normalized URL: lowercase host without `www.`, no fragment, no `utm_*`/click-id params, sorted query, no trailing slash, http = https; fallback title + outlet + hour bucket) in a bounded 50 000-key set (counter `dedup.<source>`). The raw archive writes an index sidecar (`<ulid>.idx.jsonl.gz`: offset, length, received_at, content type, transport meta) next to every data object, which is what makes replay exact; failed uploads go to a bounded local spool (`-spool-dir` / `FA_ARCHIVE_SPOOL`, 256 MiB) retried every 30 s, and a full spool makes `Put` refuse so envelopes carry `raw_missing` (counters `archive.spooled|respooled|raw_missing|spool_bytes`). Poll failures back off exponentially from 5 s with 20 % jitter, capped at the poll interval; after `breaker.failures_to_open` (5) consecutive failures the breaker opens and retries every `retry.max_backoff` (60 s) (counter `breaker_open.<source>`). Verified live: replaying a 75 s window reproduced every live kraken (15/15) and yahoo (6/6) message byte-identically (same `Nats-Msg-Id`, same bytes); two `verify` runs over the same range give the same digest.
 
-**Implemented today (keyless second wave, 2026-11-11):** five more keyless connectors run live: `frankfurter` (ECB reference rates → `MacroObservation` per `<BASE>_<CCY>` and business day; rates are a daily fixing, not a venue bid/ask, so not `Quote`s; vintage = estimated 16:00 Europe/Berlin release, `publish_time_estimated`), `ecb` (SDMX REST with `includeHistory=true`: one `MacroObservation` per `validFrom` version, `revision` when the payload holds an earlier vintage of the period; history-less flows such as EXR get a deterministic estimated vintage; series id = `<FLOW>:<key dims>` so it stays one subject token), `gdelt` (DOC 2.0 artlist → `NewsItem`, dedup = sha1 of the normalized URL, time = `seendate`, backfill only over the API's ~3-month window), `sec_edgar` (`data.sec.gov` submissions per CIK → `FilingEvent`, time = `acceptanceDateTime`, declared User-Agent from `config.extra.user_agent`) and `kraken` (public OHLC/Trades/Ticker → `Bar`/`Trade`/`Quote`; backfill limited to Kraken's latest 720 intervals). Macro observations are also written by the ingestor (with `-postgres`) to `wh.macro_observation` through `go/pkg/warehouse`, idempotent on `(source_id, series_id, period, vintage)` (spec 20 §6.1 (b)); filings are written to `wh.filing` (migration `20261111000045`, idempotent on `(source_id, accession)`; verified: 46 SEC filings from one backfill job).
+**Implemented today (keyless second wave, 2026-11-11):** five more keyless connectors run live: `frankfurter` (ECB reference rates → `MacroObservation` per `<BASE>_<CCY>` and business day; rates are a daily fixing, not a venue bid/ask, so not `Quote`s; vintage = estimated 16:00 Europe/Berlin release, `publish_time_estimated`), `ecb` (SDMX REST with `includeHistory=true`: one `MacroObservation` per `validFrom` version, `revision` when the payload holds an earlier vintage of the period; history-less flows such as EXR get a deterministic estimated vintage; series id = `<FLOW>:<key dims>` so it stays one subject token), `gdelt` (DOC 2.0 artlist → `NewsItem`, dedup = sha1 of the normalized URL, time = `seendate`, backfill only over the API's ~3-month window, throttled to 1 request / 10 s), `sec_edgar` (`data.sec.gov` submissions per CIK → `FilingEvent`, time = `acceptanceDateTime`, declared User-Agent from `config.extra.user_agent`; XBRL company facts of whitelisted concepts → `FundamentalFact` on `filing.fact.sec_edgar` → `wh.fundamental`, one row per vintage, D-078) and `kraken` (public OHLC/Trades/Ticker → `Bar`/`Trade`/`Quote`; backfill limited to Kraken's latest 720 intervals). Macro observations are also written by the ingestor (with `-postgres`) to `wh.macro_observation` through `go/pkg/warehouse`, idempotent on `(source_id, series_id, period, vintage)` (spec 20 §6.1 (b)); filings are written to `wh.filing` (migration `20261111000045`, idempotent on `(source_id, accession)`; verified: 46 SEC filings from one backfill job).
 
 ### 6.5 News & text
-- Dedup key = normalized URL hash, fallback title+outlet+time-bucket hash **(proposal)**; near-duplicate (syndicated) detection is an open question.
+- Dedup key = normalized URL hash, fallback title+outlet+time-bucket hash (implemented across sources in the ingestor pipeline, §6.4); near-duplicate (syndicated) detection is an open question.
 - Entity/ticker tagging is downstream (31); ingestion only passes through source-provided tags.
 
 ### 6.6 Media
@@ -149,11 +150,11 @@ Each connector publishes `ingest.health.<source_id>` (`fa.v1.IngestHealth`) ever
 | Name | Default (placeholder) | Notes |
 |---|---|---|
 | `archive.batch_bytes` | 8 MiB | raw archive batching |
-| `archive.flush_interval` | 5 s | |
+| `archive.flush_interval` | 5 s | implemented: an object per (source, UTC minute), uploaded when the minute ends, at 8 MiB or on shutdown; spool 256 MiB, retried every 30 s |
 | `retry.max_backoff` | 60 s | |
 | `breaker.failures_to_open` | 5 | |
-| `health.interval` | 10 s | |
-| `staleness.<class>` | stream 30 s / poll 3× interval | feeds 40 halts |
+| `health.interval` | 10 s | implemented: 5 s (`HealthInterval`) |
+| `staleness.<class>` | stream 30 s / poll 3× interval | feeds 40 halts; implemented as `down` after 3 × expected period (stream 30 s, poll = interval) |
 | `media.segment_seconds` | 30 | |
 | `backfill.depth.{s,m,h,d}` | 4w / 1y / 5y / max | per §3 |
 | `resolver.cache_ttl` | 1 h | |
@@ -164,7 +165,7 @@ Each connector publishes `ingest.health.<source_id>` (`fa.v1.IngestHealth`) ever
 | Source down / rate-limited | breaker, backoff, health `down`, downstream halts affected strategies |
 | Stream gap | reconnect, gap-fill if possible, mark `gap_filled`; otherwise emit `ingest.gap` event |
 | Unknown symbol | quarantine + alert; never guessed |
-| Garage unavailable | buffer to local disk spool (bounded); if spool full, keep publishing live but flag `raw_missing` |
+| Garage unavailable | buffer to local disk spool (bounded); if spool full, keep publishing live but flag `raw_missing` (implemented: `-spool-dir`) |
 | NATS unavailable | bounded in-memory/disk buffer; then stop connector (no silent loss) |
 | Schema change at source | normalization error rate spike → connector `degraded`, raw still archived for re-normalization |
 | Clock skew | ingestor hosts NTP-synced; `ingest_time` vs `event_time` drift monitored |

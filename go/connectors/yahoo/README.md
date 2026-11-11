@@ -9,7 +9,8 @@ First-wave connector: Yahoo Finance chart endpoint (1m bars live, backfill by wi
 - **Normalize:** every completed bar → `Bar` on `md.bar.<tf>.yahoo.<inst>` **and** a synthetic `Trade` (price = close, size = volume, `venue_trade_id = bar:<unix>`) on `md.trade.yahoo.<inst>`, because the latent pipeline, strategy features and evo-worker eval (D-044) consume `md.trade.>`. `event_time` = bar close (open + tf); `publish_time = ingest_time` (spec 10 §6.2). Live polls skip bars already emitted (per-symbol watermark, persisted as an `ingest.backfill_cursor` row per instrument/timeframe) and the still-forming bar; null-padded minutes are dropped.
 - **Backfill:** `period1/period2` windows (≤ 7 d for 1m, ≤ 60 d for 5m/15m, ≤ 730 d for 1h), all bars emitted, `TransportMeta.backfill=1`. Triggered by `jobs.ingest.backfill` jobs (`POST /api/sources/<id>/backfill`, D-054); the ingestor drives `Backfill` per instrument with a persisted range cursor.
 - **Resolution:** `Resolver.Resolve("yahoo", symbol)`; misses are reported as `Unresolved` (with Postgres the resolver provisions them, see `go/pkg/refdata`).
-- Rate limit from the catalog (`1/s, burst 3`).
+- Rate limit from the catalog (`1/s, burst 3`). Catalog symbols: `AAPL`, `MSFT`, `SPY`, `BTC-USD`, `EURUSD=X` (the resolver classifies `BTC-USD` as crypto and `EURUSD=X` as an FX pair).
+- **Knowledge delay:** bars reach the bus after their close (measured 2026-11-11: p50 51 s, p99 94 s); the catalog's `backfill.knowledge_delay_secs: 100` is applied by `fa_backtest::knowledge` in event-time replays (D-079).
 
 ## Tests
 `yahoo_test.go` on `testdata/chart_aapl_1m.json` (live response trimmed to 5 bars): poll → 4 completed bars × 2 envelopes, de-dup, cursor persistence/resume, unresolved symbol, API error, backfill chunking (15 d → 3 requests).

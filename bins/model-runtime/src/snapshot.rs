@@ -2,9 +2,10 @@
 //! timescale, where it comes from, and the `ctl.model.reload` hot swap.
 //!
 //! On start [`SnapshotLoader::resolve`] asks Helix for the **active** `Snapshot` of the
-//! timescale (`encoder_family = statistical`). A row with a `garage_key` is a trained snapshot:
-//! its `manifest.json` / `weights.bin` / `region_map.json` are read from Garage through
-//! `fa_blob` and the encoder is rebuilt with `StatisticalEncoder::from_manifest`; the region sets
+//! timescale (any family: `statistical` first, then the neural families, [`active_any_family`]).
+//! A row with a `garage_key` is a trained snapshot: its `manifest.json` / `weights.bin` /
+//! `region_map.json` are read from Garage through `fa_blob` and the encoder is rebuilt by its
+//! family ([`encoder_from_manifest`]: `StatisticalEncoder` or `NeuralEncoder`); the region sets
 //! start seeded from the region map so matched lineages continue (D-007). No active row, a row
 //! without an artifact (the in-process baseline `stat-v1-<ts>` registered by this service as
 //! `active` gen 0), Helix down or no Garage credentials → the in-process baseline, as before.
@@ -244,7 +245,7 @@ pub async fn active_any_family(hub: &HubClient, ts: Timescale) -> anyhow::Result
 }
 
 /// Builds the serving encoder of a snapshot artifact by its `encoder_family`: the statistical
-/// family from `FASTAT01` statistics, the neural families (`fsq_hybrid`, `jepa_vae`) from
+/// family from `FASTAT01` statistics, the neural families (all four) from
 /// safetensors on the configured device (`FA_ML_DEVICE`, default cpu).
 pub fn encoder_from_manifest(manifest: &SnapshotManifest, weights: &[u8]) -> anyhow::Result<Box<dyn EncoderFamily>> {
     if is_neural_family(&manifest.encoder_family) {

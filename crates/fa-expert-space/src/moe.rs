@@ -17,8 +17,9 @@
 //! * **Load balancing**: Switch-style `K · Σ_i f_i · p_i` (`f` = fraction of windows whose
 //!   top gate is `i`, held constant; `p` = mean gate probability).
 //!
-//! The decorrelation term is computed over every window (soft routing trains all predictors),
-//! per target dimension, averaged over targets. [`crate::DecorrelationLoss`] keeps the
+//! Training uses the gated decorrelation term ([`decorrelation_loss_gated`]): every window counts
+//! with the detached weight `p_i · p_j` of the pair, per target dimension (or on the scalarised
+//! residual), averaged over targets; [`decorrelation_loss`] is the ungated form over every window. [`crate::DecorrelationLoss`] keeps the
 //! host-side (f64) form used for health reporting.
 
 use candle_core::{D, DType, Device, Result, Tensor};
