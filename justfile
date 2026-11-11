@@ -4,6 +4,7 @@
 root := justfile_directory()
 compose := "docker compose -f " + root + "/compose.yaml"
 go_image := "golang:1.25-alpine"
+rust_image := "financial-auto/rust-dev:1.98"
 node_image := "node:22-alpine"
 buf_image := "bufbuild/buf:latest"
 database_url := env_var_or_default("DATABASE_URL", "postgres://fa:fa@127.0.0.1:5432/fa")
@@ -161,14 +162,24 @@ proto-check against="main":
 
 # ── rust ────────────────────────────────────────────────────────────────
 
-rust-check:
-    cargo check --workspace --all-targets
+# Run cargo in Docker, never on the host (AGENTS.md): build output goes to the fa-cargo-target
+# volume, not ./target. FA_* / DATABASE_URL are passed through; --network host reaches the stack.
+cargo *args:
+    #!/usr/bin/env sh
+    set -eu
+    docker image inspect {{rust_image}} >/dev/null 2>&1 \
+        || docker build -q -t {{rust_image}} -f "{{root}}/docker/rust-dev.Dockerfile" "{{root}}/docker" >/dev/null
+    envs=$(env | grep -oE '^(FA_[A-Z0-9_]*|DATABASE_URL|RUST_LOG|UPDATE_FIXTURE)=' | sed 's/=$//; s/^/-e /' | tr '\n' ' ')
+    docker run --rm --network host -v "{{root}}":/src -w /src \
+        -v fa-cargo-target:/target -e CARGO_TARGET_DIR=/target \
+        -v fa-cargo-registry:/usr/local/cargo/registry -v fa-cargo-git:/usr/local/cargo/git \
+        $envs {{rust_image}} cargo {{args}}
 
-rust-test:
-    cargo test --workspace
+rust-check: (cargo "check" "--workspace" "--all-targets")
 
-rust-clippy:
-    cargo clippy --workspace --all-targets -- -D warnings
+rust-test: (cargo "test" "--workspace")
+
+rust-clippy: (cargo "clippy" "--workspace" "--all-targets" "--" "-D" "warnings")
 
 # ── go ──────────────────────────────────────────────────────────────────
 
@@ -211,12 +222,10 @@ fe-build: (pnpm "check") (pnpm "build")
 
 # ── run ─────────────────────────────────────────────────────────────────
 
-control-api:
-    cargo run -p control-api
+control-api: (cargo "run" "-p" "control-api")
 
 # Fake heartbeats + trades for UI work without the ingestor or model-runtime running
-fake-publisher:
-    cargo run -p control-api --example fake_publisher
+fake-publisher: (cargo "run" "-p" "control-api" "--example" "fake_publisher")
 
 # How to run the system locally
 dev:
@@ -224,7 +233,7 @@ dev:
     @echo "2. just control-api   # http://127.0.0.1:7700 (serves frontend/build when present)"
     @echo "3. just fe-dev        # http://127.0.0.1:5173 with hot reload"
     @echo "4. go -C go run ./services/ingestor -catalog config/sources.yaml   # heartbeat feed"
-    @echo "5. cargo run -p model-runtime / strategy-runtime / risk-engine / evo-worker"
+    @echo "5. just cargo run -p model-runtime / strategy-runtime / risk-engine / evo-worker"
     @echo "   Go: go -C go run ./services/broker-gateway, ./services/evo-orchestrator"
     @echo "   (or everything in compose: just app-up; synthetic data only: just fake-publisher)"
 
