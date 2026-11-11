@@ -1,0 +1,280 @@
+//! Conformance tests of the neural families on SYNTHETIC data (spec 34 §9.1: forward, loss,
+//! save/load, cost estimate) and of the D-009 feedback API.
+
+use std::sync::Arc;
+
+use candle_core::{Device, Tensor, Var};
+use fa_core::rng::Rng;
+
+use super::{feedback, *};
+use crate::{LatentPoint, crps_quantiles};
+
+/// SYNTHETIC regime series: the drift sign flips in blocks of 150 steps; the latent carries the
+/// regime (noisy), and every 10th step a news item whose wording matches the regime.
+fn regime_data(n: usize, seed: u64) -> (Series, DecodeCtx, TextTimeline) {
+    let mut rng = Rng::seed(seed);
+    let mut lp = 4.6;
+    let mut ts = Vec::with_capacity(n);
+    let mut log_price = Vec::with_capacity(n);
+    let mut ctx = DecodeCtx::default();
+    let mut text = TextTimeline::new();
+    for i in 0..n {
+        let r = if (i / 150) % 2 == 0 { 1.0 } else { -1.0 };
+        lp += 0.0005 * r + 0.001 * rng.normal();
+        ts.push(i as i64 * 1000);
+        log_price.push(lp);
+        let lat = vec![(r + 0.1 * rng.normal()) as f32, (0.1 * rng.normal()) as f32, 0.5];
+        ctx.push("inst-syn", LatentPoint { as_of_ms: i as i64 * 1000, vec: lat });
+        if i % 10 == 0 {
+            let words = if r > 0.0 { "stocks rally strong gains record surge" } else { "shares plunge weak losses slump crash" };
+            text.push(i as i64 * 1000, words, "");
+        }
+    }
+    text.finish();
+    (Series { instrument_id: "inst-syn".into(), ts_ms: ts, log_price, step_ms: 1000 }, ctx, text)
+}
+
+fn fit(genome: &str, n: usize) -> (NeuralDecoder, Series) {
+    let (s, ctx, text) = regime_data(n, 11);
+    let g = DecoderGenome::parse(genome).unwrap();
+    let d = train(&g, std::slice::from_ref(&s), Arc::new(ctx), Arc::new(text), &TrainOptions::default()).unwrap();
+    (d, s)
+}
+
+/// Mean CRPS of the decoder vs the naive zero forecast over the evaluation window.
+fn crps_skill(d: &NeuralDecoder, s: &Series) -> (f64, usize) {
+    let h = d.genome().horizon;
+    let (mut c, mut naive, mut n) = (0.0, 0.0, 0);
+    for t in 0..s.len() {
+        let Some(f) = d.forecast(s, t) else { continue };
+        let Some(y) = s.forward_return(t, h) else { continue };
+        assert!(s.ts_ms[t] >= d.meta.cutoff_ms, "forecast inside the training window");
+        assert!(f.quantiles.windows(2).all(|w| w[0] <= w[1] + 1e-12), "{:?}", f.quantiles);
+        c += crps_quantiles(&f.quantiles, &f.levels, y);
+        naive += y.abs();
+        n += 1;
+    }
+    (1.0 - c / naive, n)
+}
+
+#[test]
+fn nn_forecast_learns_the_regime_from_the_latent() {
+    let (d, s) = fit("nn_forecast:h=5;lb=16;width=16;depth=2;steps=250;lr=0.01;train=0.6", 2400);
+    let r = &d.meta.train;
+    assert!(r.train_loss < r.initial_loss, "{r:?}");
+    assert_eq!(r.latent_dim, 3);
+    assert!(r.latent_coverage > 0.99);
+    let (skill, n) = crps_skill(&d, &s);
+    assert!(n > 800, "{n}");
+    assert!(skill > 0.1, "skill {skill}");
+    assert!(d.ops_per_forecast(s.len()) > 100.0);
+    // without the latent the regime is much harder to see
+    let (s2, ctx, text) = regime_data(2400, 11);
+    let g = DecoderGenome::parse("nn_forecast:h=5;lb=16;width=16;depth=2;steps=250;lr=0.01;train=0.6;lat=0").unwrap();
+    let blind = train(&g, std::slice::from_ref(&s2), Arc::new(ctx), Arc::new(text), &TrainOptions::default()).unwrap();
+    assert_eq!(blind.meta.layout.latent, 0);
+    let (blind_skill, _) = crps_skill(&blind, &s2);
+    assert!(skill > blind_skill, "{skill} vs blind {blind_skill}");
+}
+
+#[test]
+fn gru_prior_trains_and_is_point_in_time() {
+    let (d, s) = fit("nn_forecast:h=3;lb=12;width=12;depth=1;gru=1;steps=60;lr=0.01", 1200);
+    assert!(d.meta.train.train_loss < d.meta.train.initial_loss, "{:?}", d.meta.train);
+    let t = s.len() - 50;
+    let f = d.forecast(&s, t).unwrap();
+    let mut shorter = s.clone();
+    shorter.log_price.truncate(t + 1);
+    shorter.ts_ms.truncate(t + 1);
+    let g = d.forecast(&shorter, t).unwrap();
+    for (a, b) in f.quantiles.iter().zip(&g.quantiles) {
+        assert!((a - b).abs() < 1e-9, "future data changed the forecast");
+    }
+}
+
+#[test]
+fn nn_retrieval_respects_the_gap_and_has_skill() {
+    let (d, s) = fit("nn_retrieval:h=4;lb=12;k=20;gap=6;emb=8;width=16;steps=150;lr=0.01;temp=0.2", 2400);
+    assert!(d.meta.train.train_loss < d.meta.train.initial_loss, "{:?}", d.meta.train);
+    let mut checked = 0;
+    for t in (0..s.len()).step_by(37) {
+        let Some(f) = d.forecast(&s, t) else { continue };
+        assert!(!f.analogs.is_empty() && f.analogs.len() <= 20);
+        for a in &f.analogs {
+            let dt_steps = (a.time_distance_days * 86_400.0).round() as usize;
+            assert!(dt_steps >= 6 + 4, "analog too recent: {dt_steps} steps");
+        }
+        checked += 1;
+    }
+    assert!(checked > 10);
+    let (skill, _) = crps_skill(&d, &s);
+    assert!(skill > 0.0, "skill {skill}");
+}
+
+#[test]
+fn visual_families_reconstruct_better_than_the_mean_raster() {
+    let (chart, s) = fit("nn_chart:lb=24;res=8;width=32;steps=250;lr=0.01", 2000);
+    assert_eq!(chart.meta.layout.seq, 0, "latent-only input");
+    let r = chart.recon_eval(std::slice::from_ref(&s), chart.meta.cutoff_ms, 5000).unwrap().unwrap();
+    assert!(r.n > 500 && r.skill > 0.0, "{r:?} {:?}", chart.meta.train);
+    assert!(chart.forecast(&s, s.len() - 10).is_none(), "chart does not forecast");
+
+    let (future, s) = fit("nn_future:h=5;lb=16;res=8;width=32;steps=250;lr=0.01", 2000);
+    let r = future.recon_eval(std::slice::from_ref(&s), future.meta.cutoff_ms, 5000).unwrap().unwrap();
+    assert!(r.skill > 0.0, "{r:?} {:?}", future.meta.train);
+    let (skill, n) = crps_skill(&future, &s);
+    assert!(n > 500 && skill > 0.0, "future-chart quantiles: skill {skill}");
+}
+
+#[test]
+fn text_families_reconstruct_news_from_the_latent() {
+    let (news, s) = fit("nn_news:lb=8;tdim=64;tw=0.5;width=32;steps=250;lr=0.01", 2000);
+    let r = news.recon_eval(std::slice::from_ref(&s), news.meta.cutoff_ms, 5000).unwrap().unwrap();
+    assert!(r.n > 200 && r.skill > 0.05, "{r:?}");
+    let (narr, s) = fit("nn_narrative:lb=8;tdim=64;tw=0.5;width=32;steps=250;lr=0.01", 2000);
+    assert_eq!(narr.meta.layout.extra, 64);
+    let r = narr.recon_eval(std::slice::from_ref(&s), narr.meta.cutoff_ms, 5000).unwrap().unwrap();
+    assert!(r.n > 200 && r.skill > 0.0, "{r:?}");
+    // serving: sentiment score follows the regime
+    let (_, ctx, text) = regime_data(2000, 11);
+    let up_t = 150 * 12 + 100; // inside an up block (blocks of 150 alternate, 12 is even)
+    let mut cut = s.clone();
+    cut.log_price.truncate(up_t + 1);
+    cut.ts_ms.truncate(up_t + 1);
+    let lat = ctx.latent_as_of("inst-syn", cut.ts_ms[up_t]).map(|l| l.vec.clone());
+    let served = news.serve(&cut, lat.as_deref(), &text).unwrap();
+    assert!(served.score > 0.0, "{served:?}");
+    assert!((-1.0..=1.0).contains(&served.score));
+}
+
+#[test]
+fn bundles_round_trip_and_training_is_deterministic() {
+    let (d, s) = fit("nn_forecast:h=3;lb=12;width=8;depth=1;steps=40", 900);
+    let bytes = d.to_bundle().unwrap();
+    let meta = NeuralDecoder::meta_of(&bytes).unwrap();
+    assert_eq!(meta, d.meta);
+    let (_, ctx, text) = regime_data(900, 11);
+    let loaded = NeuralDecoder::from_bundle(&bytes, &Device::Cpu)
+        .unwrap()
+        .with_context(Arc::new(ctx), Arc::new(text))
+        .with_eval_from(Some(d.meta.cutoff_ms));
+    assert_eq!(loaded.n_params(), d.n_params());
+    let t = s.len() - 20;
+    assert_eq!(loaded.forecast(&s, t), d.forecast(&s, t));
+    let (again, _) = fit("nn_forecast:h=3;lb=12;width=8;depth=1;steps=40", 900);
+    assert_eq!(again.forecast(&s, t), d.forecast(&s, t), "same genome, same weights");
+    assert!(NeuralDecoder::meta_of(b"not a bundle").is_err());
+}
+
+#[test]
+fn warm_start_copies_matching_variables() {
+    let (parent, _) = fit("nn_forecast:h=3;lb=12;width=8;depth=1;steps=40", 900);
+    let (s, ctx, text) = regime_data(900, 11);
+    let g = DecoderGenome::parse("nn_forecast:h=3;lb=12;width=8;depth=1;steps=1;seed=99").unwrap();
+    let opts = TrainOptions { warm_start: Some(parent.to_bundle().unwrap()), ..Default::default() };
+    let child = train(&g, std::slice::from_ref(&s), Arc::new(ctx), Arc::new(text), &opts).unwrap();
+    assert_eq!(child.meta.train.warm_started, 4, "l0 + out weights and biases");
+    let wide = DecoderGenome::parse("nn_forecast:h=3;lb=12;width=16;depth=1;steps=1").unwrap();
+    let (s, ctx, text) = regime_data(900, 11);
+    let c2 = train(&wide, std::slice::from_ref(&s), Arc::new(ctx), Arc::new(text), &opts).unwrap();
+    assert_eq!(c2.meta.train.warm_started, 1, "only the out bias keeps its shape");
+}
+
+#[test]
+fn interruption_and_insufficient_data() {
+    let (s, ctx, text) = regime_data(900, 1);
+    let g = DecoderGenome::parse("nn_forecast:steps=5000;lb=12").unwrap();
+    let opts = TrainOptions { should_stop: Some(Box::new(|| true)), ..Default::default() };
+    let d = train(&g, std::slice::from_ref(&s), Arc::new(ctx.clone()), Arc::new(text.clone()), &opts).unwrap();
+    assert!(d.meta.train.interrupted && d.meta.train.steps == 0);
+    let mut tiny = s.clone();
+    tiny.log_price.truncate(30);
+    tiny.ts_ms.truncate(30);
+    assert!(matches!(
+        train(&g, &[tiny], Arc::new(ctx), Arc::new(text), &TrainOptions::default()),
+        Err(NeuralError::InsufficientData(_))
+    ));
+    let base = DecoderGenome::parse("forecast").unwrap();
+    assert!(matches!(
+        train(&base, &[s], Arc::default(), Arc::default(), &TrainOptions::default()),
+        Err(NeuralError::NotNeural(_))
+    ));
+}
+
+#[test]
+fn feedback_gradients_reach_the_latents_only() {
+    let mut bundles = Vec::new();
+    let mut cards = Vec::new();
+    for (i, genome) in [
+        "nn_forecast:h=3;lb=12;width=8;steps=60;lr=0.01",
+        "nn_retrieval:h=3;lb=12;gap=3;emb=4;width=8;steps=30",
+        "nn_chart:lb=12;res=6;width=8;steps=60",
+        "nn_news:lb=8;tdim=32;tw=0.5;width=8;steps=60",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (mut d, _) = fit(genome, 900);
+        d.meta.score = 0.1 + i as f64 * 0.01;
+        d.meta.objectives.insert("crps_skill".into(), d.meta.score);
+        let key = feedback::bundle_key("gen-test", &d.meta, &format!("job{i}"));
+        assert!(key.starts_with("decoders/gen-test/") && key.ends_with(".safetensors"), "{key}");
+        assert!(feedback::card_key(&key).ends_with(".card.json"));
+        cards.push(feedback::EliteCard { meta: d.meta.clone(), bucket: feedback::BUCKET.into(), key, created_ms: i as i64 });
+        bundles.push((d.to_bundle().unwrap(), 1.0));
+    }
+    // an unconditioned decoder is not a feedback elite
+    let (s, ctx, text) = regime_data(900, 11);
+    let blind_g = DecoderGenome::parse("nn_forecast:lb=12;width=8;steps=5;lat=0").unwrap();
+    let blind = train(&blind_g, std::slice::from_ref(&s), Arc::new(ctx.clone()), Arc::new(text.clone()), &TrainOptions::default())
+        .unwrap();
+    bundles.push((blind.to_bundle().unwrap(), 1.0));
+
+    let top = feedback::select_top_k(&cards, 1, Some(3));
+    assert_eq!(top.len(), 4, "one per output family");
+    let w = feedback::quota_weights(&top);
+    assert!((w.iter().map(|x| x.1).sum::<f64>() - 1.0).abs() < 1e-9);
+    assert!(feedback::select_top_k(&cards, 1, Some(7)).is_empty(), "dimension filter");
+
+    let set = feedback::FeedbackSet::load(&bundles, 3, &Device::Cpu).unwrap();
+    assert_eq!(set.elites.len(), 4);
+    assert_eq!(set.skipped.len(), 1, "{:?}", set.skipped);
+    let steps: Vec<(&Series, usize)> = (100..164).map(|t| (&s, t * 5)).collect();
+    let batch = set.prepare(&steps, &text).unwrap();
+    assert!(batch.rows_per_elite().iter().all(|n| *n > 0), "{:?}", batch.rows_per_elite());
+    let lat: Vec<f32> = steps
+        .iter()
+        .flat_map(|(s, t)| ctx.latent_as_of("inst-syn", s.ts_ms[*t]).unwrap().vec.clone())
+        .collect();
+    let latents = Var::from_tensor(&Tensor::from_vec(lat, (steps.len(), 3), &Device::Cpu).unwrap()).unwrap();
+    let out = set.aux_loss(latents.as_tensor(), &batch).unwrap();
+    assert_eq!(out.parts.len(), 4, "{:?}", out.parts.iter().map(|p| &p.1).collect::<Vec<_>>());
+    let total = out.total.to_scalar::<f32>().unwrap();
+    assert!(total.is_finite() && total > 0.0);
+    let grads = out.total.backward().unwrap();
+    let g = grads.get(latents.as_tensor()).expect("gradient on the latents");
+    let gnorm = g.sqr().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
+    assert!(gnorm > 0.0, "zero gradient");
+    // weights are constants: nothing in the elites is a Var
+    for e in &set.elites {
+        assert!(e.decoder.params.iter().all(|(_, t)| !t.is_variable()));
+    }
+    // a dimension mismatch is an error, not a panic
+    let wrong = Tensor::zeros((steps.len(), 5), candle_core::DType::F32, &Device::Cpu).unwrap();
+    assert!(set.aux_loss(&wrong, &batch).is_err());
+}
+
+#[test]
+fn latent_only_chart_falls_back_when_latents_start_after_the_cutoff() {
+    let (s, full, text) = regime_data(900, 4);
+    // latents only in the last 10 % of the window (e.g. a worker that just started)
+    let mut late = DecodeCtx::default();
+    for p in full.latents.values().flatten().filter(|p| p.as_of_ms >= 810_000) {
+        late.push("inst-syn", p.clone());
+    }
+    let g = DecoderGenome::parse("nn_chart:lb=12;res=6;width=8;steps=20").unwrap();
+    let d = train(&g, std::slice::from_ref(&s), Arc::new(late), Arc::new(text), &TrainOptions::default()).unwrap();
+    assert_eq!(d.meta.layout.latent, 0, "unconditioned fallback");
+    assert_eq!(d.meta.layout.seq, 12);
+    assert_eq!(d.genome().latent_weight, 0.0);
+}

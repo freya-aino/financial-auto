@@ -86,13 +86,30 @@ metrics service="control-api":
 # ── backups (spec 60 §6.6, spec 20 §6.6, D-056) ─────────────────────────
 
 # Postgres dump + HelixDB volume tar (helix paused for seconds) + Garage critical buckets → backups/<timestamp>/
-# backup.schedule: `0 3 * * * cd <repo> && scripts/backup.sh >> backups/backup.log 2>&1` in crontab (no cron container)
+# The scheduled backup (backup.schedule 03:00) runs in the `backup` compose sidecar, not host cron.
 backup *args:
     {{root}}/scripts/backup.sh {{args}}
+
+# Run the sidecar's scheduled backup now (PITR base backup + dump + hot Helix tar + buckets + pruning)
+backup-now:
+    {{compose}} exec backup run.sh
+
+# Restore drill into throwaway containers, live data untouched: just restore-drill [backups/<ts>] [--target TIME]
+restore-drill *args:
+    {{root}}/scripts/restore-drill.sh {{args}}
+
+# End-to-end alerting check: rule → vmalert → control-api → NATS ops.alert → audit.log
+alert-drill *args:
+    {{root}}/scripts/alert-drill.sh {{args}}
+
+# Active and recent alerts as control-api sees them (vmalert UI: http://127.0.0.1:8880)
+alerts:
+    curl -fsS 'http://127.0.0.1:7700/api/alerts'
 
 # Restore a backup directory in the §6.4 order (asks for confirmation; `--yes` skips it):
 #   just restore backups/<ts>                       # overwrite live Postgres/Helix/Garage
 #   just restore backups/<ts> --postgres-db fa_restore_test   # drill: Postgres only, into a scratch database
+#   just restore backups/<ts> --pitr [--target '2026-11-11 03:00:00+00']   # point-in-time recovery (scheduled backups)
 restore dir *args:
     {{root}}/scripts/restore.sh {{dir}} {{args}}
 

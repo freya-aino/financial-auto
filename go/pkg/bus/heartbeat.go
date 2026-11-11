@@ -59,8 +59,12 @@ func RunHeartbeat(ctx context.Context, p *Publisher, service, instance, version 
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
-		if err := p.Publish(Heartbeat(service), BuildHeartbeat(service, instance, version, counters)); err != nil && onErr != nil {
-			onErr(err)
+		if err := p.Publish(Heartbeat(service), BuildHeartbeat(service, instance, version, counters)); err != nil {
+			if onErr != nil {
+				onErr(err)
+			}
+		} else {
+			heartbeatPublished(time.Now())
 		}
 		select {
 		case <-ctx.Done():

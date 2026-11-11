@@ -735,6 +735,11 @@ impl HubClient {
         resp.take_one("created_row")
     }
 
+    /// `getRegion` under its catalog name; same as [`Self::region_by_id`].
+    pub async fn get_region(&self, region_id: &str) -> Result<Option<LatentRegion>> {
+        self.region_by_id(region_id).await
+    }
+
     /// `getRegion`: lookup by business id.
     pub async fn region_by_id(&self, region_id: &str) -> Result<Option<LatentRegion>> {
         let mut resp =
@@ -935,42 +940,22 @@ impl HubClient {
 
     /// `addLatent`: a `LatentVec` node whose vector sits in `vec<dim>`. Call
     /// [`HubClient::ensure_latent_index`](crate::HubClient::ensure_latent_index) for that
-    /// dimension once per server, or searches report `index_not_found`.
+    /// dimension once per server, or searches report `index_not_found`
+    /// ([`HubClient::add_latents_checked`] does both and validates the space's `dim`).
+    /// Empty, zero-norm or non-finite vectors fail with [`HubError::InvalidVector`].
     pub async fn add_latent(&self, latent: &NewLatent) -> Result<u64> {
-        let prop = latent_vec_property(latent.vector.len());
-        let props = vec![
-            (LATENT_TENANT, s(&latent.expert_space_id)),
-            ("kind", s(&latent.kind)),
-            ("ref_id", s(&latent.ref_id)),
-            ("instrument_id", s(&latent.instrument_id)),
-            ("ts", Input::Lit(Val::DateTime(latent.ts_ms))),
-            ("uncertainty", latent.uncertainty.into()),
-            (prop.as_str(), latent.vector.clone().into()),
-        ];
-        let mut resp =
-            self.batch(&Batch::write().named("add_latent").ret("n", Op::add_n(node::LATENT_VEC, props))).await?;
-        Ok(resp.take_one::<IdRow>("n")?.id)
+        let mut ids = self.add_latents(std::slice::from_ref(latent)).await?;
+        Ok(ids.pop().expect("one row in, one id out"))
     }
 
     /// Several latents (same or mixed dimensions) in one write batch; returns their node ids.
     pub async fn add_latents(&self, latents: &[NewLatent]) -> Result<Vec<u64>> {
-        let mut batch = Batch::write().named("add_latents");
-        let names: Vec<String> = (0..latents.len()).map(|i| format!("n{i}")).collect();
-        for (name, l) in names.iter().zip(latents) {
-            let prop = latent_vec_property(l.vector.len());
-            let props = vec![
-                (LATENT_TENANT, s(&l.expert_space_id)),
-                ("kind", s(&l.kind)),
-                ("ref_id", s(&l.ref_id)),
-                ("instrument_id", s(&l.instrument_id)),
-                ("ts", Input::Lit(Val::DateTime(l.ts_ms))),
-                ("uncertainty", l.uncertainty.into()),
-                (prop.as_str(), l.vector.clone().into()),
-            ];
-            batch = batch.ret(name, Op::add_n(node::LATENT_VEC, props));
+        if latents.is_empty() {
+            return Ok(Vec::new());
         }
+        let batch = crate::vectors::add_latents_batch(latents)?;
         let mut resp = self.batch(&batch).await?;
-        names.iter().map(|n| Ok(resp.take_one::<IdRow>(n)?.id)).collect()
+        (0..latents.len()).map(|i| Ok(resp.take_one::<IdRow>(&format!("n{i}"))?.id)).collect()
     }
 
     /// `searchLatent`, scoped to one expert space (the index tenant): k nearest `LatentVec`s

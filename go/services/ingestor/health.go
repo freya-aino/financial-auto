@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/fey/financial-auto/go/pkg/bus"
@@ -15,13 +16,13 @@ import (
 	"github.com/fey/financial-auto/go/pkg/connector"
 )
 
-// Health subjects (spec 21 §4.1, spec 10 §6.7). Payloads are JSON, not proto:
-// there is no health message in fa.v1 and `Heartbeat` only carries numeric
-// counters, while status, reason and last error are strings the UI shows
-// verbatim. control-api decodes these frames into its sources view (D-054).
-func healthSubject(source string) string     { return "ingest.health." + source }
-func gapSubject(source string) string        { return "ingest.gap." + source }
-func unresolvedSubject(source string) string { return "ingest.unresolved." + source }
+// Health subjects (spec 21 §4.1, spec 10 §6.7). Payloads are the fa.v1 messages
+// IngestHealth / IngestGap / IngestUnresolved; until 2026-11-11 they were JSON
+// (D-054) and `-health-json` still selects that legacy encoding. Consumers
+// (risk-engine, control-api via fa_bus::ingest) accept both.
+func healthSubject(source string) string     { return bus.IngestHealth(source) }
+func gapSubject(source string) string        { return bus.IngestGap(source) }
+func unresolvedSubject(source string) string { return bus.IngestUnresolved(source) }
 
 // HaltScope is the `risk.halt.<scope>` token for a source (D-042 family
 // `source`, qualifier after the colon; fa_risk::HaltScope::parse maps
@@ -135,6 +136,8 @@ type Tracker struct {
 	halts map[string]bool
 	// Published counts frames/halts/resumes for tests.
 	Published struct{ Frames, Halts, Resumes int64 }
+	// JSON selects the legacy D-054 JSON payloads instead of fa.v1 protos.
+	JSON bool
 }
 
 // NewTracker builds a tracker; pub may be nil (frames are still computed).
@@ -304,7 +307,7 @@ func (t *Tracker) Tick(ctx context.Context) {
 	defer t.mu.Unlock()
 	for id, h := range t.sources {
 		f := t.frameLocked(h, true)
-		t.publishJSON(healthSubject(id), f)
+		t.publishFrame(healthSubject(id), f, HealthProto(f))
 		t.Published.Frames++
 		down := f.Status == "down"
 		deliberate := !h.running && h.stopReason == "stopped by operator"
@@ -316,7 +319,7 @@ func (t *Tracker) Tick(ctx context.Context) {
 			t.log("source down, halt raised", "source", id, "reason", f.Reason)
 		case !down && h.halted:
 			h.halted = false
-			t.publishProto("risk.resume."+HaltScope(id), &fav1.Halt{Scope: HaltScope(id), Reason: "ingest: " + id + " recovered", Since: timestamppb.New(f.At)})
+			t.publishProto(bus.RiskResume(HaltScope(id)), &fav1.Resume{Scope: HaltScope(id), Reason: "ingest: " + id + " recovered", At: timestamppb.New(f.At), Actor: "system:ingestor"})
 			t.Published.Resumes++
 			t.log("source recovered, halt cleared", "source", id)
 		}
@@ -343,16 +346,27 @@ func (t *Tracker) Run(ctx context.Context, interval time.Duration) {
 }
 
 // PublishGap emits an `ingest.gap.<source>` frame.
-func (t *Tracker) PublishGap(g Gap) { t.publishJSON(gapSubject(g.Source), g) }
+func (t *Tracker) PublishGap(g Gap) { t.publishFrame(gapSubject(g.Source), g, GapProto(g)) }
 
 // PublishUnresolved emits an `ingest.unresolved.<source>` frame.
-func (t *Tracker) PublishUnresolved(u UnresolvedEvent) { t.publishJSON(unresolvedSubject(u.Source), u) }
+func (t *Tracker) PublishUnresolved(u UnresolvedEvent) {
+	t.publishFrame(unresolvedSubject(u.Source), u, UnresolvedProto(u))
+}
 
-func (t *Tracker) publishJSON(subject string, v any) {
+// publishFrame sends the proto message, or v as JSON when the tracker is in legacy mode.
+func (t *Tracker) publishFrame(subject string, v any, m proto.Message) {
 	if t.pub == nil {
 		return
 	}
-	b, err := json.Marshal(v)
+	var (
+		b   []byte
+		err error
+	)
+	if t.JSON {
+		b, err = json.Marshal(v)
+	} else {
+		b, err = proto.Marshal(m)
+	}
 	if err != nil {
 		return
 	}
@@ -361,7 +375,53 @@ func (t *Tracker) publishJSON(subject string, v any) {
 	}
 }
 
-func (t *Tracker) publishProto(subject string, m *fav1.Halt) {
+func tsOrNil(t *time.Time) *timestamppb.Timestamp {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	return timestamppb.New(*t)
+}
+
+// HealthStatus maps the frame status string onto the proto enum.
+func HealthStatus(s string) fav1.HealthStatus {
+	switch s {
+	case "ok":
+		return fav1.HealthStatus_HEALTH_STATUS_OK
+	case "degraded":
+		return fav1.HealthStatus_HEALTH_STATUS_DEGRADED
+	case "down":
+		return fav1.HealthStatus_HEALTH_STATUS_DOWN
+	}
+	return fav1.HealthStatus_HEALTH_STATUS_UNSPECIFIED
+}
+
+// HealthProto converts a frame into its fa.v1 message (ages are derived from `at` by consumers).
+func HealthProto(f Frame) *fav1.IngestHealth {
+	return &fav1.IngestHealth{
+		Source: f.Source, Status: HealthStatus(f.Status), Running: f.Running, Mode: f.Mode,
+		At: timestamppb.New(f.At), Reason: f.Reason, Halted: f.Halted,
+		StartedAt: tsOrNil(f.StartedAt), ExpectedPeriodS: f.ExpectedPeriodS,
+		LastActivityAt: tsOrNil(f.LastActivityAt), LastEventAt: tsOrNil(f.LastEventAt),
+		EventsTotal: f.EventsTotal, ErrorsTotal: f.ErrorsTotal,
+		WindowS: f.WindowS, EventsWindow: f.EventsWindow, ErrorsWindow: f.ErrorsWindow, ErrorRate: f.ErrorRate,
+		LimiterSaturation: f.LimiterSaturation, LimiterRequests: f.LimiterRequests,
+		LastError: f.LastError, LastErrorAt: tsOrNil(f.LastErrorAt),
+	}
+}
+
+// GapProto converts a gap into its fa.v1 message.
+func GapProto(g Gap) *fav1.IngestGap {
+	return &fav1.IngestGap{Source: g.Source, InstrumentId: g.InstrumentID, Timeframe: g.Timeframe,
+		From: timestamppb.New(g.From), To: timestamppb.New(g.To), MissingPeriods: g.MissingPeriods, At: timestamppb.New(g.At)}
+}
+
+// UnresolvedProto converts an unresolved-symbol event into its fa.v1 message.
+func UnresolvedProto(u UnresolvedEvent) *fav1.IngestUnresolved {
+	return &fav1.IngestUnresolved{Source: u.Source, VenueSymbol: u.VenueSymbol, InstrumentId: u.InstrumentID,
+		Reason: u.Reason, At: timestamppb.New(u.At)}
+}
+
+func (t *Tracker) publishProto(subject string, m proto.Message) {
 	if t.pub == nil {
 		return
 	}

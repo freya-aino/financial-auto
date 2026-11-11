@@ -20,3 +20,40 @@ message Halt {
   google.protobuf.Timestamp since = 3;
   bool manual = 4;
 }
+
+// `risk.resume.<scope>`: re-arms a halt (D-030). Wire-compatible with `Halt` (fields 1-4 share
+// numbers and types), so a consumer still decoding `Halt` reads `at` as `since`.
+message Resume {
+  string scope = 1;
+  string reason = 2;
+  google.protobuf.Timestamp at = 3;
+  bool manual = 4;
+  string actor = 5; // ui | system:<service>
+}
+
+// `risk.event.<account>`: one decision or state change of the risk service (spec 40, D-042).
+// Gated foreign intents are also still answered with `OrderEvent{REJECTED}` on
+// `order.event.<account>` for consumers that predate this message.
+message RiskEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_INTENT_REJECTED = 1;
+    KIND_INTENT_APPROVED = 2;
+    KIND_HALT_RAISED = 3;
+    KIND_HALT_CLEARED = 4;
+    KIND_LIMIT_BREACH = 5;
+    KIND_LIMITS_CHANGED = 6;
+    KIND_RECONCILIATION_DIFF = 7;
+  }
+  string event_id = 1; // ULID
+  Kind kind = 2;
+  google.protobuf.Timestamp at = 3;
+  string account = 4;
+  string intent_id = 5;
+  string client_order_id = 6;
+  string strategy_id = 7;
+  string instrument_id = 8;
+  string scope = 9; // halt scope for halt kinds
+  string reason = 10;
+  map<string, double> metrics = 11; // e.g. requested/limit notional, drawdown
+}

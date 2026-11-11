@@ -221,3 +221,26 @@ func TestLiveStatusesBackfillCursorsProvisionHook(t *testing.T) {
 		t.Fatalf("ListCursors missing the range: %+v", rows)
 	}
 }
+
+func TestClassifyYahooSymbols(t *testing.T) {
+	h := DefaultHints["yahoo"]
+	cases := map[string]Class{
+		"AAPL":     {"equity", "equity", "", "USD"},
+		"EURUSD=X": {"fx", "fx_pair", "EUR", "USD"},
+		"BTC-USD":  {"crypto", "crypto_spot", "BTC", "USD"},
+		"^GSPC":    {AssetClass: "index", Kind: "index"},
+		"GC=F":     {AssetClass: "derivative", Kind: "future", Quote: "USD"},
+		"SAP.DE":   {"equity", "equity", "", "EUR"},
+	}
+	for sym, want := range cases {
+		if got := Classify("yahoo", sym, h); got != want {
+			t.Errorf("%s: got %+v want %+v", sym, got, want)
+		}
+	}
+	if got := Classify("oanda", "EUR_USD", DefaultHints["oanda"]); got != (Class{"fx", "fx_pair", "EUR", "USD"}) {
+		t.Errorf("oanda: %+v", got)
+	}
+	if got := Classify("kraken", "XBT/EUR", Hint{AssetClass: "crypto", Kind: "crypto_spot"}); got != (Class{"crypto", "crypto_spot", "XBT", "EUR"}) {
+		t.Errorf("kraken: %+v", got)
+	}
+}

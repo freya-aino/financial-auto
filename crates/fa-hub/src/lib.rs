@@ -12,19 +12,47 @@
 //! [`HubClient::ensure_schema`] and [`HubClient::ensure_latent_index`] create idempotently.
 //! Index builds are asynchronous; wait for them with [`HubClient::wait_for_index`] (or the
 //! `*_ready` helpers) before relying on uniqueness or vector search.
+//!
+//! Further plumbing (spec 20 §4, §6.3–§6.5, §8):
+//! - [`vectors`]: per-dimension vector indexes (cached "ensured" set), dimension validation
+//!   against the registered `ExpertSpace.dim`, `knn(space, v, k, filter)`, and the
+//!   `NewsDoc` / `MediaSegment` embedding indexes.
+//! - [`meta`]: the schema/migration version marker stored in Helix (`SchemaMeta`).
+//! - [`asof`]: as-of variants of the snapshot-scoped reads (`created_at <= t`).
+//! - [`retention`]: pruning of old `observation` latents into per-region aggregates.
+//! - [`buffer`]: a bounded, drop-oldest write buffer for when Helix is unavailable.
+//! - [`regions`]: region lifecycle/lineage (`DescendsFrom`), hierarchy (`Hier`), persisted region
+//!   sets and kernel models, cross-asset priors (spec 30 §5, spec 33 §5).
 
+pub mod asof;
 pub mod ast;
+pub mod buffer;
 pub mod catalog;
+pub mod meta;
 pub mod queries;
+pub mod regions;
+pub mod retention;
 pub mod schema;
+pub mod vectors;
 
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value as Json;
 
+pub use asof::*;
 pub use ast::{Batch, Cond, EdgeRef, IndexSpec, Input, Metric, NodeRef, Op, ParamType, Pred, Val, param};
+pub use buffer::{BufferStats, FlushReport, WriteBuffer};
+pub use meta::{SCHEMA_VERSION, SchemaMarker};
 pub use queries::*;
+pub use regions::{
+    LineageLink, NewCrossPrior, NewDescent, NewHierEdge, NewKernelModel, NewRegionSet, RegionLineage, RegionSetRow,
+    RegionStatsUpdate,
+};
+pub use retention::{PruneReport, RetentionPolicy};
+pub use vectors::{EmbeddingHit, KnnFilter, NewEmbedding};
 
 /// Default base URL (D-014: host port 6969 maps to the container's 8080).
 pub const DEFAULT_URL: &str = "http://127.0.0.1:6969";
@@ -65,6 +93,16 @@ pub enum HubError {
     /// `catalog::run_named` was given a missing or ill-typed parameter.
     #[error("bad parameter: {0}")]
     BadParam(String),
+    /// A vector whose length differs from the registered `ExpertSpace.dim` of its space.
+    #[error("expert space `{expert_space_id}` has dim {expected}, vector has {got}")]
+    DimMismatch { expert_space_id: String, expected: u32, got: usize },
+    /// An empty, zero-norm or non-finite vector (the cosine index rejects them; NaN would not
+    /// even serialize).
+    #[error("invalid vector: {0}")]
+    InvalidVector(String),
+    /// The `SchemaMeta` marker in Helix is newer than this build understands ([`SCHEMA_VERSION`]).
+    #[error("helix schema version {stored} is newer than this build's {supported}; upgrade the service")]
+    SchemaTooNew { stored: u32, supported: u32 },
 }
 
 impl HubError {
@@ -85,7 +123,14 @@ impl HubError {
     }
     /// A caller-side problem: unknown query name, bad parameter, or an id that does not exist.
     pub fn is_client_error(&self) -> bool {
-        matches!(self, HubError::NotFound { .. } | HubError::UnknownQuery(_) | HubError::BadParam(_))
+        matches!(
+            self,
+            HubError::NotFound { .. }
+                | HubError::UnknownQuery(_)
+                | HubError::BadParam(_)
+                | HubError::DimMismatch { .. }
+                | HubError::InvalidVector(_)
+        )
     }
 }
 
@@ -177,16 +222,32 @@ impl Response {
     }
 }
 
-/// Client for one HelixDB server.
+/// Per-client memo of what is known to exist server-side, shared by clones of a [`HubClient`]:
+/// vector indexes already ensured (so the DDL is not re-sent on every write) and the `dim` of
+/// expert spaces already looked up. Never holds a lock across an `.await`.
+#[derive(Debug, Default)]
+pub(crate) struct ClientCache {
+    /// `(label, property)` of vector indexes known to be active.
+    pub(crate) vector_indexes: Mutex<HashSet<(String, String)>>,
+    /// `expert_space_id → dim`.
+    pub(crate) space_dims: Mutex<HashMap<String, u32>>,
+}
+
+/// Client for one HelixDB server. Clones share one connection pool and one [`ClientCache`].
 #[derive(Clone, Debug)]
 pub struct HubClient {
     base: String,
     http: reqwest::Client,
+    pub(crate) cache: Arc<ClientCache>,
 }
 
 impl HubClient {
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self { base: base_url.into().trim_end_matches('/').to_owned(), http: reqwest::Client::new() }
+        Self {
+            base: base_url.into().trim_end_matches('/').to_owned(),
+            http: reqwest::Client::new(),
+            cache: Arc::default(),
+        }
     }
 
     /// Like [`Self::new`] with a per-request timeout (and a short connect timeout), so a slow or
@@ -197,7 +258,13 @@ impl HubClient {
             .connect_timeout(timeout.min(Duration::from_secs(2)))
             .build()
             .unwrap_or_default();
-        Self { base: base_url.into().trim_end_matches('/').to_owned(), http }
+        Self { base: base_url.into().trim_end_matches('/').to_owned(), http, cache: Arc::default() }
+    }
+
+    /// Forget every cached index / expert-space fact (e.g. after a server was wiped).
+    pub fn clear_caches(&self) {
+        lock(&self.cache.vector_indexes).clear();
+        lock(&self.cache.space_dims).clear();
     }
 
     /// `FA_HELIX_URL` or [`DEFAULT_URL`].
@@ -368,23 +435,85 @@ impl HubClient {
         self.ensure_indexes(schema::static_indexes()).await
     }
 
-    /// [`Self::ensure_schema`] and wait for the builds to activate.
+    /// [`Self::ensure_schema`], wait for the builds to activate, then run pending migrations and
+    /// stamp the schema version marker ([`Self::migrate_schema`], spec 20 §8). Fails with
+    /// [`HubError::SchemaTooNew`] when Helix was stamped by a newer build.
     pub async fn ensure_schema_ready(&self, timeout: Duration) -> Result<()> {
         let receipts = self.ensure_schema().await?;
-        self.wait_for_receipts(&receipts, timeout).await
+        self.wait_for_receipts(&receipts, timeout).await?;
+        self.migrate_schema().await?;
+        Ok(())
     }
 
-    /// Idempotently create the latent vector index for one dimension (partitioned by expert space).
+    /// Idempotently create the latent vector index for one dimension (partitioned by expert
+    /// space). Always sends the DDL; an `already_active` receipt is remembered so that
+    /// [`Self::ensure_latent_index_ready`] can skip the round trip next time.
     pub async fn ensure_latent_index(&self, dim: usize) -> Result<IndexReceipt> {
-        let mut receipts = self.ensure_indexes(vec![schema::latent_vec_index(dim)]).await?;
-        Ok(receipts.pop().expect("one spec, one receipt"))
+        self.ensure_vector_index(
+            schema::latent_vec_index(dim),
+            schema::node::LATENT_VEC,
+            &schema::latent_vec_property(dim),
+        )
+        .await
     }
 
-    /// [`Self::ensure_latent_index`] and wait for the build to activate.
+    /// [`Self::ensure_latent_index`] and wait for the build to activate. Cached per client:
+    /// once a dimension's index is known active, later calls return without a request.
     pub async fn ensure_latent_index_ready(&self, dim: usize, timeout: Duration) -> Result<()> {
-        let r = self.ensure_latent_index(dim).await?;
-        self.wait_for_receipts(&[r], timeout).await
+        if dim == 0 {
+            return Err(HubError::InvalidVector("dimension 0".into()));
+        }
+        self.ensure_vector_index_ready(
+            schema::latent_vec_index(dim),
+            schema::node::LATENT_VEC,
+            &schema::latent_vec_property(dim),
+            timeout,
+        )
+        .await
     }
+
+    /// Send one vector-index DDL and remember it when the receipt says `already_active`.
+    pub(crate) async fn ensure_vector_index(
+        &self,
+        spec: IndexSpec,
+        label: &str,
+        property: &str,
+    ) -> Result<IndexReceipt> {
+        let mut receipts = self.ensure_indexes(vec![spec]).await?;
+        let r = receipts.pop().expect("one spec, one receipt");
+        if r.is_active() {
+            lock(&self.cache.vector_indexes).insert((label.to_owned(), property.to_owned()));
+        }
+        Ok(r)
+    }
+
+    /// Ensure + wait, skipping the request entirely when `(label, property)` is cached as active.
+    pub(crate) async fn ensure_vector_index_ready(
+        &self,
+        spec: IndexSpec,
+        label: &str,
+        property: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let key = (label.to_owned(), property.to_owned());
+        if lock(&self.cache.vector_indexes).contains(&key) {
+            return Ok(());
+        }
+        let r = self.ensure_vector_index(spec, label, property).await?;
+        self.wait_for_receipts(&[r], timeout).await?;
+        lock(&self.cache.vector_indexes).insert(key);
+        Ok(())
+    }
+
+    /// Whether this client has seen the vector index `label.property` active.
+    pub fn vector_index_cached(&self, label: &str, property: &str) -> bool {
+        lock(&self.cache.vector_indexes).contains(&(label.to_owned(), property.to_owned()))
+    }
+}
+
+/// Poison-tolerant lock (the guarded data are plain caches).
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn server_error(status: u16, body: Json) -> HubError {

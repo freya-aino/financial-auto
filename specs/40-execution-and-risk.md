@@ -111,7 +111,9 @@ Decision ticks are driven per timescale: a strategy on the 1h scale only re-targ
 - **Equal-risk baseline**: always running in paper as a control.
 All allocators run in parallel in paper ("allocator tournament"); their portfolio P&L is compared on the same strategy signals.
 
-**Implemented today (D-061, D-064):** `equal_weight`, `risk_parity`, `fractional_kelly` and the parametric `weighted_blend`, all expressible as an `AllocatorGenome` (`alloc:name=…;cap=…;…`). Allocators compete in a tournament (`evo.eval.allocator` replays recorded signals through allocation, netting and the cost model); the winning front is written to `fa-artifacts/allocators/<generation>.toml`, and risk-engine switches allocator at runtime via `ctl.risk.limits {set: {allocator: {name, params}}}` (audited, not persisted). Caps and concentration limits use per-instrument reference data (class, venue, provisional status).
+**Implemented today (D-061, D-064):** `equal_weight`, `risk_parity`, `fractional_kelly`, the parametric `weighted_blend` and the Bayesian bandit `thompson_rp` (`fa_allocator::ThompsonRiskParity`: one Thompson draw per strategy from `N(mean, vol²/n)`, positive draws share capital by inverse volatility, capped; deterministic per seed and call sequence), all expressible as an `AllocatorGenome` (`alloc:name=…;cap=…;…`). Allocators compete in a tournament (`evo.eval.allocator` replays recorded signals through allocation, netting and the cost model); the winning front is written to `fa-artifacts/allocators/<generation>.toml`, and risk-engine switches allocator at runtime via `ctl.risk.limits {set: {allocator: {name, params}}}` (audited, not persisted). Caps and concentration limits use per-instrument reference data (class, venue, provisional status).
+
+**Live paper tournament (implemented):** risk-engine runs `equal_weight` (control), `risk_parity`, `fractional_kelly`, `thompson_rp` and the active allocator side by side every tick (`fa_allocator::tournament`): each allocates on the same strategy posteriors, its weights earn the same per-tick strategy sleeve returns, weight turnover is charged `tournament_cost_bps` (5). Reported per entry (cumulative return, Sharpe, max drawdown, turnover, costs, weights) by `ctl.risk.allocators`, in `GET /api/trading/strategies` (`allocator_tournament`) and as heartbeat counters `allocator.<name>.return`; records persist with the risk state. The offline tournament (`evo.eval.allocator`) remains the exact one (netting and the venue cost model). **Allocator failure:** NaN / negative weights or a sum > 1 fall back to the previous allocation and raise a risk event (§8).
 
 ### 6.3 Netting
 Exposures are converted to signed EUR notionals and summed per instrument. Attribution is kept: every portfolio position carries per-strategy virtual sub-positions so strategy P&L and fitness remain computable even though orders are netted. Fees/slippage of netted orders are attributed pro-rata to the strategies whose deltas caused the trade **(proposal)**.
@@ -139,6 +141,13 @@ Limits are loaded from `config/risk.toml` at startup and can only be tightened a
 
 **Implemented today (D-041, D-051):** position, liquidity and leverage caps, concentration caps per asset class and venue, a portfolio gross cap, per-strategy drawdown (attributed sub-books, auto-pause at `strategy_max_drawdown` of the sleeve), payout-quota netting, and the halt state machine with scopes `portfolio`, `daily_loss`, `source:<id>`, `model`, `broker` (raised on a reconciliation diff). Runtime limit changes go through `ctl.risk.limits` and may only tighten (`RiskConfig::check_tightens`).
 
+**Added (implemented):**
+- **Restart-safe halts:** the halt state machine (peak and day-start equity, every active halt with reason / since / manual, the UTC day) is persisted in `ledger.risk_state` (migration `20261111000051`) on every change, every `snapshot_secs` and at shutdown, and restored after the book at start — the kill switch survives a restart until manually re-armed (§8). Limits are never restored from it; they always come from `risk.toml`.
+- **Per-instrument feed guard** (`fa_risk::health`, `[feed]`): an instrument without a trade for `stale_freeze_bars` (3) × max(fastest strategy bar trading it, its own EWMA trade gap) — at least `stale_freeze_min_secs` — is frozen **reduce-only** (no new or flipped risk; halts still flatten through it); `stale_flatten_secs` (default 0 = never) closes it. A trade more than `jump_max` (0.15 log return) from the mark is held back as a possible bad tick (instrument frozen) until `jump_confirm` (3) trades confirm the level; a trade back near the mark discards it.
+- **Pre-trade checks** for orders outside the allocator's chain (manual UI orders, any foreign `order.intent.*`; `fa_risk::pretrade`): finite quantity, known mark, limit price within `limit_price_band` (10 %) of the mark, notional ≤ `max_order_frac` (10 %) × deployable, post-trade position ≤ position cap (provisional cap) and liquidity cap, post-trade class / venue / portfolio gross ≤ their caps, frozen feeds reduce-only. Reductions always pass. This answers §10 Q2 for paper: manual orders do **not** bypass limits (an emergency hedge must fit them).
+- **Risk events:** limit clips (target cut by more than `min_order_eur`), pre-trade rejections, feed freezes / held jumps / stale flattens and allocator fallbacks are published as `fa.v1.RiskEvent{LIMIT_BREACH}` on `risk.event.paper` (`scope` = event kind, `reason` = kind + JSON detail, numeric detail as `metrics`), at most once per minute per (kind, instrument), and appended to `audit.log` as `risk.event.<kind>`. Halts, resumes and rejections are mirrored as `HALT_RAISED|HALT_CLEARED|INTENT_REJECTED`.
+- **Limit calibration rules** (`fa_risk::calibrate`, §11): from hourly equity and instrument marks the engine suggests `max_daily_loss = 1.5 · z99 · σ_day` (0.5–5 %), `max_drawdown = 3 × daily loss` (3–25 %), `max_position_frac = 0.5 % / (z99 · σ_day,inst)` at the median instrument (1–20 %), with ≥ 24 hourly points. `ctl.risk.limits {calibrate: "{}"}` reports suggestion and the tighten-only set; `{calibrate: "{\"apply\": true}"}` applies only the stricter values (audited `limits.calibrated`). Loosening still needs `risk.toml` + restart.
+
 ### 6.6 Promotion gate (paper → live)
 A strategy is promotable when **all** hold:
 1. Minimum shadow calendar time in live paper (placeholder 30 days) **and** a minimum number of completed horizons (placeholder 20).
@@ -148,7 +157,9 @@ A strategy is promotable when **all** hold:
 5. No unresolved health halts in the shadow window.
 Promotion is executed manually from the UI (gate must be green); initial live sleeve is small (placeholder 1% of equity) and grows only via the allocator. Demotion is automatic on per-strategy drawdown breach or gate-statistics decay.
 
-**Implemented today (D-051):** lifecycle `active|paused|flattening|shadow` per strategy in `ledger.strategy_state`, controlled by `ctl.risk.strategy` (`pause|resume|flatten|promote|shadow`) and `POST /api/trading/strategies/{id}/{action}`. The gate blocks on min shadow days, min horizons, deflated Sharpe (read from `validation.generation_stats`; unknown blocks) and no health halts; PBO and shadow-vs-backtest consistency are advisory. Promotion is shadow → active, since no live sleeve exists (D-029). `new_strategy_status` defaults to `active` so the baseline keeps trading.
+**Implemented today (D-051):** lifecycle `active|paused|flattening|shadow` per strategy in `ledger.strategy_state`, controlled by `ctl.risk.strategy` (`pause|resume|flatten|promote|shadow`) and `POST /api/trading/strategies/{id}/{action}`. Promotion is shadow → active, since no live sleeve exists (D-029). `new_strategy_status` defaults to `active` so the baseline keeps trading.
+
+**Gate since the strategy pipeline:** every item is blocking and unknown blocks: min shadow days, min horizons, deflated Sharpe (the strategy's holdout trial, else the registry DSR of a generation it won), PBO of its generation < `promotion.max_pbo` (0.2), shadow-vs-backtest consistency (spec 41 §6.6, `promotion.consistency_z`), no health halts. For hand-written strategies (no search, no backtest) PBO and consistency are `n/a` and pass. Evolved strategies arrive as `candidate → holdout_passed → shadow` and are promoted automatically on a green gate (`[pipeline] auto_promote`), demoted on drawdown / gate decay / runtime auto-pause and retired after `max_demotions` (spec 35 §6.4.1). `ctl.risk.strategy` also accepts `retire` and `admit`; statuses `candidate|holdout_passed|retired` are persisted (migration `20261111000050`). `POST /api/trading/strategies/{id}/retire|admit` pass them through (control-api whitelist).
 
 ### 6.7 Modes
 - **Paper**: broker-gateway `Venue` implementation simulates fills against live quotes using the same cost/slippage model as backtest (41). Shares code paths with live except the final `Submit`.
@@ -170,6 +181,10 @@ Promotion is executed manually from the UI (gate must be green); initial live sl
 | `exec.no_trade_band` | 0.5% of target | churn control |
 | `exec.smart_limit_timeout` | 30 s (scaled by timescale) | |
 | `allocator.kelly_fraction` | 0.25 | |
+| `risk.max_order_frac` / `risk.limit_price_band` | 10 % / 10 % | pre-trade checks for manual / foreign orders |
+| `feed.stale_freeze_bars` / `feed.jump_max` / `feed.jump_confirm` | 3 / 0.15 / 3 | feed guard |
+| `promotion.max_pbo` / `promotion.consistency_z` | 0.2 / 2.0 | gate |
+| `tournament_cost_bps` | 5 | live allocator tournament |
 | `promotion.min_shadow_days` | 30 | calendar days |
 | `promotion.min_horizons` | 20 | |
 | `promotion.initial_live_sleeve` | 1% equity | |
@@ -187,16 +202,16 @@ Promotion is executed manually from the UI (gate must be green); initial live sl
 
 ## 9. Acceptance criteria
 - No order can reach a live venue without passing the full risk chain; tested by property tests injecting random targets.
-- Kill switch flattens all live positions and state survives a restart of every service.
+- Kill switch flattens all live positions and state survives a restart of every service. **Met for the risk-engine** (`ledger.risk_state`).
 - Loosening a limit at runtime via API is rejected; tightening succeeds and is audited.
 - Paper and live code paths differ only in the `Venue` implementation (verified by shared integration tests).
 - Every fill has attribution to originating strategies and a recorded slippage vs arrival price.
-- Promotion endpoint refuses a strategy whose gate is not green.
-- Allocator tournament reports comparable paper P&L for all allocators on identical signals.
+- Promotion endpoint refuses a strategy whose gate is not green. **Met.**
+- Allocator tournament reports comparable paper P&L for all allocators on identical signals. **Met** (live: `ctl.risk.allocators`; offline: `evo.eval.allocator`).
 
 ## 10. Open questions
 1. Exact payout quota mechanics: fixed EUR/day, % of equity, or % of realised profit? Rollover if not withdrawn? — blocks liquidity/payout limit implementation.
-2. Can manual orders bypass limits (e.g. emergency hedge)? — blocks override API semantics.
+2. Can manual orders bypass limits (e.g. emergency hedge)? — blocks override API semantics. *(Paper answer implemented: no, they pass the pre-trade checks; reductions always pass.)*
 3. Netting cost attribution rule (pro-rata vs causal) — affects strategy fitness.
 4. Daily-loss "day" definition for mixed 24/7 and session venues — blocks daily loss limit.
 5. Margin/borrow availability checks for shorts per venue — needs catalog capability data.

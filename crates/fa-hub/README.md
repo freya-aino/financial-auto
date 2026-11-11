@@ -25,7 +25,22 @@ integration tests, see below). Supersedes the D-012 assumption of CLI-compiled
 - `catalog` – the **whitelist** of read-only named queries behind `POST /api/graph/query`
   (`NAMED_QUERIES`, `HubClient::run_named(name, params)`); business-id parameters, no raw trees.
 - `HubClient::{new, with_timeout, from_env, url_from_env_or, health, ready, diagnostics, batch,
-  query, ensure_schema, ensure_latent_index, wait_for_index}`.
+  query, ensure_schema, ensure_latent_index, wait_for_index, clear_caches}`.
+- `vectors` – vector validation (`InvalidVector`: empty / zero-norm / non-finite), registered-dim
+  checks (`space_dim`, `check_space_dim`, `DimMismatch`), `add_latents_checked` (validate + ensure
+  index + write), `knn(space, v, k, &KnnFilter)` (kind / instrument / as-of / since / exclude /
+  max-distance, over-fetched server-side filter; a dim without an index answers empty),
+  `add_latents_batch` (prepared batch), text/media embeddings `add_news_docs`, `search_news_docs`,
+  `add_media_segments`, `search_media_segments`. Vector-index ensures are cached per client
+  (`ensure_latent_index_ready` makes no request once a dim is known active).
+- `meta` – `SCHEMA_VERSION`, `MIGRATIONS`, `SchemaMeta` marker: `schema_marker`, `migrate_schema`
+  (run by `ensure_schema_ready`; `SchemaTooNew` when Helix is ahead), `stamp_schema_version`.
+- `asof` – spec 20 §6.3 variants: `list_snapshots_as_of`, `space_regions_as_of`,
+  `snapshot_graph_as_of`, `space_latents_as_of`.
+- `retention` – `prune_space_observations`, `prune_snapshot_observations`, `prune_observations`
+  with a `RetentionPolicy` (old `observation` latents folded into `kind=aggregate` rows per region).
+- `buffer` – `WriteBuffer`: bounded drop-oldest queue of write batches with `flush` /
+  `send_or_queue` and `BufferStats{queued, sent, dropped, rejected}` (spec 20 §8).
 
 ## Usage
 ```rust
@@ -163,7 +178,7 @@ Also available but unused: `GET /healthz`, `GET /readyz` (503 while indexes catc
 
 ## Tests
 ```sh
-cargo test -p fa-hub                                   # unit tests (JSON shapes, parsing, catalog validation)
+cargo test -p fa-hub                                   # unit tests + tests/coverage.rs (every queries.hx QUERY has a function)
 FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test live   # against `just up`'s helix
 
 Concurrent writers: `HubClient::batch` retries `409 transaction_conflict` (an aborted, uncommitted transaction) up to six times with a short backoff, so parallel writers and the parallel live suite do not fail spuriously.

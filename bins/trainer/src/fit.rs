@@ -82,6 +82,17 @@ pub struct FitSpec {
     /// Adapter drift guard recorded in `manifest.params.adapter_guard` (default: spec 36 §7).
     #[serde(default)]
     pub adapter_guard: Option<AdapterGuard>,
+    /// Encoder family: `statistical` (default) or a neural family (`fsq_hybrid`, `jepa_vae`;
+    /// [`crate::neural_fit`]).
+    #[serde(default)]
+    pub family: Option<String>,
+    /// Neural genome overrides merged into the per-timescale defaults (`steps`, `backbone`,
+    /// `context_steps`, `d_model`, `layers`, `moe: {max_experts, expert_dim, top_k, ...}`, `lr`, ...).
+    #[serde(default)]
+    pub neural: Option<Value>,
+    /// Compute device of a neural fit (`cpu`, `cuda[:n]`); default `FA_ML_DEVICE`, else cpu.
+    #[serde(default)]
+    pub device: Option<String>,
 }
 
 fn default_hours() -> f64 {
@@ -117,6 +128,9 @@ impl FitSpec {
             probe_max: default_probes(),
             search: SearchSpec::default(),
             adapter_guard: None,
+            family: None,
+            neural: None,
+            device: None,
         }
     }
 
@@ -230,11 +244,17 @@ pub struct Bundle {
     pub stats: NormStats,
     pub regions: Vec<Vec<FittedRegion>>,
     pub region_map: RegionMap,
+    /// safetensors weights of a neural snapshot (then `stats` is empty).
+    pub neural_weights: Option<Vec<u8>>,
 }
 
 impl Bundle {
+    /// `weights.bin`: `FASTAT01` statistics, or the neural safetensors.
     pub fn weights(&self) -> Vec<u8> {
-        self.stats.to_bytes()
+        match &self.neural_weights {
+            Some(w) => w.clone(),
+            None => self.stats.to_bytes(),
+        }
     }
 }
 
@@ -507,7 +527,7 @@ impl Fit {
             seed: self.spec.seed,
         };
         self.phase = Phase::Done;
-        Ok(Bundle { manifest, stats, regions, region_map })
+        Ok(Bundle { manifest, stats, regions, region_map, neural_weights: None })
     }
 }
 
@@ -530,7 +550,7 @@ fn fnv(ends: &[i64]) -> String {
     format!("{h:016x}")
 }
 
-fn fnv_keys(keys: &[ProbeKey]) -> String {
+pub fn fnv_keys(keys: &[ProbeKey]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for (inst, t) in keys {
         for b in inst.as_bytes().iter().copied().chain(t.to_le_bytes()) {

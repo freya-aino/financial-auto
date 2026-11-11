@@ -146,7 +146,7 @@ Constraints: max depth, max nodes, evaluation-time budget per step (cost objecti
 - Strategies are evaluated by `fa-backtest` replaying point-in-time inputs (expert views, graph state, decoder outputs) of the **same snapshot** over the evaluation window, at the strategy's timescale.
 - **Execution simulation:** exposure intent → target position (strategy capital) → simulated fills with the spread + slippage model, fees, funding/borrow (cost model per venue/asset class from spec 41/42).
 - Deterministic given seed + snapshot + data window.
-- **Today:** no strategy evaluation job exists. `evo-worker` evaluates decoders only (spec 34 §4.4); strategies run live in `bins/strategy-runtime` from the baseline file and are not scored or evolved.
+- **Implemented (D-052, D-059):** `evo.eval.strategy` replays a genome through `fa_backtest::replay` with the recorded latent graph and decoder outputs and the shared cost model; every evaluation is a `validation.trial` row. Strategies run live in `bins/strategy-runtime`: the hand-written baselines plus the managed live set of evolved strategies that passed the locked holdout (§6.4).
 
 ### 6.2 Fitness (shared Pareto, proposal)
 | Objective | Definition | Direction |
@@ -176,6 +176,22 @@ Both representations share these objectives, so they compete directly. **PBO** i
 
 **Since D-063:** `text_score` / `visual_score` read model-runtime's text and visual decoders, forecasts are chosen by horizon (`h:<steps>` refs), analog outcomes outside the in-memory history are priced from VictoriaMetrics between steps, and the runtime enforces spec 35 §8: step-budget and NaN streaks auto-pause a strategy, starved primitives are flagged. The population can be loaded from Garage (`latest`) at start.
 
+#### 6.4.1 Closed loop (implemented)
+The lifecycle runs automatically in risk-engine (`fa_risk::pipeline` decides, `bins/risk-engine/src/pipeline.rs` does the I/O), every `[pipeline] interval_secs` (60) and on `ctl.risk.pipeline {action: run}`; status on `ctl.risk.pipeline {action: status}`. Paper only (D-029).
+
+| Step | Rule | State |
+|---|---|---|
+| Discovery | newest `generations_scanned` files `fa-artifacts/strategies/<generation>.toml` (the orchestrator's final fronts); each member gets its highest-rung selection trial (`validation.trial`) and the generation's PBO (`validation.generation_stats`, latest loop) | — |
+| Selection | generation PBO known and ≤ `pbo_max`, member deflated Sharpe ≥ `dsr_min_candidate`, best `max_candidates_per_generation` | `candidate` |
+| Holdout | exactly one `evo.eval.strategy.holdout` job on the newest locked holdout of its timescale **that its selection windows never touched** (spec 41 §6.4); a job that writes no trial row is retried up to `holdout_max_attempts`, then the candidate is retired | `candidate` |
+| Verdict | holdout trial: deflated Sharpe ≥ `holdout_min_dsr`, Sharpe > 0, ≥ `holdout_min_obs` observations; failure retires | `holdout_passed` / `retired` |
+| Admission | while fewer than `max_live_evolved` evolved strategies are live: the managed live set `fa-artifacts/live/strategies.toml` is rewritten and strategy-runtime reloaded (`ctl.strategy.reload {artifact_key: managed}`); its default population is baselines + that file | `shadow` |
+| Promotion | spec 40 §6.6 gate green (every item blocking, incl. PBO and shadow-vs-backtest) and `auto_promote` | `active` |
+| Demotion | active: drawdown pause, gate decay (its own live book inconsistent with the backtest), or a strategy-runtime auto-pause (NaN / step budget) → `shadow`; after `max_demotions` → retired | `shadow` / `retired` |
+| Retirement | shadow drawdown breach, definitive gate failure after the minimum shadow time, `max_shadow_days` exceeded, runtime auto-pause, operator `retire` | `retired` (terminal, removed from the live set) |
+
+Every transition is persisted in `ledger.strategy_state` (`status` incl. `candidate|holdout_passed|retired`, `pipeline` JSONB with genome, generation, selection / holdout evidence, attempts, demotions, `last_reason`; migration `20261111000050`) and audited (`strategy.candidate|holdout_passed|admitted|promote|demoted|retired`, `strategy.live_set`, `validation.holdout.evaluate`, actor `system:pipeline`). `GET /api/trading/strategies` shows `evolved` and `pipeline` per row. Hand-written baselines are never touched by the pipeline.
+
 ### 6.5 Snapshot dependency
 Strategies are tied to the encoder snapshot they were evolved on. On a snapshot change:
 - GP programs with region literals are remapped via region lineage (spec 30);
@@ -190,8 +206,12 @@ Live strategies keep running on their snapshot until the replacement passes shad
 | `gp_max_nodes` | 64 | |
 | `step_eval_budget` | 1 ms | per strategy per step |
 | `min_share_per_repr` | 0.3 | Population share floor for GP / neural |
-| `pbo_max` | 0.2 | |
-| `dsr_min_candidate` | 0.95 (prob. Sharpe > 0) | for holdout eligibility |
+| `pbo_max` | 0.2 | `risk.toml [pipeline]` |
+| `dsr_min_candidate` | 0.95 (prob. Sharpe > 0) | for holdout eligibility, `risk.toml [pipeline]` |
+| `max_candidates_per_generation` | 3 | |
+| `holdout_min_dsr` / `holdout_min_obs` | 0.95 / 100 | single holdout trial verdict |
+| `max_live_evolved` | 8 | evolved strategies live at once |
+| `max_shadow_days` / `max_demotions` | 90 / 2 | retirement |
 | `cost_stress_mult` | 2.0 | |
 | `exposure_clip` | [-1, 1] | per asset, of strategy capital |
 
@@ -209,8 +229,8 @@ Live strategies keep running on their snapshot until the replacement passes shad
 2. Neural policies and GP programs both implement `Strategy` and emit `ExposureIntent` with mean and std.
 3. Backtest of a strategy is deterministic and reproduces identical P&L given snapshot, window and seed.
 4. Fitness computation includes costs, and the deflated Sharpe implementation matches reference values on known test vectors.
-5. PBO computation runs per generation and blocks promotion when above `pbo_max`.
-6. The lifecycle states and transitions are persisted in Helix and visible in the evolution lab and trading desk UI.
+5. PBO computation runs per generation and blocks promotion when above `pbo_max`. **Met:** a generation with PBO > `pbo_max` (or unknown) yields no candidate, and PBO is a blocking gate item.
+6. The lifecycle states and transitions are persisted in Helix and visible in the evolution lab and trading desk UI. **Partly met:** persisted and audited in Postgres (`ledger.strategy_state`, `audit.log`) and served by `GET /api/trading/strategies`; Helix `Genome` nodes carry no status yet (fa-hub schema change pending) and the UI does not render the pipeline fields.
 
 ## 10. Open questions
 1. GP program semantics: should programs be stateful (memory registers across steps) or purely functional on the current observation?

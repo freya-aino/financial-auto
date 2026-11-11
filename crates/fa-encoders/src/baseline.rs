@@ -54,7 +54,7 @@ impl MarketBar {
         ]
     }
 
-    fn from_row(row: &[f32]) -> Result<Self, EncoderError> {
+    pub fn from_row(row: &[f32]) -> Result<Self, EncoderError> {
         if row.len() != MARKET_ROW_LEN {
             return Err(EncoderError::Shape(format!(
                 "market row has {} features, expected {MARKET_ROW_LEN}",

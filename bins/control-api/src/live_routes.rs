@@ -260,13 +260,15 @@ pub async fn halt(State(s): State<AppState>, body: Option<Json<HaltBody>>) -> Re
     Json(json!({ "ok": true, "halted": "portfolio" })).into_response()
 }
 
-/// Re-arms trading after a manual halt (`risk.resume.portfolio`, D-030).
+/// Re-arms trading after a manual halt (`risk.resume.portfolio`, D-030; payload `fa.v1.Resume`,
+/// wire-compatible with the `Halt` older consumers decode).
 pub async fn resume(State(s): State<AppState>) -> Response {
-    let h = Halt {
+    let h = fa_proto::v1::Resume {
         scope: "portfolio".into(),
         reason: "manual resume (operator UI)".into(),
-        since: Some(now()),
+        at: Some(now()),
         manual: true,
+        actor: "ui".into(),
     };
     if let Err(e) = publish(&s, subjects::risk_resume("portfolio"), &h).await {
         return e.into_response();

@@ -136,6 +136,8 @@ marketaux, newsapi (dev-only free tier), gdelt, hackernews (**first wave**), goo
 **Broadcast media**
 youtube (Data API + capture; ToS), earnings_webcasts (IR sites; discovery via earnings calendars), central_bank_pressers (Fed/ECB/BoE…).
 
+**Implemented today (2026-11-11):** `frankfurter`, `ecb`, `gdelt`, `sec_edgar` and `kraken` (public market data only) are `live` keyless connectors with a `rate_limit` and `config:` block in `config/sources.yaml` (frankfurter `extra.{base,currencies}`, ecb `queries` = SDMX `<FLOW>/<KEY>`, gdelt `queries`, sec_edgar `extra.{ciks,user_agent}`, kraken `symbols`). Verified facts: Frankfurter moved to `api.frankfurter.dev/v1` (`.app` answers 301); the ECB portal's firewall answers HTML blocks to bursts and to some user agents (limit 1 request / 10 s); GDELT enforces one request per 5 s per IP with multi-minute 429 penalties (limit 1 / 10 s); EDGAR's `data.sec.gov` needs a declared User-Agent (`financial-auto ingestor` accepted, the generic ingestor UA refused with 403; `www.sec.gov` feeds refuse it); Kraken public REST needs no key and returns at most 720 OHLC intervals. CoinGecko was not added (catalog entry still `api_key`).
+
 ### 6.3 Generic adapters **(proposal)**
 - `ccxt` adapter covers long-tail crypto venues before dedicated connectors.
 - SDMX adapter shared by ECB, Eurostat, IMF, OECD.

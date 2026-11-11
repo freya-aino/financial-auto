@@ -17,6 +17,7 @@ mod data;
 mod feedback;
 mod fit;
 mod gpu;
+mod neural_fit;
 mod plan;
 mod run;
 mod search;
@@ -88,11 +89,33 @@ struct FitArgs {
     carry_threshold: f64,
     #[arg(long, default_value_t = 512)]
     probe_max: usize,
+    /// Encoder family: `statistical` (default), `fsq_hybrid` or `jepa_vae` (neural, candle).
+    #[arg(long, default_value = "statistical")]
+    family: String,
+    /// Neural genome overrides as JSON, e.g. `{"steps":300,"backbone":"gru","moe":{"max_experts":6}}`.
+    #[arg(long)]
+    neural: Option<String>,
+    /// SGD steps of a neural fit (shorthand for `--neural '{"steps":N}'`).
+    #[arg(long)]
+    steps: Option<usize>,
+    /// Compute device of a neural fit (`cpu`, `cuda[:n]`; CUDA needs the `cuda` feature).
+    #[arg(long, env = "FA_ML_DEVICE")]
+    device: Option<String>,
 }
 
 impl FitArgs {
-    fn spec(&self) -> FitSpec {
-        FitSpec {
+    fn spec(&self) -> anyhow::Result<FitSpec> {
+        let mut neural: Option<serde_json::Value> = match &self.neural {
+            Some(s) => Some(serde_json::from_str(s).map_err(|e| anyhow::anyhow!("--neural: {e}"))?),
+            None => None,
+        };
+        if let Some(n) = self.steps {
+            neural.get_or_insert_with(|| serde_json::json!({}))["steps"] = serde_json::json!(n);
+        }
+        Ok(FitSpec {
+            family: Some(self.family.clone()),
+            neural,
+            device: self.device.clone(),
             window_hours: self.window_hours,
             instrument: self.instrument.clone(),
             instruments: self.instruments.as_deref().map(data::Instruments::parse_cli),
@@ -106,7 +129,7 @@ impl FitArgs {
             carry_threshold: self.carry_threshold,
             probe_max: self.probe_max,
             ..FitSpec::new(self.timescale)
-        }
+        })
     }
 }
 
@@ -229,8 +252,8 @@ async fn main() -> anyhow::Result<()> {
     let svc = Services { stores: &stores, tsdb: &tsdb, pg_url: Some(cfg.postgres.url.as_str()) };
 
     let outcome = match args.cmd {
-        Cmd::Pretrain(f) => run::run_fit(Kind::Pretrain, f.spec(), &svc, &Control::local("")).await,
-        Cmd::Generation(f) => run::run_fit(Kind::Generation, f.spec(), &svc, &Control::local("")).await,
+        Cmd::Pretrain(f) => run::run_fit(Kind::Pretrain, f.spec()?, &svc, &Control::local("")).await,
+        Cmd::Generation(f) => run::run_fit(Kind::Generation, f.spec()?, &svc, &Control::local("")).await,
         Cmd::Adapter { snapshot, timescale, window_hours, instrument, max_drift } => {
             let spec = AdapterSpec {
                 snapshot_id: snapshot,

@@ -21,6 +21,22 @@ import (
 
 var processStart = time.Now()
 
+// Heartbeat publication stats, the Go side of fa_metrics::heartbeat::record: rendered as
+// fa_heartbeat_published_total{service} / fa_heartbeat_last_unix_seconds{service} so the
+// HeartbeatStale alert covers Go services too (D-056 parity).
+var hbStats struct {
+	sync.Mutex
+	published uint64
+	last      time.Time
+}
+
+func heartbeatPublished(at time.Time) {
+	hbStats.Lock()
+	hbStats.published++
+	hbStats.last = at
+	hbStats.Unlock()
+}
+
 // MetricsBindDefault returns FA_METRICS_BIND when set, else the host default port of the service
 // (same table as fa_metrics::default_bind in Rust). "off" disables the endpoint.
 func MetricsBindDefault(service string) string {
@@ -93,6 +109,13 @@ func RenderMetrics(service, version string, counters *Counters) string {
 		for _, k := range keys {
 			fmt.Fprintf(&b, "fa_heartbeat_counter{service=%q,key=%q} %s\n", service, k, ff(snap[k]))
 		}
+	}
+	hbStats.Lock()
+	published, last := hbStats.published, hbStats.last
+	hbStats.Unlock()
+	if published > 0 {
+		fmt.Fprintf(&b, "# HELP fa_heartbeat_published_total Heartbeats published by this process\n# TYPE fa_heartbeat_published_total counter\nfa_heartbeat_published_total{service=%q} %d\n", service, published)
+		fmt.Fprintf(&b, "# HELP fa_heartbeat_last_unix_seconds Unix time of the last heartbeat published\n# TYPE fa_heartbeat_last_unix_seconds gauge\nfa_heartbeat_last_unix_seconds{service=%q} %s\n", service, ff(float64(last.UnixNano())/1e9))
 	}
 	renderConsumerLag(&b)
 	return b.String()

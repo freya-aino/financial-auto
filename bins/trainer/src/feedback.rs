@@ -110,3 +110,185 @@ pub async fn parent_skill(pg_url: Option<&str>, snapshot_id: Option<&str>) -> cr
         Err(e) => none(&format!("validation tables unreadable: {e}")),
     }
 }
+
+// ── D-009 decoder feedback for neural fits ──────────────────────────────────
+
+use candle_core::Tensor;
+use fa_encoders::neural::{
+    Dataset, DecoderFeedback, FeedbackBatch, N_FEATURES, N_TARGETS, NeuralEncoder, NeuralModel, data::targets_at,
+};
+
+/// Frozen "elite decoder" stand-in for the D-009 hook: one ridge-regression readout per expert of
+/// the **parent** snapshot, fitted on the parent's own latents of training windows to predict the
+/// next-step targets, then frozen. During generation training the child's expert latent at the
+/// same position must stay decodable by the parent's readout (`aux = mean_k MSE(W_k·[z_k;1], y)`),
+/// which is the D-009 form (backprop through frozen decoders into the encoder) with the simplest
+/// decoder. Neural elite decoders from `fa-decoders` implement the same
+/// [`fa_encoders::neural::DecoderFeedback`] trait and are pushed onto `NeuralTrainer::feedback`.
+pub struct FrozenProbeFeedback {
+    /// `[dim + 1, T]` per parent expert position.
+    probes: Vec<Tensor>,
+    r2: Vec<f64>,
+    n_fit: usize,
+    parent: String,
+}
+
+impl FrozenProbeFeedback {
+    /// Fits the probes on up to `max_windows` training windows (evenly spread). Targets are
+    /// normalised with the **child's** statistics so the loss is on the child's scale.
+    pub fn fit(parent: &NeuralEncoder, child: &NeuralModel, ds: &Dataset, max_windows: usize) -> anyhow::Result<Self> {
+        let idx: Vec<(usize, usize)> =
+            crate::fit::evenly(ds.train.len(), max_windows).into_iter().map(|i| ds.train[i]).collect();
+        if idx.len() < 8 {
+            anyhow::bail!("too few windows ({}) to fit probe decoders", idx.len());
+        }
+        let k = parent.model().moe.n_active();
+        let mut xs: Vec<Vec<Vec<f64>>> = vec![Vec::with_capacity(idx.len()); k];
+        let mut ys: Vec<Vec<f64>> = Vec::with_capacity(idx.len());
+        for (s, ends) in group(&idx) {
+            let enc = parent.encode_windows(&ds.series[s].bars, &ends)?;
+            for (e, end) in enc.into_iter().zip(&ends) {
+                for (pos, mu) in e.mu.into_iter().enumerate() {
+                    xs[pos].push(mu.into_iter().map(f64::from).chain([1.0]).collect());
+                }
+                let t = targets_at(&ds.series[s].feats, *end).unwrap_or([0.0; N_TARGETS]);
+                ys.push(t.iter().enumerate().map(|(j, v)| f64::from(child.norm.target(j, *v))).collect());
+            }
+        }
+        let mut probes = Vec::with_capacity(k);
+        let mut r2 = Vec::with_capacity(k);
+        for x in &xs {
+            let w = ridge(x, &ys, 1e-2);
+            let (mut sse, mut sst) = (0.0, 0.0);
+            for (xi, yi) in x.iter().zip(&ys) {
+                for (t, yt) in yi.iter().enumerate() {
+                    let p: f64 = xi.iter().zip(&w).map(|(a, row)| a * row[t]).sum();
+                    sse += (yt - p).powi(2);
+                    sst += yt * yt;
+                }
+            }
+            r2.push(if sst > 0.0 { 1.0 - sse / sst } else { 0.0 });
+            let d = w.len();
+            let flat: Vec<f32> = w.iter().flatten().map(|v| *v as f32).collect();
+            probes.push(Tensor::from_vec(flat, (d, N_TARGETS), child.device())?);
+        }
+        let _ = N_FEATURES;
+        Ok(Self { probes, r2, n_fit: idx.len(), parent: parent.snapshot_id_str().to_owned() })
+    }
+}
+
+trait SnapshotIdStr {
+    fn snapshot_id_str(&self) -> &str;
+}
+
+impl SnapshotIdStr for NeuralEncoder {
+    fn snapshot_id_str(&self) -> &str {
+        fa_encoders::EncoderFamily::snapshot_id(self)
+    }
+}
+
+/// Windows grouped by series (in order).
+fn group(idx: &[(usize, usize)]) -> Vec<(usize, Vec<usize>)> {
+    let mut out: Vec<(usize, Vec<usize>)> = Vec::new();
+    for &(s, e) in idx {
+        match out.last_mut() {
+            Some((ls, v)) if *ls == s => v.push(e),
+            _ => out.push((s, vec![e])),
+        }
+    }
+    out
+}
+
+/// Ridge regression `W = (XᵀX + λI)⁻¹ XᵀY` by Gauss–Jordan elimination (`X: [n][d]`, `Y: [n][t]`).
+pub fn ridge(x: &[Vec<f64>], y: &[Vec<f64>], lambda: f64) -> Vec<Vec<f64>> {
+    let d = x.first().map_or(0, Vec::len);
+    let t = y.first().map_or(0, Vec::len);
+    let mut a = vec![vec![0.0; d + t]; d];
+    for (xi, yi) in x.iter().zip(y) {
+        for i in 0..d {
+            for j in 0..d {
+                a[i][j] += xi[i] * xi[j];
+            }
+            for j in 0..t {
+                a[i][d + j] += xi[i] * yi[j];
+            }
+        }
+    }
+    for (i, row) in a.iter_mut().enumerate() {
+        row[i] += lambda;
+    }
+    for c in 0..d {
+        let piv = (c..d).max_by(|p, q| a[*p][c].abs().total_cmp(&a[*q][c].abs())).unwrap_or(c);
+        a.swap(c, piv);
+        let pv = a[c][c];
+        if pv.abs() < 1e-12 {
+            continue;
+        }
+        for v in a[c].iter_mut() {
+            *v /= pv;
+        }
+        let pivot_row = a[c].clone();
+        for (r, row) in a.iter_mut().enumerate() {
+            if r != c {
+                let f = row[c];
+                if f != 0.0 {
+                    for (v, p) in row.iter_mut().zip(&pivot_row) {
+                        *v -= f * p;
+                    }
+                }
+            }
+        }
+    }
+    a.into_iter().map(|row| row[d..].to_vec()).collect()
+}
+
+impl DecoderFeedback for FrozenProbeFeedback {
+    fn name(&self) -> &str {
+        "frozen_linear_probe"
+    }
+
+    fn aux_loss(&self, b: &FeedbackBatch<'_>) -> candle_core::Result<Option<Tensor>> {
+        let k = b.mu.dim(1)?.min(self.probes.len());
+        if k == 0 {
+            return Ok(None);
+        }
+        let bsz = b.mu.dim(0)?;
+        let ones = Tensor::ones((bsz, 1), b.mu.dtype(), b.mu.device())?;
+        let mut acc: Option<Tensor> = None;
+        for (pos, w) in self.probes.iter().enumerate().take(k) {
+            let z = Tensor::cat(&[&b.mu.narrow(1, pos, 1)?.squeeze(1)?, &ones], 1)?;
+            let l = fa_expert_space::nn::mse(&z.matmul(w)?, b.targets)?;
+            acc = Some(match acc {
+                Some(a) => (a + l)?,
+                None => l,
+            });
+        }
+        acc.map(|a| a.affine(1.0 / k as f64, 0.0)).transpose()
+    }
+
+    fn summary(&self) -> Value {
+        json!({
+            "name": self.name(),
+            "kind": "D-009 frozen elite decoders (stand-in: ridge readouts of the parent's experts)",
+            "parent": self.parent,
+            "experts": self.probes.len(),
+            "fit_windows": self.n_fit,
+            "probe_r2": self.r2,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ridge_recovers_a_linear_map() {
+        let x: Vec<Vec<f64>> = (0..50).map(|i| vec![i as f64 / 10.0, ((i * 7) % 11) as f64, 1.0]).collect();
+        let y: Vec<Vec<f64>> = x.iter().map(|r| vec![2.0 * r[0] - r[1] + 0.5, r[1]]).collect();
+        let w = ridge(&x, &y, 1e-9);
+        assert!((w[0][0] - 2.0).abs() < 1e-5 && (w[1][0] + 1.0).abs() < 1e-5 && (w[2][0] - 0.5).abs() < 1e-4, "{w:?}");
+        assert!((w[1][1] - 1.0).abs() < 1e-6);
+        assert_eq!(group(&[(0, 1), (0, 2), (1, 5), (0, 3)]), vec![(0, vec![1, 2]), (1, vec![5]), (0, vec![3])]);
+    }
+}

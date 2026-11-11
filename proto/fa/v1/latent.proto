@@ -57,3 +57,141 @@ message TransitionProb {
   double lower = 3; // credible interval
   double upper = 4;
 }
+
+// ── Region membership, lifecycle and graph-level inference (specs 30, 33) ──
+
+message RegionWeight {
+  string region_id = 1;
+  float weight = 2;
+}
+
+// Soft membership of one expert's latent (spec 30 §4.1 Membership): k nearest regions with
+// weights summing to 1, plus novelty (distance to the nearest centroid in radii).
+message ExpertMembership {
+  uint32 expert_index = 1;
+  repeated RegionWeight weights = 2;
+  float novelty = 3;
+  bool out_of_region = 4; // novelty >= novelty_threshold
+}
+
+// latent.membership.<timescale>.<instrument> (spec 30 §4.2; one message for all experts).
+message RegionMembership {
+  string snapshot_id = 1;
+  string timescale = 2;
+  string instrument_id = 3;
+  google.protobuf.Timestamp as_of = 4;
+  repeated ExpertMembership experts = 5;
+}
+
+message RegionAncestor {
+  string region_id = 1;
+  string lineage_id = 2;
+  double overlap = 3; // Jaccard overlap of probe sets (snapshot alignment) or mass share (online split)
+  string kind = 4;    // carry | split | merge | partial
+}
+
+// latent.lifecycle.<timescale> (spec 30 §4.2 RegionLifecycleEvent): every birth, carry, split,
+// merge and death with event time, lineage edges and the region's statistics.
+message RegionLifecycleEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_BORN = 1;    // new lineage (online birth or unmatched region of a snapshot)
+    KIND_CARRIED = 2; // snapshot region inheriting a parent's lineage
+    KIND_SPLIT = 3;   // region split off a parent (ancestors carry kind = split)
+    KIND_MERGED = 4;  // survivor of a merge (ancestors: the absorbed regions)
+    KIND_DIED = 5;    // retired: merged away, too little support, or no descendant in a new snapshot
+  }
+  Kind kind = 1;
+  ExpertSpaceRef space = 2;
+  string region_id = 3;
+  string lineage_id = 4;
+  google.protobuf.Timestamp as_of = 5;
+  repeated RegionAncestor ancestors = 6;
+  string reason = 7; // died: merged | support | unmatched; born: online | snapshot
+  repeated float centroid = 8;
+  double mass = 9;
+  double occupancy = 10;
+  string related_region_id = 11; // died by merge: the survivor
+  bool regime_break = 12;        // snapshot alignment carried < 50 % of the probe mass
+}
+
+message RegionDist {
+  string region_id = 1;
+  double mean = 2;
+  double lower = 3;
+  double upper = 4;
+  double sd = 5;
+}
+
+message SamplerScore {
+  string sampler_id = 1;
+  double log_score = 2;
+  double brier = 3;
+  double ece = 4;
+  double pit_ks = 5;
+  double cost_us = 6;
+  uint64 evals = 7;
+  bool pareto = 8;
+  bool serving = 9;
+}
+
+// latent.mcmc.<timescale>.<expert> (spec 33 §4.3 KernelUpdate): graph-level posterior summary of
+// one expert space: stationary distribution with intervals, relaxation time, sampler standings
+// (calibration suite) and occupancy drift.
+message KernelUpdate {
+  ExpertSpaceRef space = 1;
+  google.protobuf.Timestamp as_of = 2;
+  string serving_sampler_id = 3;
+  repeated SamplerScore samplers = 4;
+  repeated RegionDist stationary = 5;
+  double relaxation_steps = 6;
+  double relaxation_lower = 7;
+  double relaxation_upper = 8;
+  uint64 n_rows = 9;
+  double observation_mass = 10;
+  uint32 live_regions = 11;
+  double drift_kl = 12;
+  bool refit_due = 13;
+  uint32 draws = 14;
+}
+
+message HierEdge {
+  string fine_region_id = 1;
+  string coarse_region_id = 2;
+  double p_coarse_given_fine = 3;
+  double p_fine_given_coarse = 4;
+  double support = 5;
+  double pmi_bits = 6;
+}
+
+// latent.hier.<fine_timescale>.<coarse_timescale> (spec 30 §6.5 REFINES edges) per expert index.
+message RegionHierarchy {
+  ExpertSpaceRef fine = 1;
+  ExpertSpaceRef coarse = 2;
+  google.protobuf.Timestamp as_of = 3;
+  double mutual_information_bits = 4;
+  double n = 5;
+  repeated HierEdge edges = 6;
+}
+
+message CrossAssetPair {
+  string source_instrument_id = 1;
+  string target_instrument_id = 2;
+  uint32 n = 3;
+  double correlation = 4; // Ledoit–Wolf shrunk
+  double shrinkage = 5;
+  uint32 lead_lag = 6;    // bars by which source leads target
+  double lead_corr = 7;
+  double predictive_gain = 8; // Δ CRPS (return units)
+  double uncertainty = 9;
+  double score = 10;          // gain / uncertainty
+}
+
+// latent.crossprior.<timescale> (spec 33 §6.5): ranked cross-asset pair proposals.
+message CrossAssetPriors {
+  string timescale = 1;
+  google.protobuf.Timestamp as_of = 2;
+  repeated CrossAssetPair proposals = 3;
+  uint32 instruments = 4;
+  uint32 pairs_evaluated = 5;
+}

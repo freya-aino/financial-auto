@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | draft |
-| **Maturity** | Medium |
+| **Maturity** | Medium-high |
 | **Owners (code)** | `crates/fa-decoders`, `crates/fa-evolution`, `bins/evo-worker`, `go/services/evo-orchestrator` |
 | **Depends on** | 32 Expert spaces, 33 MCMC graph, 30 Latent regions, 36 Training lifecycle, 41 Backtest & validation, 60 Ops |
 
@@ -101,6 +101,38 @@ Families: `forecast` (aliases `quantile`, `rnn_prior`; outputs on `decoder.outpu
 
 Result payload (`JobResult.result` JSON, protocol `evo.eval.decoder/v0`): `score` (= `crps_skill`, the orchestrator's provisional scalar, D-025), `objectives` and `directions` (keys in §6.3), `genome`, `data` (source + instruments), `budget {budget_ms, elapsed_ms, truncated}`, `stop`, `report_ref {planned, persisted}`.
 
+### 4.5 Neural genome families (implemented, `fa_decoders::neural`, candle)
+The same string genome carries six trainable families (aliases in parentheses); bare ids still derive baseline genomes only.
+
+| Genome family | Output family | Network input | Target / loss |
+|---|---|---|---|
+| `nn_forecast` (`nn_quantile`, `nn_rnn`) | `rnn_prior` | return window (+ latent) — MLP, or with `gru=1` a GRU over the window whose initial state is `tanh(W·[latent, flag])` | `z = r_{t→t+h}/(σ_t√h)`; monotone quantiles (cumulative softplus), pinball loss |
+| `nn_retrieval` (`nn_metric`) | `retrieval` | return window + latent → L2-normalised embedding (`emb`) | soft-kNN CRPS: `w = softmax(cos/temp − Δt/τ)` over candidates whose outcome ended ≥ `gap` before the query; serving takes the top `k` of the last `pool` windows |
+| `nn_chart` | `visual.chart` | latent only (the return window when trained without latents) | raster of the lookback window (`res`×`res`, `fa_decoders::render`), per-column cross-entropy |
+| `nn_future` | `visual.future` | return window + latent | raster of the next `h` steps (rows ±`band·σ√h`), per-column CE; the last column is a predictive distribution → quantiles / `P(up)` |
+| `nn_news` | `text.news` | return window + latent | hashed news embedding (`tdim`, stop-worded, `1 + ln tf`) of `(t − tw, t]`, `1 − cos` |
+| `nn_narrative` | `text.narrative` | return window + current news embedding + latent | news embedding of `(t, t + tw]`, `1 − cos` |
+
+Latents are the instrument's `latent.state` as of the step (concatenated expert means, standardised with the training mean / std — std floored at 1e-3, values clipped to ±8 in training, serving and feedback alike — plus a presence flag; `lat=0` trains unconditioned). A latent-conditioned `nn_chart` without enough latents before the cutoff falls back to the unconditioned decoder (return window → chart). Neural genes (all numeric, mutated by `evo.vary.decoder`, clamped by `with_params`): `width` 4–256, `depth` 1–4, `gru` 0/1, `steps` 1–20000, `lr`, `wd`, `bs`, `train` (share of the window by time used for training, 0.2–0.9), `emb`, `temp`, `pool`, `res` 4–32, `band`, `tdim` 16–1024, `tw` (minutes), `seed` (not mutated). Example: `nn_forecast:h=5;lb=32;width=32;depth=2;gru=1;steps=300;lr=0.003`. The canonical kv form prints the neural genes only for neural families, so baseline genome strings are unchanged.
+
+**Training (point-in-time).** `neural::train` uses only rows whose target is known by the **train cutoff** (`outcome_end ≤ cutoff`), AdamW minibatch SGD, deterministic seeded initialisation, early stopping on the last 10 % of the training rows (best validation weights kept). The decoder then forecasts only at steps after the cutoff, so every objective is out of sample. Optional warm start copies parent variables with matching name and shape (§6.2.3).
+
+**Bundles.** One safetensors file per trained decoder: the network variables (`net.*`) plus a `__meta__` u8 tensor with the `BundleMeta` JSON (`format = fa-decoder-bundle/v1`, canonical genome, families, input layout, latent normaliser, training-mean target, cutoff, train report, objectives, score). Garage: `fa-models/decoders/<generation>/<family>-<genome hash>-<job_id>.safetensors` and a JSON **card** `….card.json` (`EliteCard {meta, bucket, key, created_ms}`) next to it; cards are what elites are selected from (listing, no index object, so concurrent workers never race).
+
+### 4.6 Decoder → encoder feedback API (implemented, D-009, `fa_decoders::neural::feedback`)
+For the encoder trainer (spec 36); all types are re-exported candle types (`fa_decoders::neural::{Tensor, Device, DType}`).
+
+| Item | Purpose |
+|---|---|
+| `feedback::{BUCKET, PREFIX, CARD_SUFFIX}` | `fa-models`, `decoders/`, `.card.json`: list the cards with `fa_blob::BlobStore::list(BUCKET, PREFIX)` and parse each as `EliteCard` |
+| `select_top_k(&cards, k, Some(latent_dim)) -> Vec<EliteCard>` | top `k` per output family: Pareto rank over the §6.3 objectives, then family score, newest first; only decoders with `score > 0` (better than naive) and, with `Some(d)`, latent-conditioned with exactly that latent dimension |
+| `quota_weights(&elites) -> Vec<(EliteCard, w)>` | §6.6 weights: equal family quota, `1/(1+rank)` inside a family, Σ w = 1 |
+| `FeedbackSet::load(&[(bundle bytes, w)], latent_dim, &device)` | frozen elites (weights are constants, not `Var`s); bundles of another latent dimension or unconditioned ones are skipped (`skipped`), weights renormalised |
+| `set.prepare(&[(&Series, step)], &TextTimeline) -> FeedbackBatch` | per elite: context (return window / news embedding) and target (z, raster, embedding) of each step; steps without context or target are left out for that elite only |
+| `set.aux_loss(&latents [n, latent_dim], &batch) -> FeedbackLoss {total, parts}` | `L_gen = Σ_d w_d · L_d(decoder_d([context, (latent − μ)/σ, 1]), target_d)` with the family loss of training (pinball, in-batch soft-kNN with the leakage gap, raster CE, 1 − cos); `total` is a scalar differentiable w.r.t. `latents` only; `parts` = `(decoder id, family, loss, weight)` |
+
+`n` rows of `latents` correspond to the `n` prepared steps; the encoder trainer adds `λ_gen · total` to its loss (spec 32 `L_gen`). A conformance test checks that the gradient reaches the latents and that no elite weight is a variable.
+
 ## 5. Data model
 | Entity | Store | Fields |
 |---|---|---|
@@ -138,7 +170,9 @@ Result payload (`JobResult.result` JSON, protocol `evo.eval.decoder/v0`): `score
 - Output: predictive distribution per step (mixture density or quantiles).
 - Scores: **CRPS / NLL** over the trajectory; **tradeable value** = return of a fixed naive policy trading the forecast's sign/quantiles, net of costs (spec 35 cost model).
 
-**Implemented today (D-044, D-062):** CPU baselines exist for `rnn_prior` (quantile forecaster) and `retrieval` (analog retriever) as evolvable genomes in evo-worker, and for `text.news` / `text.summary` (lexicon sentiment and vocabulary novelty over `news.item.>`) and `visual.chart` / `visual.future` (breakout, trend t-statistic and range compression over bars) as fixed decoders in model-runtime. All publish `DecoderOutput` with `quantiles[0]` as the score and `inst:` / `topic:` / `kind:` / `src:` / `h:` refs. `text.narrative`, `visual.frame` and every neural decoder remain open.
+**Implemented today (D-044, D-062):** CPU baselines exist for `rnn_prior` (quantile forecaster) and `retrieval` (analog retriever) as evolvable genomes in evo-worker, and for `text.news` / `text.summary` (lexicon sentiment and vocabulary novelty over `news.item.>`) and `visual.chart` / `visual.future` (breakout, trend t-statistic and range compression over bars) as fixed decoders in model-runtime. All publish `DecoderOutput` with `quantiles[0]` as the score and `inst:` / `topic:` / `kind:` / `src:` / `h:` refs.
+
+**Neural families (implemented, §4.5):** trainable candle decoders for `rnn_prior` (MLP / GRU quantile prior), `retrieval` (learned metric), `visual.chart`, `visual.future`, `text.news` and `text.narrative`, evolved through `evo.eval.decoder` like the baselines and served by model-runtime (§6.7). Differences to the text above: visual decoders stay in **embedding/raster space at low resolution** (open question 3 answered "raster, no pixels"); the chart "perceptual loss on the frozen vision encoder" is replaced by the column CE on the raster (no frozen vision encoder exists); text decoders reconstruct **hashed bag-of-words embeddings**, not tokens; retrieval searches the series' own history in memory, not Helix vectors; the RNN prior forecasts the cumulative horizon return of the **same** instrument (no cross-asset source → target pair yet). `visual.frame` (needs broadcast frames, an external source) and `text.summary` (open question 2) have no neural family.
 
 ### 6.2 Evolution loop (per generation, per timescale)
 1. **Seed:** elites of the previous generation + MCMC-proposed RNN pairs (spec 33 §6.5) + random immigrants (`immigrant_frac`).
@@ -169,13 +203,19 @@ Families without a meaningful value for an objective get a neutral value. Fronts
 ### 6.5 Orchestration (Go ↔ Rust)
 - `evo-orchestrator` (Go) owns the generation state machine, variation operators (or delegates them to Rust via a job), rung scheduling, budget accounting and the NSGA selection call. `fa-evolution` exposes NSGA as a job so both decoders and strategies share it.
 - `evo-worker` (Rust) pulls `jobs.evo.decoder.eval`, loads the snapshot + data window, trains/evaluates and returns `EvalResult`. Workers are stateless. Scaling = more workers.
-- **Today (D-044):** the worker scores the genome **sequentially point-in-time** over an in-memory buffer of `md.trade.>` (last 50 000 trades per instrument, stopgap until VictoriaMetrics reads via `fa-tsdb` land), under `budget_gpu_ms`, holding a `ctl.gpu.*` lease (class `evolution_eval`) and returning `PREEMPTED` with a `checkpoint_ref` on `ctl.gpu.preempt`. Since D-049 the data comes from VictoriaMetrics (`fa_tsdb::trade_prices`, default 6 h window) with the buffer as fallback, decoders take a point-in-time `DecodeCtx` of `latent.state.>` latents, and multi-generation runs carry Pareto elites over and breed children through `evo.vary.decoder` (`fa_evolution::vary`). Eval reports persist to Garage (D-045). There is still no training step.
+- **Today (D-044):** the worker scores the genome **sequentially point-in-time** over an in-memory buffer of `md.trade.>` (last 50 000 trades per instrument, stopgap until VictoriaMetrics reads via `fa-tsdb` land), under `budget_gpu_ms`, holding a `ctl.gpu.*` lease (class `evolution_eval`) and returning `PREEMPTED` with a `checkpoint_ref` on `ctl.gpu.preempt`. Since D-049 the data comes from VictoriaMetrics (`fa_tsdb::trade_prices`, default 6 h window) with the buffer as fallback, decoders take a point-in-time `DecodeCtx` of `latent.state.>` latents, and multi-generation runs carry Pareto elites over and breed children through `evo.vary.decoder` (`fa_evolution::vary`). Eval reports persist to Garage (D-045).
+- **Neural genomes** (`nn_*`, §4.5) take the same job: the worker loads the window, the latents (the recorded `LATENT` stream over the whole window whenever the recorder is enabled — training needs the past, which the live buffer only holds since the worker started —, else the live buffer) and, for the text families, the `TEXT` stream (`news.item.>` over `[start − tw, end]` by receive time); trains on the CPU for at most 60 % of the job budget (preemption / cancellation stop training early, best validation weights kept), then scores out of sample after the train cutoff with `fa_backtest::eval` (forecasting families) and `recon_eval` (reconstruction families). The bundle + card go to Garage (`neural.weights` in the payload), the trial registry gets the naive-policy P&L, `rnn_prior` / `retrieval` outputs are published like the baselines. Payload extras: `neural {decoder_id, output_family, params, layout, cutoff_ms, train {rows, steps, best_step, initial/train/val loss, latent_dim, latent_coverage, interrupted, warm_started, device}, recon, weights}`, `data.text`, `budget.train_ms`. Envelope key `warm_start: "<bucket>/<key>"` warm-starts from a parent bundle. Small genomes train and evaluate in seconds on the CPU (live check: 1 h of 1 s data, ~1 300 training rows, 150 steps ≈ 0.1–1.7 s training).
 
-### 6.6 Feedback to encoders (proposal — core blocker #3)
+### 6.6 Feedback to encoders (core blocker #3; mechanism implemented in `fa-decoders`, D-009)
 At generation end, the elite set `E` (per family, top by front rank and diversity) is handed to the encoder trainer (spec 36) as a feedback term:
 `L_gen = Σ_{d∈E} w_d · L_d(decoder_d(expert_view(x)), target_d)`
 Default proposal: **backprop through frozen elite decoders** into encoder + expert projectors for `feedback_steps`. Elite weights are frozen during encoder updates and re-fine-tuned on the next generation's warm start.
 Weights `w_d` ∝ family quota × front rank. Family quotas ensure no single family dominates the representation.
+
+**Implemented:** the elite selection, weighting, frozen loading and the differentiable auxiliary loss are the §4.6 API; the trainer side (when to call it, `λ_gen`, `feedback_steps`) belongs to spec 36.
+
+### 6.7 Serving (model-runtime, implemented)
+`bins/model-runtime` lists the cards every `FA_NEURAL_RELOAD_SECS` (300 s) and on `ctl.decoders.reload`, ranks them per (output family, timescale) with `select_top_k` and loads the best three bundles. The best decoder of a slot **serves** (`decoder.output.<family>`), the next one runs in **shadow** (`decoder.shadow.<family>`, not consumed by strategies), both at every closed bar of the decoder's timescale, with the series' closes, the latent the pipeline just produced for the instrument and the live news timeline as inputs. Contract: `rnn_prior` / `retrieval` publish horizon-return quantiles (+ analogs, `h:`), `visual.*` / `text.*` publish a score in [-1, 1] as `quantiles[0]` (future chart `2·P(up) − 1`, chart direction of the reconstructed raster, news / narrative sentiment of the decoded embedding normalised by the training targets) followed by components; refs add `src:neural`, `role:serving|shadow`, `card:<key>`. `FA_NEURAL_REPLACE_BASELINE=1` makes a serving neural decoder replace the baseline output of its family and timescale (default: alongside). Forecasts are scored online when their horizon closes (CRPS), chart / news outputs immediately (raster CE, `1 − cos`); a shadow that beats the serving decoder by `FA_NEURAL_PROMOTE_MARGIN` (2 %) after `FA_NEURAL_PROMOTE_MIN` (200) scored outputs each and `FA_NEURAL_PROMOTE_MINUTES` (30) of shadow time is promoted (roles swap, the promotion becomes a pin). `ctl.decoders.{status, reload, promote, pin, unpin, off, on}` (CtlRequest / CtlReply; `ctl.model.>` stays with the encoder snapshot listener). Heartbeat gauges `neural.*` (cards, loaded, slots, serving per slot, outputs per family and role, online n / loss per role, promotions, load errors, inference ms).
 
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
@@ -191,6 +231,8 @@ Weights `w_d` ∝ family quota × front rank. Family quotas ensure no single fam
 | `retrieval_k_range` | 5–200 | |
 | `retrieval_min_gap` | ≥ horizon | Leakage guard |
 | `rnn_pairs_from_mcmc` | 50 per generation | spec 33 |
+| neural training share of the job budget | 0.6 | `evo-worker` (`TRAIN_BUDGET_SHARE`) |
+| `FA_NEURAL_RELOAD_SECS` / `_PROMOTE_MIN` / `_PROMOTE_MARGIN` / `_PROMOTE_MINUTES` / `_REPLACE_BASELINE` | 300 / 200 / 0.02 / 30 / 0 | model-runtime serving (§6.7) |
 
 ## 8. Failure modes
 | Failure | Response |
@@ -211,6 +253,15 @@ Weights `w_d` ∝ family quota × front rank. Family quotas ensure no single fam
 6. The elite feedback export produces a loadable bundle consumed by the encoder trainer (spec 36) in an integration test.
 7. Killing a worker mid-generation doesn't lose results (redelivery test).
 
+**Status of the criteria (implementation):**
+1. Six of eight families have a trainable decoder with conformance tests on SYNTHETIC data (forward, loss decrease, out-of-sample skill vs naive / mean target, save/load bundle round trip, deterministic training, cost estimate, point-in-time truncation, leakage gap); `visual.frame` and `text.summary` have none (external frames, no summary targets).
+2. kv / JSON round trip and clamped mutation of the neural genes are tested; protobuf genomes do not exist (genomes travel as strings, D-044).
+3. Budget, NSGA front, lineage: as before (D-049); neural training respects the job budget share.
+4. Retrieval leakage gap: tested for the baseline and the learned retrieval (training masks, serving, feedback).
+5. RNN-prior CRPS + tradeable value: via `fa_backtest::eval` (naive sign policy net of 1 bp, not yet the spec 35 venue cost model).
+6. The feedback bundle is loadable and gives gradients on latents (unit test); the trainer integration test belongs to the spec 36 owner.
+7. Redelivery: unchanged (JetStream ack window, D-044).
+
 ## 10. Open questions
 1. **[Core blocker #3] Decoder→encoder feedback path.** Blocks spec 36 training loop and 32 `L_gen`. Options:
    - (a) Backprop through frozen elite decoders (default proposal §6.6). Simple, but couples encoders to specific decoders.
@@ -219,7 +270,7 @@ Weights `w_d` ∝ family quota × front rank. Family quotas ensure no single fam
    - (d) **Fitness-only:** encoder genomes are selected by how well the decoder population does on them (evolution at the encoder level, no gradient feedback).
    - (e) Combination: (a) for differentiable families, (d) for retrieval/non-differentiable parts.
 2. Targets for the **event summary** text decoder: where do ground-truth summaries come from?
-3. Should visual decoders generate pixels (expensive) or stay in embedding space for v1?
+3. ~~Should visual decoders generate pixels (expensive) or stay in embedding space for v1?~~ v1: low-resolution rasters (≤ 32×32, column distributions), no pixel generation (§4.5).
 4. Is retrieval history re-embedded on every snapshot (cost!) or only a sampled subset?
 5. Does the orchestrator implement variation operators in Go, or call Rust for them (single genome implementation)?
 6. How are objectives normalised across families so the cross-family front is meaningful?

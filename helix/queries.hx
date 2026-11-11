@@ -105,6 +105,57 @@ QUERY matchRegions(prev: ID, next: ID, score: F64) =>
     m <- AddE<RegionMatch>({score: score})::From(prev)::To(next)
     RETURN m
 
+// ── Region lifecycle, lineage, hierarchy, kernels (specs 30 §5, 33 §5; fa-hub `regions.rs`) ──
+QUERY updateRegionStats(region_id: String, mass: F64, occupancy: F64, spread: F64, age: I64) =>
+    r <- N<LatentRegion>({region_id: region_id})::UPDATE({mass: mass, occupancy: occupancy, spread: spread, age: age, updated_at: NOW})
+    RETURN r
+
+QUERY markRegionDied(region_id: String, reason: String, related_region_id: String) =>
+    r <- N<LatentRegion>({region_id: region_id})::UPDATE({status: "retired", retire_reason: reason, related_region_id: related_region_id, died_at: NOW})
+    RETURN r
+
+// upsertCentroid: drop the region's `centroid` LatentVec, then addLatent(kind: "centroid", ref_id: region_id).
+
+// upsertDescents (batched, one entry group per row): child::OutE<DescendsFrom>::WHERE(parent_region_id, kind) updated, else AddE.
+QUERY upsertDescents(child_region_id: String, parent_region_id: String, kind: String, overlap: F64) =>
+    c <- N<LatentRegion>({region_id: child_region_id})
+    p <- N<LatentRegion>({region_id: parent_region_id})
+    e <- AddE<DescendsFrom>({child_region_id: child_region_id, parent_region_id: parent_region_id, kind: kind, overlap: overlap})::From(c)::To(p)
+    RETURN e
+
+// upsertHierEdges (batched): fine::OutE<Hier>::WHERE(coarse_region_id) updated, else AddE (fine → coarse).
+QUERY upsertHierEdges(fine_region_id: String, coarse_region_id: String, p_coarse_given_fine: F64, p_fine_given_coarse: F64, support: F64, pmi_bits: F64, mi_bits: F64) =>
+    f <- N<LatentRegion>({region_id: fine_region_id})
+    c <- N<LatentRegion>({region_id: coarse_region_id})
+    e <- AddE<Hier>({weight: p_coarse_given_fine, fine_region_id: fine_region_id, coarse_region_id: coarse_region_id, p_coarse_given_fine: p_coarse_given_fine, p_fine_given_coarse: p_fine_given_coarse, support: support, pmi_bits: pmi_bits, mi_bits: mi_bits})::From(f)::To(c)
+    RETURN e
+
+// upsertRegionSet / upsertKernelModel: get-or-create by region_set_id / kernel_id (= expert_space_id),
+// linked ExpertSpace -HasRegionSet-> RegionSet / -HasKernel-> KernelModel on create.
+QUERY regionSet(region_set_id: String) =>
+    r <- N<RegionSet>({region_set_id: region_set_id})
+    RETURN r
+
+QUERY snapshotKernels(snapshot_id: String) =>
+    k <- N<KernelModel>({snapshot_id: snapshot_id})
+    RETURN k
+
+QUERY snapshotHierarchy(snapshot_id: String) =>
+    regions <- N<Snapshot>({snapshot_id: snapshot_id})::Out<HasSpace>::In<InSpace>
+    edges <- regions::OutE<Hier>
+    RETURN edges
+
+QUERY lineageMembers(lineage_id: String) =>
+    r <- N<LatentRegion>({lineage_id: lineage_id})
+    RETURN r
+
+// regionLineage(region_id, depth): depth-unrolled walk over OutE<DescendsFrom> + InE<RegionMatch>
+// (ancestors) and InE<DescendsFrom> + OutE<RegionMatch> (descendants).
+
+QUERY crossPriors(timescale: String) =>
+    c <- N<CrossPrior>({timescale: timescale})::ORDER<Desc>(_::{score})
+    RETURN c
+
 // ── Latent vectors (centroids, observations, retrieval windows) ─────────
 QUERY addLatent(vector: [F64], expert_space_id: String, kind: String, ref_id: String, instrument_id: String, uncertainty: F64) =>
     v <- AddV<LatentVec>(vector, {expert_space_id: expert_space_id, kind: kind, ref_id: ref_id, instrument_id: instrument_id, uncertainty: uncertainty})
@@ -114,6 +165,71 @@ QUERY addLatent(vector: [F64], expert_space_id: String, kind: String, ref_id: St
 QUERY searchLatent(vector: [F64], k: I64) =>
     hits <- SearchV<LatentVec>(vector, k)
     RETURN hits
+
+// Spec 20 §4 knn(space, v, k, filter): vector length must equal ExpertSpace.dim; the search runs in
+// the space's tenant partition of LatentVec.vec<dim>, filtered after the (over-fetched) top-k.
+QUERY knn(expert_space_id: String, vector: [F64], k: I64, kind: String, instrument_id: String, as_of: Date) =>
+    space <- N<ExpertSpace>({expert_space_id: expert_space_id}) // dim check
+    hits <- SearchV<LatentVec>(vector, k)::WHERE(AND(_::{kind}::EQ(kind), _::{instrument_id}::EQ(instrument_id), _::{ts}::LTE(as_of)))
+    RETURN hits
+
+// Retention (spec 20 §6.5): fold observation latents older than `cutoff` into one kind=aggregate
+// LatentVec per (space, ref_id) (obs_count, mean vector, mean uncertainty) and drop them.
+QUERY pruneSpaceObservations(expert_space_id: String, cutoff: Date) =>
+    old <- N<LatentVec>::WHERE(AND(_::{expert_space_id}::EQ(expert_space_id), _::{kind}::EQ("observation"), _::{ts}::LT(cutoff)))
+    agg <- N<LatentVec>::WHERE(AND(_::{expert_space_id}::EQ(expert_space_id), _::{kind}::EQ("aggregate")))
+    // per ref_id: agg::UPDATE({obs_count, vec<dim>, uncertainty, ts}) or AddN<LatentVec>({kind: "aggregate", ...})
+    DROP old
+    RETURN agg
+
+// ── As-of reads (spec 20 §6.3: snapshot id and created_at <= t) ─────────
+QUERY listSnapshotsAsOf(as_of: Date) =>
+    snaps <- N<Snapshot>::WHERE(_::{created_at}::LTE(as_of))
+    RETURN snaps
+
+QUERY spaceRegionsAsOf(space: ID, as_of: Date) =>
+    regions <- N<ExpertSpace>(space)::In<InSpace>::WHERE(_::{created_at}::LTE(as_of))
+    RETURN regions
+
+QUERY snapshotGraphAsOf(snapshot_id: String, as_of: Date) =>
+    snap <- N<Snapshot>({snapshot_id: snapshot_id})::WHERE(_::{created_at}::LTE(as_of))
+    spaces <- snap::Out<HasSpace>
+    regions <- spaces::In<InSpace>::WHERE(_::{created_at}::LTE(as_of))
+    transitions <- regions::OutE<Transition> // kept when the target region is visible too
+    RETURN snap, spaces, regions, transitions
+
+QUERY spaceLatentsAsOf(expert_space_id: String, kind: String, as_of: Date, limit: I64) =>
+    rows <- N<LatentVec>::WHERE(AND(_::{expert_space_id}::EQ(expert_space_id), _::{kind}::EQ(kind), _::{ts}::LTE(as_of)))::ORDER<Desc>(_::{ts})::RANGE(0, limit)
+    RETURN rows
+
+// ── Text / media embeddings (NewsDoc.vec<dim>, MediaSegment.vec<dim>) ────
+QUERY addNewsDocs(doc_id: String, source_id: String, ts: Date, vector: [F64]) =>
+    d <- AddV<NewsDoc>(vector, {doc_id: doc_id, source_id: source_id, ts: ts})
+    RETURN d
+
+QUERY searchNewsDocs(vector: [F64], k: I64, as_of: Date) =>
+    hits <- SearchV<NewsDoc>(vector, k)::WHERE(_::{ts}::LTE(as_of))
+    RETURN hits
+
+QUERY addMediaSegments(segment_id: String, media_id: String, ts: Date, vector: [F64]) =>
+    m <- AddV<MediaSegment>(vector, {segment_id: segment_id, media_id: media_id, ts: ts})
+    RETURN m
+
+QUERY searchMediaSegments(vector: [F64], k: I64, as_of: Date) =>
+    hits <- SearchV<MediaSegment>(vector, k)::WHERE(_::{ts}::LTE(as_of))
+    RETURN hits
+
+// ── Schema version marker (spec 20 §8) ──────────────────────────────────
+QUERY schemaMarker() =>
+    m <- N<SchemaMeta>({meta_id: "fa-hub"})
+    RETURN m
+
+// Never lowers the stored version (UPDATE only WHERE version <= new version).
+QUERY stampSchemaVersion(version: U32, fingerprint: String) =>
+    existing <- N<SchemaMeta>({meta_id: "fa-hub"})
+    raised <- existing::WHERE(_::{version}::LTE(version))::UPDATE({version: version, index_fingerprint: fingerprint, updated_at: NOW}) // when existing is not empty
+    created <- AddN<SchemaMeta>({meta_id: "fa-hub", version: version, index_fingerprint: fingerprint}) // when existing is empty
+    RETURN existing
 
 // ── Evolution ───────────────────────────────────────────────────────────
 QUERY addGenome(genome_id: String, kind: String, family: String, params: String) =>
@@ -146,6 +262,16 @@ QUERY addFitnessRecord(genome_id: String, generation: U32, objectives: String, p
     rec <- AddN<FitnessRecord>({genome_id: genome_id, generation: generation, objectives: objectives, pareto_rank: pareto_rank})
     edge <- AddE<Scored>::From(genome)::To(rec)
     RETURN rec
+
+// ── Adapters (spec 36 §5) ───────────────────────────────────────────────
+QUERY addAdapterState(snapshot: ID, adapter_id: String, snapshot_id: String, timescale: String, version: U64, garage_key: String, drift: F64, max_drift: F64, frozen: Boolean, n_windows: U64, window_start: Date, window_end: Date) =>
+    a <- AddN<AdapterState>({adapter_id: adapter_id, snapshot_id: snapshot_id, timescale: timescale, version: version, garage_key: garage_key, drift: drift, max_drift: max_drift, frozen: frozen, n_windows: n_windows, window_start: window_start, window_end: window_end})
+    edge <- AddE<HasAdapter>::From(snapshot)::To(a)
+    RETURN a
+
+QUERY latestAdapter(snapshot_id: String) =>
+    a <- N<AdapterState>::WHERE(_::{snapshot_id}::EQ(snapshot_id))::ORDER<Desc>(_::{version})::RANGE(0, 1)
+    RETURN a
 
 QUERY genomeParents(genome: ID) =>
     parents <- N<Genome>(genome)::In<ParentOf>

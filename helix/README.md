@@ -51,8 +51,15 @@ genomes/lineage/fitness through `upsert_genome` / `link_parent` / `add_fitness_r
   the unique indexes and fail with 409 `unique_constraint_violation` on duplicates.
 - **Index DDL is asynchronous** and cannot share a batch with data writes; `fa-hub` waits for
   builds (`wait_for_index`) in its `*_ready` helpers.
-- `NewsDoc` / `MediaSegment` vector indexes are not created yet (dims unknown); use
-  `HubClient::ensure_indexes([IndexSpec::node_vector(...)])` when the ingestors land.
+- `NewsDoc` / `MediaSegment` embeddings use the same `vec<d>` convention, one un-partitioned
+  cosine index per `(label, d)` created on first write (`add_news_docs` / `add_media_segments`,
+  `search_news_docs` / `search_media_segments`); no ingestor writes them yet.
+- **Dimensions:** `ExpertSpace.dim` is authoritative; `add_latents_checked` / `knn` reject other
+  vector lengths. Index ensures are cached per client.
+- **Version marker:** `N::SchemaMeta` (`meta_id = "fa-hub"`) holds the data-model version and an
+  index-set fingerprint, stamped by `ensure_schema_ready` (`fa-hub::meta`, spec 20 §8).
+- **Coverage:** `crates/fa-hub/tests/coverage.rs` fails when a `QUERY` here has no same-named
+  function; `schema.rs` unit tests fail when an `INDEX` line has no index DDL.
 
 ## Running (D-033)
 `just up` starts HelixDB from `ghcr.io/helixdb/helixdb:v0.0.14` on `127.0.0.1:6969`

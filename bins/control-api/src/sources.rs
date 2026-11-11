@@ -67,11 +67,12 @@ pub struct HealthStore {
 }
 
 impl HealthStore {
-    /// Feeds one `ingest.<kind>.<source>` message. Non-JSON payloads are ignored.
+    /// Feeds one `ingest.<kind>.<source>` message: fa.v1 `IngestHealth|IngestGap|IngestUnresolved`
+    /// or the legacy D-054 JSON, both mapped to the same JSON shape. Undecodable payloads are ignored.
     pub fn ingest(&mut self, subject: &str, payload: &[u8], at: DateTime<Utc>) {
         let Some(rest) = subject.strip_prefix("ingest.") else { return };
         let Some((kind, source)) = rest.split_once('.') else { return };
-        let Ok(mut v) = serde_json::from_slice::<Value>(payload) else { return };
+        let Some(mut v) = fa_bus::ingest::frame_json(kind, payload) else { return };
         if let Value::Object(m) = &mut v {
             m.insert("received_at".into(), json!(at));
         }
@@ -168,6 +169,17 @@ mod tests {
         h.ingest("ingest.health.hn", b"not json", at);
         h.ingest("svc.heartbeat.ingestor", b"{}", at);
         assert_eq!(h.frames_seen, 4);
+        // fa.v1 IngestHealth frames map to the same JSON shape
+        let proto = fa_proto::v1::IngestHealth {
+            source: "gdelt".into(),
+            status: fa_proto::v1::HealthStatus::Down as i32,
+            reason: "connector exited".into(),
+            ..Default::default()
+        };
+        h.ingest("ingest.health.gdelt", &fa_proto::Message::encode_to_vec(&proto), at);
+        assert_eq!(h.frames_seen, 5);
+        assert_eq!(h.health("gdelt").unwrap()["status"], "down");
+        assert_eq!(h.running("gdelt"), Some(false));
         assert_eq!(h.health("yahoo").unwrap()["status"], "degraded");
         assert!(h.health("yahoo").unwrap()["received_at"].is_string());
         assert_eq!(h.running("yahoo"), Some(true));

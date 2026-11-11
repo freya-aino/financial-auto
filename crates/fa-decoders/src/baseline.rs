@@ -96,10 +96,16 @@ pub fn build(genome: &DecoderGenome) -> Box<dyn SeriesDecoder> {
 }
 
 /// Instantiates the decoder with a conditioning context (used by the retrieval family).
+///
+/// Neural genomes need training ([`crate::neural::train`]); for them this returns the untrained
+/// stand-in of the same output contract (the retrieval baseline for `nn_retrieval`, the quantile
+/// forecaster otherwise), which is also what their warm-up/data needs are sized against.
 pub fn build_with(genome: &DecoderGenome, ctx: Arc<DecodeCtx>) -> Box<dyn SeriesDecoder> {
     match genome.family {
-        BaselineFamily::Forecast => Box::new(QuantileForecaster { genome: genome.clone() }),
-        BaselineFamily::Retrieval => Box::new(AnalogRetriever { genome: genome.clone(), ctx }),
+        BaselineFamily::Retrieval | BaselineFamily::NnRetrieval => {
+            Box::new(AnalogRetriever { genome: genome.clone(), ctx })
+        }
+        _ => Box::new(QuantileForecaster { genome: genome.clone() }),
     }
 }
 

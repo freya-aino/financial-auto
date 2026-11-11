@@ -4,7 +4,7 @@
 mode = "paper"              # the only mode that exists (D-029)
 account = "paper"           # order.intent.paper / order.approved.paper / order.event.paper
 starting_cash_eur = 100000  # D-028
-allocator = "equal_weight"  # equal-risk control allocator (spec 40 §6.2); risk_parity | fractional_kelly also available
+allocator = "equal_weight"  # equal-risk control allocator (spec 40 §6.2); risk_parity | fractional_kelly | thompson_rp also available
 max_strategy_weight = 0.5
 kelly_fraction = 0.25
 performance_decay = 0.95
@@ -37,10 +37,61 @@ history_days = 60           # rates loaded into memory at start (older fills use
 new_strategy_status = "active"
 shadow_sleeve_eur = 10000   # virtual capital behind a shadow strategy's book (spec 41 §6.6)
 
+tournament_cost_bps = 5     # live paper allocator tournament: cost charged on weight turnover (spec 40 §6.2)
+
 [promotion]                 # gate (spec 40 §6.6, §7): all must hold; unknown statistics block promotion
 min_shadow_days = 30        # promotion.min_shadow_days
 min_horizons = 20           # promotion.min_horizons completed in shadow
-min_deflated_sharpe = 0.0   # deflated Sharpe from validation.trial must exceed this (unknown when the table is absent)
+min_deflated_sharpe = 0.0   # deflated Sharpe of the holdout trial (else the registry's) must exceed this
+max_pbo = 0.2               # spec 41 pbo.max_for_promotion: PBO of the strategy's generation (n/a for hand-written strategies)
+consistency_z = 2.0         # shadow Sharpe/h may sit at most z standard errors below the backtest's (n/a for hand-written)
+
+# Automatic evolved-strategy lifecycle (spec 35 §6.4): candidate → holdout → shadow → active →
+# retired, driven every interval_secs (and by ctl.risk.pipeline {action: run}). Paper only.
+[pipeline]
+enabled = true
+interval_secs = 60
+generations_scanned = 20    # newest fa-artifacts/strategies/<generation>.toml files read
+dsr_min_candidate = 0.95    # spec 35 §7: selection deflated Sharpe (probability) for holdout eligibility
+pbo_max = 0.2               # spec 35 §7: a generation above it (or with unknown PBO) promotes no one
+max_candidates_per_generation = 3
+holdout_min_dsr = 0.95      # spec 41 dsr.min_for_promotion applied to the single holdout trial
+holdout_min_obs = 100
+holdout_timeout_secs = 1800 # requested evaluation without a trial row → retried
+holdout_max_attempts = 2    # then retired
+max_live_evolved = 8        # evolved strategies in the live set (shadow + active + paused)
+auto_promote = true         # shadow → active when the gate is green (paper)
+max_shadow_days = 90        # never promoted after this long → retired
+max_demotions = 2           # active → shadow demotions before retirement
+decay_min_hours = 24        # hourly book points behind the shadow/live consistency check
+
+# Locked holdouts (spec 41 §6.4, §7): kept per timescale automatically. Each is the latest completed
+# segment at lock time; it is only locked when VictoriaMetrics holds ≥ min_bars bars in it, otherwise
+# reported as missing (heartbeat holdout.missing, ctl.risk.pipeline status) and retried.
+[holdout]
+auto_lock = true
+check_secs = 300
+timescales = ["1s", "1m"]   # the baselines' and evolution's timescales; candidates add theirs on demand
+min_bars = 300
+relock_after_days = 0       # 0 = never re-lock automatically (spec 41 Q5 open)
+[holdout.length_secs]       # holdout.length.<ts>: placeholders scaled to the history the stack has
+"1s" = 7200
+"1m" = 43200
+"1h" = 7776000
+"1d" = 31536000
+[holdout.embargo_secs]      # embargo.<ts>: selection windows shifted before a holdout end this early
+"1s" = 300
+"1m" = 3600
+"1h" = 172800
+"1d" = 864000
+
+# Per-instrument feed guard (spec 40 §6.5 health halts, §8 bad tick): reduce-only while frozen.
+[feed]
+stale_freeze_bars = 3       # risk.feed_stale_freeze: × max(fastest strategy bar, the instrument's own trade gap)
+stale_freeze_min_secs = 3
+stale_flatten_secs = 0      # second threshold: flatten after this long without a trade (0 = keep positions)
+jump_max = 0.15             # |log return| vs the mark held back as a possible bad tick …
+jump_confirm = 3            # … until this many trades confirm the new level
 
 # Runtime changes through ctl.risk.limits / PUT /api/trading/limits may only TIGHTEN these
 # (lower every cap, raise the payout reserve); loosening needs an edit here + restart (spec 40 §6.5).
@@ -54,6 +105,8 @@ max_class_frac = 0.40       # risk.max_class_pct: gross per asset class / deploy
 max_venue_frac = 0.50       # risk.max_venue_pct: gross per venue / deployable (counterparty risk)
 portfolio_gross_cap = 2.0   # risk.portfolio_gross_cap: total gross / deployable
 liquidity_k = 0.01          # |position| ≤ k × horizon volume (EUR)
+max_order_frac = 0.10       # pre-trade (manual / foreign orders): notional ≤ this × deployable (fat finger)
+limit_price_band = 0.10     # pre-trade: limit price within ±10 % of the mark
 daily_payout_quota_eur = 0  # payout rule still open (spec 42 Q1); the larger of this and today's ledger.payout_quota row is reserved
                             # (deployable = equity − reserve); ctl.risk.limits {set: {daily_payout_quota_eur}} raises both (tighten-only)
 

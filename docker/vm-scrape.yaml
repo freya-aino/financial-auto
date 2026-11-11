@@ -9,6 +9,9 @@ global:
 scrape_configs:
   # Platform services, one static target each (compose DNS names; `service` label = heartbeat name).
   - job_name: fa
+    # The services label their own series with `service` (e.g. fa_heartbeat_last_unix_seconds);
+    # honor it instead of renaming it to exported_service. Same value as the target label.
+    honor_labels: true
     static_configs:
       - targets: ["control-api:9100"]
         labels: { service: control-api }
@@ -27,6 +30,7 @@ scrape_configs:
 
   # evo-worker can run as N replicas (--scale); the compose DNS A record lists every replica.
   - job_name: fa-evo-worker
+    honor_labels: true
     dns_sd_configs:
       - names: ["evo-worker"]
         type: A
@@ -43,5 +47,15 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["garage:3903"]
-  # NATS (:8222 is JSON only), Postgres and HelixDB need exporters; their health is covered by
-  # control-api `/api/health` dependency probes and the compose healthchecks.
+  # Exporters and ops services inside compose (spec 60 §6.5).
+  - job_name: nats
+    static_configs:
+      - targets: ["nats-exporter:7777"] # natsio/prometheus-nats-exporter: varz, connz, JetStream streams/consumers
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+  - job_name: vmalert
+    static_configs:
+      - targets: ["vmalert:8880"]
+  # HelixDB has no Prometheus endpoint; its reachability is control-api's fa_dependency_up{dep="helix"}.
+  # The backup sidecar pushes fa_backup_* / fa_wal_archive_* / fa_restore_drill_* itself (job="fa-backup").

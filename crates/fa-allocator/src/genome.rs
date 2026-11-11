@@ -29,11 +29,13 @@ pub enum AllocatorName {
     FractionalKelly,
     /// Parametric mix of the three above (`w_eq`, `w_rp`, `w_k`).
     WeightedBlend,
+    /// Bayesian bandit (Thompson sampling) + risk parity (spec 40 §6.2 paper default proposal).
+    ThompsonRp,
 }
 
 impl AllocatorName {
-    pub const ALL: [AllocatorName; 4] =
-        [Self::EqualWeight, Self::RiskParity, Self::FractionalKelly, Self::WeightedBlend];
+    pub const ALL: [AllocatorName; 5] =
+        [Self::EqualWeight, Self::RiskParity, Self::FractionalKelly, Self::WeightedBlend, Self::ThompsonRp];
 
     /// Whether this allocator reads gene `key` (`kelly` only Kelly and blend, `w_*` only the
     /// blend; the other genes always).
@@ -51,6 +53,7 @@ impl AllocatorName {
             Self::RiskParity => "risk_parity",
             Self::FractionalKelly => "fractional_kelly",
             Self::WeightedBlend => "weighted_blend",
+            Self::ThompsonRp => "thompson_rp",
         }
     }
 }
@@ -63,6 +66,7 @@ impl FromStr for AllocatorName {
             "risk_parity" | "risk_parity_capped" => Self::RiskParity,
             "fractional_kelly" | "kelly" => Self::FractionalKelly,
             "weighted_blend" | "blend" => Self::WeightedBlend,
+            "thompson_rp" | "thompson" | "bandit" => Self::ThompsonRp,
             other => return Err(GenomeError::Name(other.to_owned())),
         })
     }
@@ -78,7 +82,7 @@ impl fmt::Display for AllocatorName {
 pub enum GenomeError {
     #[error("allocator genome must start with `{PREFIX}`: `{0}`")]
     Prefix(String),
-    #[error("unknown allocator `{0}` (equal_weight | risk_parity | fractional_kelly | weighted_blend)")]
+    #[error("unknown allocator `{0}` (equal_weight | risk_parity | fractional_kelly | weighted_blend | thompson_rp)")]
     Name(String),
     #[error("gene `{0}`: expected `key=value`")]
     Pair(String),
@@ -163,6 +167,7 @@ impl AllocatorGenome {
             AllocatorName::RiskParity => (g.w_eq, g.w_rp, g.w_k) = (0.0, 1.0, 0.0),
             AllocatorName::FractionalKelly => (g.w_eq, g.w_rp, g.w_k) = (0.0, 0.0, 1.0),
             AllocatorName::WeightedBlend => (g.w_eq, g.w_rp, g.w_k) = (0.34, 0.33, 0.33),
+            AllocatorName::ThompsonRp => (g.w_eq, g.w_rp, g.w_k) = (0.0, 1.0, 0.0),
         }
         g
     }
@@ -266,6 +271,10 @@ impl AllocatorGenome {
                 w_risk_parity: self.w_rp,
                 w_kelly: self.w_k,
             }),
+            // seeded by the genome text: one genome, one draw sequence (replays are deterministic)
+            AllocatorName::ThompsonRp => {
+                Box::new(crate::ThompsonRiskParity::new(self.cap, stable_hash(&self.to_string())))
+            }
         }
     }
 
@@ -492,8 +501,8 @@ mod tests {
     #[test]
     fn builds_the_named_allocator_and_tracker() {
         let stats = vec![
-            StrategyStats { strategy_id: "a".into(), mean_return: 0.01, volatility: 0.1 },
-            StrategyStats { strategy_id: "b".into(), mean_return: 0.01, volatility: 0.2 },
+            StrategyStats { strategy_id: "a".into(), mean_return: 0.01, volatility: 0.1, observations: 0 },
+            StrategyStats { strategy_id: "b".into(), mean_return: 0.01, volatility: 0.2, observations: 0 },
         ];
         for name in AllocatorName::ALL {
             let g = AllocatorGenome::named(name);

@@ -22,6 +22,70 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type RiskEvent_Kind int32
+
+const (
+	RiskEvent_KIND_UNSPECIFIED         RiskEvent_Kind = 0
+	RiskEvent_KIND_INTENT_REJECTED     RiskEvent_Kind = 1
+	RiskEvent_KIND_INTENT_APPROVED     RiskEvent_Kind = 2
+	RiskEvent_KIND_HALT_RAISED         RiskEvent_Kind = 3
+	RiskEvent_KIND_HALT_CLEARED        RiskEvent_Kind = 4
+	RiskEvent_KIND_LIMIT_BREACH        RiskEvent_Kind = 5
+	RiskEvent_KIND_LIMITS_CHANGED      RiskEvent_Kind = 6
+	RiskEvent_KIND_RECONCILIATION_DIFF RiskEvent_Kind = 7
+)
+
+// Enum value maps for RiskEvent_Kind.
+var (
+	RiskEvent_Kind_name = map[int32]string{
+		0: "KIND_UNSPECIFIED",
+		1: "KIND_INTENT_REJECTED",
+		2: "KIND_INTENT_APPROVED",
+		3: "KIND_HALT_RAISED",
+		4: "KIND_HALT_CLEARED",
+		5: "KIND_LIMIT_BREACH",
+		6: "KIND_LIMITS_CHANGED",
+		7: "KIND_RECONCILIATION_DIFF",
+	}
+	RiskEvent_Kind_value = map[string]int32{
+		"KIND_UNSPECIFIED":         0,
+		"KIND_INTENT_REJECTED":     1,
+		"KIND_INTENT_APPROVED":     2,
+		"KIND_HALT_RAISED":         3,
+		"KIND_HALT_CLEARED":        4,
+		"KIND_LIMIT_BREACH":        5,
+		"KIND_LIMITS_CHANGED":      6,
+		"KIND_RECONCILIATION_DIFF": 7,
+	}
+)
+
+func (x RiskEvent_Kind) Enum() *RiskEvent_Kind {
+	p := new(RiskEvent_Kind)
+	*p = x
+	return p
+}
+
+func (x RiskEvent_Kind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (RiskEvent_Kind) Descriptor() protoreflect.EnumDescriptor {
+	return file_fa_v1_risk_proto_enumTypes[0].Descriptor()
+}
+
+func (RiskEvent_Kind) Type() protoreflect.EnumType {
+	return &file_fa_v1_risk_proto_enumTypes[0]
+}
+
+func (x RiskEvent_Kind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use RiskEvent_Kind.Descriptor instead.
+func (RiskEvent_Kind) EnumDescriptor() ([]byte, []int) {
+	return file_fa_v1_risk_proto_rawDescGZIP(), []int{3, 0}
+}
+
 type RiskState struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	AsOf             *timestamppb.Timestamp `protobuf:"bytes,1,opt,name=as_of,json=asOf,proto3" json:"as_of,omitempty"`
@@ -182,6 +246,211 @@ func (x *Halt) GetManual() bool {
 	return false
 }
 
+// `risk.resume.<scope>`: re-arms a halt (D-030). Wire-compatible with `Halt` (fields 1-4 share
+// numbers and types), so a consumer still decoding `Halt` reads `at` as `since`.
+type Resume struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Scope         string                 `protobuf:"bytes,1,opt,name=scope,proto3" json:"scope,omitempty"`
+	Reason        string                 `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
+	At            *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=at,proto3" json:"at,omitempty"`
+	Manual        bool                   `protobuf:"varint,4,opt,name=manual,proto3" json:"manual,omitempty"`
+	Actor         string                 `protobuf:"bytes,5,opt,name=actor,proto3" json:"actor,omitempty"` // ui | system:<service>
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Resume) Reset() {
+	*x = Resume{}
+	mi := &file_fa_v1_risk_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Resume) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Resume) ProtoMessage() {}
+
+func (x *Resume) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_risk_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Resume.ProtoReflect.Descriptor instead.
+func (*Resume) Descriptor() ([]byte, []int) {
+	return file_fa_v1_risk_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *Resume) GetScope() string {
+	if x != nil {
+		return x.Scope
+	}
+	return ""
+}
+
+func (x *Resume) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *Resume) GetAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.At
+	}
+	return nil
+}
+
+func (x *Resume) GetManual() bool {
+	if x != nil {
+		return x.Manual
+	}
+	return false
+}
+
+func (x *Resume) GetActor() string {
+	if x != nil {
+		return x.Actor
+	}
+	return ""
+}
+
+// `risk.event.<account>`: one decision or state change of the risk service (spec 40, D-042).
+// Gated foreign intents are also still answered with `OrderEvent{REJECTED}` on
+// `order.event.<account>` for consumers that predate this message.
+type RiskEvent struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	EventId       string                 `protobuf:"bytes,1,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"` // ULID
+	Kind          RiskEvent_Kind         `protobuf:"varint,2,opt,name=kind,proto3,enum=fa.v1.RiskEvent_Kind" json:"kind,omitempty"`
+	At            *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=at,proto3" json:"at,omitempty"`
+	Account       string                 `protobuf:"bytes,4,opt,name=account,proto3" json:"account,omitempty"`
+	IntentId      string                 `protobuf:"bytes,5,opt,name=intent_id,json=intentId,proto3" json:"intent_id,omitempty"`
+	ClientOrderId string                 `protobuf:"bytes,6,opt,name=client_order_id,json=clientOrderId,proto3" json:"client_order_id,omitempty"`
+	StrategyId    string                 `protobuf:"bytes,7,opt,name=strategy_id,json=strategyId,proto3" json:"strategy_id,omitempty"`
+	InstrumentId  string                 `protobuf:"bytes,8,opt,name=instrument_id,json=instrumentId,proto3" json:"instrument_id,omitempty"`
+	Scope         string                 `protobuf:"bytes,9,opt,name=scope,proto3" json:"scope,omitempty"` // halt scope for halt kinds
+	Reason        string                 `protobuf:"bytes,10,opt,name=reason,proto3" json:"reason,omitempty"`
+	Metrics       map[string]float64     `protobuf:"bytes,11,rep,name=metrics,proto3" json:"metrics,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"fixed64,2,opt,name=value"` // e.g. requested/limit notional, drawdown
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RiskEvent) Reset() {
+	*x = RiskEvent{}
+	mi := &file_fa_v1_risk_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RiskEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RiskEvent) ProtoMessage() {}
+
+func (x *RiskEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_risk_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RiskEvent.ProtoReflect.Descriptor instead.
+func (*RiskEvent) Descriptor() ([]byte, []int) {
+	return file_fa_v1_risk_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *RiskEvent) GetEventId() string {
+	if x != nil {
+		return x.EventId
+	}
+	return ""
+}
+
+func (x *RiskEvent) GetKind() RiskEvent_Kind {
+	if x != nil {
+		return x.Kind
+	}
+	return RiskEvent_KIND_UNSPECIFIED
+}
+
+func (x *RiskEvent) GetAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.At
+	}
+	return nil
+}
+
+func (x *RiskEvent) GetAccount() string {
+	if x != nil {
+		return x.Account
+	}
+	return ""
+}
+
+func (x *RiskEvent) GetIntentId() string {
+	if x != nil {
+		return x.IntentId
+	}
+	return ""
+}
+
+func (x *RiskEvent) GetClientOrderId() string {
+	if x != nil {
+		return x.ClientOrderId
+	}
+	return ""
+}
+
+func (x *RiskEvent) GetStrategyId() string {
+	if x != nil {
+		return x.StrategyId
+	}
+	return ""
+}
+
+func (x *RiskEvent) GetInstrumentId() string {
+	if x != nil {
+		return x.InstrumentId
+	}
+	return ""
+}
+
+func (x *RiskEvent) GetScope() string {
+	if x != nil {
+		return x.Scope
+	}
+	return ""
+}
+
+func (x *RiskEvent) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *RiskEvent) GetMetrics() map[string]float64 {
+	if x != nil {
+		return x.Metrics
+	}
+	return nil
+}
+
 var File_fa_v1_risk_proto protoreflect.FileDescriptor
 
 const file_fa_v1_risk_proto_rawDesc = "" +
@@ -200,7 +469,39 @@ const file_fa_v1_risk_proto_rawDesc = "" +
 	"\x05scope\x18\x01 \x01(\tR\x05scope\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\x120\n" +
 	"\x05since\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x05since\x12\x16\n" +
-	"\x06manual\x18\x04 \x01(\bR\x06manualB\x83\x01\n" +
+	"\x06manual\x18\x04 \x01(\bR\x06manual\"\x90\x01\n" +
+	"\x06Resume\x12\x14\n" +
+	"\x05scope\x18\x01 \x01(\tR\x05scope\x12\x16\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\x12*\n" +
+	"\x02at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x02at\x12\x16\n" +
+	"\x06manual\x18\x04 \x01(\bR\x06manual\x12\x14\n" +
+	"\x05actor\x18\x05 \x01(\tR\x05actor\"\x93\x05\n" +
+	"\tRiskEvent\x12\x19\n" +
+	"\bevent_id\x18\x01 \x01(\tR\aeventId\x12)\n" +
+	"\x04kind\x18\x02 \x01(\x0e2\x15.fa.v1.RiskEvent.KindR\x04kind\x12*\n" +
+	"\x02at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x02at\x12\x18\n" +
+	"\aaccount\x18\x04 \x01(\tR\aaccount\x12\x1b\n" +
+	"\tintent_id\x18\x05 \x01(\tR\bintentId\x12&\n" +
+	"\x0fclient_order_id\x18\x06 \x01(\tR\rclientOrderId\x12\x1f\n" +
+	"\vstrategy_id\x18\a \x01(\tR\n" +
+	"strategyId\x12#\n" +
+	"\rinstrument_id\x18\b \x01(\tR\finstrumentId\x12\x14\n" +
+	"\x05scope\x18\t \x01(\tR\x05scope\x12\x16\n" +
+	"\x06reason\x18\n" +
+	" \x01(\tR\x06reason\x127\n" +
+	"\ametrics\x18\v \x03(\v2\x1d.fa.v1.RiskEvent.MetricsEntryR\ametrics\x1a:\n" +
+	"\fMetricsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\x01R\x05value:\x028\x01\"\xcb\x01\n" +
+	"\x04Kind\x12\x14\n" +
+	"\x10KIND_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14KIND_INTENT_REJECTED\x10\x01\x12\x18\n" +
+	"\x14KIND_INTENT_APPROVED\x10\x02\x12\x14\n" +
+	"\x10KIND_HALT_RAISED\x10\x03\x12\x15\n" +
+	"\x11KIND_HALT_CLEARED\x10\x04\x12\x15\n" +
+	"\x11KIND_LIMIT_BREACH\x10\x05\x12\x17\n" +
+	"\x13KIND_LIMITS_CHANGED\x10\x06\x12\x1c\n" +
+	"\x18KIND_RECONCILIATION_DIFF\x10\aB\x83\x01\n" +
 	"\tcom.fa.v1B\tRiskProtoP\x01Z6github.com/fey/financial-auto/go/pkg/bus/pb/fa/v1;fav1\xa2\x02\x03FXX\xaa\x02\x05Fa.V1\xca\x02\x05Fa\\V1\xe2\x02\x11Fa\\V1\\GPBMetadata\xea\x02\x06Fa::V1b\x06proto3"
 
 var (
@@ -215,21 +516,30 @@ func file_fa_v1_risk_proto_rawDescGZIP() []byte {
 	return file_fa_v1_risk_proto_rawDescData
 }
 
-var file_fa_v1_risk_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_fa_v1_risk_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_fa_v1_risk_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
 var file_fa_v1_risk_proto_goTypes = []any{
-	(*RiskState)(nil),             // 0: fa.v1.RiskState
-	(*Halt)(nil),                  // 1: fa.v1.Halt
-	(*timestamppb.Timestamp)(nil), // 2: google.protobuf.Timestamp
+	(RiskEvent_Kind)(0),           // 0: fa.v1.RiskEvent.Kind
+	(*RiskState)(nil),             // 1: fa.v1.RiskState
+	(*Halt)(nil),                  // 2: fa.v1.Halt
+	(*Resume)(nil),                // 3: fa.v1.Resume
+	(*RiskEvent)(nil),             // 4: fa.v1.RiskEvent
+	nil,                           // 5: fa.v1.RiskEvent.MetricsEntry
+	(*timestamppb.Timestamp)(nil), // 6: google.protobuf.Timestamp
 }
 var file_fa_v1_risk_proto_depIdxs = []int32{
-	2, // 0: fa.v1.RiskState.as_of:type_name -> google.protobuf.Timestamp
-	1, // 1: fa.v1.RiskState.active_halts:type_name -> fa.v1.Halt
-	2, // 2: fa.v1.Halt.since:type_name -> google.protobuf.Timestamp
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	6, // 0: fa.v1.RiskState.as_of:type_name -> google.protobuf.Timestamp
+	2, // 1: fa.v1.RiskState.active_halts:type_name -> fa.v1.Halt
+	6, // 2: fa.v1.Halt.since:type_name -> google.protobuf.Timestamp
+	6, // 3: fa.v1.Resume.at:type_name -> google.protobuf.Timestamp
+	0, // 4: fa.v1.RiskEvent.kind:type_name -> fa.v1.RiskEvent.Kind
+	6, // 5: fa.v1.RiskEvent.at:type_name -> google.protobuf.Timestamp
+	5, // 6: fa.v1.RiskEvent.metrics:type_name -> fa.v1.RiskEvent.MetricsEntry
+	7, // [7:7] is the sub-list for method output_type
+	7, // [7:7] is the sub-list for method input_type
+	7, // [7:7] is the sub-list for extension type_name
+	7, // [7:7] is the sub-list for extension extendee
+	0, // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_fa_v1_risk_proto_init() }
@@ -242,13 +552,14 @@ func file_fa_v1_risk_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_fa_v1_risk_proto_rawDesc), len(file_fa_v1_risk_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   2,
+			NumEnums:      1,
+			NumMessages:   5,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_fa_v1_risk_proto_goTypes,
 		DependencyIndexes: file_fa_v1_risk_proto_depIdxs,
+		EnumInfos:         file_fa_v1_risk_proto_enumTypes,
 		MessageInfos:      file_fa_v1_risk_proto_msgTypes,
 	}.Build()
 	File_fa_v1_risk_proto = out.File

@@ -42,7 +42,14 @@ Expert encoders turn the multimodal, multi-asset input stream into the latent re
 
 ## 4. Interfaces
 
-**Implemented today (D-058, D-062, D-065):** only the statistical family exists. It reads connector bars (OHLCV) where a venue publishes them and trades elsewhere, is fitted by the trainer into Garage snapshots (`weights.bin` = folded normalisation statistics and gains), served by model-runtime with shadow serving and online adapters, and tuned per generation by a stated proxy search instead of a learned loss. The four neural families remain descriptors behind `EncoderFamily`.
+**Implemented today (D-058, D-062, D-065, and the neural-family round):** two encoder lines serve the same `EncoderFamily` / snapshot contract.
+
+* **Statistical family** (`fa_encoders::StatisticalEncoder`): reads connector bars (OHLCV) where a venue publishes them and trades elsewhere, is fitted by the trainer into Garage snapshots (`weights.bin` = folded normalisation statistics and gains), served by model-runtime with shadow serving and online adapters, and tuned per generation by a stated proxy search.
+* **Neural families** (`fa_encoders::neural`, candle, CPU by default): `fsq_hybrid` (family 1) and `jepa_vae` (family 3) on a market front-end of 7 per-bar features (`ret, gap, range, body, wick, ln(1+volume), ln(1+trades)`, z-scored with an `InputNorm` fitted on the training windows and stored with the weights). Backbone is a family gene: `tcn` (causal dilated temporal convolutions, kernel 3, dilation 2^l, residual + RMS norm, pooled `[last, mean]`) or `gru`. On top sits the learned expert space of spec 32 (`fa_expert_space::moe`). `fsq_hybrid` quantises the leading `len(fsq_levels)` dims of every expert latent with FSQ (straight-through, default `[8,5,5,5]`, code index exported) and keeps the rest a continuous Gaussian residual; its SSL term reconstructs the last `recon_steps` bars from the gated expert latents. `jepa_vae` has Gaussian expert heads and predicts the **EMA target encoder's** embedding of the window `jepa_horizon` steps ahead (no input reconstruction). Both train the spec 32 objective (§6.5 below). Weights are safetensors in `weights.bin` (`p.<param>`, metadata `format=fa-neural-v1`, `family`, `config` = genome JSON, `norm`, `active` experts). Initialisation and minibatches are seeded (`ParamStore` / `Rng`), so the same data + genome + seed gives bit-identical weights on CPU and a resumed job continues bit for bit (parameters, Adam moments, EMA target and step are checkpointed). `NeuralEncoder` serves a snapshot in model-runtime and fills `ExpertView.router_weights` with its learned top-k gates.
+* **Families still descriptors only:** `hier_vae_flow` (2) and `latent_diffusion` (4).
+* **Media towers (D-010):** `fa_encoders::media` defines `MediaTower`, the pretrained-tower registry (`PretrainedTowerSpec`: Garage key under `fa-models/pretrained/<name>/`, SHA-256, licence; Whisper-small, bge-small, SigLIP-base listed with empty hashes) and `select_tower`, which falls back to `HashedEmbeddingTower` (signed feature hashing of tokens / byte 4-grams, L2-normalised) when weights are absent or do not verify. No pretrained weights are downloaded and no candle runner for them is built in; `point_in_time` / `embed_window` implement the §6.3 publish-time guard. The neural families are market-only: media embeddings are not fused yet.
+* **Device:** `FA_ML_DEVICE` / `--device` (`cpu` default, `cuda[:n]`); CUDA is the `cuda` cargo feature of `fa-expert-space`, `fa-encoders`, `trainer` and `model-runtime`, off by default (no GPU on the dev host); without it a CUDA request resolves to the CPU with a logged note.
+* **candle, not burn, trains** (deviation from §3 / §6.6 and ADR 0003's split): candle's autograd is sufficient for these model sizes and keeps one tensor library; burn is not a dependency. candle is pinned to 0.10.x because 0.11's AVX512-VNNI kernels do not compile with the host toolchain.
 
 ### 4.1 Family trait (proposal)
 ```rust
@@ -90,7 +97,7 @@ Front-ends output timestamped token sequences in a shared `d_model`. The family 
 - `model-runtime` loads the **active snapshot** per timescale (spec 36) and consumes canonical events (spec 10). It emits:
   - `latent.z.<timescale>.<instrument>` (`fa.v1.LatentFrame`: snapshot id, expert latents after spec 32 router, uncertainty)
   - region memberships (spec 30).
-- Weights are stored in Garage as safetensors (burn records exportable to safetensors); metadata goes to Helix (`EncoderSnapshot` node).
+- Weights are stored in Garage as safetensors (`fa-models/snapshots/<snapshot_id>/weights.bin`, D-058 layout; neural families) or `FASTAT01` (statistical); metadata goes to Helix (`Snapshot` node, `encoder_family` = `statistical | fsq_hybrid | jepa_vae`).
 
 ## 5. Data model
 | Entity | Store | Fields |
@@ -131,6 +138,8 @@ Lookback ≈ horizon scale (spec 00: 1h→2h, 1d→2d). The exact numbers are tu
 - Candidate sets come from MCMC cross-asset priors (spec 33) or evolution (spec 34/35) when the end-to-end route doesn't scale (universe of thousands of instruments).
 
 ### 6.5 Training objective (gen 0, SSL)
+*Implemented form (neural families):* `L = λ_next Σ_k L_pred,k + λ_mix L_mix + λ_dec L_decor + λ_bal L_balance + β KL + λ_ssl L_ssl (+ λ_anchor L_anchor + λ_fb L_feedback from gen 1)`, with `L_pred,k` the per-expert next-step MSE on the normalised targets `[next return, |next return|, next range]`, `L_mix` the MSE of the gate-weighted mixture prediction (trains the router), `L_ssl` the family's reconstruction / JEPA term, and the spec 32 terms. Defaults (CPU-sized): context 64 (1s/1m), 48 (1h), 32 (1d/1w) bars, `d_model` 32, 4 layers, `K_max` 4, `expert_dim` 8, top-2, 600 Adam steps of batch 64, lr 3e-3, 15 % validation split with an embargo of the horizon.
+
 `L_enc = L_recon(modalities) + β·L_KL_or_quant + λ_next·L_next_step + L_spec32(router, decorrelation)`
 - `L_recon`: per-modality reconstruction (market series: NLL under predicted distribution; embedding-level reconstruction for text/vision/audio tokens. Pixel/waveform reconstruction is not done at gen 0).
 - `L_next_step`: predict the next-step latent and the next-step market targets (returns, volatility) per timescale. Supplies the residuals used by spec 32.
@@ -169,6 +178,7 @@ Tensor handoff happens via host memory or a shared CUDA buffer (proposal: start 
 | Pretrained weights unavailable / license unclear | Family falls back to a learned-from-scratch front-end. Logged |
 
 ## 9. Acceptance criteria
+*Status:* 1 holds for `fsq_hybrid` and `jepa_vae` (shapes, seed determinism, save/load, resume; `fa_encoders::neural` tests), not for families 2 and 4; 2 holds (one snapshot per timescale, trained and loaded independently); 3 holds for the media path (`media::point_in_time`), the market path has no publish-time lag; 4 not measured (no reference GPU; CPU serving of the default genome keeps up with live 1m bars of 9 instruments, not benchmarked); 5 open (no media fused); 6 holds bitwise on CPU.
 1. Each of the 4 families implements `EncoderFamily`, trains on a synthetic multimodal dataset, and passes the conformance suite (shapes, determinism with seed, save/load round-trip, cost estimate).
 2. One model per configured timescale can be trained and loaded independently.
 3. The batch builder provably excludes tokens with `publish_time` after window end (unit + property tests).

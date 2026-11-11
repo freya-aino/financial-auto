@@ -2,9 +2,17 @@
 //! objective (spec 32, D-008).
 //!
 //! The [`Router`] trait is the stage boundary between the encoder and the regions/MCMC
-//! stages. [`EvidenceSoftmaxRouter`] is the pure-Rust baseline used while the learned MoE
-//! gate is unavailable (D-004).
+//! stages. [`EvidenceSoftmaxRouter`] is the pure-Rust baseline router of the statistical family.
+//! The learned MoE gate lives in [`moe`] (candle): router, per-expert projectors and next-step
+//! predictors trained with the D-008 objective (residual decorrelation + load balancing + KL);
+//! a neural encoder fills `ExpertView.router_weights` with its learned top-k gates, which the
+//! runtime keeps instead of re-routing. [`health`] holds the §6.4 measures (residual
+//! correlation, `K_eff`, per-expert skill) and the §6.5 CKA expert matching; [`nn`] the small
+//! deterministic parameter store / Adam shared with `fa-encoders::neural`.
 
+pub mod health;
+pub mod moe;
+pub mod nn;
 pub mod router;
 
 use fa_core::Timescale;

@@ -2,7 +2,14 @@
 
 Decoder families: visual, retrieval, text, RNN-prior.
 
-**Status:** partial — `Decoder` trait and family enum; CRPS (ensemble + quantile), pinball loss, time-discounted analog weighting; **baseline genome encoding** (`genome`: parse, canonical `Display`, numeric `params()` / `with_params()` for evolution) and two **CPU point-in-time series decoders** (`baseline`: empirical quantile forecaster, analog retrieval with leakage guard and optional **latent conditioning** through `DecodeCtx`), all tested; and the **baseline text and visual decoders** served live by model-runtime (`text_baseline`, `visual_baseline`, D-062). No ML-backend models; `ExpertView` conditioning is limited to the latent-similarity term below.
+**Status:** partial — `Decoder` trait and family enum; CRPS (ensemble + quantile), pinball loss, time-discounted analog weighting; **baseline genome encoding** (`genome`: parse, canonical `Display`, numeric `params()` / `with_params()` for evolution) and two **CPU point-in-time series decoders** (`baseline`: empirical quantile forecaster, analog retrieval with leakage guard and optional **latent conditioning** through `DecodeCtx`), all tested; the **baseline text and visual decoders** served live by model-runtime (`text_baseline`, `visual_baseline`, D-062); and six **trainable neural families on candle** (`neural`: `nn_forecast` MLP/GRU quantile prior, `nn_retrieval` learned metric, `nn_chart` / `nn_future` raster decoders over `render`, `nn_news` / `nn_narrative` news-embedding decoders), with safetensors bundles and the D-009 frozen-elite feedback API (`neural::feedback`). CPU by default; feature `cuda` moves training/serving onto CUDA device 0 when present.
+
+## Neural families (`neural`, spec 34 §4.5–4.6)
+- `neural::train(&genome, &series, Arc<DecodeCtx>, Arc<TextTimeline>, &TrainOptions)` → `NeuralDecoder`: point-in-time training before the cutoff (`train` gene), AdamW, seeded init, early stopping on a held-out tail, optional warm start from a parent bundle.
+- `NeuralDecoder` implements `SeriesDecoder` (forecasts only after the cutoff, batched + cached per series), `recon_eval` (reconstruction skill vs the training-mean target), `serve` (last step with an explicit latent / news context: quantiles or a [-1, 1] score + components), `to_bundle` / `from_bundle` / `meta_of`.
+- `neural::data`: input layout `[return window | extra | latent | flag]`, targets, `TextTimeline` (hashed news embeddings by knowledge time), `sentiment_direction`.
+- `neural::feedback`: `select_top_k`, `quota_weights`, `FeedbackSet::{load, prepare, aux_loss}` — the auxiliary loss for encoder training, differentiable w.r.t. the latents only.
+- `render`: column-distribution chart rasters (lookback window, future window), `column_quantiles`, `prob_up`, `direction`.
 
 ## Genome format (`genome::DecoderGenome::parse`)
 | Form | Example | Notes |
@@ -40,7 +47,7 @@ Pure and deterministic; model-runtime feeds it `news.item.>` and publishes `text
 Tested on synthetic shapes: flat → all 0, box breakouts up/down mirrored, ramps up/down, a squeeze.
 
 ## Owns
-`Decoder` trait and family implementations (incl. the baseline text / visual scorers); genome encoding of the baseline families; `DecodeCtx` / `LatentPoint` / `instrument_token` / `cosine` conditioning primitives.
+`Decoder` trait and family implementations (incl. the baseline text / visual scorers and the neural families); genome encoding of all families; decoder bundles and the decoder → encoder feedback API; `DecodeCtx` / `LatentPoint` / `instrument_token` / `cosine` conditioning primitives.
 
 ## Governing specs
 - [34-decoder-population](../../specs/34-decoder-population.md)

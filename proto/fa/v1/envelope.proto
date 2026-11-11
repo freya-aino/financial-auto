@@ -18,6 +18,11 @@ message Envelope {
   google.protobuf.Timestamp ingest_time = 6; // when our ingestor received it
   RawRef raw_ref = 7;
   uint32 schema_version = 8;
+  // Quality flags (spec 10 §6.2, §6.3, §8, §9).
+  bool raw_missing = 9; // the raw payload could not be archived (Garage down, spool full)
+  bool publish_time_estimated = 10; // the source gives no availability time; publish_time is derived
+  bool gap_filled = 11; // re-fetched after a stream gap / outage rather than received live
+  bool backfill = 12; // produced by a backfill job, not the live connector
 
   oneof payload {
     Trade trade = 20;

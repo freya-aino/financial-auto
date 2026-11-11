@@ -60,9 +60,22 @@ hex = "0.4.3"
 serde_yaml = "0.9.34"
 quick-xml = { version = "0.37.5", features = ["serialize"] }
 rand = "0.9.2"
+# Pure-Rust ML (ADR 0003): CPU by default; members opt into CUDA with their own `cuda` feature.
+# Pinned to 0.10.x: 0.11 AVX512-VNNI kernels do not compile with the host rustc (system LLVM).
+candle-core = { version = "0.10.2", default-features = false }
+candle-nn = { version = "0.10.2", default-features = false }
+safetensors = "0.7.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# candle's CPU kernels are ~20x slower unoptimised; the neural families' tests train small models.
+[profile.dev.package.candle-core]
+opt-level = 3
+[profile.dev.package.gemm-f32]
+opt-level = 3
+[profile.dev.package.gemm-common]
+opt-level = 3

@@ -3,7 +3,8 @@
 //!
 //! | spec | meaning |
 //! |---|---|
-//! | (none), `baselines` | `crates/fa-strategies/baselines.toml` (hand-written, not evolved) |
+//! | (none), `managed` | the baselines **plus** the managed live set `fa-artifacts/live/strategies.toml` written by the risk-engine pipeline (evolved strategies past the locked holdout, spec 35 §6.4); a missing live set or Garage means baselines only |
+//! | `baselines` | `crates/fa-strategies/baselines.toml` (hand-written, not evolved) |
 //! | `garage:fa-artifacts/strategies/<gen>.toml` (bucket prefix optional) | that object in `fa-artifacts` |
 //! | `latest` | the object under `fa-artifacts/strategies/` with the greatest key (`.toml` only) |
 //! | anything else | a local file path |
@@ -14,13 +15,15 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use fa_blob::{BlobStore, ObjectKey, buckets};
-use fa_strategies::population::StrategyFile;
+use fa_strategies::population::{LIVE_SET_KEY, StrategyFile};
 
 /// Key prefix of promoted strategy populations inside `fa-artifacts`.
 pub const STRATEGIES_PREFIX: &str = "strategies/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PopulationSpec {
+    /// Baselines + the managed live set (default).
+    Managed,
     Baselines,
     Path(PathBuf),
     /// Key inside `fa-artifacts` (no bucket prefix).
@@ -32,7 +35,8 @@ impl PopulationSpec {
     pub fn parse(s: &str) -> Self {
         let s = s.trim();
         match s {
-            "" | "baselines" => Self::Baselines,
+            "" | "managed" => Self::Managed,
+            "baselines" => Self::Baselines,
             "latest" | "garage:latest" => Self::Latest,
             _ => match s.strip_prefix("garage:") {
                 Some(k) => {
@@ -59,6 +63,26 @@ pub async fn latest_key<B: BlobStore>(blob: &B) -> anyhow::Result<String> {
 pub async fn load<B: BlobStore>(spec: &PopulationSpec, blob: Option<&B>) -> anyhow::Result<(StrategyFile, String)> {
     match spec {
         PopulationSpec::Baselines => Ok((StrategyFile::baselines(), "baselines".into())),
+        PopulationSpec::Managed => {
+            let Some(blob) = blob else {
+                return Ok((StrategyFile::baselines(), "baselines (managed; Garage not configured)".into()));
+            };
+            let key = ObjectKey { bucket: buckets::ARTIFACTS, key: LIVE_SET_KEY.into() };
+            if !blob.exists(&key).await.with_context(|| format!("checking {}/{LIVE_SET_KEY}", buckets::ARTIFACTS))? {
+                return Ok((StrategyFile::baselines(), "baselines (managed; no live set yet)".into()));
+            }
+            let bytes = blob
+                .get(&key)
+                .await
+                .with_context(|| format!("not_found: fetching {}/{LIVE_SET_KEY}", buckets::ARTIFACTS))?;
+            let src = String::from_utf8(bytes).context("invalid: live set is not UTF-8")?;
+            let live = StrategyFile::parse(&src).with_context(|| format!("invalid: parsing {LIVE_SET_KEY}"))?;
+            let n = live.strategy.len();
+            Ok((
+                StrategyFile::baselines().merged(live),
+                format!("baselines+{}/{LIVE_SET_KEY} ({n} evolved)", buckets::ARTIFACTS),
+            ))
+        }
         PopulationSpec::Path(p) => {
             let src = std::fs::read_to_string(p).with_context(|| format!("not_found: reading {}", p.display()))?;
             let file = StrategyFile::parse(&src).with_context(|| format!("invalid: parsing {}", p.display()))?;
@@ -108,7 +132,8 @@ mod tests {
     #[test]
     fn parses_specs() {
         assert_eq!(PopulationSpec::parse("latest"), PopulationSpec::Latest);
-        assert_eq!(PopulationSpec::parse(""), PopulationSpec::Baselines);
+        assert_eq!(PopulationSpec::parse(""), PopulationSpec::Managed);
+        assert_eq!(PopulationSpec::parse("baselines"), PopulationSpec::Baselines);
         assert_eq!(
             PopulationSpec::parse("garage:fa-artifacts/strategies/7.toml"),
             PopulationSpec::Garage("strategies/7.toml".into())
@@ -137,6 +162,25 @@ mod tests {
         assert_eq!(f.strategy.len(), StrategyFile::baselines().strategy.len());
         assert!(warn.unwrap().contains("not_found"));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn managed_population_is_baselines_plus_the_live_set() {
+        let blob = MemoryStore::default();
+        let n = StrategyFile::baselines().strategy.len();
+        let (f, label) = load(&PopulationSpec::Managed, Some(&blob)).await.unwrap();
+        assert_eq!((f.strategy.len(), label.contains("no live set")), (n, true));
+        let (f, _) = load::<MemoryStore>(&PopulationSpec::Managed, None).await.unwrap();
+        assert_eq!(f.strategy.len(), n);
+        let key = ObjectKey { bucket: buckets::ARTIFACTS, key: LIVE_SET_KEY.into() };
+        blob.put(&key, GEN.as_bytes().to_vec(), "application/toml").await.unwrap();
+        let (f, label) = load(&PopulationSpec::Managed, Some(&blob)).await.unwrap();
+        assert_eq!(f.strategy.len(), n + 1);
+        assert!(f.strategy.iter().any(|s| s.id == "gp-a"));
+        assert!(label.contains("(1 evolved)"), "{label}");
+        // a corrupt live set is an error (start falls back to the baselines with a warning)
+        blob.put(&key, b"[[strategy]]\nid='x'".to_vec(), "application/toml").await.unwrap();
+        assert!(load(&PopulationSpec::Managed, Some(&blob)).await.is_err());
     }
 
     #[tokio::test]

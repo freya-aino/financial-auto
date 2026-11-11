@@ -35,8 +35,15 @@ pub const NAMED_QUERIES: &[NamedQuery] = &[
     NamedQuery { name: "regionNeighbors", params: &["region_id: string"], doc: "successor regions" },
     NamedQuery {
         name: "searchLatent",
-        params: &["expert_space_id: string", "vector: [number]", "k: integer?"],
-        doc: "k nearest LatentVecs in one expert space (default k = 20)",
+        params: &[
+            "expert_space_id: string",
+            "vector: [number]",
+            "k: integer?",
+            "kind: string?",
+            "instrument_id: string?",
+            "as_of_ms: integer?",
+        ],
+        doc: "k nearest LatentVecs in one registered expert space (default k = 20; vector length = space dim)",
     },
     NamedQuery { name: "genomeParents", params: &["genome_id: string"], doc: "direct parents" },
     NamedQuery { name: "genomeFitness", params: &["genome_id: string"], doc: "FitnessRecords of a genome" },
@@ -83,6 +90,21 @@ fn opt_usize(params: &Json, key: &str, default: usize, max: usize) -> Result<usi
             let n = v.as_u64().ok_or_else(|| HubError::BadParam(format!("`{key}` must be a non-negative integer")))?;
             Ok((n as usize).min(max))
         }
+    }
+}
+
+fn opt_str(params: &Json, key: &str) -> Result<Option<String>> {
+    match params.get(key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::String(s)) => Ok(Some(s.clone()).filter(|s| !s.is_empty())),
+        Some(_) => Err(HubError::BadParam(format!("`{key}` must be a string"))),
+    }
+}
+
+fn opt_i64(params: &Json, key: &str) -> Result<Option<i64>> {
+    match params.get(key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(v) => v.as_i64().map(Some).ok_or_else(|| HubError::BadParam(format!("`{key}` must be an integer"))),
     }
 }
 
@@ -147,7 +169,19 @@ impl HubClient {
                 let space = str_param(p, "expert_space_id")?;
                 let vector = vector_param(p, "vector")?;
                 let k = opt_usize(p, "k", 20, MAX_SEARCH_K)?.max(1);
-                json!(self.search_latent(space, &vector, k).await?)
+                let filter = crate::KnnFilter {
+                    kind: opt_str(p, "kind")?,
+                    instrument_id: opt_str(p, "instrument_id")?,
+                    as_of_ms: opt_i64(p, "as_of_ms")?,
+                    ..crate::KnnFilter::default()
+                };
+                match self.knn(space, &vector, k, &filter).await {
+                    Ok(hits) => json!(hits),
+                    Err(e @ (HubError::DimMismatch { .. } | HubError::InvalidVector(_))) => {
+                        return Err(HubError::BadParam(e.to_string()));
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             "genomeParents" | "genomeFitness" | "genomeAncestry" => {
                 let id = str_param(p, "genome_id")?;
@@ -200,6 +234,11 @@ mod tests {
         assert!(matches!(opt_usize(&p, "bad", 1, 5), Err(HubError::BadParam(_))));
         assert_eq!(vector_param(&p, "vector").unwrap(), vec![1.0f32, 0.5]);
         assert!(matches!(vector_param(&p, "empty"), Err(HubError::BadParam(_))));
+        assert_eq!(opt_str(&p, "region_id").unwrap().as_deref(), Some("r1"));
+        assert!(matches!(opt_str(&p, "k"), Err(HubError::BadParam(_))));
+        assert_eq!(opt_i64(&p, "k").unwrap(), Some(7));
+        assert_eq!(opt_i64(&p, "nope").unwrap(), None);
+        assert!(matches!(opt_i64(&p, "bad"), Err(HubError::BadParam(_))));
     }
 
     #[tokio::test]

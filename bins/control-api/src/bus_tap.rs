@@ -10,7 +10,7 @@ use axum::{
 };
 use fa_proto::{
     Message,
-    v1::{Envelope, Heartbeat, envelope::Payload},
+    v1::{Envelope, Halt, Heartbeat, Resume, RiskEvent, envelope::Payload},
 };
 use futures::{StreamExt, stream::select_all};
 use serde::Deserialize;
@@ -103,6 +103,50 @@ pub fn decode(subject: &str, payload: &[u8]) -> Value {
     }
     if ENVELOPE_PREFIXES.iter().any(|p| subject.starts_with(p)) {
         return Envelope::decode(payload).map(envelope_json).unwrap_or(Value::Null);
+    }
+    if let Some(rest) = subject.strip_prefix("ingest.") {
+        let kind = rest.split('.').next().unwrap_or("");
+        return fa_bus::ingest::frame_json(kind, payload)
+            .map(|v| json!({"type": format!("ingest.{kind}"), "frame": v}))
+            .unwrap_or(Value::Null);
+    }
+    if subject.starts_with("ref.changed.") || subject.starts_with("catalog.changed.") {
+        return fa_bus::ingest::ref_changed(payload)
+            .map(|r| {
+                let mut v = fa_bus::ingest::ref_changed_json(&r);
+                v["type"] = json!("ref_changed");
+                v
+            })
+            .unwrap_or(Value::Null);
+    }
+    if subject.starts_with("risk.halt.") {
+        return Halt::decode(payload)
+            .map(|h| json!({"type": "halt", "scope": h.scope, "reason": h.reason, "manual": h.manual, "since": ts(&h.since)}))
+            .unwrap_or(Value::Null);
+    }
+    if subject.starts_with("risk.resume.") {
+        return Resume::decode(payload)
+            .map(|r| json!({"type": "resume", "scope": r.scope, "reason": r.reason, "manual": r.manual, "actor": r.actor, "at": ts(&r.at)}))
+            .unwrap_or(Value::Null);
+    }
+    if subject.starts_with("risk.event.") {
+        return RiskEvent::decode(payload)
+            .map(|e| {
+                json!({
+                    "type": "risk_event",
+                    "event_id": e.event_id,
+                    "kind": e.kind().as_str_name(),
+                    "at": ts(&e.at),
+                    "account": e.account,
+                    "intent_id": e.intent_id,
+                    "strategy_id": e.strategy_id,
+                    "instrument_id": e.instrument_id,
+                    "scope": e.scope,
+                    "reason": e.reason,
+                    "metrics": e.metrics,
+                })
+            })
+            .unwrap_or(Value::Null);
     }
     Value::Null
 }

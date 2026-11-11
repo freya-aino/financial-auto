@@ -6,9 +6,18 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+candle-core.workspace = true
 fa-core.workspace = true
+safetensors.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [lints]
 workspace = true
+
+# Learned MoE router + projectors + D-008 losses run on candle's CPU backend (ADR 0003).
+# `cuda` moves them onto a CUDA device (off by default: no GPU on the dev host).
+[features]
+default = []
+cuda = ["candle-core/cuda"]

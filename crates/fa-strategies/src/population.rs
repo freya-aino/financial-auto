@@ -8,6 +8,12 @@ use crate::{GpStrategy, sexpr};
 /// Genome id that marks a hand-written, non-evolved program.
 pub const BASELINE_GENOME: &str = "baseline";
 
+/// Key (bucket `fa-artifacts`) of the **managed live set**: the evolved strategies the
+/// risk-engine pipeline has admitted (shadow, active, paused), rewritten on every admission
+/// and retirement (spec 35 §6.4). strategy-runtime's default population is the baselines plus
+/// this file ([`StrategyFile::merged`]).
+pub const LIVE_SET_KEY: &str = "live/strategies.toml";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyDef {
     pub id: String,
@@ -103,6 +109,27 @@ impl StrategyFile {
         Ok(f)
     }
 
+    /// `self` plus every strategy of `other` whose id is not already present (the first file
+    /// wins on an id clash; evolved `gp-…` ids never clash with baselines). `instruments` are
+    /// united (empty = every instrument stays empty only when both are).
+    pub fn merged(mut self, other: StrategyFile) -> Self {
+        for s in other.strategy {
+            if !self.strategy.iter().any(|x| x.id == s.id) {
+                self.strategy.push(s);
+            }
+        }
+        if !self.instruments.is_empty() && !other.instruments.is_empty() {
+            for i in other.instruments {
+                if !self.instruments.contains(&i) {
+                    self.instruments.push(i);
+                }
+            }
+        } else {
+            self.instruments.clear();
+        }
+        self
+    }
+
     /// The built-in baseline population (`crates/fa-strategies/baselines.toml`).
     pub fn baselines() -> Self {
         Self::parse(BASELINES_TOML).expect("built-in baselines must parse")
@@ -144,6 +171,20 @@ mod tests {
             assert!((-1.0..=1.0).contains(&e.mean), "{}: mean {}", def.id, e.mean);
             assert!((0.0..=1.0).contains(&e.stddev), "{}: std {}", def.id, e.stddev);
         }
+    }
+
+    #[test]
+    fn merged_keeps_the_first_definition_and_adds_new_ids() {
+        let live = StrategyFile::parse(
+            "[[strategy]]\nid='gp-1'\ngenome_id='gp-1'\ntimescale='1s'\nsignal='1'\n[[strategy]]\nid='baseline-momentum-1s'\ntimescale='1s'\nsignal='0'\n",
+        )
+        .unwrap();
+        let n = StrategyFile::baselines().strategy.len();
+        let m = StrategyFile::baselines().merged(live);
+        assert_eq!(m.strategy.len(), n + 1);
+        assert!(m.strategy.iter().any(|s| s.id == "gp-1" && !s.is_baseline()));
+        assert_ne!(m.strategy.iter().find(|s| s.id == "baseline-momentum-1s").unwrap().signal, "0");
+        assert!(m.instruments.is_empty());
     }
 
     #[test]

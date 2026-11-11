@@ -18,10 +18,10 @@ Specs are the source of truth until code exists. Each one follows [`_template.md
 | [12 Reference data](12-reference-data.md) | draft | Medium | Authoritative source per field, adjustment policy |
 | [20 Storage](20-storage.md) | draft | Medium | Order books / cardinality in VictoriaMetrics, retention budget, Helix schema |
 | [21 Bus & contracts](21-bus-and-contracts.md) | draft | Medium-high | Retention per stream, versioning, backpressure |
-| [30 Latent regions](30-latent-regions.md) | draft | Low-medium | **Region identity across retraining** |
+| [30 Latent regions](30-latent-regions.md) | draft | High | Neural-family discovery methods (density/Mapper/codebook), anchored training (D-007 primary) |
 | [31 Expert encoders](31-expert-encoders.md) | draft | Low-medium | Modality fusion, router mechanics, **pure-Rust media feasibility** |
 | [32 Expert spaces](32-expert-spaces.md) | draft | Low | **Exact decorrelation/generalization loss**, expert-count stability |
-| [33 MCMC graph](33-mcmc-graph.md) | draft | Low-medium | Transitions across snapshots, calibration scoring |
+| [33 MCMC graph](33-mcmc-graph.md) | draft | High | Richer kernels (covariates, hierarchical, semi-Markov) with HMC/Gibbs refits |
 | [34 Decoder population](34-decoder-population.md) | draft | Medium | Genome encoding, **decoder→encoder feedback path** |
 | [35 Strategies](35-strategies.md) | draft | Medium-low | GP DSL semantics, comparing policies and programs |
 | [36 Training lifecycle](36-training-lifecycle.md) | draft | Medium | Generation cadence, adapter drift/reset |

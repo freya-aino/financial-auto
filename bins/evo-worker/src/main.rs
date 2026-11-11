@@ -21,6 +21,7 @@ mod holdout;
 mod job;
 mod latent;
 mod market;
+mod neural;
 mod recorded;
 mod run;
 mod strategy;

@@ -4,11 +4,13 @@
 //! `fa_strategies` programs with execution simulation through the [`cost`] model, and
 //! [`validation`], the per-generation statistics over a trial set (deflated Sharpe, PBO), and
 //! [`allocator_replay`], the portfolio replay of recorded strategy signals through one
-//! allocator genome (allocator tournament, spec 40 §6.2).
+//! allocator genome (allocator tournament, spec 40 §6.2), and [`holdout`], the locked-holdout
+//! planner and holdout-aware selection windows (spec 41 §6.4).
 
 pub mod allocator_replay;
 pub mod cost;
 pub mod eval;
+pub mod holdout;
 pub mod latents;
 pub mod replay;
 pub mod stats;

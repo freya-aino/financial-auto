@@ -20,8 +20,20 @@
 //! start, every `refdata_refresh_secs` and (debounced) on `ref.changed.>` / `ingest.unresolved.>`;
 //! the ECB daily reference rates are fetched every `fx.ecb_refresh_secs` into `ref.fx_rate` and
 //! the in-memory FX table reloaded; today's `ledger.payout_quota` is polled every 30 s.
+//!
+//! Strategy pipeline and holdouts ([`pipeline`], spec 35 §6.4, spec 41 §6.4): with Postgres a
+//! background task keeps a locked holdout per timescale, selects candidates from the newest
+//! strategy generations in Garage, requests their single holdout evaluation, admits passing
+//! ones to the managed live set (strategy-runtime reload), promotes on a green gate (paper) and
+//! demotes / retires; `ctl.risk.pipeline {action: status|run}`. `ctl.risk.allocators` reports
+//! the live allocator tournament; `ctl.risk.limits {calibrate: "{}"|"{\"apply\":true}"}` the
+//! limit calibration rules (applying only tightens). The halt state machine (kill switch,
+//! halts, drawdown peak) is persisted in `ledger.risk_state` and restored at start. Limit
+//! clips, pre-trade rejections, feed freezes / bad ticks and allocator fallbacks go out as
+//! `fa.v1.RiskEvent{LIMIT_BREACH}` on `risk.event.<account>` and into `audit.log`.
 mod engine;
 mod persist;
+mod pipeline;
 mod settings;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -43,13 +55,15 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    engine::{Engine, Out},
+    engine::{Engine, Evidence, Out},
     persist::Persist,
+    pipeline::Pipeline,
     settings::Settings,
 };
 
 type Shared = Arc<Mutex<Engine>>;
 type Store = Option<Arc<Persist>>;
+type Pipe = Option<Arc<Pipeline>>;
 
 const SERVICE: &str = "risk-engine";
 
@@ -102,6 +116,9 @@ async fn publish_outs(bus: &Bus, store: &Store, engine: &Shared, outs: Vec<Out>)
                     p.audit("resume", Some(&h.scope), serde_json::json!({"reason": h.reason, "raised_by": SERVICE}))
                         .await;
                 }
+                Out::RiskEvent { kind, scope, detail } => {
+                    p.audit(&format!("risk.event.{kind}"), Some(scope), detail.clone()).await;
+                }
                 _ => {}
             }
         }
@@ -112,19 +129,90 @@ async fn publish_outs(bus: &Bus, store: &Store, engine: &Shared, outs: Vec<Out>)
             }
             Out::Intent(i) => bus.publish(subjects::order_intent(&i.account_id), i).await,
             Out::Approved(i) => bus.publish(subjects::order_approved(&i.account_id), i).await,
-            Out::Rejected { account, event } => bus.publish(subjects::order_event(account), event).await,
+            Out::Rejected { account, event } => {
+                // typed decision on risk.event.<account>; the OrderEvent{REJECTED} stays for older consumers
+                let _ = bus.publish(subjects::risk_event(account), &rejection_event(account, event)).await;
+                bus.publish(subjects::order_event(account), event).await
+            }
+            Out::RiskEvent { kind, scope, detail } => {
+                tracing::info!(%kind, %scope, %detail, "risk event");
+                bus.publish(subjects::risk_event(RISK_EVENT_ACCOUNT), &breach_event(kind, scope, detail)).await
+            }
             Out::Halt(h) => {
                 tracing::warn!(scope = %h.scope, reason = %h.reason, "raising halt");
+                let _ = bus.publish(subjects::risk_event(RISK_EVENT_ACCOUNT), &halt_event(h, true)).await;
                 bus.publish(subjects::risk_halt(&h.scope), h).await
             }
             Out::Resume(h) => {
                 tracing::info!(scope = %h.scope, reason = %h.reason, "clearing own halt");
-                bus.publish(subjects::risk_resume(&h.scope), h).await
+                let _ = bus.publish(subjects::risk_event(RISK_EVENT_ACCOUNT), &halt_event(h, false)).await;
+                // fa.v1 Resume is wire-compatible with Halt (D-030 consumers keep decoding Halt)
+                let resume = fa_proto::v1::Resume {
+                    scope: h.scope.clone(),
+                    reason: h.reason.clone(),
+                    at: h.since.or_else(|| Some(fa_proto::now())),
+                    manual: h.manual,
+                    actor: format!("system:{SERVICE}"),
+                };
+                bus.publish(subjects::risk_resume(&h.scope), &resume).await
             }
         };
         if let Err(e) = r {
             tracing::warn!(error = %e, "publish failed");
         }
+    }
+}
+
+/// Account token of `risk.event.<account>` for engine-wide halts (the engine guards the paper book).
+const RISK_EVENT_ACCOUNT: &str = "paper";
+
+/// `RiskEvent{INTENT_REJECTED}` for a gated intent (D-042 follow-up).
+fn rejection_event(account: &str, ev: &OrderEvent) -> fa_proto::v1::RiskEvent {
+    fa_proto::v1::RiskEvent {
+        event_id: ulid::Ulid::generate().to_string(),
+        kind: fa_proto::v1::risk_event::Kind::IntentRejected as i32,
+        at: ev.event_time.or_else(|| Some(fa_proto::now())),
+        account: account.to_owned(),
+        intent_id: ev.intent_id.clone(),
+        reason: ev.reason.clone(),
+        ..Default::default()
+    }
+}
+
+/// `RiskEvent{LIMIT_BREACH}` for an engine event (limit clip, pre-trade rejection, feed freeze
+/// or bad tick, allocator fallback): `reason` = `<kind>: <detail JSON>`, `scope` = the kind,
+/// `instrument_id` when the scope is an instrument, numeric detail fields as `metrics`.
+fn breach_event(kind: &str, scope: &str, detail: &serde_json::Value) -> fa_proto::v1::RiskEvent {
+    let metrics = detail
+        .as_object()
+        .map(|o| o.iter().filter_map(|(k, v)| v.as_f64().map(|x| (k.clone(), x))).collect())
+        .unwrap_or_default();
+    let instrument = if Uuid::parse_str(scope).is_ok() { scope.to_owned() } else { String::new() };
+    fa_proto::v1::RiskEvent {
+        event_id: ulid::Ulid::generate().to_string(),
+        kind: fa_proto::v1::risk_event::Kind::LimitBreach as i32,
+        at: Some(fa_proto::now()),
+        account: RISK_EVENT_ACCOUNT.to_owned(),
+        intent_id: detail["intent_id"].as_str().unwrap_or_default().to_owned(),
+        instrument_id: instrument,
+        scope: kind.to_owned(),
+        reason: format!("{kind}: {detail}"),
+        metrics,
+        ..Default::default()
+    }
+}
+
+/// `RiskEvent{HALT_RAISED|HALT_CLEARED}` mirroring a halt or resume the engine publishes.
+fn halt_event(h: &Halt, raised: bool) -> fa_proto::v1::RiskEvent {
+    use fa_proto::v1::risk_event::Kind;
+    fa_proto::v1::RiskEvent {
+        event_id: ulid::Ulid::generate().to_string(),
+        kind: if raised { Kind::HaltRaised } else { Kind::HaltCleared } as i32,
+        at: h.since.or_else(|| Some(fa_proto::now())),
+        account: RISK_EVENT_ACCOUNT.to_owned(),
+        scope: h.scope.clone(),
+        reason: h.reason.clone(),
+        ..Default::default()
     }
 }
 
@@ -139,45 +227,45 @@ fn actor_of(req: &CtlRequest) -> String {
 
 /// One control request. Ok → JSON for the reply message; Err → prefixed message
 /// (`not_found:` / `conflict:` / `invalid:` / `loosen:`).
-async fn handle_ctl(verb: &str, req: &CtlRequest, engine: &Shared, store: &Store) -> Result<serde_json::Value, String> {
+async fn handle_ctl(
+    verb: &str,
+    req: &CtlRequest,
+    engine: &Shared,
+    store: &Store,
+    pipe: &Pipe,
+) -> Result<serde_json::Value, String> {
     let now = now_ms();
     let actor = actor_of(req);
     match verb {
         "strategy" => {
             let action = req.args.get("action").map(String::as_str).unwrap_or("");
             if action == "list" {
-                let candidates: Vec<(String, Vec<String>)> = {
-                    let e = engine.lock().await;
-                    e.strategy_ids().into_iter().map(|id| (id.clone(), e.candidate_ids(&id))).collect()
-                };
-                let mut dsr = std::collections::BTreeMap::new();
+                let ids: Vec<String> = engine.lock().await.strategy_ids();
+                let mut evidence = std::collections::BTreeMap::new();
                 if let Some(p) = store {
-                    for (id, cands) in &candidates {
-                        let refs: Vec<&str> = cands.iter().map(String::as_str).collect();
-                        dsr.insert(id.clone(), p.deflated_sharpe(&refs).await);
+                    for id in &ids {
+                        evidence.insert(id.clone(), evidence_for(engine, p, id).await);
                     }
                 }
-                return Ok(engine.lock().await.strategies_view(&dsr, now));
+                return Ok(engine.lock().await.strategies_view(&evidence, now));
             }
             let Some(action) = StrategyAction::parse(action) else {
-                return Err(format!("invalid: action {action:?}; use pause|resume|flatten|promote|shadow|list"));
+                return Err(format!(
+                    "invalid: action {action:?}; use pause|resume|flatten|promote|shadow|retire|admit|list"
+                ));
             };
             let id = req.args.get("strategy_id").cloned().unwrap_or_default();
             if id.is_empty() {
                 return Err("invalid: strategy_id is required".into());
             }
-            let dsr = match (action, store) {
-                (StrategyAction::Promote, Some(p)) => {
-                    let cands = engine.lock().await.candidate_ids(&id);
-                    let refs: Vec<&str> = cands.iter().map(String::as_str).collect();
-                    p.deflated_sharpe(&refs).await
-                }
-                _ => None,
+            let ev = match store {
+                Some(p) => evidence_for(engine, p, &id).await,
+                None => Evidence::default(),
             };
             let (state, gate) = {
                 let mut e = engine.lock().await;
-                let state = e.strategy_action(&id, action, dsr, now)?;
-                let gate = e.checklist(&id, dsr, now);
+                let state = e.strategy_action(&id, action, &ev, now)?;
+                let gate = e.checklist(&id, &ev, now);
                 (state, gate)
             };
             if let Some(p) = store {
@@ -192,6 +280,38 @@ async fn handle_ctl(verb: &str, req: &CtlRequest, engine: &Shared, store: &Store
             }
             let view = engine.lock().await.strategy_json(&state, gate.as_ref(), now);
             Ok(view)
+        }
+        "limits" if req.args.contains_key("calibrate") => {
+            // limit calibration rules (spec 40 §7): suggestions; `apply` only ever tightens
+            let opts: serde_json::Value =
+                serde_json::from_str(req.args.get("calibrate").map(String::as_str).unwrap_or("{}")).unwrap_or_default();
+            let rules = fa_risk::calibrate::CalibrationRules::default();
+            let cal = engine.lock().await.calibration(&rules);
+            let mut v = serde_json::to_value(&cal).unwrap_or_default();
+            if opts["apply"].as_bool() == Some(true) && !cal.tightened.is_empty() {
+                let patch: serde_json::Map<String, serde_json::Value> = cal
+                    .tightened
+                    .iter()
+                    .filter_map(|k| cal.suggested.get(k).map(|x| (k.clone(), serde_json::json!(x))))
+                    .collect();
+                let patch = serde_json::Value::Object(patch);
+                let (before, after) = {
+                    let mut e = engine.lock().await;
+                    let before = e.limits().clone();
+                    (before, e.set_limits(&patch)?)
+                };
+                if let Some(p) = store {
+                    p.audit_as(
+                        &actor,
+                        "limits.calibrated",
+                        Some("paper"),
+                        serde_json::json!({"set": patch, "before": before, "after": after, "calibration": cal}),
+                    )
+                    .await;
+                }
+                v["applied"] = patch;
+            }
+            Ok(v)
         }
         "limits" => {
             let Some(set) = req.args.get("set") else {
@@ -270,8 +390,35 @@ async fn handle_ctl(verb: &str, req: &CtlRequest, engine: &Shared, store: &Store
             tracing::warn!(%actor, ?ids, "portfolio flatten requested");
             Ok(serde_json::json!({"ok": true, "flattening": ids}))
         }
+        "allocators" => Ok(engine.lock().await.tournament_view()),
+        "pipeline" => {
+            let Some(pipe) = pipe else {
+                return Err("invalid: the strategy pipeline needs [postgres]".into());
+            };
+            match req.args.get("action").map(String::as_str).unwrap_or("status") {
+                "status" => Ok(pipe.status().await),
+                "run" => {
+                    if let Some(p) = store {
+                        p.audit_as(&actor, "pipeline.run", Some("paper"), serde_json::json!({})).await;
+                    }
+                    Ok(pipe.round().await)
+                }
+                other => Err(format!("invalid: pipeline action {other:?}; use status|run")),
+            }
+        }
         _ => Err(format!("invalid: unknown verb {verb}")),
     }
+}
+
+/// Gate evidence of one strategy from the validation registry.
+async fn evidence_for(engine: &Shared, p: &Persist, id: &str) -> Evidence {
+    let (cands, genome, generation) = {
+        let e = engine.lock().await;
+        let rec = e.strategy(id).and_then(|s| s.pipeline.clone());
+        (e.candidate_ids(id), rec.as_ref().map(|r| r.genome.clone()), rec.map(|r| r.generation))
+    };
+    let refs: Vec<&str> = cands.iter().map(String::as_str).collect();
+    p.evidence(&refs, genome.as_deref(), generation.as_deref()).await
 }
 
 #[tokio::main]
@@ -325,9 +472,15 @@ async fn main() -> anyhow::Result<()> {
                 let refs = p.load_refdata().await;
                 let fx = p.load_fx(&fx_settings.source, fx_settings.history_days).await;
                 let reserve = p.payout_reserve_today().await;
+                let risk_state = p.load_risk_state().await;
                 let mut e = engine.lock().await;
                 e.seed_ledger(ledger);
                 e.seed_strategies(states);
+                if let Some(r) = risk_state {
+                    // kill switch / halts / drawdown peak survive the restart (spec 40 §8)
+                    tracing::warn!(halts = ?r.halt_scopes(), "risk state restored from ledger.risk_state");
+                    e.restore_risk(r);
+                }
                 if let Some(r) = refs {
                     tracing::info!(instruments = r.len(), "reference data loaded");
                     e.set_refdata(r);
@@ -371,6 +524,13 @@ async fn main() -> anyhow::Result<()> {
                     c.insert("halted".into(), if e.halted() { 1.0 } else { 0.0 });
                     for (venue, eur) in e.exposure_by_venue() {
                         c.insert(format!("exposure_eur.venue.{venue}"), eur);
+                    }
+                    if let Some(rows) = e.tournament_view()["entries"].as_array() {
+                        for r in rows {
+                            if let (Some(n), Some(v)) = (r["name"].as_str(), r["cumulative_return"].as_f64()) {
+                                c.insert(format!("allocator.{n}.return"), v);
+                            }
+                        }
                     }
                     c
                 };
@@ -522,16 +682,15 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // ingest.health.<source> (JSON frames from the ingestor): `down` halts the source, `ok` clears it
+    // ingest.health.<source> (fa.v1 IngestHealth, or legacy D-054 JSON): `down` halts the source, `ok` clears it
     {
         let (engine, store) = (engine.clone(), store.clone());
         let mut sub = bus.subscribe_raw("ingest.health.>".into()).await?;
         tokio::spawn(async move {
             while let Some(m) = sub.next().await {
                 let Some(source) = m.subject.strip_prefix("ingest.health.") else { continue };
-                let Ok(frame) = serde_json::from_slice::<serde_json::Value>(&m.payload) else { continue };
-                let status = frame["status"].as_str().unwrap_or("");
-                let reason = frame["reason"].as_str().unwrap_or("");
+                let Some((status, reason)) = fa_bus::ingest::health_status(&m.payload) else { continue };
+                let (status, reason) = (status.as_str(), reason.as_str());
                 let changed = engine.lock().await.on_source_health(source, status, reason, now_ms());
                 if changed {
                     tracing::warn!(source, status, reason, "source health changed the halt set");
@@ -549,15 +708,54 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // control plane: ctl.risk.strategy | ctl.risk.limits | ctl.risk.flatten (request/reply, CtlReply)
-    for verb in ["strategy", "limits", "flatten"] {
-        let (bus, engine, store) = (bus.clone(), engine.clone(), store.clone());
+    // strategy pipeline + holdout locking (spec 35 §6.4, spec 41 §6.4): needs Postgres
+    let pipe: Pipe = match &store {
+        Some(p) => {
+            let blob = fa_core::secrets::Secrets::load()
+                .map_err(|e| tracing::warn!(error = %e, "no secrets: the pipeline cannot read Garage"))
+                .ok()
+                .and_then(|sec| {
+                    fa_blob::S3BlobStore::from_config(&cfg, &sec)
+                        .map_err(
+                            |e| tracing::warn!(error = %e, "Garage unavailable: no generation discovery / live set"),
+                        )
+                        .ok()
+                });
+            let tsdb =
+                (!cfg.victoriametrics.url.is_empty()).then(|| fa_tsdb::Tsdb::new(cfg.victoriametrics.url.clone()));
+            Some(Arc::new(Pipeline::new(bus.clone(), p.clone(), blob, tsdb, engine.clone(), &settings)))
+        }
+        None => None,
+    };
+    if let Some(pp) = pipe.clone() {
+        let every = Duration::from_secs(settings.pipeline.interval_secs.min(settings.holdout.check_secs).max(5));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            loop {
+                tick.tick().await; // the first tick fires at once: holdouts are ensured at start
+                let st = pp.round().await;
+                tracing::debug!(status = %st, "pipeline round");
+            }
+        });
+        let pp = pipe.clone().expect("some");
+        let mut results =
+            bus.subscribe::<fa_proto::v1::JobResult>(subjects::job_result(pipeline::HOLDOUT_JOB_KIND)).await?;
+        tokio::spawn(async move {
+            while let Some((_, r)) = results.next().await {
+                pp.on_job_result(&r).await;
+            }
+        });
+    }
+
+    // control plane: ctl.risk.strategy | limits | flatten | pipeline | allocators (request/reply, CtlReply)
+    for verb in ["strategy", "limits", "flatten", "pipeline", "allocators"] {
+        let (bus, engine, store, pipe) = (bus.clone(), engine.clone(), store.clone(), pipe.clone());
         let mut sub = bus.subscribe_raw(subjects::ctl("risk", verb)).await?;
         tokio::spawn(async move {
             while let Some(m) = sub.next().await {
                 let Some(reply_to) = m.reply.clone() else { continue };
                 let req = CtlRequest::decode(m.payload.as_ref()).unwrap_or_default();
-                let (ok, message) = match handle_ctl(verb, &req, &engine, &store).await {
+                let (ok, message) = match handle_ctl(verb, &req, &engine, &store, &pipe).await {
                     Ok(v) => (true, v.to_string()),
                     Err(e) => (false, e),
                 };
@@ -586,6 +784,8 @@ async fn main() -> anyhow::Result<()> {
                 for (s, book) in &rows {
                     p_s.strategy_state(s, Some(book), None).await;
                 }
+                let rec = engine_s.lock().await.risk_record();
+                p_s.save_risk_state(&rec).await;
             }
         });
         let (engine_d, p_d) = (engine.clone(), p.clone());
@@ -593,9 +793,17 @@ async fn main() -> anyhow::Result<()> {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
                 tick.tick().await;
-                let dirty = engine_d.lock().await.take_dirty_strategies();
+                let (dirty, risk) = {
+                    let mut e = engine_d.lock().await;
+                    let d = e.take_dirty_strategies();
+                    let r = e.take_risk_dirty().then(|| e.risk_record());
+                    (d, r)
+                };
                 for (s, book) in &dirty {
                     p_d.strategy_state(s, Some(book), None).await;
+                }
+                if let Some(r) = risk {
+                    p_d.save_risk_state(&r).await;
                 }
             }
         });
@@ -722,6 +930,8 @@ async fn main() -> anyhow::Result<()> {
         for (s, book) in &rows {
             p.strategy_state(s, Some(book), None).await;
         }
+        let rec = engine.lock().await.risk_record();
+        p.save_risk_state(&rec).await;
         tracing::info!(strategies = rows.len(), "shutdown flush: book snapshot and strategy sub-books written");
     }
     Ok(())

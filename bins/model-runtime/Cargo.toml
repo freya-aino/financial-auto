@@ -30,3 +30,8 @@ ulid.workspace = true
 
 [lints]
 workspace = true
+
+# Neural snapshots serve on candle's CPU backend; `cuda` lets `FA_ML_DEVICE=cuda:0` use a GPU.
+[features]
+default = []
+cuda = ["fa-encoders/cuda"]

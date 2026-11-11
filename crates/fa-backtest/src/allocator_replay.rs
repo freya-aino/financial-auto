@@ -619,7 +619,7 @@ pub(crate) mod tests {
         // tournament: every allocator on identical inputs, results differ where the policy differs
         let genomes: Vec<AllocatorGenome> = AllocatorName::ALL.iter().map(|n| AllocatorGenome::named(*n)).collect();
         let t = tournament(&genomes, &signals, &marks, &spec, &cost);
-        assert_eq!(t.len(), 4);
+        assert_eq!(t.len(), AllocatorName::ALL.len());
         let reports: Vec<&AllocatorReport> = t.iter().map(|(_, r)| r.as_ref().unwrap()).collect();
         assert!(reports.iter().all(|r| r.n_steps == a.n_steps && r.n_signals == a.n_signals));
         assert_ne!(reports[0].returns, reports[2].returns, "equal weight vs Kelly decide differently");

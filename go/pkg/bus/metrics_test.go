@@ -3,6 +3,7 @@ package bus
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRenderMetricsFromCounters(t *testing.T) {
@@ -69,5 +70,16 @@ func TestMetricsBindDefault(t *testing.T) {
 	t.Setenv("FA_METRICS_BIND", "0.0.0.0:9100")
 	if got := MetricsBindDefault("ingestor"); got != "0.0.0.0:9100" {
 		t.Fatalf("env override = %s", got)
+	}
+}
+
+func TestRenderMetricsHeartbeatStats(t *testing.T) {
+	heartbeatPublished(time.Unix(1_800_000_000, 500_000_000))
+	out := RenderMetrics("svc-hb", "x", nil)
+	if !strings.Contains(out, `fa_heartbeat_last_unix_seconds{service="svc-hb"} 1.8000000005e+09`) {
+		t.Fatalf("last heartbeat missing:\n%s", out)
+	}
+	if !strings.Contains(out, `fa_heartbeat_published_total{service="svc-hb"} `) {
+		t.Fatalf("published counter missing:\n%s", out)
 	}
 }

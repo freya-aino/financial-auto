@@ -1,8 +1,18 @@
 //! Ledger: positions, cash and P&L in EUR, fees, idempotent intents, reconciliation (spec 42).
 //! [`Ledger`] is the in-memory book; [`pg::PgLedger`] persists intents, fills, cash movements,
 //! snapshots and reconciliation runs to the `ledger.*` tables and rebuilds a `Ledger` from them.
+//! [`accounting`] derives tax lots (FIFO or average cost), as-of positions, equity and the P&L
+//! breakdown (realised / unrealised / FX / fees / funding / borrow) per book and per strategy
+//! from the event stream; [`statement`] builds book statements; `pg_accounting` adds the
+//! Postgres reads, the lot cache, orphan fills and payout booking to [`pg::PgLedger`].
 
+pub mod accounting;
 pub mod pg;
+pub mod pg_accounting;
+pub mod statement;
+
+pub use accounting::{BookPosition, BookState, LotMethod, Marks, PnlBreakdown};
+pub use statement::Statement;
 
 use std::collections::{BTreeMap, HashSet};
 

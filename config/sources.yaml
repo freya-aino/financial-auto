@@ -133,9 +133,13 @@ sources:
     asset_classes: [crypto, crypto_derivative]
     transport: [rest, websocket]
     auth: hmac
-    status: planned
-    tos_notes: ""
-    notes: ""
+    status: live
+    tos_notes: "Public market-data endpoints need no key; trading (hmac) not implemented."
+    notes: "Verified live 2026-11-11. Keyless public REST: OHLC→Bar, Trades→Trade, Ticker→Quote polled per minute (3 requests per pair); backfill limited to Kraken's latest 720 intervals."
+    rate_limit: {per_second: 0.5, burst: 2}
+    config:
+      symbols: [XBTEUR, ETHEUR, SOLEUR]
+      timeframe: 1m
   - id: coinbase
     name: Coinbase Advanced Trade API
     category: crypto_exchange
@@ -383,9 +387,12 @@ sources:
     asset_classes: [fx]
     transport: [rest]
     auth: none
-    status: planned
+    status: live
     tos_notes: ""
-    notes: "ECB reference rates mirror."
+    notes: "Verified live 2026-11-11 (8 series, 220 rows each for 2026 after live poll + backfill, idempotent). ECB reference rates mirror (api.frankfurter.dev/v1), polled hourly → MacroObservation per BASE_CCY and business day (vintage = estimated 16:00 Europe/Berlin release); backfill from 1999 in yearly windows."
+    rate_limit: {per_second: 0.5, burst: 2}
+    config:
+      extra: {base: EUR, currencies: "USD,GBP,JPY,CHF,CNY,SEK,NOK,PLN"}
   - id: exchangerate_host
     name: exchangerate.host
     category: fx_reference
@@ -517,9 +524,12 @@ sources:
     asset_classes: [macro, fx, rates]
     transport: [rest]
     auth: none
-    status: planned
-    tos_notes: ""
-    notes: "SDMX API; official EUR reference rates."
+    status: live
+    tos_notes: "Portal WAF blocks bursts and some user agents with an HTML page."
+    notes: "Verified live 2026-11-11 (HICP, MRO, DFR, EXR vintages in wh.macro_observation). SDMX 2.1 REST (data-api.ecb.europa.eu) with includeHistory → one MacroObservation per vintage (validFrom); queries are <FLOW>/<KEY>; polled hourly, backfill in 5-year startPeriod windows."
+    rate_limit: {per_second: 0.1, burst: 1}
+    config:
+      queries: ["HICP/M.U2.N.000000.4D0.ANR", "FM/B.U2.EUR.4F.KR.MRR_FR.LEV", "FM/D.U2.EUR.4F.KR.DFR.LEV", "EXR/D.USD.EUR.SP00.A"]
   - id: eurostat
     name: Eurostat
     category: macro
@@ -639,9 +649,12 @@ sources:
     asset_classes: [filings, fundamentals]
     transport: [rest, file]
     auth: none
-    status: planned
-    tos_notes: "Requires declared User-Agent; fair-access rate limit."
-    notes: ""
+    status: live
+    tos_notes: "Requires declared User-Agent; fair-access limit 10 req/s."
+    notes: "Verified live 2026-11-11 (19 filings for 5 CIKs). Submissions API (data.sec.gov/submissions/CIK##########.json) polled per CIK every 10 minutes → FilingEvent; backfill filters recent + older pages by acceptance time. UA 'financial-auto ingestor' answered 200 on 2026-11-11 (the generic ingestor UA → 403); override with extra.user_agent or secret sources.sec_edgar.user_agent."
+    rate_limit: {per_second: 2, burst: 4}
+    config:
+      extra: {ciks: "320193,789019,1045810,1652044,1018724", user_agent: "financial-auto ingestor"}
   - id: simfin
     name: SimFin
     category: fundamentals
@@ -701,9 +714,12 @@ sources:
     asset_classes: [news, events]
     transport: [rest, file]
     auth: none
-    status: planned
-    tos_notes: ""
-    notes: "Global event/news graph, 15-min updates."
+    status: live
+    tos_notes: "Max one request per 5 s per IP; violations answer 429 for minutes."
+    notes: "Verified live 2026-11-11 (news items flowing; this IP gets intermittent 429s, so one request per 10 s). DOC 2.0 artlist JSON per query every 15 minutes → NewsItem (dedup = sha1 of normalized URL, time = seendate); backfill in 1-day windows, last ~3 months only, 250 articles per window."
+    rate_limit: {per_second: 0.1, burst: 1}
+    config:
+      queries: ['"stock market" sourcelang:english', '"Federal Reserve" sourcelang:english']
   - id: hackernews
     name: Hacker News
     category: news

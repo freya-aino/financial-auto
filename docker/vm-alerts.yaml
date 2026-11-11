@@ -1,0 +1,198 @@
+# vmalert rules (spec 60 §6.5): evaluated by the `vmalert` compose service every 30 s against
+# VictoriaMetrics; firing/resolved notifications go to control-api (Alertmanager v2 API at
+# /api/alerts/vmalert), which publishes each transition on NATS `ops.alert` and writes audit.log
+# (`ops.alert.firing|resolved`). GET /api/alerts lists active + recent alerts.
+# Validate: docker run --rm -v $PWD/docker/vm-alerts.yaml:/r.yaml:ro victoriametrics/vmalert:v1.155.0 -rule=/r.yaml -dryRun
+# Reload after editing: docker compose kill -s HUP vmalert
+# Severities: critical (trading or data at risk), warning (degraded), info (drills), none (Watchdog).
+# Thresholds are starting points for a single-workstation paper stack (spec 60 §7).
+groups:
+  - name: fa-meta
+    interval: 30s
+    rules:
+      # Always firing: control-api tracks its arrival as proof the rule → vmalert → control-api path
+      # works (`pipeline.ok` in /api/alerts); severity none is never published or audited.
+      - alert: Watchdog
+        expr: vector(1)
+        labels: { severity: none }
+        annotations: { summary: "alerting pipeline heartbeat" }
+      # End-to-end drill: scripts/alert-drill.sh writes fa_alert_drill{drill_id} = 1 into VictoriaMetrics.
+      - alert: AlertDrill
+        expr: max by (drill_id) (max_over_time(fa_alert_drill[2m])) > 0
+        labels: { severity: info }
+        annotations: { summary: "alert drill {{ $labels.drill_id }}" }
+
+  - name: fa-services
+    interval: 30s
+    rules:
+      - alert: ServiceScrapeDown
+        expr: up{job=~"fa|fa-evo-worker"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "{{ $labels.service }} /metrics not scraped for 1m (process down or hung)" }
+      - alert: ServiceTargetsMissing
+        # A compose service that is not running at all has no DNS name, so `up` disappears instead of being 0.
+        expr: absent(up{job="fa-evo-worker"}) or absent(up{job="fa",service="risk-engine"}) or absent(up{job="fa",service="ingestor"})
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "a core service has no scrape target (container stopped?)" }
+      - alert: HeartbeatStale
+        # ops.heartbeat_timeout is 15 s (spec 60 §7); the 15 s scrape adds up to 15 s more.
+        expr: time() - fa_heartbeat_last_unix_seconds > 45
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "{{ $labels.service }} has not published a heartbeat for {{ $value | humanizeDuration }}" }
+      - alert: ServiceCrashLooping
+        expr: changes(fa_process_start_time_seconds[15m]) > 2
+        labels: { severity: critical }
+        annotations: { summary: "{{ $labels.service }} restarted {{ $value }} times in 15 min" }
+      - alert: ProcessRssHigh
+        expr: fa_process_resident_memory_bytes > 2 * 1024 * 1024 * 1024
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.service }} RSS above 2 GiB" }
+
+  - name: fa-infra
+    interval: 30s
+    rules:
+      - alert: DependencyDown
+        # control-api's TCP probe (fa_dependency_up); the only signal for HelixDB, which has no /metrics.
+        expr: fa_dependency_up == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "{{ $labels.dep }} unreachable from control-api for 1m" }
+      - alert: InfraScrapeDown
+        expr: up{job=~"victoriametrics|garage|nats|postgres|vmalert"} == 0
+        for: 2m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.job }} metrics endpoint down" }
+      - alert: DiskSpaceLow
+        # VictoriaMetrics reports free space of its data volume, which shares the disk with every volume.
+        expr: vm_free_disk_space_bytes < 20 * 1024 * 1024 * 1024
+        for: 5m
+        labels: { severity: critical }
+        annotations: { summary: "less than 20 GiB free on the data disk ({{ $value | humanize1024 }}B)" }
+      - alert: PostgresConnectionsHigh
+        expr: sum(pg_stat_activity_count) > 0.8 * max(pg_settings_max_connections)
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "Postgres connections above 80 % of max_connections" }
+      - alert: NatsSlowConsumers
+        expr: increase(gnatsd_varz_slow_consumers[10m]) > 0
+        labels: { severity: warning }
+        annotations: { summary: "NATS reported slow consumers (messages dropped for a lagging subscriber)" }
+
+  - name: fa-backup
+    interval: 1m
+    # The sidecar pushes these samples once per run (daily / weekly / every 5 min), so every rule reads
+    # them through last_over_time: a plain instant query loses a sample after the 5 min lookback.
+    rules:
+      - alert: WalArchiveFailing
+        expr: increase(fa_wal_archive_failed_total[15m]) > 0
+        labels: { severity: critical }
+        annotations: { summary: "Postgres archive_command failed (WAL piles up in pg_wal, PITR gap)" }
+      - alert: WalArchiveStale
+        # archive_timeout = 300 s forces a segment at least every 5 min while anything writes.
+        expr: time() - last_over_time(fa_wal_archive_last_archived_timestamp_seconds[15m]) > 1800 or last_over_time(fa_wal_archive_mode_on[15m]) == 0
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "no WAL archived for 30 min, or archive_mode is off" }
+      - alert: WalArchiveMonitorDown
+        expr: absent_over_time(fa_wal_archive_up[20m]) or fa_wal_archive_up == 0
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "backup sidecar has not reported WAL archiver status (sidecar down?)" }
+      - alert: BackupFailed
+        expr: last_over_time(fa_backup_last_status{kind="scheduled"}[2d]) == 0
+        labels: { severity: critical }
+        annotations: { summary: "the last scheduled backup failed (see docker compose logs backup)" }
+      - alert: BackupStale
+        expr: time() - last_over_time(fa_backup_last_success_timestamp_seconds{kind="scheduled"}[3d]) > 26 * 3600 or absent_over_time(fa_backup_last_success_timestamp_seconds{kind="scheduled"}[3d])
+        labels: { severity: critical }
+        annotations: { summary: "no successful scheduled backup for 26 h" }
+      - alert: RestoreDrillFailed
+        expr: last_over_time(fa_restore_drill_last_status[9d]) == 0
+        labels: { severity: critical }
+        annotations: { summary: "the last restore drill failed — backups may not restore" }
+      - alert: RestoreDrillStale
+        expr: time() - last_over_time(fa_restore_drill_last_success_timestamp_seconds[30d]) > 8 * 86400 or absent_over_time(fa_restore_drill_last_success_timestamp_seconds[30d])
+        labels: { severity: warning }
+        annotations: { summary: "no successful restore drill for 8 days (weekly in the backup sidecar)" }
+
+  - name: fa-bus
+    interval: 30s
+    rules:
+      - alert: WorkQueueBacklog
+        expr: fa_bus_consumer_num_pending > 100
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.stream }}/{{ $labels.consumer }} has {{ $value }} undelivered jobs" }
+      - alert: JetStreamConsumerLag
+        # Every JetStream consumer (nats-exporter), not only the work queues the services export.
+        expr: jetstream_consumer_num_pending > 10000
+        for: 15m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.stream_name }}/{{ $labels.consumer_name }} is {{ $value }} messages behind" }
+      - alert: JetStreamStorageHigh
+        expr: gnatsd_varz_jetstream_stats_storage / gnatsd_varz_jetstream_config_max_storage > 0.85
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "JetStream file storage above 85 % of its limit" }
+      - alert: DeadLetters
+        expr: increase(jetstream_stream_total_messages{stream_name=~"DLQ.*"}[15m]) > 0
+        labels: { severity: warning }
+        annotations: { summary: "messages moved to {{ $labels.stream_name }} (poison messages, spec 21 §8)" }
+      - alert: WorkQueueRedeliveries
+        expr: increase(fa_bus_consumer_redelivered[15m]) > 10
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.stream }} redelivering jobs (worker crashes or ack_wait too short)" }
+
+  - name: fa-control-api
+    interval: 30s
+    rules:
+      - alert: ApiErrorRate
+        expr: sum(rate(fa_http_requests_total{status=~"5.."}[5m])) / sum(rate(fa_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "control-api 5xx ratio above 5 %" }
+      - alert: ApiLatencyP99
+        expr: histogram_quantile(0.99, sum by (le) (rate(fa_http_request_duration_seconds_bucket[5m]))) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "control-api p99 latency above 1 s" }
+
+  - name: fa-trading
+    interval: 30s
+    rules:
+      - alert: RiskHalted
+        expr: fa_heartbeat_counter{service="risk-engine",key="halted"} > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "risk-engine reports an active halt" }
+      - alert: FxRatesStale
+        expr: fa_heartbeat_counter{service="risk-engine",key="fx.stale_now"} > 0
+        for: 30m
+        labels: { severity: warning }
+        annotations: { summary: "risk-engine FX rates stale for 30 min (EUR conversion uses old rates)" }
+
+  - name: fa-ingestion
+    interval: 30s
+    rules:
+      - alert: IngestionStalled
+        # The synthetic heartbeat connector emits continuously; if it stops, the pipeline itself is stuck.
+        expr: increase(fa_heartbeat_counter{service="ingestor",key="events.heartbeat"}[10m]) == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "ingestor pipeline stalled: no heartbeat-source events for 10 min" }
+      - alert: TsdbWriteErrors
+        expr: increase(fa_heartbeat_counter{service="ingestor",key=~"tsdb.(errors|dropped)"}[10m]) > 0
+        labels: { severity: warning }
+        annotations: { summary: "ingestor {{ $labels.key }} rising: market data not reaching VictoriaMetrics" }
+      - alert: RawArchiveErrors
+        expr: increase(fa_heartbeat_counter{service="ingestor",key="archive.errors"}[15m]) > 0
+        labels: { severity: warning }
+        annotations: { summary: "ingestor raw archive (Garage) writes failing" }
+      - alert: HubWriteErrors
+        expr: increase(fa_heartbeat_counter{service="model-runtime",key="hub.errors"}[15m]) > 0
+        labels: { severity: warning }
+        annotations: { summary: "model-runtime HelixDB writes failing" }

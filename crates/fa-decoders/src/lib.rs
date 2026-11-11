@@ -3,11 +3,17 @@
 //! - [`genome`]: the concrete, deterministic genome encoding of the baseline families.
 //! - [`baseline`]: CPU-only point-in-time series decoders (quantile forecaster, analog
 //!   retrieval) built from a genome; used by `evo-worker` for `evo.eval.decoder` jobs.
+//! - [`neural`]: trainable candle decoder families (quantile / GRU prior, learned retrieval
+//!   metric, chart and future-chart rasters, news and narrative embeddings), safetensors bundles,
+//!   and the D-009 frozen-elite feedback API ([`neural::feedback`]).
+//! - [`render`]: deterministic chart rasters (visual targets).
 //! - Scoring primitives: CRPS (ensemble + quantile), pinball loss, time-discounted analog
 //!   weighting.
 
 pub mod baseline;
 pub mod genome;
+pub mod neural;
+pub mod render;
 pub mod text_baseline;
 pub mod visual_baseline;
 

@@ -6,8 +6,16 @@
 //! to and from the bus scope strings of `risk.halt.<scope>` (spec 21, D-030).
 //! [`RiskConfig::check_tightens`] enforces "runtime changes may only tighten" (spec 40 §6.5).
 //! [`strategy`] holds the strategy lifecycle (`active|paused|flattening|shadow`), the
-//! per-strategy drawdown tracker and the promotion gate checklist (spec 40 §6.6).
+//! per-strategy drawdown tracker and the promotion gate checklist (spec 40 §6.6);
+//! [`pipeline`] the automatic evolved-strategy lifecycle (candidate → holdout → shadow →
+//! active → retired); [`pretrade`] the checks for foreign/manual orders; [`health`] the
+//! per-instrument stale-feed freeze and bad-tick filter; [`calibrate`] the limit calibration
+//! rules (suggestions, tighten-only).
 
+pub mod calibrate;
+pub mod health;
+pub mod pipeline;
+pub mod pretrade;
 pub mod strategy;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,6 +54,10 @@ pub struct RiskConfig {
     /// `None` = half of `max_position_frac`.
     #[serde(default)]
     pub provisional_position_frac: Option<f64>,
+    /// Pre-trade fat-finger cap: one foreign/manual order's notional ≤ this × deployable.
+    pub max_order_frac: f64,
+    /// Pre-trade: a limit price must lie within this fraction of the mark.
+    pub limit_price_band: f64,
 }
 
 impl Default for RiskConfig {
@@ -67,6 +79,8 @@ impl Default for RiskConfig {
             liquidity_k: 0.01,
             daily_payout_quota_eur: 0.0,
             provisional_position_frac: None,
+            max_order_frac: 0.10,
+            limit_price_band: 0.10,
         }
     }
 }
@@ -99,6 +113,8 @@ impl RiskConfig {
         le("max_venue_frac", self.max_venue_frac, new.max_venue_frac);
         le("portfolio_gross_cap", self.portfolio_gross_cap, new.portfolio_gross_cap);
         le("liquidity_k", self.liquidity_k, new.liquidity_k);
+        le("max_order_frac", self.max_order_frac, new.max_order_frac);
+        le("limit_price_band", self.limit_price_band, new.limit_price_band);
         for (class, cap) in &new.leverage_cap {
             let old = self.leverage_cap.get(class).copied().unwrap_or(0.0);
             le(&format!("leverage_cap.{class:?}").to_lowercase(), old, *cap);

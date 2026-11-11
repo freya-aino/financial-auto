@@ -325,10 +325,16 @@ func (b *Backfiller) execute(ctx context.Context, log *slog.Logger, job *fav1.Jo
 
 func (b *Backfiller) instrument(ctx context.Context, log *slog.Logger, c connector.Connector, norm connector.Normalizer, bf connector.Backfiller, deps connector.Deps, spec BackfillSpec, sym string, start, end time.Time) BackfillInstrumentRs {
 	r := BackfillInstrumentRs{Symbol: sym, Status: "done"}
-	if sym != "" && deps.Resolver != nil {
+	// Only market-data sources (with a venue) resolve symbols to instruments; for macro series,
+	// news queries or CIKs resolving would provision bogus instruments (spec 12 §6). Their
+	// cursor is kept per series instead: timescale "<tf>|<series>".
+	cursorScope := spec.Timescale
+	if sym != "" && deps.Resolver != nil && c.Capabilities().Venue != "" {
 		r.InstrumentID, _ = deps.Resolver.Resolve(spec.Source, sym)
+	} else if sym != "" {
+		cursorScope = spec.Timescale + "|" + sym
 	}
-	cur, status, ok, err := b.Cursors.GetBackfill(ctx, spec.Source, r.InstrumentID, spec.Timescale, start)
+	cur, status, ok, err := b.Cursors.GetBackfill(ctx, spec.Source, r.InstrumentID, cursorScope, start)
 	if err != nil {
 		r.Status, r.Error = "failed", "cursor: "+err.Error()
 		return r
@@ -345,7 +351,7 @@ func (b *Backfiller) instrument(ctx context.Context, log *slog.Logger, c connect
 		req.Cursor = cur.Format(time.RFC3339)
 		req.From = cur
 	}
-	_ = b.Cursors.SetBackfill(ctx, spec.Source, r.InstrumentID, spec.Timescale, start, end, cur, "running")
+	_ = b.Cursors.SetBackfill(ctx, spec.Source, r.InstrumentID, cursorScope, start, end, cur, "running")
 
 	out := make(chan connector.RawMessage, 16)
 	errc := make(chan error, 1)
@@ -362,7 +368,7 @@ func (b *Backfiller) instrument(ctx context.Context, log *slog.Logger, c connect
 		r.Events += n
 		if t.After(newest) {
 			newest = t
-			_ = b.Cursors.SetBackfill(ctx, spec.Source, r.InstrumentID, spec.Timescale, start, end, newest, "running")
+			_ = b.Cursors.SetBackfill(ctx, spec.Source, r.InstrumentID, cursorScope, start, end, newest, "running")
 		}
 	}
 	if !newest.IsZero() {
@@ -370,13 +376,13 @@ func (b *Backfiller) instrument(ctx context.Context, log *slog.Logger, c connect
 	}
 	if err := <-errc; err != nil && !errors.Is(err, context.Canceled) {
 		r.Status, r.Error = "failed", err.Error()
-		_ = b.Cursors.SetBackfill(ctx, spec.Source, r.InstrumentID, spec.Timescale, start, end, newest, "failed")
+		_ = b.Cursors.SetBackfill(ctx, spec.Source, r.InstrumentID, cursorScope, start, end, newest, "failed")
 		return r
 	}
 	if ctx.Err() != nil {
 		r.Status, r.Error = "failed", "interrupted"
 		return r
 	}
-	_ = b.Cursors.SetBackfill(ctx, spec.Source, r.InstrumentID, spec.Timescale, start, end, newest, "done")
+	_ = b.Cursors.SetBackfill(ctx, spec.Source, r.InstrumentID, cursorScope, start, end, newest, "done")
 	return r
 }

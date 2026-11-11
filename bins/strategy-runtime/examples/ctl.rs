@@ -7,6 +7,8 @@
 //! cargo run -p strategy-runtime --example ctl -- reload artifact_key=strategies/strategies.3.toml
 //! cargo run -p strategy-runtime --example ctl -- reload artifact_key=latest
 //! cargo run -p strategy-runtime --example ctl -- status          # JSON: population, stats, primitive sources
+//! FA_CTL_SERVICE=risk cargo run -p strategy-runtime --example ctl -- pipeline action=status
+//! FA_CTL_SERVICE=risk cargo run -p strategy-runtime --example ctl -- allocators
 //! ```
 use std::time::Duration;
 
@@ -27,8 +29,9 @@ async fn main() -> anyhow::Result<()> {
     };
     let url = std::env::var("FA_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
     let bus = Bus::connect(&url).await?;
-    let fut = bus.client().request(subjects::ctl("strategy", &verb), Bytes::from(req.encode_to_vec()));
-    let msg = tokio::time::timeout(Duration::from_secs(10), fut).await??;
+    let service = std::env::var("FA_CTL_SERVICE").unwrap_or_else(|_| "strategy".into());
+    let fut = bus.client().request(subjects::ctl(&service, &verb), Bytes::from(req.encode_to_vec()));
+    let msg = tokio::time::timeout(Duration::from_secs(60), fut).await??;
     let reply = CtlReply::decode(msg.payload.as_ref())?;
     println!("ok={} message={}", reply.ok, reply.message);
     Ok(())

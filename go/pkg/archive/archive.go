@@ -10,16 +10,27 @@
 // gunzip(object)[offset:offset+length]. Objects are uploaded when their
 // minute ends, when they exceed MaxBatchBytes, and on Flush/shutdown
 // (at-least-once, asynchronous — the ref is handed out before the upload).
+//
+// Next to every data object the writer stores an index object
+// (`<ulid>.idx.jsonl.gz`, one IndexEntry per payload: offset, length,
+// received_at, content type, transport meta), which is what Replay needs to
+// rebuild the exact RawMessages and re-run the normalizers (spec 10 §9).
+// Failed uploads go to a bounded local spool and are retried; when the spool
+// is full Put returns ErrSpoolFull so the pipeline flags raw_missing (§8).
 package archive
 
 import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -96,10 +107,14 @@ func (s *S3Store) Get(ctx context.Context, bucket, key string) ([]byte, error) {
 
 // Stats are the writer's cumulative counters.
 type Stats struct {
-	Messages uint64 // payloads accepted by Put
-	Objects  uint64 // objects uploaded
-	Bytes    uint64 // compressed bytes uploaded
-	Errors   uint64 // failed uploads (whole batch lost after retries)
+	Messages   uint64 // payloads accepted by Put
+	Objects    uint64 // objects uploaded
+	Bytes      uint64 // compressed bytes uploaded
+	Errors     uint64 // failed uploads (after retries; spooled when a spool is configured)
+	Spooled    uint64 // batches written to the local spool
+	Respooled  uint64 // spooled batches uploaded later
+	Dropped    uint64 // payloads refused because the spool was full (raw_missing)
+	SpoolBytes int64  // current spool size
 }
 
 type batch struct {
@@ -107,7 +122,23 @@ type batch struct {
 	minute time.Time
 	buf    bytes.Buffer
 	n      int
+	idx    []IndexEntry
 }
+
+// IndexEntry describes one payload inside a data object.
+type IndexEntry struct {
+	Offset      uint64            `json:"o"`
+	Length      uint64            `json:"l"`
+	ReceivedAt  time.Time         `json:"t"`
+	ContentType string            `json:"ct,omitempty"`
+	Meta        map[string]string `json:"m,omitempty"`
+}
+
+// IndexKey is the index object key for a data object key.
+func IndexKey(dataKey string) string { return strings.TrimSuffix(dataKey, ".raw.gz") + ".idx.jsonl.gz" }
+
+// ErrSpoolFull is returned by Put while uploads fail and the spool is full.
+var ErrSpoolFull = errors.New("archive: garage unavailable and spool full (raw_missing)")
 
 // Writer implements connector.RawArchive.
 type Writer struct {
@@ -117,11 +148,15 @@ type Writer struct {
 	maxBatchBytes int
 	retries       int
 
-	mu      sync.Mutex
-	open    map[string]*batch // source → current minute batch
-	pending chan *batch
-	stats   Stats
-	wg      sync.WaitGroup
+	spoolDir      string
+	spoolMaxBytes int64
+
+	mu        sync.Mutex
+	open      map[string]*batch // source → current minute batch
+	pending   chan *batch
+	stats     Stats
+	wg        sync.WaitGroup
+	spoolFull bool // last upload failed and the spool had no room
 }
 
 // WriterOptions tune batching; zero values take the defaults.
@@ -131,6 +166,10 @@ type WriterOptions struct {
 	Clock         connector.Clock // default wall clock
 	Retries       int             // upload attempts (default 3)
 	Queue         int             // pending uploads before Put blocks (default 64)
+	// SpoolDir keeps batches whose upload failed (spec 10 §8); empty disables.
+	SpoolDir string
+	// SpoolMaxBytes bounds the spool (default 256 MiB).
+	SpoolMaxBytes int64
 }
 
 // NewWriter creates a writer; call Run in a goroutine.
@@ -150,8 +189,16 @@ func NewWriter(store ObjectStore, o WriterOptions) *Writer {
 	if o.Queue <= 0 {
 		o.Queue = 64
 	}
-	return &Writer{store: store, bucket: o.Bucket, clock: o.Clock, maxBatchBytes: o.MaxBatchBytes, retries: o.Retries,
-		open: map[string]*batch{}, pending: make(chan *batch, o.Queue)}
+	if o.SpoolMaxBytes <= 0 {
+		o.SpoolMaxBytes = 256 << 20
+	}
+	w := &Writer{store: store, bucket: o.Bucket, clock: o.Clock, maxBatchBytes: o.MaxBatchBytes, retries: o.Retries,
+		open: map[string]*batch{}, pending: make(chan *batch, o.Queue), spoolDir: o.SpoolDir, spoolMaxBytes: o.SpoolMaxBytes}
+	if w.spoolDir != "" {
+		_ = os.MkdirAll(w.spoolDir, 0o755)
+		w.stats.SpoolBytes = spoolSize(w.spoolDir)
+	}
+	return w
 }
 
 // Key builds the object key for a source and minute.
@@ -171,6 +218,11 @@ func (w *Writer) Put(_ context.Context, raw connector.RawMessage) (*fav1.RawRef,
 	}
 	minute := at.UTC().Truncate(time.Minute)
 	w.mu.Lock()
+	if w.spoolFull {
+		w.stats.Dropped++
+		w.mu.Unlock()
+		return nil, ErrSpoolFull
+	}
 	b := w.open[raw.SourceID]
 	if b != nil && (!b.minute.Equal(minute) || b.buf.Len() >= w.maxBatchBytes) {
 		w.rotateLocked(raw.SourceID)
@@ -181,6 +233,7 @@ func (w *Writer) Put(_ context.Context, raw connector.RawMessage) (*fav1.RawRef,
 		w.open[raw.SourceID] = b
 	}
 	ref := &fav1.RawRef{Key: b.key, Offset: uint64(b.buf.Len()), Length: uint64(len(raw.Bytes))}
+	b.idx = append(b.idx, IndexEntry{Offset: ref.Offset, Length: ref.Length, ReceivedAt: at.UTC(), ContentType: raw.ContentType, Meta: raw.TransportMeta})
 	b.buf.Write(raw.Bytes)
 	b.buf.WriteByte('\n')
 	b.n++
@@ -218,6 +271,9 @@ func (w *Writer) Run(ctx context.Context, onErr func(error)) {
 			w.wg.Wait()
 			return
 		case <-t.C:
+			if w.spoolDir != "" && w.clock.Now().Second()%30 == 0 {
+				w.retrySpool(ctx, onErr)
+			}
 			now := w.clock.Now().UTC().Truncate(time.Minute)
 			w.mu.Lock()
 			for src, b := range w.open {
@@ -257,28 +313,126 @@ func (w *Writer) FlushSync(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-func (w *Writer) upload(ctx context.Context, b *batch, onErr func(error)) {
+func gz(b []byte) []byte {
 	var zb bytes.Buffer
 	zw := gzip.NewWriter(&zb)
-	zw.Write(b.buf.Bytes())
+	zw.Write(b)
 	zw.Close()
+	return zb.Bytes()
+}
+
+func encodeIndex(idx []IndexEntry) []byte {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	for _, e := range idx {
+		_ = enc.Encode(e)
+	}
+	return buf.Bytes()
+}
+
+func (w *Writer) putRetry(ctx context.Context, key string, body []byte) error {
 	var err error
 	for attempt := 0; attempt < w.retries; attempt++ {
-		if err = w.store.Put(ctx, w.bucket, b.key, zb.Bytes(), "application/gzip"); err == nil {
-			break
+		if err = w.store.Put(ctx, w.bucket, key, body, "application/gzip"); err == nil {
+			return nil
 		}
 		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+	}
+	return err
+}
+
+func (w *Writer) upload(ctx context.Context, b *batch, onErr func(error)) {
+	data, index := gz(b.buf.Bytes()), gz(encodeIndex(b.idx))
+	err := w.putRetry(ctx, b.key, data)
+	if err == nil {
+		err = w.putRetry(ctx, IndexKey(b.key), index)
 	}
 	w.mu.Lock()
 	if err == nil {
 		w.stats.Objects++
-		w.stats.Bytes += uint64(zb.Len())
+		w.stats.Bytes += uint64(len(data) + len(index))
+		w.spoolFull = false
 	} else {
 		w.stats.Errors++
 	}
 	w.mu.Unlock()
-	if err != nil && onErr != nil {
-		onErr(fmt.Errorf("archive: put %s: %w", b.key, err))
+	if err != nil {
+		spooled := w.spool(b.key, data, index)
+		if onErr != nil {
+			onErr(fmt.Errorf("archive: put %s (spooled=%v): %w", b.key, spooled, err))
+		}
+	}
+}
+
+// spoolName flattens an object key into one file name.
+func spoolName(key string) string { return strings.ReplaceAll(key, "/", "__") }
+
+func spoolSize(dir string) int64 {
+	var n int64
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if fi, err := e.Info(); err == nil {
+			n += fi.Size()
+		}
+	}
+	return n
+}
+
+// spool keeps a failed batch on local disk; reports false (and marks the
+// writer spool-full) when there is no spool or no room.
+func (w *Writer) spool(key string, data, index []byte) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	size := int64(len(data) + len(index))
+	if w.spoolDir == "" || w.stats.SpoolBytes+size > w.spoolMaxBytes {
+		w.spoolFull = w.spoolDir != ""
+		return false
+	}
+	base := filepath.Join(w.spoolDir, spoolName(key))
+	if os.WriteFile(base+".data", data, 0o644) != nil || os.WriteFile(base+".idx", index, 0o644) != nil {
+		w.spoolFull = true
+		return false
+	}
+	w.stats.Spooled++
+	w.stats.SpoolBytes += size
+	return true
+}
+
+// retrySpool uploads spooled batches (oldest first) until one fails.
+func (w *Writer) retrySpool(ctx context.Context, onErr func(error)) {
+	entries, err := os.ReadDir(w.spoolDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".data") {
+			continue
+		}
+		base := filepath.Join(w.spoolDir, strings.TrimSuffix(name, ".data"))
+		key := strings.ReplaceAll(strings.TrimSuffix(name, ".data"), "__", "/")
+		data, err1 := os.ReadFile(base + ".data")
+		index, err2 := os.ReadFile(base + ".idx")
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		if err := w.store.Put(ctx, w.bucket, key, data, "application/gzip"); err != nil {
+			return
+		}
+		if err := w.store.Put(ctx, w.bucket, IndexKey(key), index, "application/gzip"); err != nil {
+			return
+		}
+		_ = os.Remove(base + ".data")
+		_ = os.Remove(base + ".idx")
+		w.mu.Lock()
+		w.stats.Respooled++
+		w.stats.Objects++
+		w.stats.SpoolBytes -= int64(len(data) + len(index))
+		w.spoolFull = false
+		w.mu.Unlock()
+		if onErr != nil {
+			onErr(fmt.Errorf("archive: spooled %s uploaded", key)) // informational
+		}
 	}
 }
 

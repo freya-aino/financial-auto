@@ -1,4 +1,5 @@
-//! `evo.eval.decoder` job evaluation: genome → baseline decoder → sequential point-in-time
+//! `evo.eval.decoder` job evaluation: genome → baseline decoder (neural `nn_*` genomes:
+//! [`crate::neural`], train then score out of sample) → sequential point-in-time
 //! scoring on the evaluation window (VictoriaMetrics via `fa-tsdb`, buffer fallback; see
 //! [`crate::data`]) → `JobResult` + `DecoderOutput`. `evo.vary.decoder` jobs are delegated to
 //! [`crate::vary`].
@@ -309,6 +310,9 @@ impl Worker {
         };
         if !job.checkpoint_ref.is_empty() {
             tracing::info!(job = %job.job_id, checkpoint = %job.checkpoint_ref, "resuming preempted job (re-evaluating from the start; evaluation is cheap)");
+        }
+        if genome.family.is_neural() {
+            return self.evaluate_neural(job, run, genome, window).await;
         }
         run.progress(0.0, format!("parsed genome: {}", genome.summary())).await;
 

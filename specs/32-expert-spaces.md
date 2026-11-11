@@ -36,6 +36,8 @@ This spec defines the router, the objective and the **decoder-facing contract** 
 
 ## 4. Interfaces
 
+**Implemented today (D-008 in code; neural-family round):** `fa_expert_space::moe::MoeExpertSpace` is the learned expert space of the neural encoders (candle): a linear router over `K_max` experts (softmax, seeded Gaussian logit noise during training, top-k gates renormalised at inference and published as `router_weights`; the runtime keeps them and only routes encoders without a learned gate), per-expert projectors to `(mu, logvar)` with `mu = tanh(·)` (bounded like the statistical latents so region radii stay comparable; FSQ on the leading dims for `fsq_hybrid`), per-expert linear next-step predictors. Losses (`moe::decorrelation_loss`, `load_balance_loss`, `gaussian_kl`) are differentiable and trained jointly with the encoder (spec 31 §6.5). `health::HealthReport::compute_gated` measures §6.4 on the validation windows; `health::linear_cka` + `match_experts` implement §6.5. Experts with validation usage below `prune_usage_below` (0.05) are pruned after training, at least 2 kept (emergent count); the snapshot stores the surviving expert ids. The statistical family keeps its 3 fixed experts and the `EvidenceSoftmaxRouter`. The `ExpertView` proto of §4.2 / `latent.expert.*` / `latent.expert.health` subjects are not produced; health lives in the snapshot manifest (`metrics.k_eff`, `resid_corr_max`, `skill_e<k>`, `usage_e<k>`, `params.health` with the full matrix).
+
 ### 4.1 Router and experts (proposal)
 ```rust
 pub struct ExpertSpaceConfig {
@@ -117,11 +119,15 @@ with:
 
 The weights `λ_dec, λ_gen` are tunable and may be **evolved** as encoder genes (spec 34 Pareto then decides the trade-off).
 
+*Implemented form:* residuals are vector-valued over the three next-step targets of spec 31 §6.5 (`[next return, |next return|, next range]`, normalised); `L_decor = mean_targets Σ_{i≠j} corr(r_i, r_j)²` over every window of the minibatch (soft routing trains all predictors; no EMA of the covariance), `L_balance` is the Switch form `K · Σ f_i p_i` (auxiliary-loss balancing, not the bias-adjustment variant), `L_gen` at gen 0 is per-expert next-step prediction plus the family's SSL head, from gen 1 the D-009 frozen-decoder term. Defaults `λ_dec 1.0`, `λ_bal 0.01`, `β 1e-3`. Observed on live 1m bars (9 instruments, 12 h): `λ_dec = 1` reaches `K_eff ≈ 2.6` of 4 with residual correlations up to 0.64; `λ_dec = 0.1` gives better per-expert skill (≈ 0.25) but `K_eff ≈ 1.3` — the independence/skill trade-off of open question 1 is real on market data, and the 0.1 health target is not met by either.
+
 ### 6.4 Measured quantities (health)
 - Residual correlation matrix per timescale on a held-out validation window (not the locked holdout, spec 41).
 - **Effective number of independent experts:** `K_eff = (Σλ)² / Σλ²` over eigenvalues of the residual correlation matrix.
 - Per-expert skill vs naive baseline, calibration (PIT / CRPS) of `next_step`.
 - Per-expert decodability: best elite decoder score per family (spec 34).
+
+*Implemented:* on the validation windows of each fit; residual correlation of a pair over the windows where both experts are in the top-k (all windows when fewer than 30 are shared), skill of an expert over the windows routed to it (top-k gate weighted, naive = the training mean of the normalised target), `K_eff` from the correlation matrix (`tr(C)² / ‖C‖_F²`), usage = mean router probability. They feed the promotion checklist (spec 36 §6.4 item 2).
 
 ### 6.5 Expert identity across generations (proposal)
 - Experts are matched between generations by **CKA similarity** of their latents on the fixed probe set (same probe set as spec 30 §6.4) plus overlap of specialisation summaries.
@@ -153,7 +159,10 @@ The weights `λ_dec, λ_gen` are tunable and may be **evolved** as encoder genes
 | Residual correlation spikes live (regime change) | Health signal on bus; strategies/allocator can widen uncertainty; can trigger refresh (spec 36) |
 | Expert count changes between generations | Lifecycle events. Decoders/strategies remap or re-evaluate (spec 34/35) |
 
+*Implemented:* a neural generation encodes the probe windows with parent and child, computes linear CKA per expert pair, matches greedily (threshold 0.5) and moves matched experts to the parent's index; the matrix and matches are in `manifest.feedback.expert_alignment`. No `Expert` / `ALIGNED_TO` Helix nodes yet (expert spaces stay `ExpertSpace <snapshot>-e<k>`).
+
 ## 9. Acceptance criteria
+*Status:* 1 in miniature (`moe::tests::two_experts_learn_decorrelated_specialisations`: two independent factors, two experts, both beat naive, decorrelation term < 0.2), not at `target_resid_corr_max` on market data; 2 measured per snapshot (`skill_e<k>`), enforced by the checklist; 3 open (no `ExpertView` proto); 4 implemented with threshold 0.5; 5 emitted per generation in the manifest, not on the bus / UI.
 1. On a synthetic dataset built from K independent latent factors, the router recovers ≥ K−1 experts, and the residual correlation off-diagonal max is ≤ `target_resid_corr_max`.
 2. Every active expert beats the naive baseline by ≥ `min_skill` on the validation window.
 3. The `ExpertView` proto round-trips between Rust and Go and contains every field listed in §4.2.

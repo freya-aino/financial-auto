@@ -12,6 +12,12 @@ Everything runs through Docker Compose (D-034): `compose.yaml` at the repo root 
 | victoriametrics | `victoriametrics/victoria-metrics:v1.155.0` | 8428 | `curl localhost:8428/health` |
 | garage | `dxflrs/garage:v2.5.0` | S3 3900, admin 3903 | `docker compose exec garage /garage status` |
 | helix | `ghcr.io/helixdb/helixdb:v0.0.14` (data in `/var/lib/helix`) | 6969 → 8080 | `curl localhost:6969/healthz` |
+| vmalert | `victoriametrics/vmalert:v1.155.0` (rules `vm-alerts.yaml`) | 8880 | `curl localhost:8880/health` |
+| nats-exporter | `natsio/prometheus-nats-exporter:0.17.3` | — (7777 in compose) | scraped as job `nats` |
+| postgres-exporter | `quay.io/prometheuscommunity/postgres-exporter:v0.17.1` | — (9187 in compose) | scraped as job `postgres` |
+| backup | `financial-auto/backup:dev` (`backup/Dockerfile`) | — | crond running; `docker compose logs backup` |
+
+Every service has a healthcheck now: infra natively (garage: `/garage status`), the Rust services `curl` their `/metrics`, the distroless Go images run `healthprobe` (`go/services/healthprobe`) against theirs. Postgres runs with WAL archiving (`docker/postgres/`).
 
 ## Usage
 ```sh
@@ -73,7 +79,10 @@ Every service exposes Prometheus text on `GET /metrics` (`crates/fa-metrics`, re
 
 What is exported: `fa_heartbeat_counter{service,key}` (every heartbeat counter, mirrored at publish time, so nothing is instrumented twice), `fa_heartbeat_last_unix_seconds`, process gauges (`fa_process_uptime_seconds`, `fa_process_resident_memory_bytes` from `/proc/self/statm`, `fa_build_info{service,version}`), `fa_bus_consumer_num_pending|ack_pending|redelivered|waiting{stream,consumer}` for every JetStream pull consumer a service owns (evo-worker `JOBS_EVO`, ingestor `JOBS_INGEST`), and on control-api `fa_http_requests_total{method,path,status}` plus the `fa_http_request_duration_seconds` histogram (path = matched axum route, or the raw path with id-like segments collapsed to `{id}` where routers are chained through `fallback_service`).
 
-**Scrape:** `victoriametrics` runs with `-promscrape.config=/etc/vm-scrape.yaml` (`docker/vm-scrape.yaml`, mounted read-only): static targets for each service, DNS discovery for the evo-worker replicas, plus VictoriaMetrics itself and Garage's admin `/metrics`. Check with `just metrics-up` or `curl 'http://127.0.0.1:8428/api/v1/query?query=up'` — every target should be `1`. `just metrics <service>` dumps one endpoint. NATS, Postgres and HelixDB have no Prometheus endpoint without exporters; their reachability is in control-api `/api/health`. Alerting thresholds are a documented proposal in `docker/vm-alerts.proposal.yaml` (no vmalert container yet).
+**Scrape:** `victoriametrics` runs with `-promscrape.config=/etc/vm-scrape.yaml` (`docker/vm-scrape.yaml`, mounted read-only): static targets for each service, DNS discovery for the evo-worker replicas, plus VictoriaMetrics itself and Garage's admin `/metrics`. Check with `just metrics-up` or `curl 'http://127.0.0.1:8428/api/v1/query?query=up'` — every target should be `1`. `just metrics <service>` dumps one endpoint. NATS, Postgres and HelixDB have no Prometheus endpoint without exporters; their reachability is in control-api `/api/health`. NATS and Postgres are covered by the `nats-exporter` / `postgres-exporter` services; HelixDB has no endpoint, so control-api probes every dependency each 15 s into `fa_dependency_up{dep}`. The `fa` jobs use `honor_labels: true`. Dashboards: VictoriaMetrics' vmui (`http://127.0.0.1:8428/vmui`) and vmalert's UI (`http://127.0.0.1:8880`); no Grafana.
+
+## Alerting (spec 60 §6.5)
+`vmalert` evaluates `docker/vm-alerts.yaml` every 30 s and notifies control-api (`/api/alerts/vmalert/api/v2/alerts`), which publishes each transition on NATS `ops.alert` and writes `audit.log`. `just alerts` (= `GET /api/alerts`) shows active + recent alerts and `pipeline.ok` (the always-firing `Watchdog` arrived within 3 min). Edit the rules, check them with `docker run --rm -v $PWD/docker/vm-alerts.yaml:/r.yaml:ro victoriametrics/vmalert:v1.155.0 -rule=/r.yaml -dryRun`, reload with `docker compose kill -s HUP vmalert`. `just alert-drill` is the end-to-end check.
 
 ## Backup and restore (spec 60 §6.6, spec 20 §6.6, D-056)
 ```sh
@@ -85,7 +94,10 @@ just restore backups/<ts> --postgres-db fa_restore_test   # drill: Postgres only
 
 `scripts/restore.sh DIR` verifies the checksums, asks for confirmation, stops the app services, recreates and `pg_restore`s the database, replaces the Helix volume contents, syncs the buckets back and prints the §6.4 recovery order; `just app-up` then applies migrations (control-api), reconciles the ledger (risk-engine) and waits for health. Nothing restores over the live databases without the prompt or `--yes`.
 
-`backup.schedule` (03:00 daily, spec 60 §7) is a crontab line, not a container: `0 3 * * * cd /path/to/financial-auto && scripts/backup.sh >> backups/backup.log 2>&1`. `backups/` ignores itself (`backup.sh` drops a `.gitignore` there); copy it to a second disk or the `fa-backup` bucket off-machine (open question 60 §10.4).
+**Scheduled backups, WAL archiving, drills (spec 60 §6.6):** `backup.schedule` runs inside compose. The `backup` sidecar (`docker/backup/`) runs `run.sh` at `FA_BACKUP_SCHEDULE` (default `0 3 * * *`, `FA_BACKUP_TZ` default UTC): a PITR base backup (`postgres/base/`), the dump, a hot Helix tar, the Garage buckets, an incremental `backups/raw-mirror/fa-raw`, then pruning (`FA_BACKUP_KEEP`=7 scheduled backups, WAL back to the oldest kept base). Postgres archives every WAL segment (gzip) into the `pg-wal-archive` volume (`docker/postgres/archive-wal.sh`, `archive_timeout` 300 s). Weekly (`FA_DRILL_SCHEDULE`) the sidecar restores the newest backup into scratch clusters (logical + PITR); `just restore-drill` does the same from the host plus a Helix boot check. `just backup-now` runs the sidecar backup immediately; PITR restore: `just restore backups/<ts> --pitr [--target …]` (runbook in `scripts/README.md`). Off-machine: `FA_BACKUP_OFFSITE_ENABLED=1` + `FA_BACKUP_OFFSITE_REMOTE=<rclone remote:path>` (disabled by default). `backups/` ignores itself.
+
+## Host reboot (rootless Docker)
+The rootless daemon is a systemd *user* unit: with `Linger=no` it starts only when the user logs in, and stops at logout. After a reboot the `restart: unless-stopped` policy brings every container back at the same moment (the daemon ignores compose `depends_on`), which is what happened on 2026-11-11 (power-off 22:40 CET, boot 02:37, login 02:43 → all containers started at 01:43 UTC; the ingestor's first start hit a Postgres that was not yet accepting connections and was restarted by the policy — it now retries for 60 s instead). To have the stack up without a login: `loginctl enable-linger $USER` (host configuration; on NixOS `users.users.<name>.linger = true`).
 
 ## Startup / recovery order (spec 60 §6.4)
 `just app-up` runs `scripts/healthwait.sh` after `up -d`: it waits for the five infra health endpoints, then control-api `/api/health` (NATS connected and every dependency reachable; migrations ran on start), then the risk-engine heartbeat in `/api/services` (ledger loaded, reconciliation armed — trading stays halted until then), and reports the other services' heartbeats as they appear. `just healthwait [timeout]` runs it on its own.
@@ -111,4 +123,4 @@ G key info fa-local --show-secret   # copy into config/secrets.toml [garage]
 The standalone server image speaks `POST /v2/query` (operation-tree contract) plus `GET /healthz`, `GET /readyz` and `GET /v2/diagnostics`. `helix/schema.hx` and `helix/queries.hx` are not loaded by the image; `fa-hub` still targets the CLI-compiled `POST /<query_name>` endpoints (D-012), so its query layer has to move to `/v2/query` before Helix-backed routes work. Until then `/api/health` reports Helix reachable and nothing else uses it.
 
 ## Data
-All state lives in named volumes (`financial-auto_{nats,helix,postgres,vm,garage-meta,garage-data}-data`). `docker compose down -v` wipes everything — take `just backup` first.
+All state lives in named volumes (`financial-auto_{nats,helix,postgres,vm,garage-meta,garage-data}-data`, plus `financial-auto_pg-wal-archive`). `docker compose down -v` wipes everything — take `just backup` first.

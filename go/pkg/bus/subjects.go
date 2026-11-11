@@ -44,6 +44,17 @@ func OrderEvent(account string) string      { return "order.event." + account }
 const RiskState = "risk.state"
 
 func RiskHalt(scope string) string    { return "risk.halt." + scope }
+func RiskResume(scope string) string  { return "risk.resume." + scope }
+func RiskEvent(account string) string { return "risk.event." + account }
+
+// Ingestion operability frames (fa.v1 IngestHealth / IngestGap / IngestUnresolved, D-054)
+// and change notices (fa.v1 RefChanged, specs 11 §4 and 12 §6).
+func IngestHealth(source string) string     { return "ingest.health." + source }
+func IngestGap(source string) string        { return "ingest.gap." + source }
+func IngestUnresolved(source string) string { return "ingest.unresolved." + source }
+func RefChanged(entity string) string       { return "ref.changed." + entity }
+func CatalogChanged(source string) string   { return "catalog.changed." + source }
+
 func Jobs(kind string) string         { return "jobs." + kind }
 func JobResult(kind string) string    { return "jobs.result." + kind }
 func JobProgress(jobID string) string { return "jobs.progress." + jobID }

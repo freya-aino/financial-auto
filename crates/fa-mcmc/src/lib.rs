@@ -1,8 +1,23 @@
 //! Markov state graph over latent regions with Bayesian transition kernels (spec 33).
 //!
 //! Each outgoing row of the graph has a Dirichlet posterior over next-region
-//! probabilities (Dirichlet–multinomial conjugacy). Samplers are pluggable and compete
-//! on calibration and cost.
+//! probabilities (Dirichlet–multinomial conjugacy), optionally with the geometric structural
+//! prior of spec 33 §6.1 (`m_ij ∝ exp(−d(i,j)/τ)`). Modules:
+//!
+//! - [`inference`]: graph-level queries as posterior **distributions** (spec 33 §4.2):
+//!   transition probabilities k steps ahead, path probabilities, hitting times, stationary
+//!   distribution and relaxation time, all by Monte Carlo over Dirichlet kernel draws.
+//! - [`kernel`]: competing online samplers (`ConjugateExact`, `SmcParticle`) behind
+//!   [`kernel::KernelSampler`].
+//! - [`calibration`]: the calibration suite (log score, Brier, ECE, PIT) and the
+//!   [`calibration::Arena`] that scores samplers prequentially and picks the serving one.
+//! - [`cross_asset`]: cross-asset priors (shrunk correlation, lead-lag, predictive gain) and
+//!   the ranked pair proposals (spec 33 §6.5).
+
+pub mod calibration;
+pub mod cross_asset;
+pub mod inference;
+pub mod kernel;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -38,11 +53,129 @@ pub struct MarkovGraph {
     /// Live regions that receive prior mass in every row even before being observed as successors.
     #[serde(default)]
     support: BTreeSet<RegionKey>,
+    /// Region centroids for the geometric prior (spec 33 §6.1); empty → symmetric prior.
+    #[serde(default)]
+    geo: BTreeMap<RegionKey, Vec<f32>>,
+    /// Geometric prior temperature `tau_geo`; ≤ 0 → median nearest-neighbour distance.
+    #[serde(default)]
+    pub tau_geo: f64,
+    /// Effective τ (cached when centroids change).
+    #[serde(default)]
+    tau_eff: f64,
 }
+
+/// Floor share of the prior mass every successor keeps under the geometric prior (`ε`).
+const GEO_EPS_SHARE: f64 = 0.1;
 
 impl MarkovGraph {
     pub fn new(prior: f64, decay: f64) -> Self {
-        Self { prior, decay, rows: HashMap::new(), support: BTreeSet::new() }
+        Self {
+            prior,
+            decay,
+            rows: HashMap::new(),
+            support: BTreeSet::new(),
+            geo: BTreeMap::new(),
+            tau_geo: 0.0,
+            tau_eff: 0.0,
+        }
+    }
+
+    /// Sets (or moves) a region centroid for the geometric prior. Rows of regions with a
+    /// centroid then spread their prior mass `prior · |successors|` as `ε + (rest) · m_ij`, with
+    /// `m_ij ∝ exp(−d(i,j)/τ)`: latent neighbours are more likely successors, so sparse rows
+    /// borrow strength from geometry. The total prior mass per row is unchanged.
+    pub fn set_centroid(&mut self, id: &str, centroid: &[f32]) {
+        self.geo.insert(id.to_owned(), centroid.to_vec());
+        self.refresh_tau();
+    }
+
+    /// Removes a centroid (retired region).
+    pub fn drop_centroid(&mut self, id: &str) {
+        if self.geo.remove(id).is_some() {
+            self.refresh_tau();
+        }
+    }
+
+    pub fn has_geometry(&self) -> bool {
+        !self.geo.is_empty()
+    }
+
+    fn refresh_tau(&mut self) {
+        if self.tau_geo > 0.0 {
+            self.tau_eff = self.tau_geo;
+            return;
+        }
+        let pts: Vec<&Vec<f32>> = self.geo.values().collect();
+        let mut nn: Vec<f64> = pts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| {
+                pts.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, b)| euclid(a, b)).min_by(f64::total_cmp)
+            })
+            .collect();
+        nn.sort_by(f64::total_cmp);
+        self.tau_eff = nn.get(nn.len() / 2).copied().filter(|t| *t > 0.0).unwrap_or(1.0);
+    }
+
+    /// Prior concentration per successor key of row `from` (`keys` must be sorted, unique).
+    fn prior_for(&self, from: &str, keys: &[&str]) -> Vec<f64> {
+        let Some(c) = self.geo.get(from) else {
+            return vec![self.prior; keys.len()];
+        };
+        let tau = if self.tau_eff > 0.0 { self.tau_eff } else { 1.0 };
+        let raw: Vec<Option<f64>> =
+            keys.iter().map(|k| self.geo.get(*k).map(|ck| (-euclid(c, ck) / tau).exp())).collect();
+        let known: Vec<f64> = raw.iter().flatten().copied().collect();
+        if known.is_empty() {
+            return vec![self.prior; keys.len()];
+        }
+        // Keys without geometry (`unknown`, unregistered) get the mean affinity.
+        let fill = known.iter().sum::<f64>() / known.len() as f64;
+        let m: Vec<f64> = raw.into_iter().map(|x| x.unwrap_or(fill)).collect();
+        let total_m: f64 = m.iter().sum();
+        let mass = self.prior * keys.len() as f64;
+        let eps = GEO_EPS_SHARE * self.prior;
+        let rest = mass - eps * keys.len() as f64;
+        m.into_iter().map(|w| eps + rest * w / total_m).collect()
+    }
+
+    /// Soft-membership update (spec 30 open question 3): the row of every source region `i`
+    /// with weight `w_i` decays by `decay^{w_i}` and gains `w_i · w_j` on every successor `j`.
+    pub fn observe_soft(&mut self, from: &[(RegionKey, f64)], to: &[(RegionKey, f64)]) {
+        for (f, wf) in from.iter().filter(|x| x.1 > 0.0) {
+            let d = self.decay.powf(*wf);
+            let row = self.rows.entry(f.clone()).or_default();
+            for c in row.counts.values_mut() {
+                *c *= d;
+            }
+            for (t, wt) in to.iter().filter(|x| x.1 > 0.0) {
+                *row.counts.entry(t.clone()).or_insert(0.0) += wf * wt;
+            }
+        }
+    }
+
+    /// Posterior predictive of the next region from `from`: the posterior mean when the row
+    /// has evidence, otherwise the prior over the live support and [`UNKNOWN`] (never empty).
+    pub fn predictive(&self, from: &str) -> Vec<(RegionKey, f64)> {
+        if self.rows.contains_key(from) {
+            return self.posterior_mean(from);
+        }
+        let mut keys: BTreeSet<&str> = self.support.iter().map(String::as_str).collect();
+        keys.insert(UNKNOWN);
+        let keys: Vec<&str> = keys.into_iter().collect();
+        let p = self.prior_for(from, &keys);
+        let s: f64 = p.iter().sum();
+        keys.into_iter().zip(p).map(|(k, a)| (k.to_owned(), a / s)).collect()
+    }
+
+    /// Observation mass (decayed counts) of a row.
+    pub fn row_mass(&self, from: &str) -> f64 {
+        self.rows.get(from).map_or(0.0, |r| r.counts.values().sum())
+    }
+
+    /// Total observation mass of the graph.
+    pub fn total_mass(&self) -> f64 {
+        self.rows.values().flat_map(|r| r.counts.values()).sum()
     }
 
     /// Records an observed transition `from → to`.
@@ -86,7 +219,12 @@ impl MarkovGraph {
         let mut keys: BTreeSet<&str> = row.counts.keys().map(String::as_str).collect();
         keys.extend(self.support.iter().map(String::as_str));
         keys.insert(UNKNOWN);
-        keys.into_iter().map(|k| (k.to_owned(), row.counts.get(k).copied().unwrap_or(0.0) + self.prior)).collect()
+        let keys: Vec<&str> = keys.into_iter().collect();
+        let prior = self.prior_for(from, &keys);
+        keys.into_iter()
+            .zip(prior)
+            .map(|(k, p)| (k.to_owned(), row.counts.get(k).copied().unwrap_or(0.0) + p))
+            .collect()
     }
 
     /// Posterior mean transition probabilities.
@@ -160,6 +298,7 @@ impl MarkovGraph {
     pub fn transfer(old: &MarkovGraph, carries: &[RegionCarry], new_support: &[RegionKey], shrink: f64) -> Transfer {
         let shrink = shrink.clamp(0.0, 1.0);
         let mut graph = MarkovGraph::new(old.prior, old.decay);
+        graph.tau_geo = old.tau_geo;
         for id in new_support {
             graph.register_region(id);
         }
@@ -361,8 +500,12 @@ impl MarkovGraph {
     }
 }
 
+fn euclid(a: &[f32], b: &[f32]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum::<f64>().sqrt()
+}
+
 /// Standard normal quantile (Acklam), used to recover Dirichlet concentrations from intervals.
-fn normal_quantile(p: f64) -> f64 {
+pub fn normal_quantile(p: f64) -> f64 {
     const A: [f64; 6] = [
         -3.969683028665376e1,
         2.209460984245205e2,
@@ -733,5 +876,39 @@ mod tests {
     fn log_score_prefers_likely_transitions() {
         let g = graph();
         assert!(log_score(&g, &[("a".into(), "b".into())]) > log_score(&g, &[("a".into(), "c".into())]));
+    }
+
+    #[test]
+    fn geometric_prior_favours_latent_neighbours_and_keeps_total_mass() {
+        let mut g = MarkovGraph::new(1.0, 1.0);
+        for r in ["a", "b", "c"] {
+            g.register_region(r);
+        }
+        g.set_centroid("a", &[0.0, 0.0]);
+        g.set_centroid("b", &[1.0, 0.0]);
+        g.set_centroid("c", &[10.0, 0.0]);
+        let p: BTreeMap<_, _> = g.predictive("a").into_iter().collect();
+        assert!(p["b"] > p["c"] * 2.0, "{p:?}");
+        assert!(p["a"] > p["b"], "self is the nearest");
+        assert!((p.values().sum::<f64>() - 1.0).abs() < 1e-12);
+        g.observe("a", "c");
+        let s: f64 = g.alpha("a").iter().map(|x| x.1).sum();
+        assert!((s - (4.0 + 1.0)).abs() < 1e-9, "prior mass 1 per key (4 keys) + 1 count: {s}");
+        // a region without a centroid keeps the symmetric prior
+        g.observe("x", "a");
+        let ax: BTreeMap<_, _> = g.alpha("x").into_iter().collect();
+        assert_eq!(ax["b"], 1.0);
+        g.drop_centroid("c");
+        assert!(g.has_geometry());
+    }
+
+    #[test]
+    fn soft_observation_splits_counts_by_weights() {
+        let mut g = MarkovGraph::new(1.0, 1.0);
+        g.observe_soft(&[("a".into(), 0.75), ("b".into(), 0.25)], &[("c".into(), 0.5), ("d".into(), 0.5)]);
+        assert!((g.row("a").unwrap().counts["c"] - 0.375).abs() < 1e-12);
+        assert!((g.row("b").unwrap().counts["d"] - 0.125).abs() < 1e-12);
+        assert!((g.total_mass() - 1.0).abs() < 1e-12);
+        assert!(g.predictive("never").iter().any(|(k, _)| k == UNKNOWN));
     }
 }

@@ -265,8 +265,25 @@ impl Worker {
         let def = genome.def();
         run.progress(0.0, format!("parsed strategy {} ({} nodes)", def.id, genome.size())).await;
 
-        // 2. bars at the strategy's timescale (VictoriaMetrics, buffer fallback)
+        // 2. bars at the strategy's timescale (VictoriaMetrics, buffer fallback). A now-relative
+        // selection window that would touch a locked holdout moves before it with an embargo of
+        // 2 × horizon (spec 41 §6.4 layout [selection][embargo][holdout]; holdouts are locked
+        // automatically by the risk-engine, so evaluations must not stall behind a fresh one).
         let need = genome.lookback_bars + genome.steps as usize + 2;
+        if spec.window.start_ms.is_none()
+            && spec.purpose == ReplayPurpose::Selection
+            && let Some(t) = &self.trials
+        {
+            let hs = t.holdouts(genome.timescale).await.unwrap_or_default();
+            let step_ms = i64::try_from(genome.timescale.duration().as_millis()).unwrap_or(1000);
+            let w = spec.window.resolve(now_ms(), self.data_window_hours, step_ms);
+            let embargo = (2 * i64::try_from(genome.horizon().duration().as_millis()).unwrap_or(0)).max(60_000);
+            let shifted = fa_backtest::holdout::avoid_holdouts(w, genome.timescale, &hs, embargo);
+            if shifted != w {
+                tracing::info!(job = %job.job_id, from = ?w, to = ?shifted, "selection window moved before the locked holdout");
+                spec.window = DataWindow { hours: None, start_ms: Some(shifted.0), end_ms: Some(shifted.1) };
+            }
+        }
         let loaded = data::load_bars(
             self.tsdb.as_ref(),
             &self.market,

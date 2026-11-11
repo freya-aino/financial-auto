@@ -22,6 +22,7 @@ use fa_core::{Secrets, Timescale, config::PlatformConfig};
 use fa_encoders::{
     EncoderFamily, MANIFEST_FILE, NormStats, REGION_MAP_FILE, STATISTICAL_FAMILY, SnapshotManifest, StatisticalEncoder,
     WEIGHTS_FILE,
+    neural::{InputNorm, NeuralEncoder, NeuralFamily, is_neural_family},
 };
 use fa_hub::HubClient;
 use fa_patterns::RegionMap;
@@ -97,7 +98,7 @@ impl SnapshotLoader {
                 Some(r) => r,
                 None => anyhow::bail!("snapshot {id} not found in Helix"),
             },
-            None => match hub.active_snapshot(ts.as_str(), STATISTICAL_FAMILY).await {
+            None => match active_any_family(hub, ts).await {
                 Ok(Some(r)) => r,
                 Ok(None) => return Ok(Self::baseline(ts, Some(format!("no active snapshot for {ts} in Helix")))),
                 Err(e) => return Ok(Self::baseline(ts, Some(format!("helix unavailable: {e}")))),
@@ -138,7 +139,7 @@ impl SnapshotLoader {
         if manifest.timescale != ts {
             anyhow::bail!("manifest of {id} is for {} not {ts}", manifest.timescale);
         }
-        let enc = StatisticalEncoder::from_manifest(&manifest, &weights)?;
+        let enc = encoder_from_manifest(&manifest, &weights)?;
         Ok(Loaded {
             desc: SnapshotDesc {
                 snapshot_id: enc.snapshot_id().to_owned(),
@@ -149,7 +150,7 @@ impl SnapshotLoader {
                 garage_key: row.garage_key.clone(),
                 status: row.status.clone(),
             },
-            encoder: Box::new(enc),
+            encoder: enc,
             region_map,
             source: "garage",
             note: None,
@@ -194,18 +195,58 @@ impl SnapshotLoader {
         if art.frozen {
             anyhow::bail!("adapter {key} is frozen (drift {:?} > max {:?})", art.drift, art.max_drift);
         }
-        let encoder: Box<dyn EncoderFamily> = match blob.get(&fa_blob::snapshot_file(snapshot_id, MANIFEST_FILE)).await
-        {
-            Ok(m) => {
-                Box::new(StatisticalEncoder::from_manifest(&SnapshotManifest::from_json(&m)?, &art.stats.to_bytes())?)
-            }
-            Err(fa_blob::BlobError::NotFound(..)) => {
-                Box::new(StatisticalEncoder::with_stats(ts, snapshot_id.to_owned(), art.stats.clone()))
-            }
+        let manifest = match blob.get(&fa_blob::snapshot_file(snapshot_id, MANIFEST_FILE)).await {
+            Ok(m) => Some(SnapshotManifest::from_json(&m)?),
+            Err(fa_blob::BlobError::NotFound(..)) => None,
             Err(e) => return Err(e.into()),
+        };
+        let encoder: Box<dyn EncoderFamily> = match (&manifest, &art.stats, &art.input_norm) {
+            // neural snapshot: the adapter re-fits the input normalisation (spec 36 §6.5 input adapter)
+            (Some(m), _, Some(norm)) if is_neural_family(&m.encoder_family) => {
+                let weights = blob.get(&fa_blob::snapshot_file(snapshot_id, WEIGHTS_FILE)).await?;
+                let (dev, _) = fa_encoders::neural::device_from_env();
+                let base = NeuralEncoder::from_manifest_on(m, &weights, &dev)?;
+                let mut model = base.model().clone();
+                model.norm = norm.clone();
+                Box::new(NeuralEncoder::new(model, ts, snapshot_id.to_owned()))
+            }
+            (Some(m), Some(stats), _) => Box::new(StatisticalEncoder::from_manifest(m, &stats.to_bytes())?),
+            (None, Some(stats), _) => {
+                Box::new(StatisticalEncoder::with_stats(ts, snapshot_id.to_owned(), stats.clone()))
+            }
+            _ => anyhow::bail!("adapter {key} carries neither statistics nor an input normalisation for this snapshot"),
         };
         Ok(LoadedAdapter { encoder, key, ts_ms: art.ts_ms, drift: art.drift })
     }
+}
+
+/// The active snapshot of `ts` whatever its encoder family (control-api keeps at most one
+/// `active` row per timescale across families: promotion retires the replaced one).
+pub async fn active_any_family(hub: &HubClient, ts: Timescale) -> anyhow::Result<Option<fa_hub::Snapshot>> {
+    let mut families = vec![STATISTICAL_FAMILY];
+    families.extend(NeuralFamily::ALL.iter().map(|f| f.as_str()));
+    for f in families {
+        if let Some(r) = hub.active_snapshot(ts.as_str(), f).await? {
+            return Ok(Some(r));
+        }
+    }
+    Ok(None)
+}
+
+/// Builds the serving encoder of a snapshot artifact by its `encoder_family`: the statistical
+/// family from `FASTAT01` statistics, the neural families (`fsq_hybrid`, `jepa_vae`) from
+/// safetensors on the configured device (`FA_ML_DEVICE`, default cpu).
+pub fn encoder_from_manifest(manifest: &SnapshotManifest, weights: &[u8]) -> anyhow::Result<Box<dyn EncoderFamily>> {
+    if is_neural_family(&manifest.encoder_family) {
+        let (dev, note) = fa_encoders::neural::device_from_env();
+        if let Some(n) = note {
+            tracing::warn!(snapshot = %manifest.snapshot_id, "{n}");
+        }
+        let enc = NeuralEncoder::from_manifest_on(manifest, weights, &dev)?;
+        tracing::info!(snapshot = %manifest.snapshot_id, family = %manifest.encoder_family, experts = enc.sizing().max_experts, dim = enc.sizing().latent_dim, context = enc.sizing().context_steps, "neural encoder loaded");
+        return Ok(Box::new(enc));
+    }
+    Ok(Box::new(StatisticalEncoder::from_manifest(manifest, weights)?))
 }
 
 /// An adapter ready to replace the serving encoder.
@@ -223,7 +264,12 @@ pub struct AdapterArtifact {
     pub snapshot_id: String,
     pub timescale: Timescale,
     pub ts_ms: i64,
-    pub stats: NormStats,
+    /// Statistical family: re-fitted normalisation statistics.
+    #[serde(default)]
+    pub stats: Option<NormStats>,
+    /// Neural families: re-fitted input normalisation (`fa_encoders::neural::InputNorm`).
+    #[serde(default)]
+    pub input_norm: Option<InputNorm>,
     #[serde(default)]
     pub drift: Option<f64>,
     #[serde(default)]
@@ -355,7 +401,14 @@ mod tests {
             (a.snapshot_id.as_str(), a.timescale, a.ts_ms, a.frozen),
             ("stat-v1-1m", Timescale::Minute, 1_700_000_000_000, false)
         );
-        assert_eq!(a.stats, stats);
+        assert_eq!(a.stats, Some(stats));
+        assert!(a.input_norm.is_none());
+        // neural adapter artifacts carry an input normalisation instead
+        let neural = serde_json::json!({
+            "snapshot_id": "fsq-v1-1m-g0-1", "timescale": "1m", "ts_ms": 1, "input_norm": InputNorm::default(), "frozen": false
+        });
+        let n = AdapterArtifact::from_json(&serde_json::to_vec(&neural).unwrap()).unwrap();
+        assert!(n.stats.is_none() && n.input_norm.is_some());
         assert_eq!(adapter_ms("adapters/stat-v1-1m/1700000000000.json"), Some(1_700_000_000_000));
         assert_eq!(adapter_ms("adapters/stat-v1-1m/notes.txt"), None);
     }

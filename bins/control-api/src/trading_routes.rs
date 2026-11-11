@@ -31,7 +31,7 @@ use sqlx::Row;
 use crate::state::AppState;
 
 const CTL_TIMEOUT: Duration = Duration::from_secs(5);
-const ACTIONS: [&str; 5] = ["pause", "resume", "flatten", "promote", "shadow"];
+const ACTIONS: [&str; 7] = ["pause", "resume", "flatten", "promote", "shadow", "retire", "admit"];
 
 /// Returns `app` with the trading routes layered in front.
 pub fn install(state: AppState, app: Router) -> Router {

@@ -19,7 +19,9 @@
 mod bars;
 mod decoders;
 mod hub_sink;
+mod neural_serving;
 mod pipeline;
+mod regions;
 mod shadow;
 mod snapshot;
 
@@ -90,6 +92,25 @@ struct Args {
     /// `postgres.url` of the config).
     #[arg(long)]
     pg_url: Option<String>,
+    /// Persist region sets, kernels, region statistics and centroids to Helix this often
+    /// (spec 30 §8); the region sets are restored from there on start.
+    #[arg(long, default_value_t = 120)]
+    hub_state_secs: u64,
+    /// Start with empty region sets even when Helix holds a stored set for the snapshot.
+    #[arg(long)]
+    no_region_restore: bool,
+    /// Particles per source row of the SMC sampler competing with the conjugate one (0 = off).
+    #[arg(long, default_value_t = 64)]
+    smc_particles: usize,
+    /// Event-time cadence of `KernelUpdate`s (`latent.mcmc.<ts>.<expert>`) per expert space.
+    #[arg(long, default_value_t = 60)]
+    kernel_every_secs: u64,
+    /// Publish region hierarchy (`latent.hier.*`) and cross-asset priors (`latent.crossprior.*`) this often.
+    #[arg(long, default_value_t = 60)]
+    graph_every_secs: u64,
+    /// Minimum seconds between drift-triggered `train.adapter` requests per timescale.
+    #[arg(long, default_value_t = 6 * 3600)]
+    drift_refit_cooldown_secs: u64,
 }
 
 type Counters = Arc<Mutex<BTreeMap<String, f64>>>;
@@ -177,6 +198,12 @@ struct Runtime {
     visual: Vec<Timescale>,
     text: decoders::TextDecoder,
     refs: watch::Receiver<Arc<InstrumentIndex>>,
+    /// Elite neural decoders, serving + shadow (spec 34, [`neural_serving`]).
+    neural: neural_serving::NeuralServing,
+    /// Region hierarchy across timescales and cross-asset priors (specs 30 §6.5, 33 §6.5).
+    xscale: regions::CrossScale,
+    /// Sustained occupancy drift → `train.adapter` request (spec 30 §6.6).
+    drift_refit: regions::DriftTrigger,
 }
 
 impl Runtime {
@@ -277,6 +304,34 @@ impl Runtime {
         if let Some(sink) = &self.sink {
             sink.observe(ts, closed, &out, self.region_radius);
         }
+        if let Some(state) = &out.state {
+            self.xscale.observe(ts, state, closed, bars.last().map(|b| b.close), as_of_ms);
+        }
+        for ev in &out.lifecycle {
+            if ev.kind == fa_proto::v1::region_lifecycle_event::Kind::Died as i32 {
+                self.xscale.forget(&ev.region_id);
+            }
+        }
+        let neural_latent = if closed { out.state.clone() } else { None };
+        for k in &out.kernels {
+            if let Some(spec) = self.drift_refit.observe(k, now_ms()) {
+                let job = fa_proto::v1::Job {
+                    job_id: ulid::Ulid::generate().to_string(),
+                    kind: "train.adapter".into(),
+                    priority: 1,
+                    snapshot_id: spec["snapshot_id"].as_str().unwrap_or_default().to_owned(),
+                    spec: serde_json::to_vec(&spec).unwrap_or_default(),
+                    ..Default::default()
+                };
+                match self.bus.publish(subjects::jobs(&job.kind), &job).await {
+                    Ok(()) => {
+                        tracing::info!(%ts, job = %job.job_id, drift = ?spec["drift_kl"], "region occupancy drift: partial refit requested");
+                        *self.counters.lock().await.entry(format!("drift_refit_requests.{ts}")).or_default() += 1.0;
+                    }
+                    Err(e) => tracing::warn!(error = %e, "drift refit request failed"),
+                }
+            }
+        }
         publish_step(&self.bus, &self.counters, ts, inst, closed, out, &self.states[i].pipeline).await;
         if let Some(s) = shadow_state
             && let Err(e) = self.bus.publish(shadow::shadow_subject(ts, &token), &s).await
@@ -293,11 +348,23 @@ impl Runtime {
         {
             self.publish_outputs(&outs).await;
         }
+        if closed {
+            let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
+            let outs = self.neural.on_bar_close(inst, ts, as_of_ms, &closes, neural_latent.as_ref());
+            for (subject, o) in outs {
+                if let Err(e) = self.bus.publish(subject, &o).await {
+                    tracing::warn!(error = %e, family = %o.family, "neural decoder output publish failed");
+                }
+            }
+        }
     }
 
     async fn publish_outputs(&self, outs: &[DecoderOutput]) {
         let mut c = self.counters.lock().await;
         for o in outs {
+            if self.neural.replaces(&o.family, &o.timescale) {
+                continue; // a serving neural decoder replaces this baseline (FA_NEURAL_REPLACE_BASELINE)
+            }
             if let Err(e) = self.bus.publish(subjects::decoder_output(&o.family), o).await {
                 tracing::warn!(error = %e, family = %o.family, "decoder output publish failed");
                 continue;
@@ -317,6 +384,7 @@ impl Runtime {
             *self.counters.lock().await.entry("news.duplicates".into()).or_default() += 1.0;
             return;
         };
+        self.neural.on_news(doc.ts_ms, &doc.title, &doc.body);
         {
             let mut c = self.counters.lock().await;
             *c.entry("news.items".into()).or_default() += 1.0;
@@ -353,6 +421,7 @@ impl Runtime {
     /// Gauges that change without steps (shadow minutes, bar sources).
     async fn gauge_tick(&self) {
         let mut c = self.counters.lock().await;
+        c.extend(self.neural.gauges());
         for st in &self.states {
             let ts = st.pipeline.timescale();
             if let Some(sh) = &st.shadow {
@@ -361,6 +430,48 @@ impl Runtime {
             for src in [BarSource::Bus, BarSource::Trades] {
                 let n = st.source.values().filter(|s| **s == src).count();
                 c.insert(format!("bars_source.{ts}.{}", src.as_str()), n as f64);
+            }
+        }
+    }
+
+    /// Publishes the region hierarchy and the cross-asset priors (and persists them).
+    async fn graph_tick(&self) {
+        let now = now_ms();
+        let hier = self.xscale.hierarchy(now);
+        let cross = self.xscale.cross_priors(now);
+        let mut c = self.counters.lock().await;
+        for h in hier {
+            let (Some(f), Some(co)) = (h.fine.as_ref(), h.coarse.as_ref()) else { continue };
+            let (Ok(fine), Ok(coarse)) = (f.timescale.parse::<Timescale>(), co.timescale.parse::<Timescale>()) else {
+                continue;
+            };
+            c.insert(format!("hier.{fine}.{coarse}.e{}.mi_bits", f.expert_index), h.mutual_information_bits);
+            c.insert(format!("hier.{fine}.{coarse}.e{}.edges", f.expert_index), h.edges.len() as f64);
+            if let Err(e) = self.bus.publish(subjects::latent_hier(fine, coarse), &h).await {
+                tracing::warn!(error = %e, "hierarchy publish failed");
+            }
+            if let Some(sink) = &self.sink {
+                sink.send(hub_sink::HubEvent::Hierarchy(h));
+            }
+        }
+        for x in cross {
+            let Ok(ts) = x.timescale.parse::<Timescale>() else { continue };
+            c.insert(format!("crossprior.{ts}.instruments"), f64::from(x.instruments));
+            c.insert(format!("crossprior.{ts}.proposals"), x.proposals.len() as f64);
+            if let Err(e) = self.bus.publish(subjects::latent_crossprior(ts), &x).await {
+                tracing::warn!(error = %e, "cross-prior publish failed");
+            }
+            if let Some(sink) = &self.sink {
+                sink.send(hub_sink::HubEvent::CrossPriors(x));
+            }
+        }
+    }
+
+    /// Region sets, kernels, statistics and centroids to Helix (spec 30 §8).
+    fn persist_tick(&self) {
+        if let Some(sink) = &self.sink {
+            for st in &self.states {
+                sink.send(hub_sink::HubEvent::Persist(st.pipeline.persist_rows()));
             }
         }
     }
@@ -401,11 +512,16 @@ impl Runtime {
         if let Some(sink) = &self.sink {
             sink.announce_snapshot(loaded.desc.clone());
         }
-        let out = pipeline::StepOutput { region_events: report.events, ..Default::default() };
+        let regime_break = report.regime_break;
+        let out =
+            pipeline::StepOutput { region_events: report.events, lifecycle: report.lifecycle, ..Default::default() };
         if let Some(sink) = &self.sink {
             sink.observe(ts, false, &out, self.region_radius);
         }
         publish_step(&self.bus, &self.counters, ts, "", false, out, &self.states[i].pipeline).await;
+        if regime_break {
+            tracing::warn!(%ts, snapshot = %loaded.desc.snapshot_id, "region alignment is a representation regime break: transition posteriors restarted from the prior");
+        }
         {
             let mut c = self.counters.lock().await;
             *c.entry("reloads".into()).or_default() += 1.0;
@@ -413,6 +529,7 @@ impl Runtime {
             *c.entry(format!("kernel_transfer.{ts}.carried")).or_default() += report.carried;
             c.insert(format!("kernel_transfer.{ts}.rows"), report.rows_carried as f64);
             c.insert(format!("kernel_transfer.{ts}.dropped"), report.dropped);
+            c.insert(format!("regime_break.{ts}"), f64::from(u8::from(regime_break)));
             c.remove(&format!("adapter.{ts}.ts_ms"));
         }
         CtlReply {
@@ -535,6 +652,11 @@ async fn main() -> anyhow::Result<()> {
             max_regions: args.max_regions,
             ..OnlineRegionCfg::default()
         },
+        kernel: regions::KernelCfg {
+            smc_particles: args.smc_particles,
+            kernel_every_ms: (args.kernel_every_secs * 1000) as i64,
+            ..regions::KernelCfg::default()
+        },
         ..PipelineConfig::default()
     };
     // Active snapshot per timescale from Helix + Garage, else the in-process baseline (spec 36).
@@ -542,14 +664,17 @@ async fn main() -> anyhow::Result<()> {
     let loader = snapshot::SnapshotLoader::new(&cfg, (!args.no_hub).then(|| hub_url.clone()));
     let mut states: Vec<TimescaleState> = Vec::with_capacity(cfg.timescales.len());
     let mut descs = Vec::with_capacity(cfg.timescales.len());
+    let mut seeded_lifecycle = Vec::new();
     for &ts in &cfg.timescales {
         let loaded = match loader.resolve(ts, None).await {
             Ok(l) => l,
             Err(e) => snapshot::SnapshotLoader::baseline(ts, Some(format!("active snapshot unusable: {e}"))),
         };
         tracing::info!(%ts, snapshot = %loaded.desc.snapshot_id, generation = loaded.desc.generation, source = loaded.source, note = ?loaded.note, seeded_regions = loaded.region_map.as_ref().map_or(0, fa_patterns::RegionMap::n_regions), "encoder resolved");
+        let pipeline = TimescalePipeline::with_encoder(ts, &pcfg, loaded.encoder, loaded.region_map.as_ref());
+        seeded_lifecycle.push(pipeline.seeded_lifecycle(loaded.region_map.as_ref(), now_ms()));
         states.push(TimescaleState {
-            pipeline: TimescalePipeline::with_encoder(ts, &pcfg, loaded.encoder, loaded.region_map.as_ref()),
+            pipeline,
             series: HashMap::new(),
             source: HashMap::new(),
             last_preview: HashMap::new(),
@@ -588,11 +713,15 @@ async fn main() -> anyhow::Result<()> {
         sink
     });
     let region_radius = f64::from(args.region_radius);
+    // Region sets and kernels persisted by a previous run of the same snapshot (spec 30 §8).
+    if !args.no_hub && !args.no_region_restore {
+        restore_regions(&hub_url, &mut states, &counters).await;
+    }
     // Seeded regions of loaded snapshots are announced like births so the bus and Helix know them.
-    for st in &states {
+    for (st, lifecycle) in states.iter().zip(seeded_lifecycle) {
         let events = st.pipeline.seeded_region_events();
-        if !events.is_empty() {
-            let out = pipeline::StepOutput { region_events: events, ..Default::default() };
+        if !events.is_empty() || !lifecycle.is_empty() {
+            let out = pipeline::StepOutput { region_events: events, lifecycle, ..Default::default() };
             if let Some(sink) = &sink {
                 sink.observe(st.pipeline.timescale(), false, &out, region_radius);
             }
@@ -630,6 +759,17 @@ async fn main() -> anyhow::Result<()> {
         visual: parse_ts(&args.visual_timescales),
         text: decoders::TextDecoder::new(text_ts),
         refs: refs_rx,
+        neural: neural_serving::NeuralServing::spawn(
+            &bus,
+            fa_core::Secrets::load().ok().and_then(|s| fa_blob::S3BlobStore::from_config(&cfg, &s).ok()),
+            neural_serving::ServingCfg::from_env(),
+        ),
+        xscale: regions::CrossScale::new(
+            cfg.timescales.clone(),
+            fa_patterns::HierarchyCfg::default(),
+            fa_mcmc::cross_asset::CrossAssetCfg::default(),
+        ),
+        drift_refit: regions::DriftTrigger::new(3, (args.drift_refit_cooldown_secs * 1000) as i64),
     };
 
     let mut trades = bus.subscribe::<Envelope>(subjects::ALL_MD_TRADES.into()).await?;
@@ -637,6 +777,10 @@ async fn main() -> anyhow::Result<()> {
     let mut jobs = bus.subscribe::<JobResult>("jobs.result.train.>".into()).await?;
     let mut text_tick = tokio::time::interval(Duration::from_secs(args.text_refresh_secs.max(5)));
     let mut gauge_tick = tokio::time::interval(Duration::from_secs(args.heartbeat_secs.max(1)));
+    let mut graph_tick = tokio::time::interval(Duration::from_secs(args.graph_every_secs.max(5)));
+    let mut persist_tick = tokio::time::interval(Duration::from_secs(args.hub_state_secs.max(10)));
+    graph_tick.tick().await;
+    persist_tick.tick().await;
     loop {
         tokio::select! {
             msg = trades.next() => match msg {
@@ -655,6 +799,8 @@ async fn main() -> anyhow::Result<()> {
             Some(cmd) = ctl_rx.recv() => rt.on_ctl(cmd).await,
             _ = text_tick.tick() => if !rt.text.timescales().is_empty() { rt.text_tick().await },
             _ = gauge_tick.tick() => rt.gauge_tick().await,
+            _ = graph_tick.tick() => rt.graph_tick().await,
+            _ = persist_tick.tick() => rt.persist_tick(),
         }
     }
     Ok(())
@@ -739,11 +885,49 @@ async fn publish_step(
         }
         *published.entry("region_events").or_default() += 1.0;
     }
+    for ev in &out.lifecycle {
+        if let Err(e) = bus.publish(subjects::latent_lifecycle(ts), ev).await {
+            tracing::warn!(error = %e, "lifecycle publish failed");
+        }
+        let kind = fa_proto::v1::region_lifecycle_event::Kind::try_from(ev.kind).unwrap_or_default();
+        *published.entry(lifecycle_counter(kind)).or_default() += 1.0;
+    }
     for tr in &out.transitions {
         if let Err(e) = bus.publish(subjects::latent_transition(ts), tr).await {
             tracing::warn!(error = %e, "transition publish failed");
         }
         *published.entry("transitions_published").or_default() += 1.0;
+    }
+    let mut gauges = Vec::new();
+    for k in &out.kernels {
+        let e = k.space.as_ref().map_or(0, |s| s.expert_index);
+        if let Err(err) = bus.publish(subjects::latent_mcmc(ts, e), k).await {
+            tracing::warn!(error = %err, "kernel update publish failed");
+        }
+        *published.entry("kernel_updates").or_default() += 1.0;
+        gauges.push((format!("mcmc.{ts}.e{e}.drift_kl"), k.drift_kl));
+        gauges.push((format!("mcmc.{ts}.e{e}.refit_due"), f64::from(u8::from(k.refit_due))));
+        gauges.push((format!("mcmc.{ts}.e{e}.relaxation_steps"), k.relaxation_steps));
+        for sc in &k.samplers {
+            let p = format!("mcmc.{ts}.e{e}.{}", sc.sampler_id);
+            gauges.push((format!("{p}.log_score"), sc.log_score));
+            gauges.push((format!("{p}.ece"), sc.ece));
+            gauges.push((format!("{p}.brier"), sc.brier));
+            gauges.push((format!("{p}.pit_ks"), sc.pit_ks));
+            gauges.push((format!("{p}.cost_us"), sc.cost_us));
+            gauges.push((format!("{p}.serving"), f64::from(u8::from(sc.serving))));
+        }
+    }
+    if let Some(m) = &out.membership
+        && !inst.is_empty()
+    {
+        let token = inst.replace('-', "");
+        if let Err(e) = bus.publish(subjects::latent_membership(ts, &token), m).await {
+            tracing::warn!(error = %e, "membership publish failed");
+        }
+        *published.entry("memberships_published").or_default() += 1.0;
+        let novel = m.experts.iter().filter(|e| e.out_of_region).count();
+        *published.entry("out_of_region").or_default() += novel as f64;
     }
     if let Some(state) = &out.state {
         // Subject per instrument: `latent.state.<ts>.<instrument token>` (D-017 token).
@@ -763,6 +947,50 @@ async fn publish_step(
     }
     c.insert(format!("regions_live.{ts}"), pl.live_regions() as f64);
     c.insert(format!("transition_rows.{ts}"), pl.transition_rows() as f64);
+    c.extend(gauges);
+}
+
+fn lifecycle_counter(kind: fa_proto::v1::region_lifecycle_event::Kind) -> &'static str {
+    use fa_proto::v1::region_lifecycle_event::Kind;
+    match kind {
+        Kind::Born => "lifecycle.born",
+        Kind::Carried => "lifecycle.carried",
+        Kind::Split => "lifecycle.split",
+        Kind::Merged => "lifecycle.merged",
+        Kind::Died => "lifecycle.died",
+        Kind::Unspecified => "lifecycle.unknown",
+    }
+}
+
+/// Restores every expert's region set and kernel stored in Helix for the serving snapshot
+/// (`RegionSet` rows written every `--hub-state-secs`). Helix down or no row → empty sets.
+async fn restore_regions(hub_url: &str, states: &mut [TimescaleState], counters: &Counters) {
+    let hub = fa_hub::HubClient::with_timeout(hub_url.to_owned(), Duration::from_secs(5));
+    for st in states.iter_mut() {
+        let ts = st.pipeline.timescale();
+        let mut restored = 0usize;
+        for k in 0..st.pipeline.n_experts() {
+            let space = st.pipeline.space_ref(k as u32);
+            let id = hub_sink::expert_space_id(&space.snapshot_id, space.expert_index);
+            match hub.region_set(&id).await {
+                Ok(Some(row)) => {
+                    let Ok(state) = serde_json::from_str::<serde_json::Value>(&row.state) else { continue };
+                    if st.pipeline.restore_expert(k, &state, &row.kernel_state) {
+                        restored += 1;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(%ts, error = %e, "region set restore unavailable; starting empty");
+                    break;
+                }
+            }
+        }
+        if restored > 0 {
+            tracing::info!(%ts, snapshot = %st.pipeline.snapshot_id(), experts = restored, regions = st.pipeline.live_regions(), rows = st.pipeline.transition_rows(), "region sets and kernels restored from Helix");
+        }
+        counters.lock().await.insert(format!("regions_restored.{ts}"), restored as f64);
+    }
 }
 
 fn spawn_heartbeat(bus: Bus, counters: Counters, instance_id: String, every_secs: u64) {

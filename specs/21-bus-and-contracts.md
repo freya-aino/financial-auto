@@ -44,14 +44,15 @@ Define how components talk: NATS JetStream subjects and streams for live data an
 | `order.approved.<account>` | `OrderIntent` | risk → broker-gateway |
 | `order.event.<account>` | `OrderEvent` (ack/fill/cancel/reject) | broker-gateway → ledger, risk |
 | `risk.state` / `risk.halt.<scope>` | `RiskState` / `Halt` | risk-engine → all; scopes `portfolio`, `daily_loss`, `source`, `model`, `broker` (D-042) |
-| `risk.resume.<scope>` | `Halt` (reason "manual resume") | control-api / operator → risk-engine; re-arms a halt (D-030) |
+| `risk.resume.<scope>` | `Resume` (wire-compatible with `Halt`) | control-api / operator / ingestor → risk-engine; re-arms a halt (D-030) |
+| `risk.event.<account>` | `RiskEvent` (intent rejected, halt raised/cleared, ...) | risk-engine → UI, audit; rejections are still mirrored as `OrderEvent{REJECTED}` |
 | `jobs.<kind>` | `Job` | orchestrator/trainer → workers |
 | `jobs.result.<kind>` | `JobResult` | workers → orchestrator |
 | `jobs.progress.<job_id>` | `JobProgress` | workers → UI |
-| `ingest.health.<source>` / `ingest.gap.*` / `ingest.unresolved.*` | health events | ingestor → risk, UI |
+| `ingest.health.<source>` / `ingest.gap.*` / `ingest.unresolved.*` | `IngestHealth` / `IngestGap` / `IngestUnresolved` (legacy JSON accepted) | ingestor → risk, UI |
 | `ctl.<service>.<verb>` | `CtlRequest` / `CtlReply` | control-api ↔ services; today `ctl.ingest.{start,stop,status}` (D-036), `ctl.evo.{start,cancel}` (D-037) |
 | `ctl.gpu.{acquire,release}` / `ctl.gpu.{granted,preempt}` | request/reply / notifications | workers, trainer ↔ GPU arbiter in evo-orchestrator (D-006, D-044) |
-| `ref.changed.*`, `catalog.changed.*` | change notices | |
+| `ref.changed.<entity>`, `catalog.changed.<id>` | `RefChanged` | ingestor, control-api → ingestor resolver, risk-engine RefTable |
 | `svc.heartbeat.<service>` | `Heartbeat` | all → UI |
 
 Tokens (`<inst>`) use the instrument UUID without dashes **(proposal)** to keep subjects safe.
@@ -68,7 +69,8 @@ proto/fa/v1/
   decoder.proto      # DecoderOutput
   strategy.proto     # ExposureDistribution
   order.proto        # OrderIntent, OrderEvent
-  risk.proto         # RiskState, Halt
+  risk.proto         # RiskState, Halt, Resume, RiskEvent
+  ingest.proto       # IngestHealth, IngestGap, IngestUnresolved, RefChanged
   jobs.proto         # Job, JobResult, JobProgress
   control.proto      # Heartbeat, ctl requests/replies
 ```
@@ -120,6 +122,8 @@ Consumers: durable pull consumers per service; `AckExplicit`; `MaxAckPending` se
 
 **Implemented today (D-046):** the limits streams above are declared once in `crates/fa-bus/streams.json` (mirrored byte-for-byte in `go/pkg/bus/streams.json`) and ensured idempotently by control-api when NATS connects and by the ingestor at start; `GET /api/bus/streams` lists them. `ctl.*`, `svc.heartbeat.*`, `ingest.*` and `jobs.progress.*` stay core-only. No `max_bytes` caps yet.
 
+**Since 2026-11-11 (typed contracts):** the JSON workarounds of D-030, D-042 and D-054 are replaced by `fa.v1` messages, generated for Rust (`fa-proto` build) and Go (`buf generate` via Docker, committed in `go/pkg/bus/pb`); `buf lint` and `buf breaking --against main` pass. Compatibility rules used: `Resume` keeps `Halt`'s field numbers 1–4, so consumers decoding `Halt` keep working; ingest frames are switched producer-side with consumers accepting both encodings (`fa_bus::ingest::{is_json, frame_json, health_status}`); `RiskEvent` is dual-published next to the old `OrderEvent{REJECTED}`. `Envelope` gained `raw_missing`, `publish_time_estimated`, `gap_filled`, `backfill` (fields 9–12). Subjects helpers: `fa_bus::subjects::{risk_event, ingest_health, ingest_gap, ingest_unresolved, ref_changed, catalog_changed}` and the Go mirrors in `go/pkg/bus/subjects.go`. The ingestor publishes canonical events with `Nats-Msg-Id = event_id` and stable ids (spec 10), which is what makes §3's dedup rule effective. The control-api bus tap decodes the new messages. Still JSON inside proto: `CtlReply.message` for `status`/`replay` replies and `JobResult.result` (by design, D-044); `order.cancel.<account>` still carries `OrderIntent` (broker-gateway owner).
+
 ## 6. Behaviour & algorithms
 - **Versioning:** package `fa.v1`; additive changes only (new fields, new messages); breaking change → `fa.v2` side by side. `buf breaking` against `main` in CI.
 - **Ordering:** per-subject ordering relied on only within an instrument subject; consumers must tolerate out-of-order across subjects and use `event_time`.
@@ -150,6 +154,8 @@ Consumers: durable pull consumers per service; `AckExplicit`; `MaxAckPending` se
 - A job published to `jobs.<kind>` is processed exactly once in effect (idempotent result) across worker crashes in a test.
 - Adding a second evo-worker doubles throughput on a CPU-bound fake job (scaling contract works).
 - Every subject in §4.1 has a proto payload type.
+
+**Status (2026-11-11):** `buf lint` / `buf breaking` pass (run via the `bufbuild/buf` image, no CI yet); every §4.1 subject now has a proto payload type; the exactly-once and scaling criteria are owned by the job-lifecycle work (D-064). Not implemented: `DLQ.<stream>` for poison messages (§8) and `max_bytes` caps.
 
 ## 10. Open questions
 1. Retention per stream — confirm §5 values against disk budget (blocks 60).

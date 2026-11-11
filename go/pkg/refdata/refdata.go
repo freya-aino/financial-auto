@@ -10,6 +10,7 @@ import (
 	"crypto/sha1"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -177,8 +178,15 @@ type Resolver struct {
 	// (the ingestor publishes `ingest.unresolved.<source>` from it, D-054).
 	OnProvision func(sourceID, venueSymbol, instrumentID string)
 
+	// CacheTTL bounds how long a mapping is served from memory (spec 12 §7
+	// resolver.cache_ttl, default 1 h); Invalidate drops everything at once
+	// (the ingestor calls it on `ref.changed.*`, e.g. after a quarantine merge
+	// or a symbol change).
+	CacheTTL time.Duration
+	now      func() time.Time
+
 	mu    sync.RWMutex
-	cache map[string]string
+	cache map[string]cached
 	// Quarantined counts provisional creations per source (for counters/tests).
 	created map[string]int
 }
@@ -188,7 +196,30 @@ func NewResolver(store *Store, hints map[string]Hint, onErr func(error)) *Resolv
 	if hints == nil {
 		hints = DefaultHints
 	}
-	return &Resolver{store: store, hints: hints, timeout: 5 * time.Second, onErr: onErr, cache: map[string]string{}, created: map[string]int{}}
+	return &Resolver{store: store, hints: hints, timeout: 5 * time.Second, onErr: onErr, cache: map[string]cached{}, created: map[string]int{},
+		CacheTTL: time.Hour, now: time.Now}
+}
+
+type cached struct {
+	id string
+	at time.Time
+}
+
+// Invalidate drops every cached mapping (reference data changed).
+func (r *Resolver) Invalidate() {
+	r.mu.Lock()
+	r.cache = map[string]cached{}
+	r.mu.Unlock()
+}
+
+func (r *Resolver) cachedID(key string) (string, bool) {
+	r.mu.RLock()
+	c, ok := r.cache[key]
+	r.mu.RUnlock()
+	if !ok || (r.CacheTTL > 0 && r.now().Sub(c.at) > r.CacheTTL) {
+		return "", false
+	}
+	return c.id, true
 }
 
 // Resolve maps (source, symbol) → instrument UUID. It never blocks the hot
@@ -196,10 +227,7 @@ func NewResolver(store *Store, hints map[string]Hint, onErr func(error)) *Resolv
 // onErr and yield ok=false (the event goes to the connector's unresolved list).
 func (r *Resolver) Resolve(sourceID, venueSymbol string) (string, bool) {
 	key := sourceID + "\x00" + venueSymbol
-	r.mu.RLock()
-	id, ok := r.cache[key]
-	r.mu.RUnlock()
-	if ok {
+	if id, ok := r.cachedID(key); ok {
 		return id, true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
@@ -212,7 +240,7 @@ func (r *Resolver) Resolve(sourceID, venueSymbol string) (string, bool) {
 		return "", false
 	}
 	r.mu.Lock()
-	r.cache[key] = id
+	r.cache[key] = cached{id: id, at: r.now()}
 	if created {
 		r.created[sourceID]++
 	}
@@ -291,8 +319,9 @@ func (r *Resolver) resolveDB(ctx context.Context, sourceID, venueSymbol string) 
 	if err := tx.QueryRow(ctx, `select id from ref.venue where code = $1`, h.Venue).Scan(&venueID); err != nil {
 		return "", false, err
 	}
-	if _, err := tx.Exec(ctx, `insert into ref.instrument (id, asset_class, kind, name, status) values ($1,$2,$3,$4,'provisional')
-		on conflict (id) do nothing`, id, h.AssetClass, h.Kind, venueSymbol+" ("+sourceID+")"); err != nil {
+	cl := Classify(sourceID, venueSymbol, h)
+	if _, err := tx.Exec(ctx, `insert into ref.instrument (id, asset_class, kind, name, status, base_ccy, quote_ccy) values ($1,$2,$3,$4,'provisional',$5,$6)
+		on conflict (id) do nothing`, id, cl.AssetClass, cl.Kind, venueSymbol+" ("+sourceID+")", nullable(cl.Base), nullable(cl.Quote)); err != nil {
 		return "", false, fmt.Errorf("instrument: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `insert into ref.listing (instrument_id, venue_id, venue_symbol, source_id) values ($1,$2,$3,$4)
@@ -312,6 +341,68 @@ func (r *Resolver) resolveDB(ctx context.Context, sourceID, venueSymbol string) 
 		return "", false, err
 	}
 	return id, true, nil
+}
+
+// Class is what Classify infers from a venue symbol.
+type Class struct {
+	AssetClass, Kind string
+	Base, Quote      string // currencies, empty when unknown
+}
+
+var (
+	yahooFX     = regexp.MustCompile(`^([A-Z]{3})([A-Z]{3})=X$`)
+	yahooCrypto = regexp.MustCompile(`^([A-Z0-9]{2,10})-(USD|EUR|USDT|USDC|GBP|BTC|ETH)$`)
+	yahooPlain  = regexp.MustCompile(`^[A-Z.]{1,6}$`)
+	oandaPair   = regexp.MustCompile(`^([A-Z]{3})_([A-Z]{3})$`)
+	slashPair   = regexp.MustCompile(`^([A-Z0-9]{2,10})/([A-Z0-9]{2,10})$`)
+)
+
+// yahooSuffixCcy maps Yahoo exchange suffixes to the listing currency.
+var yahooSuffixCcy = map[string]string{".DE": "EUR", ".F": "EUR", ".PA": "EUR", ".AS": "EUR", ".MI": "EUR", ".MC": "EUR", ".L": "GBP", ".SW": "CHF", ".TO": "CAD", ".T": "JPY", ".HK": "HKD"}
+
+// Classify infers asset class, kind and currencies from a source's symbol
+// syntax (spec 12 §6) so provisional instruments get the right risk caps
+// (D-061) before an operator or a global identifier confirms them. Unknown
+// shapes fall back to the source hint.
+func Classify(sourceID, symbol string, h Hint) Class {
+	c := Class{AssetClass: h.AssetClass, Kind: h.Kind}
+	switch sourceID {
+	case "yahoo":
+		switch {
+		case yahooFX.MatchString(symbol):
+			m := yahooFX.FindStringSubmatch(symbol)
+			return Class{"fx", "fx_pair", m[1], m[2]}
+		case yahooCrypto.MatchString(symbol):
+			m := yahooCrypto.FindStringSubmatch(symbol)
+			return Class{"crypto", "crypto_spot", m[1], m[2]}
+		case strings.HasPrefix(symbol, "^"):
+			return Class{AssetClass: "index", Kind: "index"}
+		case strings.HasSuffix(symbol, "=F"):
+			return Class{AssetClass: "derivative", Kind: "future", Quote: "USD"}
+		}
+		for suf, ccy := range yahooSuffixCcy {
+			if strings.HasSuffix(symbol, suf) {
+				c.Quote = ccy
+				return c
+			}
+		}
+		if yahooPlain.MatchString(symbol) {
+			c.Quote = "USD"
+		}
+	case "oanda":
+		if m := oandaPair.FindStringSubmatch(symbol); m != nil {
+			return Class{"fx", "fx_pair", m[1], m[2]}
+		}
+	default:
+		if m := slashPair.FindStringSubmatch(symbol); m != nil && (h.AssetClass == "crypto" || h.AssetClass == "fx") {
+			kind := "crypto_spot"
+			if h.AssetClass == "fx" {
+				kind = "fx_pair"
+			}
+			return Class{h.AssetClass, kind, m[1], m[2]}
+		}
+	}
+	return c
 }
 
 // Cursors implements connector.CursorStore on ingest.backfill_cursor. A live

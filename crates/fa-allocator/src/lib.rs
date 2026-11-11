@@ -5,9 +5,13 @@
 //! [`PerformanceTracker`] estimates the posteriors online from signals and realised returns.
 //! [`genome`] carries the evolvable form of an allocator ([`genome::AllocatorGenome`]: name +
 //! genes, text round trip, variation operators) and [`WeightedBlend`] is the parametric family
-//! mixing the fixed allocators (spec 40 §6.2 "evolved allocator").
+//! mixing the fixed allocators (spec 40 §6.2 "evolved allocator"). [`ThompsonRiskParity`] is
+//! the spec's proposed paper default (Bayesian bandit + risk parity) and [`tournament`] runs
+//! every allocator side by side on the same live strategy returns (spec 40 §6.2 "allocator
+//! tournament").
 
 pub mod genome;
+pub mod tournament;
 
 use std::collections::BTreeMap;
 
@@ -23,6 +27,9 @@ pub struct StrategyStats {
     pub mean_return: f64,
     /// Return volatility per horizon.
     pub volatility: f64,
+    /// Observations behind the estimate (posterior width of the mean for Thompson sampling).
+    #[serde(default)]
+    pub observations: u64,
 }
 
 /// Capital weight per strategy (sum ≤ 1).
@@ -153,13 +160,60 @@ impl Allocator for WeightedBlend {
     }
 }
 
-/// Builds the allocator named in config: `equal_weight` | `risk_parity` | `fractional_kelly`
+/// Bayesian bandit + risk parity (spec 40 §6.2, the proposed paper default): every call draws
+/// one Thompson sample of each strategy's mean return from its posterior
+/// `N(mean, volatility² / max(n, 1))`; strategies whose draw is positive share the capital by
+/// inverse volatility (risk parity for uncorrelated sleeves), each capped at `max_weight`.
+/// Strategies with little history have wide posteriors and are explored; a strategy whose mean
+/// is reliably negative is almost never drawn positive. Deterministic: the k-th call uses
+/// `seed` and k, so a replay that makes the same calls gets the same weights.
+#[derive(Debug)]
+pub struct ThompsonRiskParity {
+    pub max_weight: f64,
+    pub seed: u64,
+    draws: std::sync::atomic::AtomicU64,
+}
+
+impl ThompsonRiskParity {
+    pub fn new(max_weight: f64, seed: u64) -> Self {
+        Self { max_weight, seed, draws: std::sync::atomic::AtomicU64::new(0) }
+    }
+}
+
+impl Allocator for ThompsonRiskParity {
+    fn id(&self) -> &str {
+        "thompson_rp"
+    }
+
+    fn allocate(&self, stats: &[StrategyStats]) -> Allocation {
+        let k = self.draws.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut rng = fa_core::rng::Rng::seed(self.seed ^ k.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let mut sorted: Vec<&StrategyStats> = stats.iter().filter(|s| s.volatility > 0.0).collect();
+        sorted.sort_by(|a, b| a.strategy_id.cmp(&b.strategy_id));
+        let drawn: Vec<&StrategyStats> = sorted
+            .into_iter()
+            .filter(|s| {
+                let se = s.volatility / (s.observations.max(1) as f64).sqrt();
+                let draw = s.mean_return + se * rng.normal();
+                draw.is_finite() && draw > 0.0
+            })
+            .collect();
+        let inv: f64 = drawn.iter().map(|s| 1.0 / s.volatility).sum();
+        if inv <= 0.0 {
+            return Allocation::new();
+        }
+        drawn.iter().map(|s| (s.strategy_id.clone(), ((1.0 / s.volatility) / inv).min(self.max_weight))).collect()
+    }
+}
+
+/// Builds the allocator named in config: `equal_weight` | `risk_parity` | `fractional_kelly` | `thompson_rp`
 /// (`weighted_blend` needs its blend weights: use [`genome::AllocatorGenome::build`]).
 pub fn by_name(name: &str, max_weight: f64, kelly_fraction: f64) -> Option<Box<dyn Allocator>> {
     Some(match name {
         "equal_weight" => Box::new(EqualWeight { max_weight }),
         "risk_parity" | "risk_parity_capped" => Box::new(RiskParityCapped { max_weight }),
         "fractional_kelly" | "kelly" => Box::new(FractionalKelly { fraction: kelly_fraction, max_weight }),
+        "thompson_rp" | "thompson" | "bandit" => Box::new(ThompsonRiskParity::new(max_weight, 0x7a11_0ca7)),
         _ => return None,
     })
 }
@@ -192,18 +246,27 @@ impl PerformanceTracker {
         }
     }
 
+    /// A strategy's sleeve return over one step: the mean over its assets of
+    /// `exposure_mean × realised_return` (missing returns count as 0); `None` without exposures.
+    pub fn step_return(dist: &ExposureDistribution, realised: &BTreeMap<InstrumentId, f64>) -> Option<f64> {
+        if dist.exposures.is_empty() {
+            return None;
+        }
+        Some(
+            dist.exposures
+                .iter()
+                .map(|e| e.mean.clamp(-1.0, 1.0) * realised.get(&e.instrument).copied().unwrap_or(0.0))
+                .sum::<f64>()
+                / dist.exposures.len() as f64,
+        )
+    }
+
     /// Records one step for `strategy_id` given its last exposures and the realised
     /// instrument returns over the step (missing returns count as 0).
     pub fn observe(&mut self, dist: &ExposureDistribution, realised: &BTreeMap<InstrumentId, f64>) {
-        if dist.exposures.is_empty() {
+        let Some(r) = Self::step_return(dist, realised) else {
             return;
-        }
-        let r = dist
-            .exposures
-            .iter()
-            .map(|e| e.mean.clamp(-1.0, 1.0) * realised.get(&e.instrument).copied().unwrap_or(0.0))
-            .sum::<f64>()
-            / dist.exposures.len() as f64;
+        };
         let e = self.stats.entry(dist.strategy_id.clone()).or_default();
         if e.n == 0 {
             e.mean = r;
@@ -226,6 +289,7 @@ impl PerformanceTracker {
                     strategy_id: id.to_owned(),
                     mean_return: e.map_or(0.0, |e| e.mean),
                     volatility: if vol > 0.0 { vol } else { self.prior_volatility },
+                    observations: e.map_or(0, |e| e.n),
                 }
             })
             .collect()
@@ -279,9 +343,9 @@ mod tests {
 
     fn stats() -> Vec<StrategyStats> {
         vec![
-            StrategyStats { strategy_id: "a".into(), mean_return: 0.01, volatility: 0.1 },
-            StrategyStats { strategy_id: "b".into(), mean_return: 0.01, volatility: 0.2 },
-            StrategyStats { strategy_id: "c".into(), mean_return: -0.01, volatility: 0.1 },
+            StrategyStats { strategy_id: "a".into(), mean_return: 0.01, volatility: 0.1, observations: 0 },
+            StrategyStats { strategy_id: "b".into(), mean_return: 0.01, volatility: 0.2, observations: 0 },
+            StrategyStats { strategy_id: "c".into(), mean_return: -0.01, volatility: 0.1, observations: 0 },
         ]
     }
 
@@ -361,6 +425,36 @@ mod tests {
         assert!((net_targets(std::slice::from_ref(&u), &one, 1_000.0)[&i] - 500.0).abs() < 1e-9);
         assert!((net_targets_shrunk(std::slice::from_ref(&u), &one, 1_000.0, 0.0)[&i] - 1_000.0).abs() < 1e-9);
         assert!((net_targets_shrunk(std::slice::from_ref(&u), &one, 1_000.0, 2.0)[&i] - 250.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn thompson_explores_uncertain_and_drops_reliably_bad_strategies() {
+        let st = |id: &str, m: f64, n: u64| StrategyStats {
+            strategy_id: id.into(),
+            mean_return: m,
+            volatility: 0.01,
+            observations: n,
+        };
+        // "good": mean 1e-3 over 10 000 obs (se 1e-4) → ~always drawn; "bad" the mirror → ~never;
+        // "new": no history (se = vol) → about half the draws
+        let stats = vec![st("good", 1e-3, 10_000), st("bad", -1e-3, 10_000), st("new", 0.0, 0)];
+        let t = ThompsonRiskParity::new(0.6, 42);
+        let (mut good, mut bad, mut new) = (0, 0, 0);
+        for _ in 0..400 {
+            let a = t.allocate(&stats);
+            assert!(a.values().all(|w| *w <= 0.6 + 1e-12) && a.values().sum::<f64>() <= 1.0 + 1e-12);
+            good += a.contains_key("good") as u32;
+            bad += a.contains_key("bad") as u32;
+            new += a.contains_key("new") as u32;
+        }
+        assert!(good > 390 && bad < 10 && (120..280).contains(&new), "{good} {bad} {new}");
+        // deterministic per call sequence
+        let (x, y) = (ThompsonRiskParity::new(1.0, 7), ThompsonRiskParity::new(1.0, 7));
+        for _ in 0..5 {
+            assert_eq!(x.allocate(&stats), y.allocate(&stats));
+        }
+        assert!(t.allocate(&[]).is_empty());
+        assert_eq!(by_name("thompson_rp", 0.5, 0.25).unwrap().id(), "thompson_rp");
     }
 
     #[test]

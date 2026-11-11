@@ -40,22 +40,60 @@ use serde::{Deserialize, Serialize};
 
 use crate::Family;
 
-/// Baseline family the genome instantiates.
+/// Genome family the genome instantiates: the two CPU baselines and the six trainable neural
+/// families of [`crate::neural`] (the name predates the neural families).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BaselineFamily {
     /// Empirical quantile forecaster; occupies the `rnn_prior` output family slot (the
-    /// family whose output contract is forecast quantiles) until a real RNN prior exists.
+    /// family whose output contract is forecast quantiles).
     Forecast,
     /// Analog retrieval with time distance as an explicit feature.
     Retrieval,
+    /// Neural quantile head (MLP or GRU prior over the return window, latent → initial state),
+    /// pinball loss; output family `rnn_prior`.
+    NnForecast,
+    /// Learned retrieval metric: a projector trained with a soft-kNN CRPS loss over
+    /// time-decayed analogs; output family `retrieval`.
+    NnRetrieval,
+    /// Chart reconstruction: latent (+ return window) → low-resolution raster of the lookback
+    /// window ([`crate::render`]), per-column cross-entropy; output family `visual.chart`.
+    NnChart,
+    /// Future chart: → raster of the next horizon, whose last column is a predictive
+    /// distribution of the horizon return; output family `visual.future`.
+    NnFuture,
+    /// News reconstruction: latent (+ return window) → hashed embedding of the trailing news
+    /// window, cosine loss; output family `text.news`.
+    NnNews,
+    /// Forecast narrative: latent + return window + current news embedding → embedding of the
+    /// news published in the next text window; output family `text.narrative`.
+    NnNarrative,
 }
 
 impl BaselineFamily {
+    pub const ALL: [Self; 8] = [
+        Self::Forecast,
+        Self::Retrieval,
+        Self::NnForecast,
+        Self::NnRetrieval,
+        Self::NnChart,
+        Self::NnFuture,
+        Self::NnNews,
+        Self::NnNarrative,
+    ];
+    pub const NEURAL: [Self; 6] =
+        [Self::NnForecast, Self::NnRetrieval, Self::NnChart, Self::NnFuture, Self::NnNews, Self::NnNarrative];
+
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "forecast" | "quantile" | "rnn_prior" => Some(Self::Forecast),
             "retrieval" | "analog" => Some(Self::Retrieval),
+            "nn_forecast" | "nn_quantile" | "nn_rnn" | "neural_forecast" => Some(Self::NnForecast),
+            "nn_retrieval" | "nn_metric" | "neural_retrieval" => Some(Self::NnRetrieval),
+            "nn_chart" | "neural_chart" => Some(Self::NnChart),
+            "nn_future" | "neural_future" => Some(Self::NnFuture),
+            "nn_news" | "neural_news" => Some(Self::NnNews),
+            "nn_narrative" | "neural_narrative" => Some(Self::NnNarrative),
             _ => None,
         }
     }
@@ -64,14 +102,107 @@ impl BaselineFamily {
         match self {
             Self::Forecast => "forecast",
             Self::Retrieval => "retrieval",
+            Self::NnForecast => "nn_forecast",
+            Self::NnRetrieval => "nn_retrieval",
+            Self::NnChart => "nn_chart",
+            Self::NnFuture => "nn_future",
+            Self::NnNews => "nn_news",
+            Self::NnNarrative => "nn_narrative",
         }
+    }
+
+    /// Trainable (candle) family.
+    pub fn is_neural(self) -> bool {
+        !matches!(self, Self::Forecast | Self::Retrieval)
+    }
+
+    /// Families whose output is a forecast of the horizon return (scored with `fa_backtest::eval`).
+    pub fn forecasts(self) -> bool {
+        matches!(self, Self::Forecast | Self::Retrieval | Self::NnForecast | Self::NnRetrieval | Self::NnFuture)
+    }
+
+    /// Families with a reconstruction target (`recon` / `recon_skill` objectives).
+    pub fn reconstructs(self) -> bool {
+        matches!(self, Self::NnChart | Self::NnFuture | Self::NnNews | Self::NnNarrative)
+    }
+
+    /// Families that read the news timeline.
+    pub fn uses_text(self) -> bool {
+        matches!(self, Self::NnNews | Self::NnNarrative)
     }
 
     /// Family string used on `decoder.output.<family>` (proto `DecoderOutput.family`).
     pub fn output_family(self) -> Family {
         match self {
-            Self::Forecast => Family::RnnPrior,
-            Self::Retrieval => Family::Retrieval,
+            Self::Forecast | Self::NnForecast => Family::RnnPrior,
+            Self::Retrieval | Self::NnRetrieval => Family::Retrieval,
+            Self::NnChart => Family::VisualChart,
+            Self::NnFuture => Family::VisualFuture,
+            Self::NnNews => Family::TextNews,
+            Self::NnNarrative => Family::TextNarrative,
+        }
+    }
+}
+
+/// Genes of the neural families (spec 34 §4.2 `TopologyGene` / `HyperGene` / family genes),
+/// all numeric so the `fa-evolution` operators can mutate them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NeuralGenes {
+    /// Hidden width (`width`, 4..=256).
+    pub width: usize,
+    /// Hidden layers of the MLP / head (`depth`, 1..=4).
+    pub depth: usize,
+    /// Recurrent cell: GRU over the return window when true (`gru` ≥ 0.5), else MLP.
+    pub gru: bool,
+    /// SGD (AdamW) steps (`steps`, 1..=20000).
+    pub steps: usize,
+    /// Learning rate (`lr`).
+    pub lr: f64,
+    /// Weight decay (`wd`).
+    pub wd: f64,
+    /// Minibatch size (`bs`, 4..=1024).
+    pub batch: usize,
+    /// Share of the window (by time) used for training; the rest is the evaluation window
+    /// (`train`, 0.2..=0.9).
+    pub train_frac: f64,
+    /// Retrieval: embedding dimension (`emb`).
+    pub emb: usize,
+    /// Retrieval: softmax temperature of the soft-kNN weights (`temp`).
+    pub temp: f64,
+    /// Retrieval: candidate windows kept per query at inference (`pool`).
+    pub pool: usize,
+    /// Visual: raster resolution (`res`, 4..=32; columns = rows = res).
+    pub res: usize,
+    /// Visual future: half-height of the raster in units of `σ·√h` (`band`).
+    pub band: f64,
+    /// Text: folded hash-embedding dimension (`tdim`, 16..=1024).
+    pub tdim: usize,
+    /// Text: news window in minutes (`tw`), trailing (news) or leading (narrative).
+    pub tw_min: f64,
+    /// Init / minibatch seed (`seed`; not mutated).
+    pub seed: u64,
+}
+
+impl Default for NeuralGenes {
+    fn default() -> Self {
+        Self {
+            width: 32,
+            depth: 2,
+            gru: false,
+            steps: 300,
+            lr: 3e-3,
+            wd: 1e-4,
+            batch: 64,
+            train_frac: 0.5,
+            emb: 16,
+            temp: 0.1,
+            pool: 2048,
+            res: 12,
+            band: 3.0,
+            tdim: 128,
+            tw_min: 60.0,
+            seed: 7,
         }
     }
 }
@@ -117,14 +248,20 @@ pub struct DecoderGenome {
     pub latent_weight: f64,
     /// How the genome was obtained: `kv`, `json` or `derived`.
     pub encoding: String,
+    /// Neural-family genes (ignored by the baselines).
+    #[serde(default)]
+    pub nn: NeuralGenes,
 }
 
 fn default_latent_weight() -> f64 {
     0.5
 }
 
-/// Numeric gene names exposed to the evolution operators (`params()` keys).
+/// Numeric gene names exposed to the evolution operators (`params()` keys of the baselines).
 pub const NUMERIC_GENES: [&str; 9] = ["h", "lb", "kernel", "scale", "shrink", "k", "tau", "gap", "lat"];
+/// Additional numeric genes of the neural families (`params()` adds them for those).
+pub const NEURAL_GENES: [&str; 15] =
+    ["width", "depth", "gru", "steps", "lr", "wd", "bs", "train", "emb", "temp", "pool", "res", "band", "tdim", "tw"];
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum GenomeError {
@@ -158,11 +295,38 @@ impl DecoderGenome {
             metric: Metric::Cosine,
             latent_weight: 0.5,
             encoding: "default".into(),
+            nn: NeuralGenes::default(),
         }
     }
 
-    /// Numeric genes as `name → value` (see [`NUMERIC_GENES`]); integers are exact.
+    /// Numeric genes as `name → value` (see [`NUMERIC_GENES`], plus [`NEURAL_GENES`] for the
+    /// neural families); integers are exact.
     pub fn params(&self) -> BTreeMap<String, f64> {
+        let mut m = self.baseline_params();
+        if self.family.is_neural() {
+            let n = &self.nn;
+            m.extend([
+                ("width".to_owned(), n.width as f64),
+                ("depth".to_owned(), n.depth as f64),
+                ("gru".to_owned(), if n.gru { 1.0 } else { 0.0 }),
+                ("steps".to_owned(), n.steps as f64),
+                ("lr".to_owned(), n.lr),
+                ("wd".to_owned(), n.wd),
+                ("bs".to_owned(), n.batch as f64),
+                ("train".to_owned(), n.train_frac),
+                ("emb".to_owned(), n.emb as f64),
+                ("temp".to_owned(), n.temp),
+                ("pool".to_owned(), n.pool as f64),
+                ("res".to_owned(), n.res as f64),
+                ("band".to_owned(), n.band),
+                ("tdim".to_owned(), n.tdim as f64),
+                ("tw".to_owned(), n.tw_min),
+            ]);
+        }
+        m
+    }
+
+    fn baseline_params(&self) -> BTreeMap<String, f64> {
         BTreeMap::from([
             ("h".to_owned(), self.horizon as f64),
             ("lb".to_owned(), self.lookback as f64),
@@ -195,6 +359,21 @@ impl DecoderGenome {
                 "tau" => g.tau_days = pos(*v, g.tau_days),
                 "gap" => g.min_gap = int(*v, 0),
                 "lat" => g.latent_weight = if v.is_finite() { v.clamp(0.0, 1.0) } else { g.latent_weight },
+                "width" => g.nn.width = int(*v, 4).min(256),
+                "depth" => g.nn.depth = int(*v, 1).min(4),
+                "gru" => g.nn.gru = v.is_finite() && *v >= 0.5,
+                "steps" => g.nn.steps = int(*v, 1).min(20_000),
+                "lr" => g.nn.lr = if v.is_finite() && *v > 0.0 { v.clamp(1e-5, 0.1) } else { g.nn.lr },
+                "wd" => g.nn.wd = if v.is_finite() { v.clamp(0.0, 0.1) } else { g.nn.wd },
+                "bs" => g.nn.batch = int(*v, 4).min(1024),
+                "train" => g.nn.train_frac = if v.is_finite() { v.clamp(0.2, 0.9) } else { g.nn.train_frac },
+                "emb" => g.nn.emb = int(*v, 2).min(128),
+                "temp" => g.nn.temp = if v.is_finite() && *v > 0.0 { v.clamp(0.01, 10.0) } else { g.nn.temp },
+                "pool" => g.nn.pool = int(*v, 16).min(65_536),
+                "res" => g.nn.res = int(*v, 4).min(32),
+                "band" => g.nn.band = if v.is_finite() && *v > 0.0 { v.clamp(0.5, 10.0) } else { g.nn.band },
+                "tdim" => g.nn.tdim = int(*v, 16).min(1024),
+                "tw" => g.nn.tw_min = if v.is_finite() && *v > 0.0 { v.clamp(1.0, 10_080.0) } else { g.nn.tw_min },
                 _ => {}
             }
         }
@@ -327,6 +506,28 @@ impl DecoderGenome {
                 }
             }
             "lat" | "latent" => self.latent_weight = num(v)?,
+            "width" => self.nn.width = int(v)?,
+            "depth" => self.nn.depth = int(v)?,
+            "gru" | "cell" => {
+                self.nn.gru = match v.to_ascii_lowercase().as_str() {
+                    "gru" | "rnn" | "true" => true,
+                    "mlp" | "false" => false,
+                    _ => num(v)? >= 0.5,
+                }
+            }
+            "steps" => self.nn.steps = int(v)?,
+            "lr" => self.nn.lr = num(v)?,
+            "wd" => self.nn.wd = num(v)?,
+            "bs" | "batch" => self.nn.batch = int(v)?,
+            "train" => self.nn.train_frac = num(v)?,
+            "emb" => self.nn.emb = int(v)?,
+            "temp" => self.nn.temp = num(v)?,
+            "pool" => self.nn.pool = int(v)?,
+            "res" => self.nn.res = int(v)?,
+            "band" => self.nn.band = num(v)?,
+            "tdim" => self.nn.tdim = int(v)?,
+            "tw" => self.nn.tw_min = num(v)?,
+            "seed" => self.nn.seed = v.parse::<u64>().map_err(|_| err("not an unsigned integer"))?,
             _ => return Err(err("unknown gene")),
         }
         Ok(())
@@ -363,6 +564,52 @@ impl DecoderGenome {
         if !(0.0..=1.0).contains(&self.latent_weight) {
             return Err(gene("lat", "must be in [0, 1]"));
         }
+        if self.family.is_neural() {
+            let n = &self.nn;
+            let bad = |k: &str, m: &str| Err(gene(k, m));
+            if !(4..=256).contains(&n.width) {
+                return bad("width", "must be in 4..=256");
+            }
+            if !(1..=4).contains(&n.depth) {
+                return bad("depth", "must be in 1..=4");
+            }
+            if !(1..=20_000).contains(&n.steps) {
+                return bad("steps", "must be in 1..=20000");
+            }
+            if !(n.lr > 0.0 && n.lr <= 0.1) {
+                return bad("lr", "must be in (0, 0.1]");
+            }
+            if !(0.0..=0.1).contains(&n.wd) {
+                return bad("wd", "must be in [0, 0.1]");
+            }
+            if !(4..=1024).contains(&n.batch) {
+                return bad("bs", "must be in 4..=1024");
+            }
+            if !(0.2..=0.9).contains(&n.train_frac) {
+                return bad("train", "must be in [0.2, 0.9]");
+            }
+            if !(2..=128).contains(&n.emb) {
+                return bad("emb", "must be in 2..=128");
+            }
+            if !(n.temp > 0.0 && n.temp.is_finite()) {
+                return bad("temp", "must be > 0");
+            }
+            if n.pool < 16 {
+                return bad("pool", "must be ≥ 16");
+            }
+            if !(4..=32).contains(&n.res) {
+                return bad("res", "must be in 4..=32");
+            }
+            if !(n.band > 0.0 && n.band.is_finite()) {
+                return bad("band", "must be > 0");
+            }
+            if !(16..=1024).contains(&n.tdim) {
+                return bad("tdim", "must be in 16..=1024");
+            }
+            if !(n.tw_min > 0.0 && n.tw_min.is_finite()) {
+                return bad("tw", "must be > 0");
+            }
+        }
         // Leakage guard (spec 34 §6.1): an analog's outcome window must end before now.
         self.min_gap = self.min_gap.max(self.horizon);
         Ok(())
@@ -378,6 +625,27 @@ impl DecoderGenome {
             BaselineFamily::Retrieval => format!(
                 "retrieval ts={} h={} lb={} k={} tau={:.1}d gap={} metric={:?}",
                 self.timescale, self.horizon, self.lookback, self.k, self.tau_days, self.min_gap, self.metric
+            ),
+            f => format!(
+                "{} ts={} h={} lb={} {}×{}{} steps={} lr={} lat={}{}",
+                f.as_str(),
+                self.timescale,
+                self.horizon,
+                self.lookback,
+                self.nn.width,
+                self.nn.depth,
+                if self.nn.gru { " gru" } else { "" },
+                self.nn.steps,
+                self.nn.lr,
+                self.latent_weight,
+                match f {
+                    BaselineFamily::NnRetrieval => format!(" k={} emb={} temp={}", self.k, self.nn.emb, self.nn.temp),
+                    BaselineFamily::NnChart | BaselineFamily::NnFuture => format!(" res={}", self.nn.res),
+                    BaselineFamily::NnNews | BaselineFamily::NnNarrative => {
+                        format!(" tdim={} tw={}m", self.nn.tdim, self.nn.tw_min)
+                    }
+                    _ => String::new(),
+                }
             ),
         }
     }
@@ -410,6 +678,29 @@ impl fmt::Display for DecoderGenome {
             },
             self.latent_weight
         )?;
+        if self.family.is_neural() {
+            let n = &self.nn;
+            write!(
+                f,
+                ";width={};depth={};gru={};steps={};lr={};wd={};bs={};train={};emb={};temp={};pool={};res={};band={};tdim={};tw={};seed={}",
+                n.width,
+                n.depth,
+                u8::from(n.gru),
+                n.steps,
+                n.lr,
+                n.wd,
+                n.batch,
+                n.train_frac,
+                n.emb,
+                n.temp,
+                n.pool,
+                n.res,
+                n.band,
+                n.tdim,
+                n.tw_min,
+                n.seed
+            )?;
+        }
         if let Some(inst) = &self.instrument {
             write!(f, ";inst={inst}")?;
         }
@@ -537,6 +828,42 @@ mod tests {
         assert_eq!(c.id, c.to_string());
         assert_eq!(c.family, g.family);
         assert!(matches!(DecoderGenome::parse("retrieval:lat=2"), Err(GenomeError::Gene { .. })));
+    }
+
+    #[test]
+    fn neural_genomes_parse_round_trip_and_clamp() {
+        let g = DecoderGenome::parse("nn_forecast:h=4;lb=16;width=24;depth=3;gru=gru;steps=120;lr=0.002;bs=32").unwrap();
+        assert_eq!(g.family, BaselineFamily::NnForecast);
+        assert!(g.family.is_neural() && g.family.forecasts() && !g.family.reconstructs());
+        assert_eq!(g.family.output_family(), Family::RnnPrior);
+        assert_eq!((g.nn.width, g.nn.depth, g.nn.gru, g.nn.steps, g.nn.batch), (24, 3, true, 120, 32));
+        for fam in BaselineFamily::NEURAL {
+            let g = DecoderGenome::parse(&format!("{}:h=3;lb=8;res=10;tdim=64;tw=30;emb=6;seed=5", fam.as_str())).unwrap();
+            let s = g.to_string();
+            assert!(!s.contains(','), "{s}");
+            let back = DecoderGenome::parse(&s).unwrap();
+            assert!(same_genes(&g, &back), "{s}");
+            assert_eq!(back.to_string(), s);
+            let p = g.params();
+            assert_eq!(p.len(), NUMERIC_GENES.len() + NEURAL_GENES.len());
+            assert!(same_genes(&g, &g.with_params(&p).unwrap()));
+        }
+        let fams: std::collections::HashSet<_> =
+            BaselineFamily::ALL.iter().map(|f| f.output_family()).collect();
+        assert_eq!(fams.len(), 6, "rnn_prior, retrieval, visual.chart/future, text.news/narrative");
+        let mut m = g.params();
+        m.insert("width".into(), 1000.0);
+        m.insert("lr".into(), 5.0);
+        m.insert("gru".into(), 0.2);
+        m.insert("train".into(), 0.0);
+        let c = g.with_params(&m).unwrap();
+        assert_eq!((c.nn.width, c.nn.lr, c.nn.gru, c.nn.train_frac), (256, 0.1, false, 0.2));
+        assert!(matches!(DecoderGenome::parse("nn_chart:res=64"), Err(GenomeError::Gene { .. })));
+        assert!(matches!(DecoderGenome::parse("nn_news:tdim=4"), Err(GenomeError::Gene { .. })));
+        let j = DecoderGenome::parse(r#"{"family":"nn_retrieval","params":{"emb":12,"temp":0.3,"gru":1}}"#).unwrap();
+        assert_eq!((j.nn.emb, j.nn.temp, j.nn.gru), (12, 0.3, true));
+        // baseline strings are unchanged by the neural genes
+        assert!(!DecoderGenome::parse("forecast").unwrap().to_string().contains("width"));
     }
 
     #[test]

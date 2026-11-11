@@ -1,7 +1,10 @@
 //! Risk-engine settings (`risk.toml`). Hard limits live in `fa_risk::RiskConfig` and can only
 //! come from this file (spec 40 §6.5); nothing on the bus can loosen them.
-use fa_core::AssetClass;
-use fa_risk::{RiskConfig, strategy::PromotionGate};
+use std::collections::BTreeMap;
+
+use fa_backtest::holdout::HoldoutPolicy;
+use fa_core::{AssetClass, Timescale};
+use fa_risk::{RiskConfig, health::FeedGuardConfig, pipeline::PipelinePolicy, strategy::PromotionGate};
 use serde::{Deserialize, Serialize};
 
 /// Starting paper cash (D-028).
@@ -53,6 +56,14 @@ pub struct Settings {
     pub promotion: PromotionGate,
     /// Non-evolvable hard limits.
     pub limits: RiskConfig,
+    /// Automatic evolved-strategy lifecycle (spec 35 §6.4).
+    pub pipeline: PipelinePolicy,
+    /// Automatic holdout locking (spec 41 §6.4).
+    pub holdout: HoldoutSettings,
+    /// Per-instrument stale-feed freeze and bad-tick filter (spec 40 §6.5, §8).
+    pub feed: FeedGuardConfig,
+    /// Cost charged on weight turnover in the live allocator tournament (bps).
+    pub tournament_cost_bps: f64,
 }
 
 impl Default for Settings {
@@ -79,7 +90,63 @@ impl Default for Settings {
             shadow_sleeve_eur: 10_000.0,
             promotion: PromotionGate::default(),
             limits: RiskConfig::default(),
+            pipeline: PipelinePolicy::default(),
+            holdout: HoldoutSettings::default(),
+            feed: FeedGuardConfig::default(),
+            tournament_cost_bps: 5.0,
         }
+    }
+}
+
+/// `[holdout]`: keeps a locked holdout per timescale in `validation.holdout` (spec 41 §6.4). At
+/// start and every `check_secs` the risk-engine plans the lock per timescale
+/// (`fa_backtest::holdout::plan_lock`), checks the segment holds `min_bars` bars in
+/// VictoriaMetrics and inserts it idempotently; a timescale that cannot be locked yet is
+/// reported (`holdout.missing.<ts>` gauge, `ctl.risk.pipeline` status, a warning), never
+/// silently empty.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HoldoutSettings {
+    pub auto_lock: bool,
+    pub check_secs: u64,
+    /// Timescales that must have a holdout (`1s`, `1m`, `1h`, `1d`); candidates of other
+    /// timescales are locked on demand.
+    pub timescales: Vec<String>,
+    /// `holdout.length.<ts>` in seconds (defaults: `fa_backtest::holdout::HoldoutPolicy::default_for`).
+    pub length_secs: BTreeMap<String, u64>,
+    pub embargo_secs: BTreeMap<String, u64>,
+    pub min_bars: usize,
+    /// Re-lock a new segment once the latest holdout ended this many days ago (0 = never).
+    pub relock_after_days: f64,
+}
+
+impl Default for HoldoutSettings {
+    fn default() -> Self {
+        Self {
+            auto_lock: true,
+            check_secs: 300,
+            timescales: vec!["1s".into(), "1m".into()],
+            length_secs: BTreeMap::new(),
+            embargo_secs: BTreeMap::new(),
+            min_bars: 300,
+            relock_after_days: 0.0,
+        }
+    }
+}
+
+impl HoldoutSettings {
+    pub fn policy(&self, ts: Timescale) -> HoldoutPolicy {
+        let d = HoldoutPolicy::default_for(ts);
+        HoldoutPolicy {
+            length_ms: self.length_secs.get(ts.as_str()).map_or(d.length_ms, |s| *s as i64 * 1000),
+            embargo_ms: self.embargo_secs.get(ts.as_str()).map_or(d.embargo_ms, |s| *s as i64 * 1000),
+            min_bars: self.min_bars,
+            relock_after_ms: (self.relock_after_days > 0.0).then_some((self.relock_after_days * 86_400_000.0) as i64),
+        }
+    }
+
+    pub fn timescales(&self) -> Vec<Timescale> {
+        self.timescales.iter().filter_map(|t| t.parse().ok()).collect()
     }
 }
 
@@ -129,6 +196,8 @@ pub enum SettingsError {
     Allocator(String),
     #[error("new_strategy_status `{0}` must be active or shadow")]
     NewStatus(String),
+    #[error("holdout timescale `{0}` is not one of 1s | 1m | 1h | 1d | 1w")]
+    Timescale(String),
 }
 
 impl Settings {
@@ -147,6 +216,9 @@ impl Settings {
         }
         if !matches!(self.new_strategy_status.as_str(), "active" | "shadow") {
             return Err(SettingsError::NewStatus(self.new_strategy_status.clone()));
+        }
+        if let Some(t) = self.holdout.timescales.iter().find(|t| t.parse::<Timescale>().is_err()) {
+            return Err(SettingsError::Timescale(t.clone()));
         }
         Ok(())
     }
@@ -176,5 +248,16 @@ mod tests {
             (0.05, 0.40, 0.50)
         );
         assert_eq!(s.limits.portfolio_gross_cap, 2.0);
+        assert_eq!((s.limits.max_order_frac, s.limits.limit_price_band), (0.10, 0.10));
+        assert_eq!((s.promotion.max_pbo, s.promotion.consistency_z), (0.2, 2.0));
+        assert!(s.pipeline.enabled && s.pipeline.auto_promote);
+        assert_eq!((s.pipeline.dsr_min_candidate, s.pipeline.pbo_max), (0.95, 0.2));
+        assert_eq!(s.holdout.timescales(), vec![Timescale::Second, Timescale::Minute]);
+        assert_eq!(s.holdout.policy(Timescale::Second).length_ms, 2 * 3_600_000);
+        assert_eq!(s.holdout.policy(Timescale::Minute).embargo_ms, 3_600_000);
+        assert_eq!(s.holdout.policy(Timescale::Second).relock_after_ms, None);
+        assert_eq!((s.feed.stale_freeze_bars, s.feed.stale_flatten_secs, s.feed.jump_max), (3.0, 0.0, 0.15));
+        assert!(matches!(Settings::parse("[holdout]\ntimescales = ['5s']"), Err(SettingsError::Timescale(_))));
+        assert!(Settings::parse("allocator = 'thompson_rp'").is_ok());
     }
 }

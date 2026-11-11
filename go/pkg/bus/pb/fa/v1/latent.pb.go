@@ -77,6 +77,64 @@ func (RegionEvent_Kind) EnumDescriptor() ([]byte, []int) {
 	return file_fa_v1_latent_proto_rawDescGZIP(), []int{3, 0}
 }
 
+type RegionLifecycleEvent_Kind int32
+
+const (
+	RegionLifecycleEvent_KIND_UNSPECIFIED RegionLifecycleEvent_Kind = 0
+	RegionLifecycleEvent_KIND_BORN        RegionLifecycleEvent_Kind = 1 // new lineage (online birth or unmatched region of a snapshot)
+	RegionLifecycleEvent_KIND_CARRIED     RegionLifecycleEvent_Kind = 2 // snapshot region inheriting a parent's lineage
+	RegionLifecycleEvent_KIND_SPLIT       RegionLifecycleEvent_Kind = 3 // region split off a parent (ancestors carry kind = split)
+	RegionLifecycleEvent_KIND_MERGED      RegionLifecycleEvent_Kind = 4 // survivor of a merge (ancestors: the absorbed regions)
+	RegionLifecycleEvent_KIND_DIED        RegionLifecycleEvent_Kind = 5 // retired: merged away, too little support, or no descendant in a new snapshot
+)
+
+// Enum value maps for RegionLifecycleEvent_Kind.
+var (
+	RegionLifecycleEvent_Kind_name = map[int32]string{
+		0: "KIND_UNSPECIFIED",
+		1: "KIND_BORN",
+		2: "KIND_CARRIED",
+		3: "KIND_SPLIT",
+		4: "KIND_MERGED",
+		5: "KIND_DIED",
+	}
+	RegionLifecycleEvent_Kind_value = map[string]int32{
+		"KIND_UNSPECIFIED": 0,
+		"KIND_BORN":        1,
+		"KIND_CARRIED":     2,
+		"KIND_SPLIT":       3,
+		"KIND_MERGED":      4,
+		"KIND_DIED":        5,
+	}
+)
+
+func (x RegionLifecycleEvent_Kind) Enum() *RegionLifecycleEvent_Kind {
+	p := new(RegionLifecycleEvent_Kind)
+	*p = x
+	return p
+}
+
+func (x RegionLifecycleEvent_Kind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (RegionLifecycleEvent_Kind) Descriptor() protoreflect.EnumDescriptor {
+	return file_fa_v1_latent_proto_enumTypes[1].Descriptor()
+}
+
+func (RegionLifecycleEvent_Kind) Type() protoreflect.EnumType {
+	return &file_fa_v1_latent_proto_enumTypes[1]
+}
+
+func (x RegionLifecycleEvent_Kind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use RegionLifecycleEvent_Kind.Descriptor instead.
+func (RegionLifecycleEvent_Kind) EnumDescriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{10, 0}
+}
+
 type ExpertSpaceRef struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SnapshotId    string                 `protobuf:"bytes,1,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
@@ -518,6 +576,1104 @@ func (x *TransitionProb) GetUpper() float64 {
 	return 0
 }
 
+type RegionWeight struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RegionId      string                 `protobuf:"bytes,1,opt,name=region_id,json=regionId,proto3" json:"region_id,omitempty"`
+	Weight        float32                `protobuf:"fixed32,2,opt,name=weight,proto3" json:"weight,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegionWeight) Reset() {
+	*x = RegionWeight{}
+	mi := &file_fa_v1_latent_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegionWeight) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegionWeight) ProtoMessage() {}
+
+func (x *RegionWeight) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegionWeight.ProtoReflect.Descriptor instead.
+func (*RegionWeight) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *RegionWeight) GetRegionId() string {
+	if x != nil {
+		return x.RegionId
+	}
+	return ""
+}
+
+func (x *RegionWeight) GetWeight() float32 {
+	if x != nil {
+		return x.Weight
+	}
+	return 0
+}
+
+// Soft membership of one expert's latent (spec 30 §4.1 Membership): k nearest regions with
+// weights summing to 1, plus novelty (distance to the nearest centroid in radii).
+type ExpertMembership struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ExpertIndex   uint32                 `protobuf:"varint,1,opt,name=expert_index,json=expertIndex,proto3" json:"expert_index,omitempty"`
+	Weights       []*RegionWeight        `protobuf:"bytes,2,rep,name=weights,proto3" json:"weights,omitempty"`
+	Novelty       float32                `protobuf:"fixed32,3,opt,name=novelty,proto3" json:"novelty,omitempty"`
+	OutOfRegion   bool                   `protobuf:"varint,4,opt,name=out_of_region,json=outOfRegion,proto3" json:"out_of_region,omitempty"` // novelty >= novelty_threshold
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExpertMembership) Reset() {
+	*x = ExpertMembership{}
+	mi := &file_fa_v1_latent_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExpertMembership) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExpertMembership) ProtoMessage() {}
+
+func (x *ExpertMembership) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExpertMembership.ProtoReflect.Descriptor instead.
+func (*ExpertMembership) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *ExpertMembership) GetExpertIndex() uint32 {
+	if x != nil {
+		return x.ExpertIndex
+	}
+	return 0
+}
+
+func (x *ExpertMembership) GetWeights() []*RegionWeight {
+	if x != nil {
+		return x.Weights
+	}
+	return nil
+}
+
+func (x *ExpertMembership) GetNovelty() float32 {
+	if x != nil {
+		return x.Novelty
+	}
+	return 0
+}
+
+func (x *ExpertMembership) GetOutOfRegion() bool {
+	if x != nil {
+		return x.OutOfRegion
+	}
+	return false
+}
+
+// latent.membership.<timescale>.<instrument> (spec 30 §4.2; one message for all experts).
+type RegionMembership struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SnapshotId    string                 `protobuf:"bytes,1,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	Timescale     string                 `protobuf:"bytes,2,opt,name=timescale,proto3" json:"timescale,omitempty"`
+	InstrumentId  string                 `protobuf:"bytes,3,opt,name=instrument_id,json=instrumentId,proto3" json:"instrument_id,omitempty"`
+	AsOf          *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=as_of,json=asOf,proto3" json:"as_of,omitempty"`
+	Experts       []*ExpertMembership    `protobuf:"bytes,5,rep,name=experts,proto3" json:"experts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegionMembership) Reset() {
+	*x = RegionMembership{}
+	mi := &file_fa_v1_latent_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegionMembership) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegionMembership) ProtoMessage() {}
+
+func (x *RegionMembership) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegionMembership.ProtoReflect.Descriptor instead.
+func (*RegionMembership) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *RegionMembership) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+func (x *RegionMembership) GetTimescale() string {
+	if x != nil {
+		return x.Timescale
+	}
+	return ""
+}
+
+func (x *RegionMembership) GetInstrumentId() string {
+	if x != nil {
+		return x.InstrumentId
+	}
+	return ""
+}
+
+func (x *RegionMembership) GetAsOf() *timestamppb.Timestamp {
+	if x != nil {
+		return x.AsOf
+	}
+	return nil
+}
+
+func (x *RegionMembership) GetExperts() []*ExpertMembership {
+	if x != nil {
+		return x.Experts
+	}
+	return nil
+}
+
+type RegionAncestor struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RegionId      string                 `protobuf:"bytes,1,opt,name=region_id,json=regionId,proto3" json:"region_id,omitempty"`
+	LineageId     string                 `protobuf:"bytes,2,opt,name=lineage_id,json=lineageId,proto3" json:"lineage_id,omitempty"`
+	Overlap       float64                `protobuf:"fixed64,3,opt,name=overlap,proto3" json:"overlap,omitempty"` // Jaccard overlap of probe sets (snapshot alignment) or mass share (online split)
+	Kind          string                 `protobuf:"bytes,4,opt,name=kind,proto3" json:"kind,omitempty"`         // carry | split | merge | partial
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegionAncestor) Reset() {
+	*x = RegionAncestor{}
+	mi := &file_fa_v1_latent_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegionAncestor) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegionAncestor) ProtoMessage() {}
+
+func (x *RegionAncestor) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegionAncestor.ProtoReflect.Descriptor instead.
+func (*RegionAncestor) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *RegionAncestor) GetRegionId() string {
+	if x != nil {
+		return x.RegionId
+	}
+	return ""
+}
+
+func (x *RegionAncestor) GetLineageId() string {
+	if x != nil {
+		return x.LineageId
+	}
+	return ""
+}
+
+func (x *RegionAncestor) GetOverlap() float64 {
+	if x != nil {
+		return x.Overlap
+	}
+	return 0
+}
+
+func (x *RegionAncestor) GetKind() string {
+	if x != nil {
+		return x.Kind
+	}
+	return ""
+}
+
+// latent.lifecycle.<timescale> (spec 30 §4.2 RegionLifecycleEvent): every birth, carry, split,
+// merge and death with event time, lineage edges and the region's statistics.
+type RegionLifecycleEvent struct {
+	state           protoimpl.MessageState    `protogen:"open.v1"`
+	Kind            RegionLifecycleEvent_Kind `protobuf:"varint,1,opt,name=kind,proto3,enum=fa.v1.RegionLifecycleEvent_Kind" json:"kind,omitempty"`
+	Space           *ExpertSpaceRef           `protobuf:"bytes,2,opt,name=space,proto3" json:"space,omitempty"`
+	RegionId        string                    `protobuf:"bytes,3,opt,name=region_id,json=regionId,proto3" json:"region_id,omitempty"`
+	LineageId       string                    `protobuf:"bytes,4,opt,name=lineage_id,json=lineageId,proto3" json:"lineage_id,omitempty"`
+	AsOf            *timestamppb.Timestamp    `protobuf:"bytes,5,opt,name=as_of,json=asOf,proto3" json:"as_of,omitempty"`
+	Ancestors       []*RegionAncestor         `protobuf:"bytes,6,rep,name=ancestors,proto3" json:"ancestors,omitempty"`
+	Reason          string                    `protobuf:"bytes,7,opt,name=reason,proto3" json:"reason,omitempty"` // died: merged | support | unmatched; born: online | snapshot
+	Centroid        []float32                 `protobuf:"fixed32,8,rep,packed,name=centroid,proto3" json:"centroid,omitempty"`
+	Mass            float64                   `protobuf:"fixed64,9,opt,name=mass,proto3" json:"mass,omitempty"`
+	Occupancy       float64                   `protobuf:"fixed64,10,opt,name=occupancy,proto3" json:"occupancy,omitempty"`
+	RelatedRegionId string                    `protobuf:"bytes,11,opt,name=related_region_id,json=relatedRegionId,proto3" json:"related_region_id,omitempty"` // died by merge: the survivor
+	RegimeBreak     bool                      `protobuf:"varint,12,opt,name=regime_break,json=regimeBreak,proto3" json:"regime_break,omitempty"`              // snapshot alignment carried < 50 % of the probe mass
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *RegionLifecycleEvent) Reset() {
+	*x = RegionLifecycleEvent{}
+	mi := &file_fa_v1_latent_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegionLifecycleEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegionLifecycleEvent) ProtoMessage() {}
+
+func (x *RegionLifecycleEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegionLifecycleEvent.ProtoReflect.Descriptor instead.
+func (*RegionLifecycleEvent) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *RegionLifecycleEvent) GetKind() RegionLifecycleEvent_Kind {
+	if x != nil {
+		return x.Kind
+	}
+	return RegionLifecycleEvent_KIND_UNSPECIFIED
+}
+
+func (x *RegionLifecycleEvent) GetSpace() *ExpertSpaceRef {
+	if x != nil {
+		return x.Space
+	}
+	return nil
+}
+
+func (x *RegionLifecycleEvent) GetRegionId() string {
+	if x != nil {
+		return x.RegionId
+	}
+	return ""
+}
+
+func (x *RegionLifecycleEvent) GetLineageId() string {
+	if x != nil {
+		return x.LineageId
+	}
+	return ""
+}
+
+func (x *RegionLifecycleEvent) GetAsOf() *timestamppb.Timestamp {
+	if x != nil {
+		return x.AsOf
+	}
+	return nil
+}
+
+func (x *RegionLifecycleEvent) GetAncestors() []*RegionAncestor {
+	if x != nil {
+		return x.Ancestors
+	}
+	return nil
+}
+
+func (x *RegionLifecycleEvent) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *RegionLifecycleEvent) GetCentroid() []float32 {
+	if x != nil {
+		return x.Centroid
+	}
+	return nil
+}
+
+func (x *RegionLifecycleEvent) GetMass() float64 {
+	if x != nil {
+		return x.Mass
+	}
+	return 0
+}
+
+func (x *RegionLifecycleEvent) GetOccupancy() float64 {
+	if x != nil {
+		return x.Occupancy
+	}
+	return 0
+}
+
+func (x *RegionLifecycleEvent) GetRelatedRegionId() string {
+	if x != nil {
+		return x.RelatedRegionId
+	}
+	return ""
+}
+
+func (x *RegionLifecycleEvent) GetRegimeBreak() bool {
+	if x != nil {
+		return x.RegimeBreak
+	}
+	return false
+}
+
+type RegionDist struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RegionId      string                 `protobuf:"bytes,1,opt,name=region_id,json=regionId,proto3" json:"region_id,omitempty"`
+	Mean          float64                `protobuf:"fixed64,2,opt,name=mean,proto3" json:"mean,omitempty"`
+	Lower         float64                `protobuf:"fixed64,3,opt,name=lower,proto3" json:"lower,omitempty"`
+	Upper         float64                `protobuf:"fixed64,4,opt,name=upper,proto3" json:"upper,omitempty"`
+	Sd            float64                `protobuf:"fixed64,5,opt,name=sd,proto3" json:"sd,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegionDist) Reset() {
+	*x = RegionDist{}
+	mi := &file_fa_v1_latent_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegionDist) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegionDist) ProtoMessage() {}
+
+func (x *RegionDist) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegionDist.ProtoReflect.Descriptor instead.
+func (*RegionDist) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *RegionDist) GetRegionId() string {
+	if x != nil {
+		return x.RegionId
+	}
+	return ""
+}
+
+func (x *RegionDist) GetMean() float64 {
+	if x != nil {
+		return x.Mean
+	}
+	return 0
+}
+
+func (x *RegionDist) GetLower() float64 {
+	if x != nil {
+		return x.Lower
+	}
+	return 0
+}
+
+func (x *RegionDist) GetUpper() float64 {
+	if x != nil {
+		return x.Upper
+	}
+	return 0
+}
+
+func (x *RegionDist) GetSd() float64 {
+	if x != nil {
+		return x.Sd
+	}
+	return 0
+}
+
+type SamplerScore struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SamplerId     string                 `protobuf:"bytes,1,opt,name=sampler_id,json=samplerId,proto3" json:"sampler_id,omitempty"`
+	LogScore      float64                `protobuf:"fixed64,2,opt,name=log_score,json=logScore,proto3" json:"log_score,omitempty"`
+	Brier         float64                `protobuf:"fixed64,3,opt,name=brier,proto3" json:"brier,omitempty"`
+	Ece           float64                `protobuf:"fixed64,4,opt,name=ece,proto3" json:"ece,omitempty"`
+	PitKs         float64                `protobuf:"fixed64,5,opt,name=pit_ks,json=pitKs,proto3" json:"pit_ks,omitempty"`
+	CostUs        float64                `protobuf:"fixed64,6,opt,name=cost_us,json=costUs,proto3" json:"cost_us,omitempty"`
+	Evals         uint64                 `protobuf:"varint,7,opt,name=evals,proto3" json:"evals,omitempty"`
+	Pareto        bool                   `protobuf:"varint,8,opt,name=pareto,proto3" json:"pareto,omitempty"`
+	Serving       bool                   `protobuf:"varint,9,opt,name=serving,proto3" json:"serving,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SamplerScore) Reset() {
+	*x = SamplerScore{}
+	mi := &file_fa_v1_latent_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SamplerScore) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SamplerScore) ProtoMessage() {}
+
+func (x *SamplerScore) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SamplerScore.ProtoReflect.Descriptor instead.
+func (*SamplerScore) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *SamplerScore) GetSamplerId() string {
+	if x != nil {
+		return x.SamplerId
+	}
+	return ""
+}
+
+func (x *SamplerScore) GetLogScore() float64 {
+	if x != nil {
+		return x.LogScore
+	}
+	return 0
+}
+
+func (x *SamplerScore) GetBrier() float64 {
+	if x != nil {
+		return x.Brier
+	}
+	return 0
+}
+
+func (x *SamplerScore) GetEce() float64 {
+	if x != nil {
+		return x.Ece
+	}
+	return 0
+}
+
+func (x *SamplerScore) GetPitKs() float64 {
+	if x != nil {
+		return x.PitKs
+	}
+	return 0
+}
+
+func (x *SamplerScore) GetCostUs() float64 {
+	if x != nil {
+		return x.CostUs
+	}
+	return 0
+}
+
+func (x *SamplerScore) GetEvals() uint64 {
+	if x != nil {
+		return x.Evals
+	}
+	return 0
+}
+
+func (x *SamplerScore) GetPareto() bool {
+	if x != nil {
+		return x.Pareto
+	}
+	return false
+}
+
+func (x *SamplerScore) GetServing() bool {
+	if x != nil {
+		return x.Serving
+	}
+	return false
+}
+
+// latent.mcmc.<timescale>.<expert> (spec 33 §4.3 KernelUpdate): graph-level posterior summary of
+// one expert space: stationary distribution with intervals, relaxation time, sampler standings
+// (calibration suite) and occupancy drift.
+type KernelUpdate struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Space            *ExpertSpaceRef        `protobuf:"bytes,1,opt,name=space,proto3" json:"space,omitempty"`
+	AsOf             *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=as_of,json=asOf,proto3" json:"as_of,omitempty"`
+	ServingSamplerId string                 `protobuf:"bytes,3,opt,name=serving_sampler_id,json=servingSamplerId,proto3" json:"serving_sampler_id,omitempty"`
+	Samplers         []*SamplerScore        `protobuf:"bytes,4,rep,name=samplers,proto3" json:"samplers,omitempty"`
+	Stationary       []*RegionDist          `protobuf:"bytes,5,rep,name=stationary,proto3" json:"stationary,omitempty"`
+	RelaxationSteps  float64                `protobuf:"fixed64,6,opt,name=relaxation_steps,json=relaxationSteps,proto3" json:"relaxation_steps,omitempty"`
+	RelaxationLower  float64                `protobuf:"fixed64,7,opt,name=relaxation_lower,json=relaxationLower,proto3" json:"relaxation_lower,omitempty"`
+	RelaxationUpper  float64                `protobuf:"fixed64,8,opt,name=relaxation_upper,json=relaxationUpper,proto3" json:"relaxation_upper,omitempty"`
+	NRows            uint64                 `protobuf:"varint,9,opt,name=n_rows,json=nRows,proto3" json:"n_rows,omitempty"`
+	ObservationMass  float64                `protobuf:"fixed64,10,opt,name=observation_mass,json=observationMass,proto3" json:"observation_mass,omitempty"`
+	LiveRegions      uint32                 `protobuf:"varint,11,opt,name=live_regions,json=liveRegions,proto3" json:"live_regions,omitempty"`
+	DriftKl          float64                `protobuf:"fixed64,12,opt,name=drift_kl,json=driftKl,proto3" json:"drift_kl,omitempty"`
+	RefitDue         bool                   `protobuf:"varint,13,opt,name=refit_due,json=refitDue,proto3" json:"refit_due,omitempty"`
+	Draws            uint32                 `protobuf:"varint,14,opt,name=draws,proto3" json:"draws,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *KernelUpdate) Reset() {
+	*x = KernelUpdate{}
+	mi := &file_fa_v1_latent_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *KernelUpdate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*KernelUpdate) ProtoMessage() {}
+
+func (x *KernelUpdate) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use KernelUpdate.ProtoReflect.Descriptor instead.
+func (*KernelUpdate) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *KernelUpdate) GetSpace() *ExpertSpaceRef {
+	if x != nil {
+		return x.Space
+	}
+	return nil
+}
+
+func (x *KernelUpdate) GetAsOf() *timestamppb.Timestamp {
+	if x != nil {
+		return x.AsOf
+	}
+	return nil
+}
+
+func (x *KernelUpdate) GetServingSamplerId() string {
+	if x != nil {
+		return x.ServingSamplerId
+	}
+	return ""
+}
+
+func (x *KernelUpdate) GetSamplers() []*SamplerScore {
+	if x != nil {
+		return x.Samplers
+	}
+	return nil
+}
+
+func (x *KernelUpdate) GetStationary() []*RegionDist {
+	if x != nil {
+		return x.Stationary
+	}
+	return nil
+}
+
+func (x *KernelUpdate) GetRelaxationSteps() float64 {
+	if x != nil {
+		return x.RelaxationSteps
+	}
+	return 0
+}
+
+func (x *KernelUpdate) GetRelaxationLower() float64 {
+	if x != nil {
+		return x.RelaxationLower
+	}
+	return 0
+}
+
+func (x *KernelUpdate) GetRelaxationUpper() float64 {
+	if x != nil {
+		return x.RelaxationUpper
+	}
+	return 0
+}
+
+func (x *KernelUpdate) GetNRows() uint64 {
+	if x != nil {
+		return x.NRows
+	}
+	return 0
+}
+
+func (x *KernelUpdate) GetObservationMass() float64 {
+	if x != nil {
+		return x.ObservationMass
+	}
+	return 0
+}
+
+func (x *KernelUpdate) GetLiveRegions() uint32 {
+	if x != nil {
+		return x.LiveRegions
+	}
+	return 0
+}
+
+func (x *KernelUpdate) GetDriftKl() float64 {
+	if x != nil {
+		return x.DriftKl
+	}
+	return 0
+}
+
+func (x *KernelUpdate) GetRefitDue() bool {
+	if x != nil {
+		return x.RefitDue
+	}
+	return false
+}
+
+func (x *KernelUpdate) GetDraws() uint32 {
+	if x != nil {
+		return x.Draws
+	}
+	return 0
+}
+
+type HierEdge struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	FineRegionId     string                 `protobuf:"bytes,1,opt,name=fine_region_id,json=fineRegionId,proto3" json:"fine_region_id,omitempty"`
+	CoarseRegionId   string                 `protobuf:"bytes,2,opt,name=coarse_region_id,json=coarseRegionId,proto3" json:"coarse_region_id,omitempty"`
+	PCoarseGivenFine float64                `protobuf:"fixed64,3,opt,name=p_coarse_given_fine,json=pCoarseGivenFine,proto3" json:"p_coarse_given_fine,omitempty"`
+	PFineGivenCoarse float64                `protobuf:"fixed64,4,opt,name=p_fine_given_coarse,json=pFineGivenCoarse,proto3" json:"p_fine_given_coarse,omitempty"`
+	Support          float64                `protobuf:"fixed64,5,opt,name=support,proto3" json:"support,omitempty"`
+	PmiBits          float64                `protobuf:"fixed64,6,opt,name=pmi_bits,json=pmiBits,proto3" json:"pmi_bits,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *HierEdge) Reset() {
+	*x = HierEdge{}
+	mi := &file_fa_v1_latent_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HierEdge) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HierEdge) ProtoMessage() {}
+
+func (x *HierEdge) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HierEdge.ProtoReflect.Descriptor instead.
+func (*HierEdge) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *HierEdge) GetFineRegionId() string {
+	if x != nil {
+		return x.FineRegionId
+	}
+	return ""
+}
+
+func (x *HierEdge) GetCoarseRegionId() string {
+	if x != nil {
+		return x.CoarseRegionId
+	}
+	return ""
+}
+
+func (x *HierEdge) GetPCoarseGivenFine() float64 {
+	if x != nil {
+		return x.PCoarseGivenFine
+	}
+	return 0
+}
+
+func (x *HierEdge) GetPFineGivenCoarse() float64 {
+	if x != nil {
+		return x.PFineGivenCoarse
+	}
+	return 0
+}
+
+func (x *HierEdge) GetSupport() float64 {
+	if x != nil {
+		return x.Support
+	}
+	return 0
+}
+
+func (x *HierEdge) GetPmiBits() float64 {
+	if x != nil {
+		return x.PmiBits
+	}
+	return 0
+}
+
+// latent.hier.<fine_timescale>.<coarse_timescale> (spec 30 §6.5 REFINES edges) per expert index.
+type RegionHierarchy struct {
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	Fine                  *ExpertSpaceRef        `protobuf:"bytes,1,opt,name=fine,proto3" json:"fine,omitempty"`
+	Coarse                *ExpertSpaceRef        `protobuf:"bytes,2,opt,name=coarse,proto3" json:"coarse,omitempty"`
+	AsOf                  *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=as_of,json=asOf,proto3" json:"as_of,omitempty"`
+	MutualInformationBits float64                `protobuf:"fixed64,4,opt,name=mutual_information_bits,json=mutualInformationBits,proto3" json:"mutual_information_bits,omitempty"`
+	N                     float64                `protobuf:"fixed64,5,opt,name=n,proto3" json:"n,omitempty"`
+	Edges                 []*HierEdge            `protobuf:"bytes,6,rep,name=edges,proto3" json:"edges,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *RegionHierarchy) Reset() {
+	*x = RegionHierarchy{}
+	mi := &file_fa_v1_latent_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegionHierarchy) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegionHierarchy) ProtoMessage() {}
+
+func (x *RegionHierarchy) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegionHierarchy.ProtoReflect.Descriptor instead.
+func (*RegionHierarchy) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *RegionHierarchy) GetFine() *ExpertSpaceRef {
+	if x != nil {
+		return x.Fine
+	}
+	return nil
+}
+
+func (x *RegionHierarchy) GetCoarse() *ExpertSpaceRef {
+	if x != nil {
+		return x.Coarse
+	}
+	return nil
+}
+
+func (x *RegionHierarchy) GetAsOf() *timestamppb.Timestamp {
+	if x != nil {
+		return x.AsOf
+	}
+	return nil
+}
+
+func (x *RegionHierarchy) GetMutualInformationBits() float64 {
+	if x != nil {
+		return x.MutualInformationBits
+	}
+	return 0
+}
+
+func (x *RegionHierarchy) GetN() float64 {
+	if x != nil {
+		return x.N
+	}
+	return 0
+}
+
+func (x *RegionHierarchy) GetEdges() []*HierEdge {
+	if x != nil {
+		return x.Edges
+	}
+	return nil
+}
+
+type CrossAssetPair struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	SourceInstrumentId string                 `protobuf:"bytes,1,opt,name=source_instrument_id,json=sourceInstrumentId,proto3" json:"source_instrument_id,omitempty"`
+	TargetInstrumentId string                 `protobuf:"bytes,2,opt,name=target_instrument_id,json=targetInstrumentId,proto3" json:"target_instrument_id,omitempty"`
+	N                  uint32                 `protobuf:"varint,3,opt,name=n,proto3" json:"n,omitempty"`
+	Correlation        float64                `protobuf:"fixed64,4,opt,name=correlation,proto3" json:"correlation,omitempty"` // Ledoit–Wolf shrunk
+	Shrinkage          float64                `protobuf:"fixed64,5,opt,name=shrinkage,proto3" json:"shrinkage,omitempty"`
+	LeadLag            uint32                 `protobuf:"varint,6,opt,name=lead_lag,json=leadLag,proto3" json:"lead_lag,omitempty"` // bars by which source leads target
+	LeadCorr           float64                `protobuf:"fixed64,7,opt,name=lead_corr,json=leadCorr,proto3" json:"lead_corr,omitempty"`
+	PredictiveGain     float64                `protobuf:"fixed64,8,opt,name=predictive_gain,json=predictiveGain,proto3" json:"predictive_gain,omitempty"` // Δ CRPS (return units)
+	Uncertainty        float64                `protobuf:"fixed64,9,opt,name=uncertainty,proto3" json:"uncertainty,omitempty"`
+	Score              float64                `protobuf:"fixed64,10,opt,name=score,proto3" json:"score,omitempty"` // gain / uncertainty
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *CrossAssetPair) Reset() {
+	*x = CrossAssetPair{}
+	mi := &file_fa_v1_latent_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CrossAssetPair) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CrossAssetPair) ProtoMessage() {}
+
+func (x *CrossAssetPair) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CrossAssetPair.ProtoReflect.Descriptor instead.
+func (*CrossAssetPair) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *CrossAssetPair) GetSourceInstrumentId() string {
+	if x != nil {
+		return x.SourceInstrumentId
+	}
+	return ""
+}
+
+func (x *CrossAssetPair) GetTargetInstrumentId() string {
+	if x != nil {
+		return x.TargetInstrumentId
+	}
+	return ""
+}
+
+func (x *CrossAssetPair) GetN() uint32 {
+	if x != nil {
+		return x.N
+	}
+	return 0
+}
+
+func (x *CrossAssetPair) GetCorrelation() float64 {
+	if x != nil {
+		return x.Correlation
+	}
+	return 0
+}
+
+func (x *CrossAssetPair) GetShrinkage() float64 {
+	if x != nil {
+		return x.Shrinkage
+	}
+	return 0
+}
+
+func (x *CrossAssetPair) GetLeadLag() uint32 {
+	if x != nil {
+		return x.LeadLag
+	}
+	return 0
+}
+
+func (x *CrossAssetPair) GetLeadCorr() float64 {
+	if x != nil {
+		return x.LeadCorr
+	}
+	return 0
+}
+
+func (x *CrossAssetPair) GetPredictiveGain() float64 {
+	if x != nil {
+		return x.PredictiveGain
+	}
+	return 0
+}
+
+func (x *CrossAssetPair) GetUncertainty() float64 {
+	if x != nil {
+		return x.Uncertainty
+	}
+	return 0
+}
+
+func (x *CrossAssetPair) GetScore() float64 {
+	if x != nil {
+		return x.Score
+	}
+	return 0
+}
+
+// latent.crossprior.<timescale> (spec 33 §6.5): ranked cross-asset pair proposals.
+type CrossAssetPriors struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Timescale      string                 `protobuf:"bytes,1,opt,name=timescale,proto3" json:"timescale,omitempty"`
+	AsOf           *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=as_of,json=asOf,proto3" json:"as_of,omitempty"`
+	Proposals      []*CrossAssetPair      `protobuf:"bytes,3,rep,name=proposals,proto3" json:"proposals,omitempty"`
+	Instruments    uint32                 `protobuf:"varint,4,opt,name=instruments,proto3" json:"instruments,omitempty"`
+	PairsEvaluated uint32                 `protobuf:"varint,5,opt,name=pairs_evaluated,json=pairsEvaluated,proto3" json:"pairs_evaluated,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *CrossAssetPriors) Reset() {
+	*x = CrossAssetPriors{}
+	mi := &file_fa_v1_latent_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CrossAssetPriors) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CrossAssetPriors) ProtoMessage() {}
+
+func (x *CrossAssetPriors) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CrossAssetPriors.ProtoReflect.Descriptor instead.
+func (*CrossAssetPriors) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *CrossAssetPriors) GetTimescale() string {
+	if x != nil {
+		return x.Timescale
+	}
+	return ""
+}
+
+func (x *CrossAssetPriors) GetAsOf() *timestamppb.Timestamp {
+	if x != nil {
+		return x.AsOf
+	}
+	return nil
+}
+
+func (x *CrossAssetPriors) GetProposals() []*CrossAssetPair {
+	if x != nil {
+		return x.Proposals
+	}
+	return nil
+}
+
+func (x *CrossAssetPriors) GetInstruments() uint32 {
+	if x != nil {
+		return x.Instruments
+	}
+	return 0
+}
+
+func (x *CrossAssetPriors) GetPairsEvaluated() uint32 {
+	if x != nil {
+		return x.PairsEvaluated
+	}
+	return 0
+}
+
 var File_fa_v1_latent_proto protoreflect.FileDescriptor
 
 const file_fa_v1_latent_proto_rawDesc = "" +
@@ -567,7 +1723,119 @@ const file_fa_v1_latent_proto_rawDesc = "" +
 	"\tregion_id\x18\x01 \x01(\tR\bregionId\x12\x12\n" +
 	"\x04mean\x18\x02 \x01(\x01R\x04mean\x12\x14\n" +
 	"\x05lower\x18\x03 \x01(\x01R\x05lower\x12\x14\n" +
-	"\x05upper\x18\x04 \x01(\x01R\x05upperB\x85\x01\n" +
+	"\x05upper\x18\x04 \x01(\x01R\x05upper\"C\n" +
+	"\fRegionWeight\x12\x1b\n" +
+	"\tregion_id\x18\x01 \x01(\tR\bregionId\x12\x16\n" +
+	"\x06weight\x18\x02 \x01(\x02R\x06weight\"\xa2\x01\n" +
+	"\x10ExpertMembership\x12!\n" +
+	"\fexpert_index\x18\x01 \x01(\rR\vexpertIndex\x12-\n" +
+	"\aweights\x18\x02 \x03(\v2\x13.fa.v1.RegionWeightR\aweights\x12\x18\n" +
+	"\anovelty\x18\x03 \x01(\x02R\anovelty\x12\"\n" +
+	"\rout_of_region\x18\x04 \x01(\bR\voutOfRegion\"\xda\x01\n" +
+	"\x10RegionMembership\x12\x1f\n" +
+	"\vsnapshot_id\x18\x01 \x01(\tR\n" +
+	"snapshotId\x12\x1c\n" +
+	"\ttimescale\x18\x02 \x01(\tR\ttimescale\x12#\n" +
+	"\rinstrument_id\x18\x03 \x01(\tR\finstrumentId\x12/\n" +
+	"\x05as_of\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x04asOf\x121\n" +
+	"\aexperts\x18\x05 \x03(\v2\x17.fa.v1.ExpertMembershipR\aexperts\"z\n" +
+	"\x0eRegionAncestor\x12\x1b\n" +
+	"\tregion_id\x18\x01 \x01(\tR\bregionId\x12\x1d\n" +
+	"\n" +
+	"lineage_id\x18\x02 \x01(\tR\tlineageId\x12\x18\n" +
+	"\aoverlap\x18\x03 \x01(\x01R\aoverlap\x12\x12\n" +
+	"\x04kind\x18\x04 \x01(\tR\x04kind\"\xbf\x04\n" +
+	"\x14RegionLifecycleEvent\x124\n" +
+	"\x04kind\x18\x01 \x01(\x0e2 .fa.v1.RegionLifecycleEvent.KindR\x04kind\x12+\n" +
+	"\x05space\x18\x02 \x01(\v2\x15.fa.v1.ExpertSpaceRefR\x05space\x12\x1b\n" +
+	"\tregion_id\x18\x03 \x01(\tR\bregionId\x12\x1d\n" +
+	"\n" +
+	"lineage_id\x18\x04 \x01(\tR\tlineageId\x12/\n" +
+	"\x05as_of\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\x04asOf\x123\n" +
+	"\tancestors\x18\x06 \x03(\v2\x15.fa.v1.RegionAncestorR\tancestors\x12\x16\n" +
+	"\x06reason\x18\a \x01(\tR\x06reason\x12\x1a\n" +
+	"\bcentroid\x18\b \x03(\x02R\bcentroid\x12\x12\n" +
+	"\x04mass\x18\t \x01(\x01R\x04mass\x12\x1c\n" +
+	"\toccupancy\x18\n" +
+	" \x01(\x01R\toccupancy\x12*\n" +
+	"\x11related_region_id\x18\v \x01(\tR\x0frelatedRegionId\x12!\n" +
+	"\fregime_break\x18\f \x01(\bR\vregimeBreak\"m\n" +
+	"\x04Kind\x12\x14\n" +
+	"\x10KIND_UNSPECIFIED\x10\x00\x12\r\n" +
+	"\tKIND_BORN\x10\x01\x12\x10\n" +
+	"\fKIND_CARRIED\x10\x02\x12\x0e\n" +
+	"\n" +
+	"KIND_SPLIT\x10\x03\x12\x0f\n" +
+	"\vKIND_MERGED\x10\x04\x12\r\n" +
+	"\tKIND_DIED\x10\x05\"y\n" +
+	"\n" +
+	"RegionDist\x12\x1b\n" +
+	"\tregion_id\x18\x01 \x01(\tR\bregionId\x12\x12\n" +
+	"\x04mean\x18\x02 \x01(\x01R\x04mean\x12\x14\n" +
+	"\x05lower\x18\x03 \x01(\x01R\x05lower\x12\x14\n" +
+	"\x05upper\x18\x04 \x01(\x01R\x05upper\x12\x0e\n" +
+	"\x02sd\x18\x05 \x01(\x01R\x02sd\"\xea\x01\n" +
+	"\fSamplerScore\x12\x1d\n" +
+	"\n" +
+	"sampler_id\x18\x01 \x01(\tR\tsamplerId\x12\x1b\n" +
+	"\tlog_score\x18\x02 \x01(\x01R\blogScore\x12\x14\n" +
+	"\x05brier\x18\x03 \x01(\x01R\x05brier\x12\x10\n" +
+	"\x03ece\x18\x04 \x01(\x01R\x03ece\x12\x15\n" +
+	"\x06pit_ks\x18\x05 \x01(\x01R\x05pitKs\x12\x17\n" +
+	"\acost_us\x18\x06 \x01(\x01R\x06costUs\x12\x14\n" +
+	"\x05evals\x18\a \x01(\x04R\x05evals\x12\x16\n" +
+	"\x06pareto\x18\b \x01(\bR\x06pareto\x12\x18\n" +
+	"\aserving\x18\t \x01(\bR\aserving\"\xb2\x04\n" +
+	"\fKernelUpdate\x12+\n" +
+	"\x05space\x18\x01 \x01(\v2\x15.fa.v1.ExpertSpaceRefR\x05space\x12/\n" +
+	"\x05as_of\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x04asOf\x12,\n" +
+	"\x12serving_sampler_id\x18\x03 \x01(\tR\x10servingSamplerId\x12/\n" +
+	"\bsamplers\x18\x04 \x03(\v2\x13.fa.v1.SamplerScoreR\bsamplers\x121\n" +
+	"\n" +
+	"stationary\x18\x05 \x03(\v2\x11.fa.v1.RegionDistR\n" +
+	"stationary\x12)\n" +
+	"\x10relaxation_steps\x18\x06 \x01(\x01R\x0frelaxationSteps\x12)\n" +
+	"\x10relaxation_lower\x18\a \x01(\x01R\x0frelaxationLower\x12)\n" +
+	"\x10relaxation_upper\x18\b \x01(\x01R\x0frelaxationUpper\x12\x15\n" +
+	"\x06n_rows\x18\t \x01(\x04R\x05nRows\x12)\n" +
+	"\x10observation_mass\x18\n" +
+	" \x01(\x01R\x0fobservationMass\x12!\n" +
+	"\flive_regions\x18\v \x01(\rR\vliveRegions\x12\x19\n" +
+	"\bdrift_kl\x18\f \x01(\x01R\adriftKl\x12\x1b\n" +
+	"\trefit_due\x18\r \x01(\bR\brefitDue\x12\x14\n" +
+	"\x05draws\x18\x0e \x01(\rR\x05draws\"\xed\x01\n" +
+	"\bHierEdge\x12$\n" +
+	"\x0efine_region_id\x18\x01 \x01(\tR\ffineRegionId\x12(\n" +
+	"\x10coarse_region_id\x18\x02 \x01(\tR\x0ecoarseRegionId\x12-\n" +
+	"\x13p_coarse_given_fine\x18\x03 \x01(\x01R\x10pCoarseGivenFine\x12-\n" +
+	"\x13p_fine_given_coarse\x18\x04 \x01(\x01R\x10pFineGivenCoarse\x12\x18\n" +
+	"\asupport\x18\x05 \x01(\x01R\asupport\x12\x19\n" +
+	"\bpmi_bits\x18\x06 \x01(\x01R\apmiBits\"\x89\x02\n" +
+	"\x0fRegionHierarchy\x12)\n" +
+	"\x04fine\x18\x01 \x01(\v2\x15.fa.v1.ExpertSpaceRefR\x04fine\x12-\n" +
+	"\x06coarse\x18\x02 \x01(\v2\x15.fa.v1.ExpertSpaceRefR\x06coarse\x12/\n" +
+	"\x05as_of\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x04asOf\x126\n" +
+	"\x17mutual_information_bits\x18\x04 \x01(\x01R\x15mutualInformationBits\x12\f\n" +
+	"\x01n\x18\x05 \x01(\x01R\x01n\x12%\n" +
+	"\x05edges\x18\x06 \x03(\v2\x0f.fa.v1.HierEdgeR\x05edges\"\xdb\x02\n" +
+	"\x0eCrossAssetPair\x120\n" +
+	"\x14source_instrument_id\x18\x01 \x01(\tR\x12sourceInstrumentId\x120\n" +
+	"\x14target_instrument_id\x18\x02 \x01(\tR\x12targetInstrumentId\x12\f\n" +
+	"\x01n\x18\x03 \x01(\rR\x01n\x12 \n" +
+	"\vcorrelation\x18\x04 \x01(\x01R\vcorrelation\x12\x1c\n" +
+	"\tshrinkage\x18\x05 \x01(\x01R\tshrinkage\x12\x19\n" +
+	"\blead_lag\x18\x06 \x01(\rR\aleadLag\x12\x1b\n" +
+	"\tlead_corr\x18\a \x01(\x01R\bleadCorr\x12'\n" +
+	"\x0fpredictive_gain\x18\b \x01(\x01R\x0epredictiveGain\x12 \n" +
+	"\vuncertainty\x18\t \x01(\x01R\vuncertainty\x12\x14\n" +
+	"\x05score\x18\n" +
+	" \x01(\x01R\x05score\"\xe1\x01\n" +
+	"\x10CrossAssetPriors\x12\x1c\n" +
+	"\ttimescale\x18\x01 \x01(\tR\ttimescale\x12/\n" +
+	"\x05as_of\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x04asOf\x123\n" +
+	"\tproposals\x18\x03 \x03(\v2\x15.fa.v1.CrossAssetPairR\tproposals\x12 \n" +
+	"\vinstruments\x18\x04 \x01(\rR\vinstruments\x12'\n" +
+	"\x0fpairs_evaluated\x18\x05 \x01(\rR\x0epairsEvaluatedB\x85\x01\n" +
 	"\tcom.fa.v1B\vLatentProtoP\x01Z6github.com/fey/financial-auto/go/pkg/bus/pb/fa/v1;fav1\xa2\x02\x03FXX\xaa\x02\x05Fa.V1\xca\x02\x05Fa\\V1\xe2\x02\x11Fa\\V1\\GPBMetadata\xea\x02\x06Fa::V1b\x06proto3"
 
 var (
@@ -582,31 +1850,61 @@ func file_fa_v1_latent_proto_rawDescGZIP() []byte {
 	return file_fa_v1_latent_proto_rawDescData
 }
 
-var file_fa_v1_latent_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_fa_v1_latent_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_fa_v1_latent_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_fa_v1_latent_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_fa_v1_latent_proto_goTypes = []any{
-	(RegionEvent_Kind)(0),         // 0: fa.v1.RegionEvent.Kind
-	(*ExpertSpaceRef)(nil),        // 1: fa.v1.ExpertSpaceRef
-	(*LatentState)(nil),           // 2: fa.v1.LatentState
-	(*ExpertLatent)(nil),          // 3: fa.v1.ExpertLatent
-	(*RegionEvent)(nil),           // 4: fa.v1.RegionEvent
-	(*TransitionUpdate)(nil),      // 5: fa.v1.TransitionUpdate
-	(*TransitionProb)(nil),        // 6: fa.v1.TransitionProb
-	(*timestamppb.Timestamp)(nil), // 7: google.protobuf.Timestamp
+	(RegionEvent_Kind)(0),          // 0: fa.v1.RegionEvent.Kind
+	(RegionLifecycleEvent_Kind)(0), // 1: fa.v1.RegionLifecycleEvent.Kind
+	(*ExpertSpaceRef)(nil),         // 2: fa.v1.ExpertSpaceRef
+	(*LatentState)(nil),            // 3: fa.v1.LatentState
+	(*ExpertLatent)(nil),           // 4: fa.v1.ExpertLatent
+	(*RegionEvent)(nil),            // 5: fa.v1.RegionEvent
+	(*TransitionUpdate)(nil),       // 6: fa.v1.TransitionUpdate
+	(*TransitionProb)(nil),         // 7: fa.v1.TransitionProb
+	(*RegionWeight)(nil),           // 8: fa.v1.RegionWeight
+	(*ExpertMembership)(nil),       // 9: fa.v1.ExpertMembership
+	(*RegionMembership)(nil),       // 10: fa.v1.RegionMembership
+	(*RegionAncestor)(nil),         // 11: fa.v1.RegionAncestor
+	(*RegionLifecycleEvent)(nil),   // 12: fa.v1.RegionLifecycleEvent
+	(*RegionDist)(nil),             // 13: fa.v1.RegionDist
+	(*SamplerScore)(nil),           // 14: fa.v1.SamplerScore
+	(*KernelUpdate)(nil),           // 15: fa.v1.KernelUpdate
+	(*HierEdge)(nil),               // 16: fa.v1.HierEdge
+	(*RegionHierarchy)(nil),        // 17: fa.v1.RegionHierarchy
+	(*CrossAssetPair)(nil),         // 18: fa.v1.CrossAssetPair
+	(*CrossAssetPriors)(nil),       // 19: fa.v1.CrossAssetPriors
+	(*timestamppb.Timestamp)(nil),  // 20: google.protobuf.Timestamp
 }
 var file_fa_v1_latent_proto_depIdxs = []int32{
-	7, // 0: fa.v1.LatentState.as_of:type_name -> google.protobuf.Timestamp
-	3, // 1: fa.v1.LatentState.experts:type_name -> fa.v1.ExpertLatent
-	0, // 2: fa.v1.RegionEvent.kind:type_name -> fa.v1.RegionEvent.Kind
-	1, // 3: fa.v1.RegionEvent.space:type_name -> fa.v1.ExpertSpaceRef
-	1, // 4: fa.v1.TransitionUpdate.space:type_name -> fa.v1.ExpertSpaceRef
-	6, // 5: fa.v1.TransitionUpdate.to:type_name -> fa.v1.TransitionProb
-	7, // 6: fa.v1.TransitionUpdate.as_of:type_name -> google.protobuf.Timestamp
-	7, // [7:7] is the sub-list for method output_type
-	7, // [7:7] is the sub-list for method input_type
-	7, // [7:7] is the sub-list for extension type_name
-	7, // [7:7] is the sub-list for extension extendee
-	0, // [0:7] is the sub-list for field type_name
+	20, // 0: fa.v1.LatentState.as_of:type_name -> google.protobuf.Timestamp
+	4,  // 1: fa.v1.LatentState.experts:type_name -> fa.v1.ExpertLatent
+	0,  // 2: fa.v1.RegionEvent.kind:type_name -> fa.v1.RegionEvent.Kind
+	2,  // 3: fa.v1.RegionEvent.space:type_name -> fa.v1.ExpertSpaceRef
+	2,  // 4: fa.v1.TransitionUpdate.space:type_name -> fa.v1.ExpertSpaceRef
+	7,  // 5: fa.v1.TransitionUpdate.to:type_name -> fa.v1.TransitionProb
+	20, // 6: fa.v1.TransitionUpdate.as_of:type_name -> google.protobuf.Timestamp
+	8,  // 7: fa.v1.ExpertMembership.weights:type_name -> fa.v1.RegionWeight
+	20, // 8: fa.v1.RegionMembership.as_of:type_name -> google.protobuf.Timestamp
+	9,  // 9: fa.v1.RegionMembership.experts:type_name -> fa.v1.ExpertMembership
+	1,  // 10: fa.v1.RegionLifecycleEvent.kind:type_name -> fa.v1.RegionLifecycleEvent.Kind
+	2,  // 11: fa.v1.RegionLifecycleEvent.space:type_name -> fa.v1.ExpertSpaceRef
+	20, // 12: fa.v1.RegionLifecycleEvent.as_of:type_name -> google.protobuf.Timestamp
+	11, // 13: fa.v1.RegionLifecycleEvent.ancestors:type_name -> fa.v1.RegionAncestor
+	2,  // 14: fa.v1.KernelUpdate.space:type_name -> fa.v1.ExpertSpaceRef
+	20, // 15: fa.v1.KernelUpdate.as_of:type_name -> google.protobuf.Timestamp
+	14, // 16: fa.v1.KernelUpdate.samplers:type_name -> fa.v1.SamplerScore
+	13, // 17: fa.v1.KernelUpdate.stationary:type_name -> fa.v1.RegionDist
+	2,  // 18: fa.v1.RegionHierarchy.fine:type_name -> fa.v1.ExpertSpaceRef
+	2,  // 19: fa.v1.RegionHierarchy.coarse:type_name -> fa.v1.ExpertSpaceRef
+	20, // 20: fa.v1.RegionHierarchy.as_of:type_name -> google.protobuf.Timestamp
+	16, // 21: fa.v1.RegionHierarchy.edges:type_name -> fa.v1.HierEdge
+	20, // 22: fa.v1.CrossAssetPriors.as_of:type_name -> google.protobuf.Timestamp
+	18, // 23: fa.v1.CrossAssetPriors.proposals:type_name -> fa.v1.CrossAssetPair
+	24, // [24:24] is the sub-list for method output_type
+	24, // [24:24] is the sub-list for method input_type
+	24, // [24:24] is the sub-list for extension type_name
+	24, // [24:24] is the sub-list for extension extendee
+	0,  // [0:24] is the sub-list for field type_name
 }
 
 func init() { file_fa_v1_latent_proto_init() }
@@ -619,8 +1917,8 @@ func file_fa_v1_latent_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_fa_v1_latent_proto_rawDesc), len(file_fa_v1_latent_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   6,
+			NumEnums:      2,
+			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

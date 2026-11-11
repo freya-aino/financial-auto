@@ -37,10 +37,20 @@ services:
       POSTGRES_USER: fa
       POSTGRES_PASSWORD: fa
       POSTGRES_DB: fa
+    # WAL archiving for point-in-time recovery (spec 60 §6.6): every finished segment is gzipped into
+    # the pg-wal-archive volume (docker/postgres/archive-wal.sh); archive_timeout bounds the RPO to 5 min.
+    # The entrypoint wrapper hands the fresh archive volume to the postgres user before the image's own
+    # entrypoint runs. pg_hba.conf adds network replication for the backup sidecar's pg_basebackup.
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /wal-archive && chown postgres:postgres /wal-archive && chmod 700 /wal-archive && exec docker-entrypoint.sh \"$$@\"", "postgres-wal"]
+    command: ["postgres", "-c", "hba_file=/etc/postgresql/fa/pg_hba.conf", "-c", "wal_level=replica",
+              "-c", "archive_mode=on", "-c", "archive_command=sh /etc/postgresql/fa/archive-wal.sh %p %f",
+              "-c", "archive_timeout=300", "-c", "max_wal_senders=10"]
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - pg-wal-archive:/wal-archive
+      - ./docker/postgres:/etc/postgresql/fa:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U fa -d fa"]
       interval: 5s
@@ -90,6 +100,101 @@ services:
       - ./docker/garage.toml:/etc/garage.toml:ro
       - garage-meta:/var/lib/garage/meta
       - garage-data:/var/lib/garage/data
+    healthcheck: # the image is the static binary only; `garage status` talks RPC to the local node
+      test: ["CMD", "/garage", "status"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── ops: alerting, exporters, backups (spec 60 §6.5, §6.6) ───────────────
+
+  # Evaluates docker/vm-alerts.yaml every 30 s against VictoriaMetrics and notifies control-api as an
+  # Alertmanager (POST /api/alerts/vmalert/api/v2/alerts) → NATS `ops.alert` + audit.log. ALERTS /
+  # ALERTS_FOR_STATE series are written back to VictoriaMetrics, which restores `for:` state on restart.
+  # UI: http://127.0.0.1:8880 (rules, active alerts). Reload rules: docker compose kill -s HUP vmalert.
+  vmalert:
+    image: victoriametrics/vmalert:v1.155.0
+    command:
+      - "-rule=/etc/vmalert/rules.yaml"
+      - "-datasource.url=http://victoriametrics:8428"
+      - "-remoteWrite.url=http://victoriametrics:8428"
+      - "-remoteRead.url=http://victoriametrics:8428"
+      - "-notifier.url=http://control-api:7700/api/alerts/vmalert"
+      - "-evaluationInterval=30s"
+      - "-external.url=http://127.0.0.1:8880"
+      - "-httpListenAddr=:8880"
+    ports:
+      - "127.0.0.1:8880:8880"
+    volumes:
+      - ./docker/vm-alerts.yaml:/etc/vmalert/rules.yaml:ro
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8880/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    restart: unless-stopped
+
+  # NATS server + JetStream stream/consumer metrics (:8222 is JSON only) → scraped as job "nats".
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:0.17.3
+    command: ["-varz", "-connz", "-jsz=all", "-healthz", "-port", "7777", "http://nats:8222"]
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Postgres server metrics (connections, database size, WAL, locks) → scraped as job "postgres".
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
+    environment:
+      DATA_SOURCE_NAME: postgresql://fa:fa@postgres:5432/fa?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Scheduled backups inside compose (spec 60 §6.6, replaces the host crontab line): busybox crond runs
+  # docker/backup/run.sh at FA_BACKUP_SCHEDULE (PITR base backup + pg_dump + hot Helix tar + Garage
+  # buckets → ./backups/<ts>/, retention FA_BACKUP_KEEP, WAL pruning), the Postgres restore drill
+  # weekly (scratch clusters inside this container only) and WAL-archiver metrics every 5 min.
+  # Manual: docker compose exec backup run.sh | drill-postgres.sh /backups/<ts> | prune.sh
+  backup:
+    build:
+      context: ./docker/backup
+    image: financial-auto/backup:dev
+    environment:
+      TZ: ${FA_BACKUP_TZ:-UTC}
+      FA_BACKUP_SCHEDULE: ${FA_BACKUP_SCHEDULE:-0 3 * * *} # backup.schedule (spec 60 §7)
+      FA_DRILL_SCHEDULE: ${FA_DRILL_SCHEDULE:-30 4 * * 0}
+      FA_BACKUP_KEEP: ${FA_BACKUP_KEEP:-7}
+      FA_BACKUP_BUCKETS: fa-models fa-ckpt fa-artifacts fa-backup
+      FA_SECRETS: /run/fa/secrets.toml
+      PGHOST: postgres
+      PGUSER: fa
+      PGPASSWORD: fa
+      PGDATABASE: fa
+      # Off-machine copy hook — configured but disabled (external targets are out of scope, spec 60 §10 Q4).
+      # Enable with an rclone remote configured through RCLONE_CONFIG_<NAME>_* env vars.
+      FA_BACKUP_OFFSITE_ENABLED: ${FA_BACKUP_OFFSITE_ENABLED:-0}
+      FA_BACKUP_OFFSITE_REMOTE: ${FA_BACKUP_OFFSITE_REMOTE:-}
+    volumes:
+      - ./backups:/backups
+      - pg-wal-archive:/wal-archive # read by the drill, pruned by prune.sh
+      - helix-data:/helix:ro
+      - ./config/secrets.toml:/run/fa/secrets.toml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep crond >/dev/null"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5m # the first start may run a full backup before crond
     restart: unless-stopped
 
   # ── application services (profile "app", D-026) ─────────────────────────
@@ -162,6 +267,12 @@ services:
     ports:
       - "127.0.0.1:9102:9100" # metrics
     depends_on: *core-deps
+    healthcheck: # GET /metrics answers ⇒ process up, HTTP loop alive (spec 60 §6.4)
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9100/metrics"]
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 20s
     restart: unless-stopped
     # deploy:
     #   resources:
@@ -180,6 +291,12 @@ services:
     ports:
       - "127.0.0.1:9103:9100" # metrics
     depends_on: *core-deps
+    healthcheck: # GET /metrics answers ⇒ process up, HTTP loop alive (spec 60 §6.4)
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9100/metrics"]
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 20s
     restart: unless-stopped
 
   risk-engine:
@@ -195,6 +312,12 @@ services:
     ports:
       - "127.0.0.1:9104:9100" # metrics
     depends_on: *core-deps
+    healthcheck: # GET /metrics answers ⇒ process up, HTTP loop alive (spec 60 §6.4)
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9100/metrics"]
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 20s
     restart: unless-stopped
 
   evo-worker:
@@ -206,6 +329,12 @@ services:
     ports:
       - "127.0.0.1:9110-9119:9100" # metrics; a range so up to 10 replicas can publish (scrape uses DNS inside compose)
     depends_on: *core-deps
+    healthcheck: # GET /metrics answers ⇒ process up, HTTP loop alive (spec 60 §6.4)
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9100/metrics"]
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 20s
     restart: unless-stopped
     # Scale with: docker compose --profile app up -d --scale evo-worker=N
     # deploy:
@@ -224,12 +353,13 @@ services:
     image: financial-auto/go:dev
     entrypoint: ["ingestor"]
     # Keyless live sources + the synthetic heartbeat (D-050); add lemon/oanda once keys are in config/secrets.toml.
-    command: ["-nats", "nats://nats:4222", "-catalog", "/app/config/sources.yaml", "-connectors", "heartbeat,yahoo,hackernews,google_news",
+    command: ["-nats", "nats://nats:4222", "-catalog", "/app/config/sources.yaml", "-connectors", "heartbeat,yahoo,hackernews,google_news,frankfurter,ecb,gdelt,sec_edgar,kraken",
               "-tsdb-url", "http://victoriametrics:8428", "-postgres", "postgres://fa:fa@postgres:5432/fa", "-garage", "http://garage:3900"]
     volumes: *secrets-volume
     environment:
       FA_SECRETS: /app/config/secrets.toml
       FA_METRICS_BIND: 0.0.0.0:9100
+      FA_ARCHIVE_SPOOL: /tmp/fa-raw-spool # raw-archive spool while Garage is down (spec 10 §8)
     ports:
       - "127.0.0.1:9105:9100" # metrics
     depends_on:
@@ -239,6 +369,12 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    healthcheck: # distroless image: go/services/healthprobe does the GET (spec 60 §6.4)
+      test: ["CMD", "healthprobe", "http://127.0.0.1:9100/metrics"]
+      interval: 15s
+      timeout: 4s
+      retries: 4
+      start_period: 20s
     restart: unless-stopped
 
   broker-gateway:
@@ -255,6 +391,12 @@ services:
     depends_on:
       nats:
         condition: service_healthy
+    healthcheck: # distroless image: go/services/healthprobe does the GET (spec 60 §6.4)
+      test: ["CMD", "healthprobe", "http://127.0.0.1:9100/metrics"]
+      interval: 15s
+      timeout: 4s
+      retries: 4
+      start_period: 20s
     restart: unless-stopped
 
   evo-orchestrator:
@@ -273,6 +415,12 @@ services:
     depends_on:
       nats:
         condition: service_healthy
+    healthcheck: # distroless image: go/services/healthprobe does the GET (spec 60 §6.4)
+      test: ["CMD", "healthprobe", "http://127.0.0.1:9100/metrics"]
+      interval: 15s
+      timeout: 4s
+      retries: 4
+      start_period: 20s
     restart: unless-stopped
 
   # One-off CLI, not started by default:
@@ -296,6 +444,7 @@ services:
     #           capabilities: [gpu]
 
 volumes:
+  pg-wal-archive: # archived WAL for PITR (spec 60 §6.6), pruned by the backup sidecar
   nats-data:
   helix-data:
   postgres-data:

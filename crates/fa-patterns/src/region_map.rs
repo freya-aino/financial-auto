@@ -11,7 +11,20 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DiscoveryMethod, Region, RegionMatch, align_by_probes};
+use crate::{
+    DiscoveryMethod, Region,
+    lineage::{AlignCfg, DEFAULT_REGIME_BREAK_MASS, DEFAULT_SPLIT_THRESHOLD, DescentKind, align},
+};
+
+/// One lineage edge of a fitted region (`DESCENDS_FROM`, spec 30 §5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Ancestor {
+    pub region_id: String,
+    pub lineage_id: String,
+    /// Jaccard overlap of the probe sets.
+    pub overlap: f64,
+    pub kind: DescentKind,
+}
 
 /// One region of a fitted set, with its lineage after alignment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -29,6 +42,9 @@ pub struct FittedRegion {
     /// Jaccard overlap with the parent region (0 when unmatched).
     #[serde(default)]
     pub score: f64,
+    /// Every parent region this one descends from (carry, split, merge, partial), with overlap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ancestors: Vec<Ancestor>,
 }
 
 impl FittedRegion {
@@ -55,6 +71,16 @@ pub struct ExpertRegionMap {
     pub matched: usize,
     /// Probe mass landing in regions that kept a lineage (spec 36 §6.4 `min_carry_mass`).
     pub carried_mass: f64,
+    /// Parent regions without any descendant (`died_at` at promotion, spec 30 §6.4 step 6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dead_parents: Vec<String>,
+    /// Parent regions that split into ≥ 2 new regions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub split_parents: Vec<String>,
+    /// Carried mass below 0.5 with a parent present: a regime break of the representation
+    /// (spec 30 §8). The runtime then resets the transition priors instead of transferring.
+    #[serde(default)]
+    pub regime_break: bool,
 }
 
 /// `region_map.json`: the fitted regions of every expert and how they map onto the parent.
@@ -100,6 +126,11 @@ impl RegionMap {
     pub fn n_matched(&self) -> usize {
         self.experts.iter().map(|e| e.matched).sum()
     }
+
+    /// Any expert's alignment was a representation regime break.
+    pub fn regime_break(&self) -> bool {
+        self.experts.iter().any(|e| e.regime_break)
+    }
 }
 
 /// Region id of the `i`-th region of expert `k` in `snapshot_id`: `<snapshot_id>-e<k>-r<nnn>`.
@@ -128,8 +159,15 @@ pub struct AlignInput<'a> {
     pub carry_threshold: f64,
 }
 
-/// Aligns the new regions of one expert to the parent's. Masses come from `new_assign`.
+/// Aligns the new regions of one expert to the parent's with the default split threshold
+/// (0.2); see [`align_expert_with`].
 pub fn align_expert(input: AlignInput<'_>) -> ExpertRegionMap {
+    align_expert_with(input, DEFAULT_SPLIT_THRESHOLD)
+}
+
+/// Aligns the new regions of one expert to the parent's (Hungarian carry, splits, merges,
+/// births, deaths: [`crate::lineage::align`]). Masses come from `new_assign`.
+pub fn align_expert_with(input: AlignInput<'_>, split_threshold: f64) -> ExpertRegionMap {
     let AlignInput {
         snapshot_id,
         expert_index,
@@ -147,11 +185,9 @@ pub fn align_expert(input: AlignInput<'_>) -> ExpertRegionMap {
             *c += 1;
         }
     }
-    let matches: Vec<RegionMatch> = if old_assign.len() == new_assign.len() && !old_ids.is_empty() {
-        align_by_probes(old_assign, new_assign, carry_threshold)
-    } else {
-        Vec::new()
-    };
+    let with_parent = old_assign.len() == new_assign.len() && !old_ids.is_empty();
+    let cfg = AlignCfg { carry_threshold, split_threshold, regime_break_mass: DEFAULT_REGIME_BREAK_MASS };
+    let alignment = with_parent.then(|| align(old_assign, new_assign, new_centroids.len(), &cfg));
     let mut carried = 0usize;
     let mut matched = 0usize;
     let regions = new_centroids
@@ -159,12 +195,27 @@ pub fn align_expert(input: AlignInput<'_>) -> ExpertRegionMap {
         .enumerate()
         .map(|(i, c)| {
             let id = region_id(snapshot_id, expert_index, i);
-            let m = matches.iter().find(|m| m.new_index == i && m.old_index.is_some());
-            let (lineage, parent, score) = match m.and_then(|m| old_ids.get(m.old_index?).map(|o| (o, m.score))) {
-                Some(((old_id, old_lineage), score)) => {
+            let ancestors: Vec<Ancestor> = alignment
+                .as_ref()
+                .map(|a| {
+                    a.ancestors(i)
+                        .filter_map(|d| {
+                            old_ids.get(d.old_index).map(|(rid, lin)| Ancestor {
+                                region_id: rid.clone(),
+                                lineage_id: lin.clone(),
+                                overlap: d.overlap,
+                                kind: d.kind,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let carry = ancestors.iter().find(|a| a.kind == DescentKind::Carry);
+            let (lineage, parent, score) = match carry {
+                Some(a) => {
                     carried += counts[i];
                     matched += 1;
-                    (old_lineage.clone(), Some(old_id.clone()), score)
+                    (a.lineage_id.clone(), Some(a.region_id.clone()), a.overlap)
                 }
                 None => (id.clone(), None, 0.0),
             };
@@ -177,6 +228,7 @@ pub fn align_expert(input: AlignInput<'_>) -> ExpertRegionMap {
                 mass: counts[i] as f64 / n,
                 parent_region_id: parent,
                 score,
+                ancestors,
             }
         })
         .collect();
@@ -186,7 +238,21 @@ pub fn align_expert(input: AlignInput<'_>) -> ExpertRegionMap {
         seen.dedup();
         seen.len()
     };
-    ExpertRegionMap { expert_index, regions, parent_regions, matched, carried_mass: carried as f64 / n }
+    let ids = |v: &[usize]| v.iter().filter_map(|o| old_ids.get(*o).map(|x| x.0.clone())).collect::<Vec<_>>();
+    let (dead_parents, split_parents, regime_break) = match &alignment {
+        Some(a) => (ids(&a.dead), ids(&a.splits), a.regime_break),
+        None => (Vec::new(), Vec::new(), false),
+    };
+    ExpertRegionMap {
+        expert_index,
+        regions,
+        parent_regions,
+        matched,
+        carried_mass: carried as f64 / n,
+        dead_parents,
+        split_parents,
+        regime_break,
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +286,10 @@ mod tests {
         assert_eq!(m.regions[2].parent_region_id, None);
         assert_eq!(m.matched, 2);
         assert_eq!(m.parent_regions, 2);
+        assert_eq!(m.regions[0].ancestors.len(), 1);
+        assert_eq!(m.regions[0].ancestors[0].kind, DescentKind::Carry);
+        assert!(m.dead_parents.is_empty());
+        assert!(!m.regime_break, "5/8 of the probe mass carried");
         assert!((m.carried_mass - 5.0 / 8.0).abs() < 1e-12);
         assert!((m.regions[2].mass - 3.0 / 8.0).abs() < 1e-12);
 

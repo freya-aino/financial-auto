@@ -34,6 +34,31 @@ pub fn latent_transition(ts: Timescale) -> String {
     format!("latent.transition.{ts}")
 }
 
+/// Soft region memberships of one instrument, all experts (`RegionMembership`, spec 30 §4.2).
+pub fn latent_membership(ts: Timescale, instrument: &str) -> String {
+    format!("latent.membership.{ts}.{instrument}")
+}
+
+/// Region lifecycle with lineage and event time (`RegionLifecycleEvent`, spec 30 §4.2).
+pub fn latent_lifecycle(ts: Timescale) -> String {
+    format!("latent.lifecycle.{ts}")
+}
+
+/// Graph-level kernel summary of one expert space (`KernelUpdate`, spec 33 §4.3).
+pub fn latent_mcmc(ts: Timescale, expert_index: u32) -> String {
+    format!("latent.mcmc.{ts}.{expert_index}")
+}
+
+/// Cross-timescale region hierarchy (`RegionHierarchy`, spec 30 §6.5).
+pub fn latent_hier(fine: Timescale, coarse: Timescale) -> String {
+    format!("latent.hier.{fine}.{coarse}")
+}
+
+/// Cross-asset prior proposals (`CrossAssetPriors`, spec 33 §6.5).
+pub fn latent_crossprior(ts: Timescale) -> String {
+    format!("latent.crossprior.{ts}")
+}
+
 pub fn decoder_output(family: &str) -> String {
     format!("decoder.output.{family}")
 }
@@ -65,12 +90,44 @@ pub fn risk_resume(scope: &str) -> String {
     format!("risk.resume.{scope}")
 }
 
+/// Risk decisions and state changes (`RiskEvent`, D-042 follow-up).
+pub fn risk_event(account: &str) -> String {
+    format!("risk.event.{account}")
+}
+
+/// Ingestion operability frames (`IngestHealth` / `IngestGap` / `IngestUnresolved`, D-054).
+pub fn ingest_health(source: &str) -> String {
+    format!("ingest.health.{source}")
+}
+
+pub fn ingest_gap(source: &str) -> String {
+    format!("ingest.gap.{source}")
+}
+
+pub fn ingest_unresolved(source: &str) -> String {
+    format!("ingest.unresolved.{source}")
+}
+
+/// Reference-data change notice (`RefChanged`, spec 12 §6); `entity` = instrument, listing, ...
+pub fn ref_changed(entity: &str) -> String {
+    format!("ref.changed.{entity}")
+}
+
+/// Catalog change notice (`RefChanged` with entity `source`, spec 11 §4).
+pub fn catalog_changed(source: &str) -> String {
+    format!("catalog.changed.{source}")
+}
+
 /// Wildcards for consumers that aggregate whole families (risk-engine, control-api).
 pub const ALL_SIGNALS: &str = "signal.exposure.>";
 pub const ALL_ORDERS: &str = "order.>";
 pub const ALL_RISK_HALTS: &str = "risk.halt.>";
 pub const ALL_RISK_RESUMES: &str = "risk.resume.>";
 pub const ALL_LATENT_STATES: &str = "latent.state.>";
+pub const ALL_RISK_EVENTS: &str = "risk.event.>";
+pub const ALL_INGEST_HEALTH: &str = "ingest.health.>";
+pub const ALL_REF_CHANGED: &str = "ref.changed.>";
+pub const ALL_CATALOG_CHANGED: &str = "catalog.changed.>";
 
 pub fn jobs(kind: &str) -> String {
     format!("jobs.{kind}")

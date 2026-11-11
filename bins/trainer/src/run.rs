@@ -172,6 +172,9 @@ pub async fn run_fit(kind: Kind, spec: FitSpec, svc: &Services<'_>, ctl: &Contro
 }
 
 async fn fit_inner(kind: Kind, spec: FitSpec, svc: &Services<'_>, ctl: &Control) -> anyhow::Result<Outcome> {
+    if let Some(family) = crate::neural_fit::family_of(&spec)? {
+        return crate::neural_fit::run(kind, family, spec, svc, ctl).await;
+    }
     let started = Instant::now();
     let now = data::now_ms();
     let hub = svc.stores.hub.as_ref();
@@ -304,7 +307,7 @@ async fn fit_inner(kind: Kind, spec: FitSpec, svc: &Services<'_>, ctl: &Control)
         return Ok(o);
     }
     (ctl.progress)(0.9, "regions and alignment".into());
-    let parent = artifact::parent_assignment(hub, parent_graph.as_ref(), &history, &fit).await;
+    let parent = artifact::parent_assignment(hub, parent_graph.as_ref(), &history, &fit.probe_keys(&history)).await;
     let bundle = fit.finish(&history, &parent, chrono::Utc::now().to_rfc3339())?;
     if let Some(o) = cancelled(ctl, kind, &fit, started) {
         return Ok(o);
@@ -455,7 +458,7 @@ async fn adapter_inner(spec: AdapterSpec, svc: &Services<'_>, ctl: &Control) -> 
         (Some(id), Some(h)) => h.snapshot_by_id(id).await?,
         (None, Some(h)) => {
             let ts = spec.timescale.ok_or_else(|| anyhow::anyhow!("adapter needs `snapshot_id` or `timescale`"))?;
-            h.active_snapshot(ts.as_str(), STATISTICAL_FAMILY).await?
+            crate::neural_fit::active_any(h, ts).await
         }
         (_, None) => None,
     };
@@ -475,6 +478,9 @@ async fn adapter_inner(spec: AdapterSpec, svc: &Services<'_>, ctl: &Control) -> 
     let (encoder, reference, guard) = match (&svc.stores.blob, has_artifact) {
         (Some(blob), true) => {
             let (m, w, _) = artifact::load_snapshot(blob, &snapshot_id).await?;
+            if fa_encoders::neural::is_neural_family(&m.encoder_family) {
+                return crate::neural_fit::run_adapter(spec, svc, ctl, m, w, started).await;
+            }
             let enc = StatisticalEncoder::from_manifest(&m, &w)?;
             let norm = enc.norm().cloned();
             (enc, norm, m.adapter_guard())

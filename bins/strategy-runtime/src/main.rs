@@ -12,9 +12,12 @@
 //! (step budget, NaN outputs, starved primitives) are handled in `runtime`.
 //!
 //! Population: `--strategies` = a local file, `garage:fa-artifacts/strategies/<gen>.toml`,
-//! `latest` (newest object under `fa-artifacts/strategies/`) or nothing (the hand-written
-//! **baselines**, not evolved); any failure at start falls back to the baselines with a
-//! warning. Control: `ctl.strategy.reload|pause|resume|status`.
+//! `latest` (newest object under `fa-artifacts/strategies/`), `baselines` (the hand-written
+//! programs, not evolved) or nothing / `managed` (default: the baselines plus the managed live
+//! set `fa-artifacts/live/strategies.toml` the risk-engine pipeline writes when an evolved
+//! strategy passes the locked holdout, spec 35 §6.4); any failure at start falls back to the
+//! baselines with a warning. Control: `ctl.strategy.reload|pause|resume|status`; the pipeline
+//! reloads with `{artifact_key: "managed"}`.
 mod prefetch;
 mod runtime;
 mod source;
@@ -51,8 +54,9 @@ struct Args {
     /// Platform config (spec 60).
     #[arg(long, env = "FA_CONFIG", default_value = "config/platform.toml")]
     config: PathBuf,
-    /// Population: a TOML file, `garage:fa-artifacts/strategies/<gen>.toml`, `latest` or
-    /// `baselines` (default). Falls back to the baselines with a warning.
+    /// Population: a TOML file, `garage:fa-artifacts/strategies/<gen>.toml`, `latest`,
+    /// `baselines` or `managed` (default: baselines + the pipeline's live set). Falls back to the
+    /// baselines with a warning.
     #[arg(long, env = "FA_STRATEGIES")]
     strategies: Option<String>,
     /// Scheduler resolution in milliseconds.
@@ -122,9 +126,11 @@ fn reload_spec(args: &std::collections::HashMap<String, String>) -> anyhow::Resu
     }
     match args.get("artifact_key").map(|k| k.trim()).filter(|k| !k.is_empty()) {
         Some("latest") => Ok(PopulationSpec::Latest),
+        Some("managed") => Ok(PopulationSpec::Managed),
+        Some("baselines") => Ok(PopulationSpec::Baselines),
         Some(k) => Ok(PopulationSpec::parse(&format!("garage:{k}"))),
         None => anyhow::bail!(
-            "invalid: reload needs `artifact_key` (Garage key under fa-artifacts/, or `latest`) or `path`"
+            "invalid: reload needs `artifact_key` (Garage key under fa-artifacts/, `latest`, `managed` or `baselines`) or `path`"
         ),
     }
 }
@@ -193,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
     fa_bus::metrics::serve_from_env("strategy-runtime", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config).context("loading platform config")?;
     let blob = Arc::new(blob_store(&cfg));
-    let spec = PopulationSpec::parse(args.strategies.as_deref().unwrap_or("baselines"));
+    let spec = PopulationSpec::parse(args.strategies.as_deref().unwrap_or("managed"));
     let (file, label, warning) = source::load_or_baselines(&spec, blob.as_ref().as_ref()).await;
     if let Some(w) = &warning {
         tracing::warn!("{w}");

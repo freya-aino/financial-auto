@@ -46,7 +46,7 @@ pub trait Evaluator {
 }
 ```
 - Work queue: `jobs.eval.request` / `jobs.eval.result` (21) with `EvalJob { candidate, replay_spec }` → `EvalReport`.
-- **Implemented today (D-044):** `fa_backtest::eval::evaluate` scores a `fa_decoders` series decoder **sequentially point-in-time** (forecast at every step using data `≤ t`, scored against the realised `h`-step log return) and returns the objective set of spec 34 §6.3 (`crps`, `crps_skill`, `coverage`, `coverage_err`, `hit_rate`, `trade_sharpe`, `trade_psr`, `compute_cost`, `n_eval`) with budget/preemption stop hooks and multi-instrument pooling. It is scoring, not walk-forward retraining. The job surface is spec 21's generic `Job` / `JobResult` on `jobs.evo.eval.decoder`, not the dedicated messages above. Evaluation data comes from VictoriaMetrics since D-049 (`fa_tsdb::trade_prices`, in-memory buffer as fallback). Deflated Sharpe and PBO (CSCV) are implemented in the crate but not yet applied across the generation's trial set; the ordered replay driver exists, the full pipeline replay (encoders → strategies → paper venue) and the per-venue cost model do not.
+- **Implemented today (D-044):** `fa_backtest::eval::evaluate` scores a `fa_decoders` series decoder **sequentially point-in-time** (forecast at every step using data `≤ t`, scored against the realised `h`-step log return) and returns the objective set of spec 34 §6.3 (`crps`, `crps_skill`, `coverage`, `coverage_err`, `hit_rate`, `trade_sharpe`, `trade_psr`, `compute_cost`, `n_eval`) with budget/preemption stop hooks and multi-instrument pooling. It is scoring, not walk-forward retraining. The job surface is spec 21's generic `Job` / `JobResult` on `jobs.evo.eval.decoder`, not the dedicated messages above. Evaluation data comes from VictoriaMetrics since D-049 (`fa_tsdb::trade_prices`, in-memory buffer as fallback). Deflated Sharpe and PBO (CSCV) are applied across every generation's trial set since D-052 (§6.5); the full pipeline replay re-runs strategies on recorded latents (§6.1), not the encoders themselves.
 - Control API: `GET /api/validation/holdout`, `GET /api/validation/reports/{candidate}`, `GET /api/validation/shadow/{strategy}`.
 
 ## 5. Data model
@@ -90,22 +90,33 @@ Per timescale: `[selection window] [embargo gap] [locked holdout] [live]`. The h
 
 **Implemented today (D-059):** `POST /api/validation/holdout` locks a completed segment per timescale (immutable by trigger, 409 on overlap); Promotion-purpose replays run only as `evo.eval.strategy.holdout` jobs inside a locked holdout and their trial rows never enter selection statistics.
 
+**Automatic locking (implemented):** the holdout can no longer be silently absent. risk-engine plans it per timescale at start and every `[holdout] check_secs` (300) with `fa_backtest::holdout::plan_lock`: a timescale in `[holdout] timescales` (`1s`, `1m`) or of a waiting candidate without a holdout gets `[end − holdout.length.<ts>, end)`, `end` = now on the bar grid; it is inserted only when VictoriaMetrics holds ≥ `min_bars` (300) bars of the timescale in it (no empty holdouts), in a transaction holding `pg_advisory_xact_lock` and refusing overlaps (idempotent across restarts and concurrent lockers), and audited as `validation.holdout.lock` (actor `system:pipeline`). An existing row means nothing to do; `relock_after_days` (default 0 = never) adds a new non-overlapping segment once the latest one has aged. Timescales that cannot be locked are reported in `ctl.risk.pipeline` status (`holdouts.<ts>.reason`) and the heartbeat gauge `holdout.missing`. Lengths are `risk.toml [holdout.length_secs]` (1s: 2 h, 1m: 12 h, 1h: 90 d, 1d: 365 d — scaled to the history the stack holds; §7 placeholders stay the target).
+
+**Selection windows avoid holdouts:** a now-relative selection window of `evo.eval.strategy` that would intersect a locked holdout is moved to end `2 × horizon` (≥ 60 s) before the holdout starts (`fa_backtest::holdout::avoid_holdouts`, the §6.4 layout), instead of being rejected until the window has passed it; explicit windows are still rejected. The pipeline (spec 35 §6.4.1) evaluates a candidate only on a holdout none of its selection windows touched.
+
 ### 6.5 Multiple-testing corrections
 - **Trial registry**: every evaluated candidate is recorded with its selection-window statistics.
 - **Deflated Sharpe Ratio** (Bailey & López de Prado): adjusts observed Sharpe for the number of trials, variance of trial Sharpes, skew and kurtosis; fitness uses DSR (or its probability) instead of raw Sharpe.
 - **PBO** via combinatorially symmetric cross-validation over the selection window's sub-blocks, computed per generation for the elite set; reported and used in the promotion gate. (CSCV is not walk-forward training; it reuses existing evaluations.)
 - Effective number of trials estimated from clustered correlation of trial returns **(proposal)**.
 
-**Implemented today (D-052):** every decoder or strategy evaluation writes a `validation.trial` row (generation, loop, rung, candidate, Sharpe, n_obs, objectives, 64 return block sums). After each trial the worker recomputes `validation.generation_stats` (deflated Sharpe of the best trial against the expected maximum of n trials, CSCV PBO with 16 blocks), which the orchestrator publishes in every `generation.summary`. Selection replays intersecting a locked `validation.holdout` row are rejected; the holdout lock workflow itself is pending.
+**Implemented today (D-052):** every decoder or strategy evaluation writes a `validation.trial` row (generation, loop, rung, candidate, Sharpe, n_obs, objectives, 64 return block sums). After each trial the worker recomputes `validation.generation_stats` (deflated Sharpe of the best trial against the expected maximum of n trials, CSCV PBO with 16 blocks), which the orchestrator publishes in every `generation.summary`. Selection replays intersecting a locked `validation.holdout` row are rejected; holdouts are locked automatically (§6.4).
+
+**Effective number of trials (implemented):** `fa_backtest::validation::effective_trials` = `N / (1 + (N − 1)·ρ̄)` with ρ̄ the mean pairwise correlation of the trials' block returns (negative → 0); `generation_stats` deflates the best trial against the expected maximum of `N_eff` (plus trials without a finite Sharpe) instead of `N`, and reports `effective_trials`. A population of near-copies no longer counts as many independent tries. (The evo-worker writes the new field into the result JSON; `validation.generation_stats` has no column for it yet.)
+
+**Use in promotion:** PBO and the holdout deflated Sharpe are blocking items of the spec 40 §6.6 gate; candidate selection (spec 35 §6.4.1) applies `pbo_max` per generation and `dsr_min_candidate` per member; the single holdout trial decides with `dsr.min_for_promotion`.
 
 ### 6.6 Live paper shadow
 Strategies entering shadow run on live data with the paper venue. Tracked: calendar days, completed horizons, Sharpe / drawdown / hit rate, slippage vs model, consistency vs backtest distribution. Feeds the promotion gate in 40.
 
+**Implemented:** risk-engine keeps the shadow book (virtual exposure on `shadow_sleeve_eur`, hourly P&L points) and computes the consistency itself (`fa_risk::strategy::consistency`): the hourly Sharpe of the book since admission against the selection trial's per-step Sharpe scaled to an hour (`× sqrt(3600 / step_secs)`), consistent unless the shadow falls more than `promotion.consistency_z` (2) standard errors (`1/sqrt(n_hours)`) below; at least `decay_min_hours` (24) points. The same test on an active strategy's own book is the gate-decay demotion signal.
+
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
 |---|---|---|
-| `holdout.length.<timescale>` | seconds: 3d, minutes: 1m, hours: 3m, days: 1y | |
-| `embargo.<timescale>` | 2 × horizon | |
+| `holdout.length.<timescale>` | seconds: 3d, minutes: 1m, hours: 3m, days: 1y | running values `risk.toml [holdout.length_secs]`: 2 h / 12 h / 90 d / 365 d until the history is longer |
+| `embargo.<timescale>` | 2 × horizon | selection-window shift uses 2 × the strategy horizon (≥ 60 s) |
+| `holdout.min_bars` | 300 | a segment with fewer bars is not locked (reported instead) |
 | `pbo.n_blocks` | 16 | CSCV partitions |
 | `pbo.max_for_promotion` | 0.2 | |
 | `dsr.min_for_promotion` | 0.95 | probability |
@@ -125,16 +136,16 @@ Strategies entering shadow run on live data with the paper venue. Tracked: calen
 - Replaying a recorded live day reproduces the live paper decisions exactly (same orders, same timestamps).
 - Determinism test: identical spec+seed → identical report hash.
 - Look-ahead guard: synthetic test injecting a future-dated event is caught.
-- Holdout is immutable via API; selection jobs touching it are rejected.
-- Every evaluation appears in the trial registry; DSR and PBO are computable for any generation.
+- Holdout is immutable via API; selection jobs touching it are rejected. **Met**, and a holdout per configured timescale is locked automatically (§6.4).
+- Every evaluation appears in the trial registry; DSR and PBO are computable for any generation. **Met** (with the effective-trials correction).
 - Fitness values reported to evolution are net of the cost model.
 
 ## 10. Open questions
 1. Holdout length per timescale (placeholders) — blocks gate calibration.
 2. Should online adapters be replayed online or frozen during selection replay? — affects evaluation cost and realism.
 3. Latency simulation: model order latency per venue, or assume next-event execution? — affects short timescales.
-4. Effective-trials estimation method for DSR with huge correlated populations.
-5. Re-lock cadence for the holdout as the system ages.
+4. Effective-trials estimation method for DSR with huge correlated populations. *(Mean-correlation estimate implemented; eigenvalue / clustering methods remain options.)*
+5. Re-lock cadence for the holdout as the system ages. *(Mechanism exists: `[holdout] relock_after_days`; the cadence is still open, default never.)*
 
 ## 11. Deferred
 - Walk-forward / purged CV inside evolution (explicitly rejected for now; revisit when compute scales).

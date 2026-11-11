@@ -1,8 +1,13 @@
 //! PostgreSQL warehouse access (specs 12, 20; D-013): reference data, catalog, macro vintages,
 //! the append-only [`audit`] log (spec 42), the instrument search / quarantine review
 //! functions in [`refdata`] (D-054), the instrument → asset class / venue / currency / source
-//! lookup in [`venues`] and the EUR accounting FX table in [`fx`] (D-061).
+//! lookup in [`venues`] and the EUR accounting FX table in [`fx`] (D-061); point-in-time
+//! reference reads in [`asof`], trading calendars in [`calendar`] and corporate actions,
+//! adjusted series and symbol changes in [`corpactions`] (spec 12 §4).
+pub mod asof;
 pub mod audit;
+pub mod calendar;
+pub mod corpactions;
 pub mod fx;
 pub mod refdata;
 pub mod venues;

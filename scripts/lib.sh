@@ -41,3 +41,30 @@ garage_rclone() {
         -e RCLONE_CONFIG_GARAGE_ACCESS_KEY_ID="$ak" -e RCLONE_CONFIG_GARAGE_SECRET_ACCESS_KEY="$sk" \
         "${RCLONE_IMAGE:-rclone/rclone:1.69}" "$@"
 }
+
+# Verifies every file of a backup directory against its manifest.json (sha256); returns 1 on any
+# missing or mismatching file. Used by restore.sh and restore-drill.sh before anything is restored.
+verify_manifest() {
+    local src=$1 bad=0 n=0 path sum
+    [ -f "$src/manifest.json" ] || { log "$src has no manifest.json"; return 1; }
+    while IFS=$'\t' read -r path sum; do
+        n=$((n + 1))
+        [ -f "$src/$path" ] || { log "missing $path"; bad=1; continue; }
+        [ "$(sha256_of "$src/$path")" = "$sum" ] || { log "checksum mismatch: $path"; bad=1; }
+    done < <(sed -n 's/.*"path": "\([^"]*\)".*"sha256": "\([0-9a-f]*\)".*/\1\t\2/p' "$src/manifest.json")
+    log "manifest: $n files checked"
+    [ $bad = 0 ]
+}
+
+# Newest backup directory under backups/ that has a manifest (optionally only scheduled ones).
+latest_backup() {
+    local d
+    for d in $(ls -1d "$ROOT"/backups/2*Z 2>/dev/null | sort -r); do
+        [ -f "$d/manifest.json" ] || continue
+        [ "${1:-}" = scheduled ] && ! grep -q '"kind": "scheduled"' "$d/manifest.json" && continue
+        echo "$d"; return 0
+    done
+    return 1
+}
+
+BACKUP_IMAGE=${FA_BACKUP_IMAGE:-financial-auto/backup:dev}

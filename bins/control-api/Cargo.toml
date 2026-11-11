@@ -18,6 +18,7 @@ fa-evolution.workspace = true
 fa-backtest.workspace = true
 fa-hub.workspace = true
 fa-ledger.workspace = true
+fa-mcmc.workspace = true
 fa-warehouse.workspace = true
 fa-proto.workspace = true
 futures.workspace = true

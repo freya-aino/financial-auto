@@ -7,12 +7,14 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+candle-core.workspace = true
 chrono.workspace = true
 clap.workspace = true
 fa-blob.workspace = true
 fa-bus.workspace = true
 fa-core.workspace = true
 fa-encoders.workspace = true
+fa-expert-space.workspace = true
 fa-hub.workspace = true
 fa-mcmc.workspace = true
 fa-patterns.workspace = true
@@ -29,3 +31,8 @@ ulid.workspace = true
 
 [lints]
 workspace = true
+
+# Neural fits run on candle's CPU backend; `cuda` enables CUDA devices (`--device cuda:0`).
+[features]
+default = []
+cuda = ["candle-core/cuda", "fa-encoders/cuda"]

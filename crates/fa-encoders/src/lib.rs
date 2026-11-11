@@ -6,6 +6,8 @@
 //! until then; it implements the same [`EncoderFamily`] contract.
 
 pub mod baseline;
+pub mod media;
+pub mod neural;
 pub mod snapshot;
 
 pub use baseline::{EXPERT_DIM, EXPERT_NAMES, FitConfig, MARKET_ROW_LEN, MarketBar, StatisticalEncoder};

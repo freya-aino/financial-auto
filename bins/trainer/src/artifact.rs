@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use crate::{
     data::{BarHistory, Source},
-    fit::{Bundle, Fit, ParentAssignment},
+    fit::{Bundle, Fit, ParentAssignment, ProbeKey},
 };
 
 /// The stores a run may write to; each is optional so the CLI works offline.
@@ -96,7 +96,11 @@ async fn mirror(
         .ensure_snapshot(&NewSnapshot {
             snapshot_id: m.snapshot_id.clone(),
             timescale: m.timescale.to_string(),
-            encoder_family: STATISTICAL_FAMILY.into(),
+            encoder_family: if m.encoder_family.is_empty() {
+                STATISTICAL_FAMILY.into()
+            } else {
+                m.encoder_family.clone()
+            },
             generation: m.generation,
             garage_key,
             status: "candidate".into(),
@@ -107,6 +111,12 @@ async fn mirror(
     hub.set_snapshot_manifest(snap.id, &manifest_json, bundle.region_map.carried_mass()).await?;
     let mut n_regions = 0;
     let mut n_edges = 0;
+    // Latent dimension of every expert space: the neural genome's `expert_dim`, else the statistical 8.
+    let dim = m
+        .params
+        .get("expert_dim")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(fa_encoders::EXPERT_DIM as u32, |d| d as u32);
     for (k, regions) in bundle.regions.iter().enumerate() {
         let space_id = format!("{}-e{k}", m.snapshot_id);
         let space = hub
@@ -116,7 +126,7 @@ async fn mirror(
                     expert_space_id: space_id.clone(),
                     snapshot_id: m.snapshot_id.clone(),
                     index: k as u32,
-                    dim: fa_encoders::EXPERT_DIM as u32,
+                    dim,
                 },
             )
             .await?;
@@ -167,16 +177,16 @@ pub async fn parent_assignment(
     hub: Option<&HubClient>,
     parent: Option<&SnapshotGraph>,
     histories: &[BarHistory],
-    fit: &Fit,
+    keys: &[ProbeKey],
 ) -> ParentAssignment {
     let (Some(hub), Some(g)) = (hub, parent) else {
         return ParentAssignment::none("no parent snapshot in Helix: every region opens a new lineage");
     };
-    let keys = fit.probe_keys(histories);
     let since = histories.iter().map(|h| h.start_ms).min().unwrap_or_default();
     let tokens: std::collections::HashSet<String> =
         histories.iter().map(|h| h.instrument.to_ascii_lowercase()).collect();
-    let n_experts = fa_encoders::EXPERT_NAMES.len();
+    // The parent's expert count (statistical: 3; neural: its pruned count).
+    let n_experts = if g.spaces.is_empty() { fa_encoders::EXPERT_NAMES.len() } else { g.spaces.len() };
     let mut obs = Vec::new();
     for k in 0..n_experts {
         let space_id = format!("{}-e{k}", g.snapshot.snapshot_id);
@@ -198,7 +208,7 @@ pub async fn parent_assignment(
             obs.push((k as u32, r.ref_id, lineage, token, ts));
         }
     }
-    let mut a = ParentAssignment::from_observations(&g.snapshot.snapshot_id, n_experts, &keys, obs);
+    let mut a = ParentAssignment::from_observations(&g.snapshot.snapshot_id, n_experts, keys, obs);
     if a.covered == 0 {
         a.note = Some(format!(
             "parent {} has no stored observations for the {} fitted instrument(s) in the window: every region opens a new lineage",

@@ -18,7 +18,7 @@ use serde_json::Value;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use uuid::Uuid;
 
-use crate::{Fill, Ledger};
+use crate::{Fill, Ledger, accounting::LotMethod};
 
 /// Venue id used for paper books (no real venue exists yet).
 pub const PAPER_VENUE: Uuid = Uuid::from_u128(0x7061_7065_7200_0000_0000_0000_0000_0001);
@@ -39,6 +39,10 @@ pub enum PgError {
     Sql(#[from] sqlx::Error),
     #[error("fill {fill_id} references unknown intent {intent_id}")]
     UnknownIntent { fill_id: String, intent_id: String },
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("invalid: {0}")]
+    Invalid(String),
 }
 
 /// An order intent as persisted to `ledger.order_intent` (+ its paper `venue_order`).
@@ -155,6 +159,8 @@ pub struct PayoutQuota {
 #[derive(Clone)]
 pub struct PgLedger {
     pool: PgPool,
+    /// `ledger.lot_method` (spec 42 §7) used by the derived reads in `pg_accounting`.
+    lot_method: LotMethod,
 }
 
 impl PgLedger {
@@ -164,11 +170,21 @@ impl PgLedger {
             .acquire_timeout(std::time::Duration::from_secs(3))
             .connect(url)
             .await?;
-        Ok(Self { pool })
+        Ok(Self::from_pool(pool))
     }
 
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self { pool, lot_method: LotMethod::default() }
+    }
+
+    /// Same ledger with another lot method for lots, positions and P&L (default FIFO).
+    pub fn with_lot_method(mut self, method: LotMethod) -> Self {
+        self.lot_method = method;
+        self
+    }
+
+    pub fn lot_method(&self) -> LotMethod {
+        self.lot_method
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -580,8 +596,9 @@ impl PgLedger {
         Ok(())
     }
 
-    /// Deletes everything belonging to a book (tests / paper resets). Reconciliation runs are
-    /// not per book and are left alone.
+    /// Deletes everything belonging to a book (tests / paper resets), including its orphan fills
+    /// and cached lots (tables of migration `20261111000030`, which must be applied). Reconciliation
+    /// runs and the payout quota are not per book and are left alone.
     pub async fn delete_book(&self, book: &str) -> Result<(), PgError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -607,6 +624,10 @@ impl PgLedger {
         .await?;
         for sql in [
             "DELETE FROM ledger.order_intent WHERE book = $1",
+            "DELETE FROM ledger.orphan_fill WHERE book = $1",
+            "DELETE FROM ledger.lot WHERE book = $1",
+            "DELETE FROM ledger.lot_closing WHERE book = $1",
+            "DELETE FROM ledger.lot_rebuild WHERE book = $1",
             "DELETE FROM ledger.cash_movement WHERE book = $1",
             "DELETE FROM ledger.position_snapshot WHERE book = $1",
         ] {

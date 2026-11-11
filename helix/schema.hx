@@ -126,6 +126,13 @@ N::LatentRegion {
     related_region_id: String, // merged: absorbed region; retired: survivor it merged into
     created_at: Date DEFAULT NOW,
     updated_at: Date,
+    // Online statistics (model-runtime, fa-hub `update_region_stats`) and death marks.
+    mass: F64,        // points assigned since birth
+    occupancy: F64,   // decayed occupancy share in its set
+    spread: F64,      // RMS distance of members to the centroid
+    age: I64,         // observations of the set since birth
+    died_at: Date,
+    retire_reason: String, // merged | support | unmatched
 }
 
 E::InSpace {
@@ -151,10 +158,18 @@ E::Transition {
 }
 
 E::Hier {
-    From: LatentRegion,
-    To: LatentRegion,
+    From: LatentRegion, // fine timescale (spec 30 §6.5 REFINES)
+    To: LatentRegion,   // coarse timescale, same expert index
     Properties: {
-        weight: F64, // timescale a → timescale b containment
+        weight: F64, // = p_coarse_given_fine
+        fine_region_id: String,
+        coarse_region_id: String,
+        p_coarse_given_fine: F64,
+        p_fine_given_coarse: F64,
+        support: F64,
+        pmi_bits: F64,
+        mi_bits: F64, // mutual information of the whole set pair
+        updated_at: Date,
     }
 }
 
@@ -164,6 +179,86 @@ E::RegionMatch {
     Properties: {
         score: F64, // probe-set alignment score (D-007)
     }
+}
+
+// Region lineage (spec 30 §5 DESCENDS_FROM): child → parent, written by model-runtime for
+// online splits/merges and for the alignment of a loaded snapshot's region_map.
+E::DescendsFrom {
+    From: LatentRegion, // child
+    To: LatentRegion,   // parent
+    Properties: {
+        child_region_id: String,
+        parent_region_id: String,
+        kind: String, // carry | split | merge | partial
+        overlap: F64, // probe Jaccard overlap (snapshot) or mass share (online split)
+        updated_at: Date,
+    }
+}
+
+// Persisted online region set + conjugate kernel of one expert space (spec 30 §5 RegionSet;
+// region_set_id = expert_space_id). model-runtime restores both on restart.
+N::RegionSet {
+    UNIQUE INDEX region_set_id: String,
+    INDEX snapshot_id: String,
+    timescale: String,
+    expert_index: U32,
+    family: String,
+    method: String,
+    n_regions: U32,
+    cfg_hash: String,
+    state: String,        // JSON fa_patterns::OnlineRegionSet
+    kernel_state: String, // JSON fa_mcmc::MarkovGraph
+    fit_time: Date,
+    updated_at: Date,
+}
+
+E::HasRegionSet {
+    From: ExpertSpace,
+    To: RegionSet,
+    Properties: {}
+}
+
+// Kernel model of one expert space (spec 33 §5; kernel_id = expert_space_id).
+N::KernelModel {
+    UNIQUE INDEX kernel_id: String,
+    INDEX snapshot_id: String,
+    expert_space_id: String,
+    timescale: String,
+    expert_index: U32,
+    kernel_type: String,     // dirichlet (geometric prior, forgetting)
+    serving_sampler: String, // conjugate | smc
+    scores: String,          // JSON sampler standings: log score, Brier, ECE, PIT KS, cost
+    stationary: String,      // JSON [{region_id, mean, lower, upper, sd}]
+    relaxation_steps: F64,
+    drift_kl: F64,
+    n_rows: U32,
+    observation_mass: F64,
+    live_regions: U32,
+    updated_at: Date,
+}
+
+E::HasKernel {
+    From: ExpertSpace,
+    To: KernelModel,
+    Properties: {}
+}
+
+// Cross-asset prior of one directed instrument pair at one timescale (spec 33 §6.5).
+N::CrossPrior {
+    UNIQUE INDEX pair_id: String, // <timescale>:<source>:<target>
+    INDEX timescale: String,
+    source_instrument_id: String,
+    target_instrument_id: String,
+    n: U32,
+    correlation: F64, // Ledoit–Wolf shrunk
+    shrinkage: F64,
+    lead_lag: U32,
+    lead_corr: F64,
+    predictive_gain: F64, // Δ CRPS
+    uncertainty: F64,
+    score: F64,
+    rank: U32,
+    updated_at: Date,
 }
 
 // Latent vectors: region centroids, sampled state observations, retrieval windows.
@@ -235,6 +330,8 @@ E::FeedbackFrom {
 }
 
 // ── Text and media (specs 10, 31) ───────────────────────────────────────
+// Embedding in property `vec<dim>` like LatentVec, one cosine index per (label, dim), not
+// tenant-partitioned (fa-hub `schema::embedding_index`, created on first write).
 V::NewsDoc {
     INDEX doc_id: String,
     ts: Date,
@@ -253,4 +350,15 @@ E::Mentions {
     Properties: {
         confidence: F64,
     }
+}
+
+// ── Schema / migration version marker (spec 20 §8, §10 Q6) ──────────────
+// One row per meta_id ("fa-hub"): the data-model version the last `ensure_schema_ready` migrated
+// to and a fingerprint of the static index set. A build refuses to run against a newer version.
+N::SchemaMeta {
+    UNIQUE INDEX meta_id: String,
+    version: U32,
+    index_fingerprint: String,
+    writer: String, // crate version of the build that stamped it
+    updated_at: Date DEFAULT NOW,
 }

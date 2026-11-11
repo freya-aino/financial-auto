@@ -33,6 +33,11 @@ type Envelope struct {
 	IngestTime    *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=ingest_time,json=ingestTime,proto3" json:"ingest_time,omitempty"`       // when our ingestor received it
 	RawRef        *RawRef                `protobuf:"bytes,7,opt,name=raw_ref,json=rawRef,proto3" json:"raw_ref,omitempty"`
 	SchemaVersion uint32                 `protobuf:"varint,8,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
+	// Quality flags (spec 10 §6.2, §6.3, §8, §9).
+	RawMissing           bool `protobuf:"varint,9,opt,name=raw_missing,json=rawMissing,proto3" json:"raw_missing,omitempty"`                                  // the raw payload could not be archived (Garage down, spool full)
+	PublishTimeEstimated bool `protobuf:"varint,10,opt,name=publish_time_estimated,json=publishTimeEstimated,proto3" json:"publish_time_estimated,omitempty"` // the source gives no availability time; publish_time is derived
+	GapFilled            bool `protobuf:"varint,11,opt,name=gap_filled,json=gapFilled,proto3" json:"gap_filled,omitempty"`                                    // re-fetched after a stream gap / outage rather than received live
+	Backfill             bool `protobuf:"varint,12,opt,name=backfill,proto3" json:"backfill,omitempty"`                                                       // produced by a backfill job, not the live connector
 	// Types that are valid to be assigned to Payload:
 	//
 	//	*Envelope_Trade
@@ -133,6 +138,34 @@ func (x *Envelope) GetSchemaVersion() uint32 {
 		return x.SchemaVersion
 	}
 	return 0
+}
+
+func (x *Envelope) GetRawMissing() bool {
+	if x != nil {
+		return x.RawMissing
+	}
+	return false
+}
+
+func (x *Envelope) GetPublishTimeEstimated() bool {
+	if x != nil {
+		return x.PublishTimeEstimated
+	}
+	return false
+}
+
+func (x *Envelope) GetGapFilled() bool {
+	if x != nil {
+		return x.GapFilled
+	}
+	return false
+}
+
+func (x *Envelope) GetBackfill() bool {
+	if x != nil {
+		return x.Backfill
+	}
+	return false
 }
 
 func (x *Envelope) GetPayload() isEnvelope_Payload {
@@ -346,7 +379,7 @@ var File_fa_v1_envelope_proto protoreflect.FileDescriptor
 
 const file_fa_v1_envelope_proto_rawDesc = "" +
 	"\n" +
-	"\x14fa/v1/envelope.proto\x12\x05fa.v1\x1a\x11fa/v1/macro.proto\x1a\x12fa/v1/market.proto\x1a\x11fa/v1/media.proto\x1a\x10fa/v1/text.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xf1\x05\n" +
+	"\x14fa/v1/envelope.proto\x12\x05fa.v1\x1a\x11fa/v1/macro.proto\x1a\x12fa/v1/market.proto\x1a\x11fa/v1/media.proto\x1a\x10fa/v1/text.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x83\a\n" +
 	"\bEnvelope\x12\x19\n" +
 	"\bevent_id\x18\x01 \x01(\tR\aeventId\x12\x1b\n" +
 	"\tsource_id\x18\x02 \x01(\tR\bsourceId\x12#\n" +
@@ -357,7 +390,14 @@ const file_fa_v1_envelope_proto_rawDesc = "" +
 	"\vingest_time\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"ingestTime\x12&\n" +
 	"\araw_ref\x18\a \x01(\v2\r.fa.v1.RawRefR\x06rawRef\x12%\n" +
-	"\x0eschema_version\x18\b \x01(\rR\rschemaVersion\x12$\n" +
+	"\x0eschema_version\x18\b \x01(\rR\rschemaVersion\x12\x1f\n" +
+	"\vraw_missing\x18\t \x01(\bR\n" +
+	"rawMissing\x124\n" +
+	"\x16publish_time_estimated\x18\n" +
+	" \x01(\bR\x14publishTimeEstimated\x12\x1d\n" +
+	"\n" +
+	"gap_filled\x18\v \x01(\bR\tgapFilled\x12\x1a\n" +
+	"\bbackfill\x18\f \x01(\bR\bbackfill\x12$\n" +
 	"\x05trade\x18\x14 \x01(\v2\f.fa.v1.TradeH\x00R\x05trade\x12$\n" +
 	"\x05quote\x18\x15 \x01(\v2\f.fa.v1.QuoteH\x00R\x05quote\x12\x1e\n" +
 	"\x03bar\x18\x16 \x01(\v2\n" +

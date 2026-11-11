@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 
 	"github.com/fey/financial-auto/go/pkg/bus"
 	fav1 "github.com/fey/financial-auto/go/pkg/bus/pb/fa/v1"
 	"github.com/fey/financial-auto/go/pkg/connector"
 	"github.com/fey/financial-auto/go/pkg/tsdb"
+	"github.com/fey/financial-auto/go/pkg/warehouse"
 )
 
 // Pipeline is the per-message path shared by live connectors and backfill
@@ -23,6 +25,11 @@ type Pipeline struct {
 	// SeedGaps returns inst|tf → last bar close for a source (persisted live
 	// watermarks), so the first bar after a restart is checked against the cursor.
 	SeedGaps func(ctx context.Context, source string) map[string]time.Time
+	// NewsSeen de-duplicates news across sources and restarts of a connector by
+	// the normalized-URL key (spec 10 §6.5); nil disables.
+	NewsSeen *connector.Seen
+	// Warehouse writes macro observations to wh.macro_observation (spec 20 §6.1 (b)); nil without -postgres.
+	Warehouse *warehouse.Writer
 }
 
 // Process handles one raw message. It returns the number of envelopes
@@ -34,6 +41,7 @@ func (p *Pipeline) Process(ctx context.Context, log *slog.Logger, c connector.Co
 	if err != nil {
 		p.fail(id, log, "archive", err)
 	}
+	_, nopArchive := p.Archive.(connector.NopArchive)
 	envs, unresolved, err := norm.Normalize(raw)
 	if err != nil {
 		p.fail(id, log, "normalize", err)
@@ -50,15 +58,19 @@ func (p *Pipeline) Process(ctx context.Context, log *slog.Logger, c connector.Co
 	n := 0
 	var newest time.Time
 	for _, e := range envs {
-		if e.RawRef == nil && ref != nil {
-			e.RawRef = ref
+		Finalize(e, ref, !nopArchive, backfill)
+		if n := e.GetNews(); n != nil && p.NewsSeen != nil && !backfill {
+			if !p.NewsSeen.Add(connector.NewsDedupKey(n.GetUrl(), n.GetTitle(), n.GetOutlet(), e.GetEventTime().AsTime())) {
+				p.Counters.Add("dedup."+id, 1)
+				continue
+			}
 		}
 		subj, err := bus.SubjectFor(e, venue)
 		if err != nil {
 			p.Counters.Add("errors."+id, 1)
 			continue
 		}
-		if err := p.Pub.Publish(subj, e); err != nil {
+		if err := p.Pub.PublishWithID(subj, e.EventId, e); err != nil {
 			p.fail(id, log, "publish", err)
 			continue
 		}
@@ -77,10 +89,29 @@ func (p *Pipeline) Process(ctx context.Context, log *slog.Logger, c connector.Co
 			}
 		}
 	}
+	if _, err := p.Warehouse.Write(ctx, envs); err != nil { // nil-safe; idempotent per vintage
+		p.fail(id, log, "warehouse", err)
+	}
 	if p.Health != nil {
 		p.Health.Events(id, n)
 	}
 	return n, newest
+}
+
+// Finalize applies the pipeline's envelope rules (shared by live, backfill and
+// replay so replay reproduces the live bytes): raw ref or raw_missing flag
+// (spec 10 §9, only when an archive is configured), backfill flag, schema
+// version and the deterministic event id (connector.StableEventID).
+func Finalize(e *fav1.Envelope, ref *fav1.RawRef, archiveConfigured, backfill bool) {
+	if e.RawRef == nil && ref != nil {
+		e.RawRef = ref
+	}
+	e.RawMissing = e.RawRef == nil && archiveConfigured
+	e.Backfill = e.Backfill || backfill
+	if e.SchemaVersion == 0 {
+		e.SchemaVersion = 1
+	}
+	e.EventId = connector.StableEventID(e)
 }
 
 func (p *Pipeline) fail(id string, log *slog.Logger, stage string, err error) {
@@ -143,16 +174,41 @@ func (p *Pipeline) Run(ctx context.Context, log *slog.Logger, c connector.Connec
 	return <-errc
 }
 
+// Breaker tunables (spec 10 §7 `breaker.failures_to_open`, `retry.max_backoff`).
+const (
+	BreakerFailuresToOpen = 5
+	RetryMaxBackoff       = 60 * time.Second
+)
+
+// retryWait is the wait after the n-th consecutive failure: exponential from
+// 5 s capped at the poll interval while the breaker is closed, then
+// RetryMaxBackoff (or the interval when longer) once it is open, each with
+// up to 20 % jitter so sources sharing a host do not retry in lockstep.
+func retryWait(n int, interval time.Duration, jitter func() float64) time.Duration {
+	var w time.Duration
+	if n >= BreakerFailuresToOpen {
+		w = max(RetryMaxBackoff, interval)
+	} else {
+		w = min(interval, 5*time.Second<<max(0, n-1))
+	}
+	if jitter != nil {
+		w += time.Duration(float64(w) * 0.2 * jitter())
+	}
+	return w
+}
+
 // pollLoop polls on the connector's schedule. Failures are recorded and
-// retried with exponential backoff (capped at the poll interval, spec 10 §6.3)
-// instead of ending the connector; only ctx stops it.
+// retried with exponential backoff and jitter; after BreakerFailuresToOpen
+// consecutive failures the breaker opens and retries slow to
+// RetryMaxBackoff (spec 10 §6.3) instead of ending the connector; only ctx
+// stops it.
 func (p *Pipeline) pollLoop(ctx context.Context, id string, poller connector.Poller, out chan<- connector.RawMessage) error {
 	interval := poller.Schedule().Interval
 	if interval <= 0 {
 		interval = time.Minute
 	}
 	since := time.Now().UTC()
-	backoff := time.Duration(0)
+	failures := 0
 	for {
 		msgs, err := poller.Poll(ctx, connector.PollRequest{Since: since})
 		if ctx.Err() != nil {
@@ -164,14 +220,13 @@ func (p *Pipeline) pollLoop(ctx context.Context, id string, poller connector.Pol
 			if p.Health != nil {
 				p.Health.Error(id, err)
 			}
-			if backoff == 0 {
-				backoff = min(interval, 5*time.Second)
-			} else {
-				backoff = min(interval, backoff*2)
+			failures++
+			if failures == BreakerFailuresToOpen {
+				p.Counters.Add("breaker_open."+id, 1)
 			}
-			wait = backoff
+			wait = retryWait(failures, interval, rand.Float64)
 		} else {
-			backoff = 0
+			failures = 0
 			since = time.Now().UTC()
 			if p.Health != nil {
 				p.Health.Activity(id)

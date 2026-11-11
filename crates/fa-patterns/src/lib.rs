@@ -2,17 +2,30 @@
 //!
 //! [`online`] holds the streaming leader-clustering baseline (`OnlineRegionSet`) that the
 //! live runtime uses for region discovery and membership until the family-specific
-//! density/Mapper methods exist.
+//! density/Mapper methods exist. [`lineage`] aligns region sets across refits (Hungarian
+//! matching on probe overlap, [`hungarian`]) and classifies carry / split / merge / birth /
+//! death; [`region_map`] stores the result per snapshot. [`hierarchy`] estimates the
+//! cross-timescale `REFINES` edges, [`drift`] the occupancy drift monitor, and [`conformance`]
+//! is the shared test every `RegionDiscovery` implementation must pass (spec 30 §9.1).
 
+pub mod conformance;
+pub mod drift;
+pub mod hierarchy;
+pub mod hungarian;
+pub mod lineage;
 pub mod online;
 pub mod region_map;
 
-use std::collections::HashMap;
-
+pub use drift::{DriftMonitor, DriftReport};
+pub use hierarchy::{HierEdge, HierarchyCfg, HierarchyTracker, HierarchyUpdate};
+pub use lineage::{AlignCfg, Alignment, Descent, DescentKind, align};
 pub use online::{
-    Assignment, LeaderClustering, OnlineRegionCfg, OnlineRegionDiscovery, OnlineRegionSet, RegionLifecycle,
+    Assignment, LeaderClustering, OnlineRegionCfg, OnlineRegionDiscovery, OnlineRegionSet, RegionLifecycle, RegionStat,
+    RetireReason,
 };
-pub use region_map::{AlignInput, ExpertRegionMap, FittedRegion, ParentIds, RegionMap, align_expert};
+pub use region_map::{
+    AlignInput, Ancestor, ExpertRegionMap, FittedRegion, ParentIds, RegionMap, align_expert, align_expert_with,
+};
 use serde::{Deserialize, Serialize};
 
 pub type RegionId = String;
@@ -75,48 +88,30 @@ pub struct RegionMatch {
 }
 
 /// Probe-set alignment (D-007 fallback): a fixed set of probe windows is assigned to
-/// regions under the old and the new snapshot. Regions are matched by maximising the
-/// Jaccard overlap of their probe sets (greedy, highest overlap first). Pairs below
-/// `min_score` are left unmatched and get a new lineage.
+/// regions under the old and the new snapshot, and regions are matched by **Hungarian
+/// assignment** on the Jaccard overlap of their probe sets (only pairs at or above `min_score`
+/// take part). Matched new regions carry the old identity; every other new region that holds a
+/// probe is returned with `old_index: None` (new lineage). Splits, merges, births and deaths
+/// are in [`lineage::align`].
 pub fn align_by_probes(old_assign: &[Option<usize>], new_assign: &[Option<usize>], min_score: f64) -> Vec<RegionMatch> {
-    assert_eq!(old_assign.len(), new_assign.len(), "probe sets must be the same windows");
-    let mut old_sets: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut new_sets: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (w, (o, n)) in old_assign.iter().zip(new_assign).enumerate() {
-        if let Some(o) = o {
-            old_sets.entry(*o).or_default().push(w);
-        }
-        if let Some(n) = n {
-            new_sets.entry(*n).or_default().push(w);
-        }
+    let n_new = new_assign.iter().flatten().map(|i| i + 1).max().unwrap_or(0);
+    let cfg = AlignCfg { carry_threshold: min_score, ..AlignCfg::default() };
+    let a = lineage::align(old_assign, new_assign, n_new, &cfg);
+    let mut held = vec![false; n_new];
+    for n in new_assign.iter().flatten() {
+        held[*n] = true;
     }
-    let mut pairs = Vec::new();
-    for (&n, ns) in &new_sets {
-        for (&o, os) in &old_sets {
-            let inter = ns.iter().filter(|w| os.contains(w)).count();
-            if inter > 0 {
-                let union = ns.len() + os.len() - inter;
-                pairs.push((inter as f64 / union as f64, n, o));
-            }
-        }
-    }
-    pairs.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    let mut used_new = std::collections::HashSet::new();
-    let mut used_old = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for (score, n, o) in pairs {
-        if score < min_score || used_new.contains(&n) || used_old.contains(&o) {
-            continue;
-        }
-        used_new.insert(n);
-        used_old.insert(o);
-        out.push(RegionMatch { new_index: n, old_index: Some(o), score });
-    }
-    let mut unmatched: Vec<usize> = new_sets.keys().copied().filter(|n| !used_new.contains(n)).collect();
-    unmatched.sort_unstable();
-    out.extend(unmatched.into_iter().map(|n| RegionMatch { new_index: n, old_index: None, score: 0.0 }));
-    out.sort_by_key(|m| m.new_index);
-    out
+    (0..n_new)
+        .filter(|&n| held[n])
+        .map(|n| match a.carried[n] {
+            Some(o) => RegionMatch {
+                new_index: n,
+                old_index: Some(o),
+                score: a.descents.iter().find(|d| d.new_index == n && d.old_index == o).map_or(0.0, |d| d.overlap),
+            },
+            None => RegionMatch { new_index: n, old_index: None, score: 0.0 },
+        })
+        .collect()
 }
 
 #[cfg(test)]

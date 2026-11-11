@@ -6,6 +6,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
 fa-core.workspace = true
 fa-expert-space.workspace = true
 serde.workspace = true
@@ -15,8 +17,11 @@ thiserror.workspace = true
 [lints]
 workspace = true
 
-# ML backends are opt-in (D-004).
+# The neural families (`neural`) always build on candle's CPU backend (ADR 0003, pure Rust).
+# `cuda` moves training/serving onto a CUDA device when one is present (off by default: no GPU
+# on the dev host). `burn` / `candle` are kept as no-op markers for older build scripts.
 [features]
 default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
 burn = []
 candle = []

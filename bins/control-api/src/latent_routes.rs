@@ -524,7 +524,7 @@ async fn checklist_for(
 ) -> (Checklist, Option<Value>, &'static str) {
     let (manifest, source) = snapshot_manifest(s, row).await;
     let counters = runtime_counters(s);
-    let c = promotion_checklist(
+    let mut c = promotion_checklist(
         &row.snapshot_id,
         &row.timescale,
         carried_mass_of(row, manifest.as_ref()),
@@ -532,12 +532,71 @@ async fn checklist_for(
         representation_break,
         PromotionThresholds::from_env(),
     );
+    // Items 1 and 2 for snapshots whose trainer measured them (the neural families).
+    if let Some(m) = manifest.as_ref() {
+        let extra = manifest_health_checks(m);
+        if !extra.is_empty() {
+            c.checks.extend(extra);
+            c.passed = c.checks.iter().all(|x| x.ok);
+        }
+    }
     (c, manifest, source)
 }
 
+/// Spec 36 §6.4 items 1 (`ssl_regression`: next-step skill not worse than the parent by more than
+/// `FA_PROMOTE_REGRESS_TOL`, default 0.02) and 2 (expert-space health, spec 32 §6.4: `K_eff ≥
+/// FA_PROMOTE_MIN_K_EFF` (2), max off-diagonal residual correlation ≤ `FA_PROMOTE_MAX_RESID_CORR`
+/// (0.1), every expert's skill ≥ `FA_PROMOTE_MIN_SKILL` (0.02)) from the validation metrics the
+/// trainer writes into `manifest.metrics` for neural snapshots. A metric that is absent yields no
+/// check (the statistical family has neither; a neural child of a statistical parent has no
+/// `ssl_regression`).
+pub fn manifest_health_checks(manifest: &Value) -> Vec<Check> {
+    let env = |k: &str, d: f64| {
+        std::env::var(k).ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite()).unwrap_or(d)
+    };
+    let metric = |k: &str| manifest["metrics"][k].as_f64();
+    let mut out = Vec::new();
+    if let Some(r) = metric("ssl_regression") {
+        let tol = env("FA_PROMOTE_REGRESS_TOL", 0.02);
+        out.push(Check {
+            name: "ssl_regression",
+            ok: r <= tol,
+            value: Some(r),
+            threshold: Some(tol),
+            detail: format!(
+                "parent mixture skill {:.3} − candidate {:.3} on the same validation windows",
+                metric("parent_mix_skill").unwrap_or(f64::NAN),
+                metric("mix_skill").unwrap_or(f64::NAN)
+            ),
+        });
+    }
+    for (name, key, th, at_least, what) in [
+        ("expert_k_eff", "k_eff", env("FA_PROMOTE_MIN_K_EFF", 2.0), true, "effective independent experts (spec 32 §6.4)"),
+        (
+            "expert_resid_corr",
+            "resid_corr_max",
+            env("FA_PROMOTE_MAX_RESID_CORR", 0.1),
+            false,
+            "max |corr| of expert residuals on validation",
+        ),
+        ("expert_min_skill", "skill_min", env("FA_PROMOTE_MIN_SKILL", 0.02), true, "weakest expert's skill vs naive"),
+    ] {
+        if let Some(v) = metric(key) {
+            out.push(Check {
+                name,
+                ok: if at_least { v >= th } else { v <= th },
+                value: Some(v),
+                threshold: Some(th),
+                detail: format!("manifest.metrics.{key}: {what}"),
+            });
+        }
+    }
+    out
+}
+
 const NOT_EVALUATED: [&str; 4] = [
-    "1 ssl_regression (no SSL loss for the statistical family)",
-    "2 expert_space_health (K_eff / residual correlation not computed per snapshot)",
+    "1 ssl_regression (statistical family / statistical parent: no SSL loss; neural snapshots add the check)",
+    "2 expert_space_health (statistical family; neural snapshots add expert_k_eff / expert_resid_corr / expert_min_skill)",
     "4 mcmc_ece (no ECE producer yet)",
     "5 elite_transfer (elites not re-evaluated on candidates yet)",
 ];
@@ -1224,5 +1283,20 @@ mod tests {
             call(Request::post(format!("/api/latent/snapshots/{id}/shadow")).body(Body::empty()).unwrap()).await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
         assert_eq!(v["runtime"]["error"], "nats_unavailable");
+    }
+
+    #[test]
+    fn neural_manifest_adds_ssl_and_health_checks() {
+        let stat = json!({ "metrics": { "carried_mass": 0.7 } });
+        assert!(manifest_health_checks(&stat).is_empty(), "statistical manifests add nothing");
+        let neural = json!({ "metrics": {
+            "ssl_regression": 0.01, "parent_mix_skill": 0.3, "mix_skill": 0.29,
+            "k_eff": 2.6, "resid_corr_max": 0.4, "skill_min": 0.05
+        }});
+        let c = manifest_health_checks(&neural);
+        let by = |n: &str| c.iter().find(|x| x.name == n).unwrap().ok;
+        assert_eq!(c.len(), 4);
+        assert!(by("ssl_regression") && by("expert_k_eff") && by("expert_min_skill"));
+        assert!(!by("expert_resid_corr"), "0.4 > 0.1 target");
     }
 }

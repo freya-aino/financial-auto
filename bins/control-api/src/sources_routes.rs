@@ -378,6 +378,11 @@ async fn quarantine_resolve(
             {
                 tracing::warn!(error = %e, "audit append failed");
             }
+            // spec 12 §6: caches (ingestor resolver, risk-engine RefTable) reload on ref.changed.*
+            if let Some(nats) = &s.nats {
+                let n = fa_bus::ingest::ref_changed_notice("instrument", vec![prov.to_string()], "quarantine_resolved", ACTOR);
+                let _ = nats.publish(subjects::ref_changed("instrument"), n.encode_to_vec().into()).await;
+            }
             Json(json!({ "ok": true, "instrument_id": out.instrument_id, "merged_from": out.merged_from,
                 "action": out.action, "quarantine_rows": out.quarantine_rows }))
             .into_response()

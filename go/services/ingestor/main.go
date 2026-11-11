@@ -13,11 +13,17 @@
 //	ctl.ingest.backfill args: source, timescale, start, end, instruments (comma list)
 //	                    enqueues a jobs.ingest.backfill Job; reply message = job id
 //	ctl.ingest.status   (no args)      reply message = JSON {running, health, cursors, ...}
+//	ctl.ingest.replay   source, start, end (RFC 3339), mode=verify|publish
+//	                    re-normalizes the Garage raw archive; reply = JSON digest
+//	                    (publish re-emits on replay.<subject>, core NATS only)
 //
-// Health (JSON, D-054): ingest.health.<source> every 5 s per running connector,
+// Health (fa.v1 IngestHealth/IngestGap/IngestUnresolved; legacy JSON with
+// -health-json): ingest.health.<source> every 5 s per running connector,
 // ingest.gap.<source> on bar gaps, ingest.unresolved.<source> on provisioned or
-// unresolvable symbols; risk.halt.source:<id> / risk.resume.source:<id> when a
-// source goes down unexpectedly and recovers.
+// unresolvable symbols; risk.halt.source:<id> / risk.resume.source:<id>
+// (fa.v1 Resume) when a source goes down unexpectedly and recovers;
+// ref.changed.instrument on provisioning and catalog.changed.<id> on
+// enable/disable (fa.v1 RefChanged).
 //
 // Error replies carry a prefix control-api maps to HTTP: `not_found:` (404),
 // `conflict:` (409, already running / not running / status disabled|planned),
@@ -40,6 +46,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/oklog/ulid/v2"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/fey/financial-auto/go/pkg/archive"
 	"github.com/fey/financial-auto/go/pkg/bus"
@@ -48,12 +55,18 @@ import (
 	"github.com/fey/financial-auto/go/pkg/connector"
 	"github.com/fey/financial-auto/go/pkg/refdata"
 	"github.com/fey/financial-auto/go/pkg/tsdb"
+	"github.com/fey/financial-auto/go/pkg/warehouse"
 
+	_ "github.com/fey/financial-auto/go/connectors/ecb"
+	_ "github.com/fey/financial-auto/go/connectors/frankfurter"
+	_ "github.com/fey/financial-auto/go/connectors/gdelt"
 	_ "github.com/fey/financial-auto/go/connectors/googlenews"
 	_ "github.com/fey/financial-auto/go/connectors/hackernews"
 	"github.com/fey/financial-auto/go/connectors/heartbeat"
+	_ "github.com/fey/financial-auto/go/connectors/kraken"
 	_ "github.com/fey/financial-auto/go/connectors/lemon"
 	_ "github.com/fey/financial-auto/go/connectors/oanda"
+	_ "github.com/fey/financial-auto/go/connectors/secedgar"
 	_ "github.com/fey/financial-auto/go/connectors/yahoo"
 )
 
@@ -75,6 +88,8 @@ func main() {
 	garageURL := flag.String("garage", env("FA_GARAGE_URL", ""), "Garage S3 endpoint for the raw archive, e.g. http://127.0.0.1:3900 (empty disables)")
 	secretsPath := flag.String("secrets", env("FA_SECRETS", "config/secrets.toml"), "secrets file (D-020); FA_<SOURCE>_<KEY> env vars override")
 	hbEvery := flag.Duration("heartbeat", 5*time.Second, "service heartbeat interval")
+	healthJSON := flag.Bool("health-json", env("FA_INGEST_HEALTH_JSON", "") == "1", "publish ingest.health|gap|unresolved as the legacy D-054 JSON instead of fa.v1 protos")
+	spoolDir := flag.String("spool-dir", env("FA_ARCHIVE_SPOOL", ""), "local spool for raw-archive batches while Garage is unreachable (spec 10 §8; empty disables)")
 	metricsBind := flag.String("metrics", bus.MetricsBindDefault(service), "Prometheus GET /metrics bind (FA_METRICS_BIND; off disables)")
 	flag.Parse()
 
@@ -114,6 +129,8 @@ func main() {
 				counters.Set("tsdb.written", float64(st.Written))
 				counters.Set("tsdb.errors", float64(st.Errors))
 				counters.Set("tsdb.dropped", float64(st.Dropped))
+				counters.Set("tsdb.aggregated", float64(st.Aggregated))
+				counters.Set("tsdb.late", float64(st.Late))
 				select {
 				case <-ctx.Done():
 					return
@@ -132,13 +149,15 @@ func main() {
 	// Raw archive: Garage when an endpoint and credentials exist, else discard.
 	var arch connector.RawArchive = connector.NopArchive{}
 	var archWriter *archive.Writer
+	var archStore *archive.S3Store
 	if *garageURL != "" {
 		st, err := archive.NewS3(archive.Options{Endpoint: *garageURL, AccessKey: secrets.Get("garage", "access_key_id"), SecretKey: secrets.Get("garage", "secret_access_key")})
 		if err != nil {
 			log.Error("garage", "err", err)
 			os.Exit(1)
 		}
-		archWriter = archive.NewWriter(st, archive.WriterOptions{})
+		archStore = st
+		archWriter = archive.NewWriter(st, archive.WriterOptions{SpoolDir: *spoolDir})
 		go archWriter.Run(ctx, func(err error) { log.Warn("archive", "err", err) })
 		arch = archWriter
 	}
@@ -147,6 +166,7 @@ func main() {
 	// (which only knows what connectors add themselves — nothing, so every
 	// market symbol would be unresolved; the heartbeat connector needs none).
 	health := NewTracker(pub, func(msg string, args ...any) { log.Info(msg, args...) })
+	health.JSON = *healthJSON
 	go health.Run(ctx, HealthInterval)
 
 	var resolver connector.SymbolResolver = connector.NewStaticResolver()
@@ -157,7 +177,10 @@ func main() {
 	var store *refdata.Store
 	var seedGaps func(context.Context, string) map[string]time.Time
 	if *pgURL != "" {
-		store, err = refdata.Open(ctx, *pgURL)
+		// After a host reboot the Docker daemon restarts every container at once and ignores
+		// depends_on, so Postgres may still be starting: retry with backoff (spec 60 §8).
+		store, err = retryOpen(ctx, 60*time.Second, func(c context.Context) (*refdata.Store, error) { return refdata.Open(c, *pgURL) },
+			func(err error, wait time.Duration) { log.Warn("postgres not ready, retrying", "err", err, "in", wait) })
 		if err != nil {
 			log.Error("postgres", "err", err)
 			os.Exit(1)
@@ -177,8 +200,15 @@ func main() {
 		r.OnProvision = func(source, symbol, id string) {
 			counters.Add("provisioned."+source, 1)
 			health.PublishUnresolved(UnresolvedEvent{Source: source, VenueSymbol: symbol, InstrumentID: id, Reason: "provisioned as provisional instrument; review in quarantine", At: time.Now().UTC()})
+			// spec 12 §6 change propagation: caches (risk-engine RefTable) reload on ref.changed.*
+			_ = pub.Publish(bus.RefChanged("instrument"), &fav1.RefChanged{Entity: "instrument", Ids: []string{id}, Change: "provisioned",
+				At: timestamppb.Now(), Actor: "system:ingestor", SourceId: source, Attrs: map[string]string{"venue_symbol": symbol}})
 		}
 		resolver = r
+		// spec 12 §6: reference changes (quarantine merge, symbol change, overrides) invalidate the cache
+		if _, err := pub.NC.Subscribe(bus.RefChanged(">"), func(*nats.Msg) { r.Invalidate(); counters.Add("refdata.invalidations", 1) }); err != nil {
+			log.Warn("ref.changed subscription", "err", err)
+		}
 		cursors = refdata.NewCursors(store)
 		backfillCursors = refdata.NewBackfillCursors(store)
 		runLog = refdata.NewRunLog(store)
@@ -222,7 +252,10 @@ func main() {
 			Cursors:  cursors,
 		}
 	}
-	pipe := &Pipeline{Pub: pub, Writer: writer, Archive: arch, Counters: counters, Health: health, SeedGaps: seedGaps}
+	pipe := &Pipeline{Pub: pub, Writer: writer, Archive: arch, Counters: counters, Health: health, SeedGaps: seedGaps, NewsSeen: connector.NewSeen(50_000)}
+	if store != nil {
+		pipe.Warehouse = warehouse.NewWriter(store.Pool) // macro vintages → wh.macro_observation
+	}
 	sup := NewSupervisor(cat, log, counters, deps, pipe.Run)
 	sup.Secrets = secrets.ForSource
 	sup.RunLog = runLog
@@ -244,6 +277,10 @@ func main() {
 				counters.Set("archive.messages", float64(st.Messages))
 				counters.Set("archive.objects", float64(st.Objects))
 				counters.Set("archive.errors", float64(st.Errors))
+				counters.Set("archive.spooled", float64(st.Spooled))
+				counters.Set("archive.respooled", float64(st.Respooled))
+				counters.Set("archive.raw_missing", float64(st.Dropped))
+				counters.Set("archive.spool_bytes", float64(st.SpoolBytes))
 				select {
 				case <-ctx.Done():
 					return
@@ -302,6 +339,7 @@ func main() {
 		if err != nil {
 			return "", err
 		}
+		catalogChanged(pub, id, "live", r.Args["actor"])
 		if started {
 			return "enabled and started " + id, nil
 		}
@@ -313,6 +351,7 @@ func main() {
 		if err != nil {
 			return "", err
 		}
+		catalogChanged(pub, id, "disabled", r.Args["actor"])
 		if stopped {
 			return "disabled and stopped " + id, nil
 		}
@@ -328,6 +367,21 @@ func main() {
 		}
 		raw, _ := json.Marshal(spec)
 		return backfiller.Enqueue(ctx, raw)
+	})
+	var replayStore archive.ReadStore
+	if archStore != nil {
+		replayStore = archStore
+	}
+	replayer := &Replayer{Sup: sup, Store: replayStore, Pub: pub}
+	handle("replay", func(r *fav1.CtlRequest) (string, error) {
+		rctx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+		defer cancel()
+		res, err := replayer.Replay(rctx, r.Args)
+		if err != nil {
+			return "", err
+		}
+		b, err := json.Marshal(res)
+		return string(b), err
 	})
 	handle("status", func(*fav1.CtlRequest) (string, error) {
 		st := map[string]any{"running": sup.Running(), "connectors": connector.Registered(), "health": health.Frames()}
@@ -363,4 +417,13 @@ func main() {
 		fcancel()
 	}
 	log.Info("stopped")
+}
+
+// catalogChanged publishes `catalog.changed.<id>` (spec 11 §4) after a status change.
+func catalogChanged(pub *bus.Publisher, id, status, actor string) {
+	if actor == "" {
+		actor = "ctl"
+	}
+	_ = pub.Publish(bus.CatalogChanged(id), &fav1.RefChanged{Entity: "source", Ids: []string{id}, Change: "status",
+		At: timestamppb.Now(), Actor: actor, SourceId: id, Attrs: map[string]string{"status": status}})
 }

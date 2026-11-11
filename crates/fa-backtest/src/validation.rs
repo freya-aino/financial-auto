@@ -49,6 +49,10 @@ pub struct GenerationStats {
     pub pbo: f64,
     pub pbo_blocks: usize,
     pub pbo_trials: usize,
+    /// Effective number of independent trials behind `expected_max_sharpe` ([`effective_trials`]);
+    /// equals `n_trials` when the block returns are unknown or uncorrelated.
+    #[serde(default)]
+    pub effective_trials: f64,
 }
 
 /// Compresses `returns` into exactly `n_blocks` consecutive block sums (empty blocks = 0).
@@ -95,6 +99,47 @@ pub fn deflated_sharpe_summary(sharpe: f64, n_obs: usize, skew: f64, kurt: f64, 
     stats::norm_cdf((sharpe - sr_benchmark) * ((n_obs - 1) as f64).sqrt() / denom)
 }
 
+/// Effective number of independent trials (spec 41 §6.5, "effective number of trials from the
+/// correlation of trial returns"): `N / (1 + (N − 1)·ρ̄)`, with ρ̄ the mean pairwise
+/// correlation of the trials' block returns (negative means count as 0), in `[1, N]`. Trials
+/// with fewer than 3 blocks or constant returns are left out of ρ̄. A population of near-copies
+/// (one program with jittered constants) counts as few trials, so its best member is deflated
+/// against a lower expected maximum than `N` independent trials would give.
+pub fn effective_trials(returns: &[&[f64]]) -> f64 {
+    let n = returns.len();
+    if n < 2 {
+        return n.max(1) as f64;
+    }
+    let usable: Vec<&[f64]> = returns.iter().copied().filter(|r| r.len() >= 3 && sample_var(r) > 0.0).collect();
+    let (mut sum, mut pairs) = (0.0, 0usize);
+    for i in 0..usable.len() {
+        for j in i + 1..usable.len() {
+            let len = usable[i].len().min(usable[j].len());
+            let c = stats_corr(&usable[i][..len], &usable[j][..len]);
+            if c.is_finite() {
+                sum += c;
+                pairs += 1;
+            }
+        }
+    }
+    if pairs == 0 {
+        return n as f64;
+    }
+    let rho = (sum / pairs as f64).clamp(0.0, 1.0);
+    (n as f64 / (1.0 + (n as f64 - 1.0) * rho)).clamp(1.0, n as f64)
+}
+
+fn stats_corr(a: &[f64], b: &[f64]) -> f64 {
+    let (ma, mb) = (stats::mean(a), stats::mean(b));
+    let (mut sab, mut saa, mut sbb) = (0.0, 0.0, 0.0);
+    for (x, y) in a.iter().zip(b) {
+        sab += (x - ma) * (y - mb);
+        saa += (x - ma).powi(2);
+        sbb += (y - mb).powi(2);
+    }
+    if saa <= 0.0 || sbb <= 0.0 { f64::NAN } else { sab / (saa * sbb).sqrt() }
+}
+
 /// Statistics over `trials` (see module docs). `pbo_blocks` must be even and ≥ 2.
 pub fn generation_stats(trials: &[Trial], pbo_blocks: usize) -> GenerationStats {
     let finite: Vec<&Trial> = trials.iter().filter(|t| t.sharpe.is_finite()).collect();
@@ -103,7 +148,14 @@ pub fn generation_stats(trials: &[Trial], pbo_blocks: usize) -> GenerationStats 
     let sharpe_mean = if sharpes.is_empty() { 0.0 } else { stats::mean(&sharpes) };
     let sharpe_var = sample_var(&sharpes);
     let best = finite.iter().copied().max_by(|a, b| a.sharpe.total_cmp(&b.sharpe));
-    let expected_max = if n_trials >= 2 { stats::expected_max_sharpe(n_trials, sharpe_var) } else { 0.0 };
+    let rets: Vec<&[f64]> = finite.iter().map(|t| t.returns.as_slice()).collect();
+    // trials without a finite Sharpe still count as tested
+    let n_eff = (effective_trials(&rets) + (n_trials - finite.len()) as f64).min(n_trials as f64).max(1.0);
+    let expected_max = if n_trials >= 2 && n_eff >= 2.0 {
+        stats::expected_max_sharpe(n_eff.round() as usize, sharpe_var)
+    } else {
+        0.0
+    };
     let deflated = best.map_or(f64::NAN, |b| {
         let (skew, kurt) = skew_kurt(&b.returns);
         deflated_sharpe_summary(b.sharpe, b.n_obs, skew, kurt, expected_max)
@@ -128,6 +180,7 @@ pub fn generation_stats(trials: &[Trial], pbo_blocks: usize) -> GenerationStats 
         pbo,
         pbo_blocks,
         pbo_trials: eligible.len(),
+        effective_trials: if n_trials == 0 { 0.0 } else { n_eff },
     }
 }
 
@@ -171,6 +224,33 @@ mod tests {
         assert_eq!(s.best_candidate.as_deref(), Some("edge"));
         assert!(s.deflated_sharpe > 0.99, "{s:?}");
         assert!(s.pbo < 0.1 && s.pbo < noise_pbo, "{s:?}");
+    }
+
+    #[test]
+    fn correlated_trials_count_as_fewer() {
+        let base: Vec<f64> = (0..64).map(|i| ((i * 7919) % 13) as f64 - 6.0).collect();
+        let copies: Vec<Vec<f64>> =
+            (0..10).map(|k| base.iter().map(|x| x * (1.0 + k as f64 * 0.01)).collect()).collect();
+        let refs: Vec<&[f64]> = copies.iter().map(Vec::as_slice).collect();
+        assert!((effective_trials(&refs) - 1.0).abs() < 1e-6, "ten rescaled copies are one trial");
+        let noise: Vec<Trial> = (0..30).map(|i| trial(&format!("n{i}"), 200 + i as u64, 0.0)).collect();
+        let refs: Vec<&[f64]> = noise.iter().map(|t| t.returns.as_slice()).collect();
+        let n_eff = effective_trials(&refs);
+        assert!(n_eff > 20.0 && n_eff <= 30.0, "independent noise ≈ N: {n_eff}");
+        assert_eq!(effective_trials(&[]), 1.0);
+        assert_eq!(effective_trials(&[&[], &[]]), 2.0, "unknown returns → N");
+        // a population of near-copies is deflated less than N independent trials would be
+        let mut near: Vec<Trial> = (0..20)
+            .map(|k| {
+                let mut t = trial("x", 9, 0.002);
+                t.candidate = format!("c{k}");
+                t.sharpe += k as f64 * 1e-4;
+                t
+            })
+            .collect();
+        near.push(trial("y", 10, 0.0));
+        let s = generation_stats(&near, PBO_BLOCKS);
+        assert!(s.effective_trials < 3.0, "{s:?}");
     }
 
     #[test]

@@ -14,7 +14,7 @@ use fa_risk::strategy::{Checklist, StrategyState, StrategyStatus};
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use crate::engine::{BookedFill, SubBookRecord};
+use crate::engine::{BookedFill, Evidence, RiskRecord, SubBookRecord};
 
 pub const ACTOR: &str = "system:risk-engine";
 /// Cash differences below this are not reported by the reconciliation pass.
@@ -103,13 +103,14 @@ impl Persist {
     pub async fn strategy_state(&self, s: &StrategyState, book: Option<&SubBookRecord>, gate: Option<&Checklist>) {
         let r = sqlx::query(
             "INSERT INTO ledger.strategy_state (strategy_id, status, prev_status, since, first_seen, shadow_since, \
-             horizons_completed, sleeve_eur, pnl_eur, peak_pnl_eur, max_drawdown, gate, book, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now()) \
+             horizons_completed, sleeve_eur, pnl_eur, peak_pnl_eur, max_drawdown, gate, book, pipeline, last_reason, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now()) \
              ON CONFLICT (strategy_id) DO UPDATE SET status = EXCLUDED.status, prev_status = EXCLUDED.prev_status, \
              since = EXCLUDED.since, shadow_since = EXCLUDED.shadow_since, horizons_completed = EXCLUDED.horizons_completed, \
              sleeve_eur = EXCLUDED.sleeve_eur, pnl_eur = EXCLUDED.pnl_eur, peak_pnl_eur = EXCLUDED.peak_pnl_eur, \
              max_drawdown = EXCLUDED.max_drawdown, gate = COALESCE(EXCLUDED.gate, ledger.strategy_state.gate), \
-             book = COALESCE(EXCLUDED.book, ledger.strategy_state.book), updated_at = now()",
+             book = COALESCE(EXCLUDED.book, ledger.strategy_state.book), \
+             pipeline = COALESCE(EXCLUDED.pipeline, ledger.strategy_state.pipeline), last_reason = EXCLUDED.last_reason, updated_at = now()",
         )
         .bind(&s.strategy_id)
         .bind(s.status.as_str())
@@ -124,6 +125,8 @@ impl Persist {
         .bind(s.max_drawdown)
         .bind(gate.and_then(|g| serde_json::to_value(g).ok()))
         .bind(book.and_then(|b| serde_json::to_value(b).ok()))
+        .bind(s.pipeline.as_ref().and_then(|p| serde_json::to_value(p).ok()))
+        .bind(&s.last_reason)
         .execute(self.pg.pool())
         .await;
         if let Err(e) = r {
@@ -136,7 +139,8 @@ impl Persist {
         let rows = match sqlx::query(
             "SELECT strategy_id, status, prev_status, since, first_seen, shadow_since, horizons_completed, \
              sleeve_eur::float8 AS sleeve_eur, pnl_eur::float8 AS pnl_eur, peak_pnl_eur::float8 AS peak_pnl_eur, \
-             max_drawdown::float8 AS max_drawdown, to_jsonb(s) -> 'book' AS book FROM ledger.strategy_state s",
+             max_drawdown::float8 AS max_drawdown, to_jsonb(s) -> 'book' AS book, to_jsonb(s) -> 'pipeline' AS pipeline, \
+             to_jsonb(s) ->> 'last_reason' AS last_reason FROM ledger.strategy_state s",
         )
         .fetch_all(self.pg.pool())
         .await
@@ -172,7 +176,11 @@ impl Persist {
                     pnl_eur: r.get("pnl_eur"),
                     peak_pnl_eur: r.get("peak_pnl_eur"),
                     max_drawdown: r.get("max_drawdown"),
-                    last_reason: String::new(),
+                    last_reason: r.get::<Option<String>, _>("last_reason").unwrap_or_default(),
+                    pipeline: r
+                        .get::<Option<Value>, _>("pipeline")
+                        .filter(|v| !v.is_null())
+                        .and_then(|v| serde_json::from_value(v).ok()),
                 };
                 Some((st, book))
             })
@@ -240,58 +248,232 @@ impl Persist {
         Ok(q.quota_eur)
     }
 
-    /// Latest deflated Sharpe for a strategy (promotion gate item 2). Two sources, in order:
-    /// `validation.trial(strategy_id, deflated_sharpe)` when the validation workstream adds
-    /// per-strategy rows, else `validation.generation_stats(best_candidate, deflated_sharpe)` —
-    /// the DSR corrects the *selected* candidate of a generation, so it applies to a strategy
-    /// only when it is that generation's best candidate (matched by strategy id or genome id).
-    /// `None` when neither table/column exists or no row matches: the gate reports "unknown"
-    /// and refuses to promote.
-    pub async fn deflated_sharpe(&self, ids: &[&str]) -> Option<f64> {
-        let cols = |table: &'static str| async move {
-            sqlx::query_scalar::<_, String>(
-                "SELECT column_name::text FROM information_schema.columns WHERE table_schema = 'validation' AND table_name = $1",
-            )
-            .bind(table)
-            .fetch_all(self.pg.pool())
-            .await
-            .unwrap_or_default()
-        };
-        let has = |cols: &[String], c: &str| cols.iter().any(|x| x == c);
+    /// Gate evidence for a strategy (spec 40 §6.6 items 2 and 3):
+    /// - **deflated Sharpe**: the strategy's latest holdout trial (`validation.trial`, `kind =
+    ///   holdout`, matched by genome text or `{ id = "<id>"` prefix), else the DSR of a
+    ///   generation whose best candidate it is (`validation.generation_stats`);
+    /// - **PBO**: the latest loop of the strategy's generation.
+    ///
+    /// `None` fields are unknown and block promotion.
+    pub async fn evidence(&self, ids: &[&str], genome: Option<&str>, generation: Option<&str>) -> Evidence {
         let ids: Vec<String> = ids.iter().filter(|s| !s.is_empty()).map(|s| (*s).to_owned()).collect();
-        if ids.is_empty() {
-            return None;
+        let mut exact: Vec<String> = ids.clone();
+        if let Some(g) = genome.filter(|g| !g.is_empty()) {
+            exact.push(g.to_owned());
         }
-        let trial = cols("trial").await;
-        if has(&trial, "strategy_id") && has(&trial, "deflated_sharpe") {
-            let order = ["evaluated_at", "created_at", "at"].iter().find(|c| has(&trial, c));
-            let sql = match order {
-                Some(c) => format!(
-                    "SELECT deflated_sharpe::float8 FROM validation.trial WHERE strategy_id = ANY($1) AND deflated_sharpe IS NOT NULL ORDER BY {c} DESC LIMIT 1"
-                ),
-                None => "SELECT deflated_sharpe::float8 FROM validation.trial WHERE strategy_id = ANY($1) AND deflated_sharpe IS NOT NULL LIMIT 1".into(),
-            };
-            // the only dynamic part is a column name from the whitelist above
-            if let Ok(Some(v)) =
-                sqlx::query_scalar::<_, f64>(sqlx::AssertSqlSafe(sql)).bind(&ids).fetch_optional(self.pg.pool()).await
-            {
-                return Some(v);
-            }
+        let prefixes: Vec<String> = ids.iter().map(|id| format!("{{ id = \"{id}\"%")).collect();
+        let mut ev = Evidence::default();
+        if exact.is_empty() {
+            return ev;
         }
-        let stats = cols("generation_stats").await;
-        if has(&stats, "best_candidate") && has(&stats, "deflated_sharpe") {
-            let order = if has(&stats, "computed_at") { "ORDER BY computed_at DESC " } else { "" };
-            let sql = format!(
-                "SELECT deflated_sharpe::float8 FROM validation.generation_stats WHERE best_candidate = ANY($1) AND deflated_sharpe IS NOT NULL {order}LIMIT 1"
+        ev.deflated_sharpe = sqlx::query_scalar::<_, Option<f64>>(
+            "SELECT (objectives->>'deflated_sharpe')::float8 FROM validation.trial \
+             WHERE kind = 'holdout' AND (candidate = ANY($1) OR candidate LIKE ANY($2)) ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&exact)
+        .bind(&prefixes)
+        .fetch_optional(self.pg.pool())
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+        if ev.deflated_sharpe.is_none() {
+            ev.deflated_sharpe = sqlx::query_scalar::<_, Option<f64>>(
+                "SELECT deflated_sharpe::float8 FROM validation.generation_stats \
+                 WHERE best_candidate = ANY($1) OR best_candidate LIKE ANY($2) ORDER BY computed_at DESC LIMIT 1",
+            )
+            .bind(&exact)
+            .bind(&prefixes)
+            .fetch_optional(self.pg.pool())
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+        }
+        if let Some(g) = generation.filter(|g| !g.is_empty()) {
+            ev.pbo = self.generation_pbo(g).await;
+        }
+        ev
+    }
+
+    /// PBO of the latest loop of a generation (`None` when unknown or NaN).
+    pub async fn generation_pbo(&self, generation: &str) -> Option<f64> {
+        sqlx::query_scalar::<_, Option<f64>>(
+            "SELECT pbo FROM validation.generation_stats WHERE generation = $1 ORDER BY gen_index DESC, computed_at DESC LIMIT 1",
+        )
+        .bind(generation)
+        .fetch_optional(self.pg.pool())
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .filter(|p| p.is_finite())
+    }
+
+    /// Selection evidence per strategy id of one strategy generation: the highest-rung trial of
+    /// each candidate (`kind = evo.eval.strategy`, id read from the genome text) and the
+    /// generation's PBO.
+    pub async fn front_selection(
+        &self,
+        generation: &str,
+    ) -> std::collections::BTreeMap<String, fa_risk::pipeline::Selection> {
+        let pbo = self.generation_pbo(generation).await;
+        let rows = sqlx::query(
+            "SELECT DISTINCT ON (candidate) candidate, sharpe, n_obs, (objectives->>'deflated_sharpe')::float8 AS dsr \
+             FROM validation.trial WHERE generation = $1 AND kind = 'evo.eval.strategy' \
+             ORDER BY candidate, rung DESC, created_at DESC",
+        )
+        .bind(generation)
+        .fetch_all(self.pg.pool())
+        .await
+        .unwrap_or_default();
+        let windows: std::collections::BTreeMap<String, (i64, i64)> = sqlx::query(
+            "SELECT candidate, min(window_start) AS ws, max(window_end) AS we FROM validation.trial \
+             WHERE generation = $1 AND kind = 'evo.eval.strategy' GROUP BY candidate",
+        )
+        .bind(generation)
+        .fetch_all(self.pg.pool())
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| {
+            let ws = r.get::<Option<DateTime<Utc>>, _>("ws")?.timestamp_millis();
+            let we = r.get::<Option<DateTime<Utc>>, _>("we")?.timestamp_millis();
+            Some((r.get::<String, _>("candidate"), (ws, we)))
+        })
+        .collect();
+        let mut out = std::collections::BTreeMap::new();
+        for r in &rows {
+            let cand: String = r.get("candidate");
+            let window_ms = windows.get(&cand).copied();
+            let Some(id) = crate::pipeline::genome_id_of(&cand) else { continue };
+            out.insert(
+                id.to_owned(),
+                fa_risk::pipeline::Selection {
+                    deflated_sharpe: r.get::<Option<f64>, _>("dsr").filter(|v| v.is_finite()),
+                    sharpe: r.get::<Option<f64>, _>("sharpe").filter(|v| v.is_finite()),
+                    n_obs: Some(r.get::<i32, _>("n_obs").max(0) as u64),
+                    pbo,
+                    window_ms,
+                },
             );
-            return sqlx::query_scalar::<_, f64>(sqlx::AssertSqlSafe(sql))
-                .bind(&ids)
-                .fetch_optional(self.pg.pool())
-                .await
-                .ok()
-                .flatten();
         }
-        None
+        out
+    }
+
+    /// The holdout trial of a strategy on one locked holdout, if any.
+    pub async fn holdout_outcome(
+        &self,
+        id: &str,
+        genome: &str,
+        holdout_id: &str,
+    ) -> Option<fa_risk::pipeline::HoldoutOutcome> {
+        let r = sqlx::query(
+            "SELECT id::text AS id, sharpe, n_obs, (objectives->>'deflated_sharpe')::float8 AS dsr, created_at \
+             FROM validation.trial WHERE kind = 'holdout' AND holdout_id::text = $1 \
+             AND (candidate = $2 OR candidate LIKE $3) ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(holdout_id)
+        .bind(genome)
+        .bind(format!("{{ id = \"{id}\"%"))
+        .fetch_optional(self.pg.pool())
+        .await
+        .ok()
+        .flatten()?;
+        Some(fa_risk::pipeline::HoldoutOutcome {
+            holdout_id: holdout_id.to_owned(),
+            trial_id: r.get("id"),
+            deflated_sharpe: r.get::<Option<f64>, _>("dsr").filter(|v| v.is_finite()),
+            sharpe: r.get::<Option<f64>, _>("sharpe").filter(|v| v.is_finite()),
+            n_obs: r.get::<i32, _>("n_obs").max(0) as u64,
+            at_ms: r.get::<DateTime<Utc>, _>("created_at").timestamp_millis(),
+        })
+    }
+
+    /// Every locked holdout with its id.
+    pub async fn holdouts(&self) -> anyhow::Result<Vec<(String, fa_backtest::replay::Holdout)>> {
+        let rows = sqlx::query(
+            "SELECT id::text AS id, timescale, start_at, end_at, locked_at FROM validation.holdout ORDER BY timescale, start_at",
+        )
+        .fetch_all(self.pg.pool())
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    r.get::<String, _>("id"),
+                    fa_backtest::replay::Holdout {
+                        timescale: r.get::<String, _>("timescale").parse().ok()?,
+                        start_ms: r.get::<DateTime<Utc>, _>("start_at").timestamp_millis(),
+                        end_ms: r.get::<DateTime<Utc>, _>("end_at").timestamp_millis(),
+                        locked_at_ms: r.get::<DateTime<Utc>, _>("locked_at").timestamp_millis(),
+                    },
+                ))
+            })
+            .collect())
+    }
+
+    /// Locks `[start, end)` for `timescale` unless a row of the timescale overlaps it (then
+    /// `Ok(None)`): serialised by a transaction-scoped advisory lock so concurrent lockers
+    /// (another risk-engine, the control-api route) cannot insert overlapping rows.
+    pub async fn lock_holdout(
+        &self,
+        timescale: &str,
+        start_ms: i64,
+        end_ms: i64,
+        note: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let mut tx = self.pg.pool().begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('validation.holdout'))").execute(&mut *tx).await?;
+        let overlap: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM validation.holdout WHERE timescale = $1 AND start_at < $3 AND end_at > $2)",
+        )
+        .bind(timescale)
+        .bind(at(start_ms))
+        .bind(at(end_ms))
+        .fetch_one(&mut *tx)
+        .await?;
+        if overlap {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let id: String = sqlx::query_scalar(
+            "INSERT INTO validation.holdout (timescale, start_at, end_at, note) VALUES ($1, $2, $3, $4) RETURNING id::text",
+        )
+        .bind(timescale)
+        .bind(at(start_ms))
+        .bind(at(end_ms))
+        .bind(note)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(id))
+    }
+
+    /// Persists the restart-safe risk state (`ledger.risk_state`, migration 20261111000051).
+    pub async fn save_risk_state(&self, r: &RiskRecord) {
+        let res = sqlx::query(
+            "INSERT INTO ledger.risk_state (book, state, updated_at) VALUES ($1, $2, now()) \
+             ON CONFLICT (book) DO UPDATE SET state = EXCLUDED.state, updated_at = now()",
+        )
+        .bind(&self.book)
+        .bind(serde_json::to_value(r).unwrap_or_default())
+        .execute(self.pg.pool())
+        .await;
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "risk state not persisted");
+        }
+    }
+
+    pub async fn load_risk_state(&self) -> Option<RiskRecord> {
+        let v: Value = sqlx::query_scalar("SELECT state FROM ledger.risk_state WHERE book = $1")
+            .bind(&self.book)
+            .fetch_optional(self.pg.pool())
+            .await
+            .map_err(|e| tracing::warn!(error = %e, "risk state not loaded"))
+            .ok()
+            .flatten()?;
+        serde_json::from_value(v).map_err(|e| tracing::warn!(error = %e, "risk state unreadable; starting fresh")).ok()
     }
 
     /// Compares the in-memory book with the one derived from Postgres and records a
@@ -375,8 +557,21 @@ mod tests {
         let rows = p.load_strategy_states().await;
         let (_, book) = rows.iter().find(|(r, _)| r.strategy_id == id).expect("row loaded");
         assert_eq!(book.as_ref(), Some(&rec), "sub-book restored verbatim");
-        assert_eq!(p.deflated_sharpe(&[&id]).await, None, "no validation row → unknown");
-        assert_eq!(p.deflated_sharpe(&[]).await, None);
+        // pipeline record + last_reason round trip (migration 20261111000050)
+        let mut ev_s = s.clone();
+        ev_s.pipeline = Some(fa_risk::pipeline::PipelineRecord {
+            genome: "{ id = \"x\" }".into(),
+            demotions: 1,
+            ..Default::default()
+        });
+        ev_s.last_reason = "strategy drawdown 6% ≥ limit 5%".into();
+        p.strategy_state(&ev_s, None, None).await;
+        let rows = p.load_strategy_states().await;
+        let (got, _) = rows.iter().find(|(r, _)| r.strategy_id == id).expect("row loaded");
+        assert_eq!(got.pipeline, ev_s.pipeline);
+        assert_eq!(got.last_reason, ev_s.last_reason);
+        assert_eq!(p.evidence(&[&id], None, None).await, Evidence::default(), "no validation row → unknown");
+        assert_eq!(p.evidence(&[], None, None).await, Evidence::default());
         // generation_stats path (migration 20261110000030, validation workstream): the DSR of the
         // generation whose best candidate is this strategy (or its genome)
         let have_stats: bool = sqlx::query_scalar("SELECT to_regclass('validation.generation_stats') IS NOT NULL")
@@ -391,7 +586,7 @@ mod tests {
             .execute(p.pg.pool())
             .await
             .unwrap();
-            assert_eq!(p.deflated_sharpe(&["other", &id]).await, Some(0.42));
+            assert_eq!(p.evidence(&["other", &id], None, None).await.deflated_sharpe, Some(0.42));
             sqlx::query("DELETE FROM validation.generation_stats WHERE generation = $1")
                 .bind(&id)
                 .execute(p.pg.pool())

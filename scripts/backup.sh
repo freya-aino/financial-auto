@@ -8,7 +8,8 @@
 #   manifest.json           versions, sizes, sha256 of every file
 # Usage: scripts/backup.sh [--dest DIR] [--skip postgres,helix,garage] [--no-stop-helix]
 # Env:   FA_BACKUP_BUCKETS (space-separated, default above), FA_BACKUP_NATS=1, RCLONE_IMAGE
-# Schedule (backup.schedule 03:00 daily, spec 60 §7) — add to `crontab -e`:
+# Scheduled backups run in the `backup` compose sidecar (docker/backup/run.sh: adds a PITR base backup,
+# hot Helix tar, retention); this script is the on-demand / cold-Helix variant. Old crontab line:
 #   0 3 * * * cd /path/to/financial-auto && scripts/backup.sh >> backups/backup.log 2>&1
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"

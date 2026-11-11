@@ -15,7 +15,14 @@
 //!   most one write per edge per `flush` ([`Coalescer`]), and only for successors that this
 //!   process has observed at least once (prior-only mass stays in the in-memory view, D-032);
 //! - one `LatentVec` (`kind = observation`, `ref_id = region_id`) per expert per **closed bar**
-//!   for the configured timescales (default 1m and slower), after `ensure_latent_index_ready`.
+//!   for the configured timescales (default 1m and slower), after `ensure_latent_index_ready`;
+//! - region lifecycle (spec 30 §5): `DescendsFrom` edges child → parent for online splits and
+//!   merges and for a loaded snapshot's alignment, death marks (`died_at`, `retire_reason`), the
+//!   centroid `LatentVec` (`kind = centroid`) of every born / split / carried region;
+//! - every `--hub-state-secs`: the `RegionSet` (serialised region set + kernel, restored on
+//!   restart), region statistics and moved centroids;
+//! - `KernelModel` per expert space on every `KernelUpdate`, `Hier` edges on every hierarchy
+//!   update, `CrossPrior` rows on every cross-asset update (spec 33 §5, §6.5).
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -25,11 +32,17 @@ use std::{
 };
 
 use fa_core::Timescale;
-use fa_hub::{HubClient, HubError, NewExpertSpace, NewLatent, NewRegion, NewSnapshot, NewTransition, TransitionUpsert};
-use fa_proto::v1::{ExpertLatent, ExpertSpaceRef, RegionEvent, TransitionUpdate, region_event};
+use fa_hub::{
+    HubClient, HubError, NewCrossPrior, NewDescent, NewExpertSpace, NewHierEdge, NewKernelModel, NewLatent, NewRegion,
+    NewRegionSet, NewSnapshot, NewTransition, RegionStatsUpdate, TransitionUpsert,
+};
+use fa_proto::v1::{
+    CrossAssetPriors, ExpertLatent, ExpertSpaceRef, KernelUpdate, RegionEvent, RegionHierarchy, RegionLifecycleEvent,
+    TransitionUpdate, region_event, region_lifecycle_event,
+};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::pipeline::StepOutput;
+use crate::pipeline::{ExpertPersist, StepOutput};
 
 pub type Counters = Arc<Mutex<BTreeMap<String, f64>>>;
 
@@ -84,6 +97,12 @@ pub enum HubEvent {
         ts_ms: i64,
         experts: Vec<ExpertLatent>,
     },
+    Lifecycle(RegionLifecycleEvent),
+    Kernel(KernelUpdate),
+    /// Region sets, kernels and statistics of one timescale's experts.
+    Persist(Vec<ExpertPersist>),
+    Hierarchy(RegionHierarchy),
+    CrossPriors(CrossAssetPriors),
 }
 
 /// Expert-space business id: `<snapshot_id>-e<k>` (what `LatentVec.expert_space_id` partitions on).
@@ -181,6 +200,13 @@ impl HubSink {
         for ev in &out.region_events {
             self.send(HubEvent::Region { event: ev.clone(), radius: region_radius });
         }
+        // after the region rows exist: lineage edges, death marks, centroids
+        for ev in &out.lifecycle {
+            self.send(HubEvent::Lifecycle(ev.clone()));
+        }
+        for k in &out.kernels {
+            self.send(HubEvent::Kernel(k.clone()));
+        }
         if !bar_closed {
             return;
         }
@@ -229,7 +255,12 @@ struct Drain {
     coalescer: Coalescer<EdgeKey, TransitionUpsert>,
     /// Observations per edge since process start (what `Transition.count` holds).
     counts: HashMap<EdgeKey, i64>,
+    /// Last centroid written per region (only moved centroids are rewritten).
+    centroids: HashMap<String, Vec<f32>>,
 }
+
+/// A centroid is rewritten when it moved farther than this (latent units).
+const CENTROID_MOVE: f32 = 0.05;
 
 impl Drain {
     fn new(cfg: SinkConfig, counters: Counters) -> Self {
@@ -245,6 +276,7 @@ impl Drain {
             spaces: HashMap::new(),
             latent_dims: HashSet::new(),
             counts: HashMap::new(),
+            centroids: HashMap::new(),
         }
     }
 
@@ -331,7 +363,194 @@ impl Drain {
                 }
                 self.latents(&space.snapshot_id, &instrument_id, ts_ms, &experts).await;
             }
+            other => {
+                if !self.connected().await {
+                    bump(&self.counters, "hub.dropped", 1.0).await;
+                    return;
+                }
+                let res = match other {
+                    HubEvent::Lifecycle(ev) => self.lifecycle(ev).await,
+                    HubEvent::Kernel(k) => self.kernel(k).await,
+                    HubEvent::Persist(rows) => self.persist(rows).await,
+                    HubEvent::Hierarchy(h) => self.hierarchy(h).await,
+                    HubEvent::CrossPriors(c) => self.cross_priors(c).await,
+                    _ => Ok(()),
+                };
+                match res {
+                    Ok(()) => bump(&self.counters, "hub.writes", 1.0).await,
+                    Err(e) => self.fail(&e, "region/graph write failed").await,
+                }
+            }
         }
+    }
+
+    async fn centroid(&mut self, space: &ExpertSpaceRef, region_id: &str, c: &[f32]) -> Result<(), HubError> {
+        if c.is_empty() {
+            return Ok(());
+        }
+        let moved = self.centroids.get(region_id).is_none_or(|old| {
+            old.len() != c.len()
+                || old.iter().zip(c).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt() > CENTROID_MOVE
+        });
+        if !moved {
+            return Ok(());
+        }
+        if !self.latent_dims.contains(&c.len()) {
+            self.hub.ensure_latent_index_ready(c.len(), INDEX_WAIT).await?;
+            self.latent_dims.insert(c.len());
+        }
+        let space_id = expert_space_id(&space.snapshot_id, space.expert_index);
+        if self.hub.upsert_centroid(&space_id, region_id, c).await? {
+            self.centroids.insert(region_id.to_owned(), c.to_vec());
+        }
+        Ok(())
+    }
+
+    async fn lifecycle(&mut self, ev: RegionLifecycleEvent) -> Result<(), HubError> {
+        use region_lifecycle_event::Kind;
+        let Some(space) = ev.space.clone() else { return Ok(()) };
+        match Kind::try_from(ev.kind).unwrap_or(Kind::Unspecified) {
+            Kind::Died => {
+                self.centroids.remove(&ev.region_id);
+                match self.hub.mark_region_died(&ev.region_id, &ev.reason, &ev.related_region_id).await {
+                    Err(HubError::NotFound { .. }) => Ok(()),
+                    r => r,
+                }
+            }
+            Kind::Unspecified => Ok(()),
+            _ => {
+                let descents: Vec<NewDescent> = ev
+                    .ancestors
+                    .iter()
+                    .filter(|a| !a.region_id.is_empty())
+                    .map(|a| NewDescent {
+                        child_region_id: ev.region_id.clone(),
+                        parent_region_id: a.region_id.clone(),
+                        kind: a.kind.clone(),
+                        overlap: a.overlap,
+                    })
+                    .collect();
+                self.hub.upsert_descents(&descents).await?;
+                self.centroid(&space, &ev.region_id, &ev.centroid).await
+            }
+        }
+    }
+
+    async fn kernel(&mut self, k: KernelUpdate) -> Result<(), HubError> {
+        let Some(space) = k.space.as_ref() else { return Ok(()) };
+        let scores: Vec<serde_json::Value> = k
+            .samplers
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "sampler_id": s.sampler_id, "log_score": s.log_score, "brier": s.brier, "ece": s.ece,
+                    "pit_ks": s.pit_ks, "cost_us": s.cost_us, "evals": s.evals, "pareto": s.pareto, "serving": s.serving,
+                })
+            })
+            .collect();
+        let stationary: Vec<serde_json::Value> = k
+            .stationary
+            .iter()
+            .map(|d| serde_json::json!({"region_id": d.region_id, "mean": d.mean, "lower": d.lower, "upper": d.upper, "sd": d.sd}))
+            .collect();
+        self.hub
+            .upsert_kernel_model(&NewKernelModel {
+                expert_space_id: expert_space_id(&space.snapshot_id, space.expert_index),
+                snapshot_id: space.snapshot_id.clone(),
+                timescale: space.timescale.clone(),
+                expert_index: space.expert_index,
+                kernel_type: "dirichlet".into(),
+                serving_sampler: k.serving_sampler_id.clone(),
+                scores: serde_json::Value::from(scores).to_string(),
+                stationary: serde_json::Value::from(stationary).to_string(),
+                relaxation_steps: k.relaxation_steps,
+                drift_kl: k.drift_kl,
+                n_rows: k.n_rows as u32,
+                observation_mass: k.observation_mass,
+                live_regions: k.live_regions,
+            })
+            .await
+    }
+
+    async fn persist(&mut self, rows: Vec<ExpertPersist>) -> Result<(), HubError> {
+        for r in rows {
+            let Some(state) = r.region_state.as_ref() else { continue };
+            // make sure the expert space exists (a reload may have introduced it)
+            if self.space_node(&r.space).await.is_none() {
+                continue;
+            }
+            let cfg = state.get("cfg").map(ToString::to_string).unwrap_or_default();
+            self.hub
+                .upsert_region_set(&NewRegionSet {
+                    expert_space_id: expert_space_id(&r.space.snapshot_id, r.space.expert_index),
+                    snapshot_id: r.space.snapshot_id.clone(),
+                    timescale: r.space.timescale.clone(),
+                    expert_index: r.space.expert_index,
+                    family: r.family.clone(),
+                    method: self.cfg.region_method.clone(),
+                    n_regions: r.stats.len() as u32,
+                    cfg_hash: format!("{:016x}", fnv1a(cfg.as_bytes())),
+                    state: state.to_string(),
+                    kernel_state: r.kernel_state.clone().unwrap_or_default(),
+                })
+                .await?;
+            let stats: Vec<RegionStatsUpdate> = r
+                .stats
+                .iter()
+                .map(|s| RegionStatsUpdate {
+                    region_id: s.region_id.clone(),
+                    mass: s.mass,
+                    occupancy: s.occupancy,
+                    spread: s.spread,
+                    age: s.age,
+                })
+                .collect();
+            self.hub.update_region_stats(&stats).await?;
+            for s in &r.stats {
+                self.centroid(&r.space, &s.region_id, &s.centroid).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn hierarchy(&mut self, h: RegionHierarchy) -> Result<(), HubError> {
+        let rows: Vec<NewHierEdge> = h
+            .edges
+            .iter()
+            .map(|e| NewHierEdge {
+                fine_region_id: e.fine_region_id.clone(),
+                coarse_region_id: e.coarse_region_id.clone(),
+                p_coarse_given_fine: e.p_coarse_given_fine,
+                p_fine_given_coarse: e.p_fine_given_coarse,
+                support: e.support,
+                pmi_bits: e.pmi_bits,
+                mi_bits: h.mutual_information_bits,
+            })
+            .collect();
+        self.hub.upsert_hier_edges(&rows).await
+    }
+
+    async fn cross_priors(&mut self, c: CrossAssetPriors) -> Result<(), HubError> {
+        let rows: Vec<NewCrossPrior> = c
+            .proposals
+            .iter()
+            .enumerate()
+            .map(|(i, p)| NewCrossPrior {
+                timescale: c.timescale.clone(),
+                source_instrument_id: p.source_instrument_id.clone(),
+                target_instrument_id: p.target_instrument_id.clone(),
+                n: p.n,
+                correlation: p.correlation,
+                shrinkage: p.shrinkage,
+                lead_lag: p.lead_lag,
+                lead_corr: p.lead_corr,
+                predictive_gain: p.predictive_gain,
+                uncertainty: p.uncertainty,
+                score: p.score,
+                rank: i as u32 + 1,
+            })
+            .collect();
+        self.hub.upsert_cross_priors(&rows).await
     }
 
     async fn ensure_snapshot(&mut self, d: &SnapshotDesc) {
@@ -381,7 +600,8 @@ impl Drain {
         let kind = region_event::Kind::try_from(ev.kind).unwrap_or(region_event::Kind::Unspecified);
         let related = ev.related_region_ids.first().cloned().unwrap_or_default();
         let res = match kind {
-            region_event::Kind::Created => {
+            // a split child is a new region like a birth (its lineage edge comes with the lifecycle)
+            region_event::Kind::Created | region_event::Kind::Split => {
                 let Some(space_node) = self.space_node(&space).await else {
                     bump(&self.counters, "hub.dropped", 1.0).await;
                     return;
@@ -506,6 +726,11 @@ impl Drain {
             Err(e) => self.fail(&e, "latent write failed").await,
         }
     }
+}
+
+/// FNV-1a, for the region set's `cfg_hash`.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
 }
 
 #[cfg(test)]

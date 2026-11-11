@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | draft |
-| **Maturity** | Low-medium |
+| **Maturity** | High (implemented on the baselines; see §12) |
 | **Owners (code)** | `crates/fa-patterns`, `bins/model-runtime`, `bins/trainer` |
 | **Depends on** | 31 Expert encoders, 32 Expert spaces, 20 Storage, 36 Training lifecycle |
 
@@ -62,9 +62,13 @@ pub struct Region {
 pub struct Membership { pub weights: SmallVec<[(RegionId, f32); 4]>, pub novelty: f32 }
 ```
 
+**Implemented:** the batch contract is `fa_patterns::RegionDiscovery` (`discover` / `assign`; `align` is family-independent: `fa_patterns::lineage::align` on probe assignments). The online contract is `fa_patterns::OnlineRegionDiscovery` (`observe → Assignment{region_id, lineage_id, distance, novelty, memberships, events}`, `stats`, `export_state` / `restore_state`), implemented by the leader-clustering baseline `OnlineRegionSet`. Both see only the encoder's per-expert `mean` vectors, so every `EncoderFamily` (statistical or neural) plugs in unchanged. `Membership` is `Assignment.memberships` (k nearest regions, Gaussian-kernel weights summing to 1) plus `novelty`. `Region.mass / density / persistence / parents` live in `RegionStat` (`mass`, `occupancy`, `spread`, `age`) and in the lineage edges.
+
 ### 4.2 Bus subjects (spec 21)
-- `latent.region.<timescale>.<expert>.<instrument>`: live membership updates (`fa.v1.RegionMembership`).
-- `latent.region.lifecycle`: region set refits, births, merges, splits and deaths (`fa.v1.RegionLifecycleEvent`).
+- `latent.membership.<timescale>.<instrument>`: live soft memberships of every expert (`fa.v1.RegionMembership`: per expert `weights[]`, `novelty`, `out_of_region`). *(Proposed as `latent.region.<ts>.<expert>.<instrument>`; moved off `latent.region.>` because that wildcard is consumed as `RegionEvent` by strategy-runtime, control-api and replays.)*
+- `latent.lifecycle.<timescale>`: births, carries, splits, merges and deaths with event time, ancestors (`kind`, `overlap`), centroid, mass, occupancy and the regime-break flag (`fa.v1.RegionLifecycleEvent`). *(Proposed as `latent.region.lifecycle`, moved for the same reason.)*
+- `latent.region.<timescale>`: the D-039 `RegionEvent` (created / merged / split / retired) stays for existing consumers; a split publishes `KIND_SPLIT` with the child as `region_id` and the parent in `related_region_ids`.
+- `latent.hier.<fine>.<coarse>`: cross-timescale hierarchy per expert index (`fa.v1.RegionHierarchy`, §6.5).
 
 ### 4.3 Consumers
 - spec 33: membership stream → transition counts / likelihoods.
@@ -75,12 +79,12 @@ pub struct Membership { pub weights: SmallVec<[(RegionId, f32); 4]>, pub novelty
 ## 5. Data model
 | Entity | Store | Fields |
 |---|---|---|
-| `RegionSet` | Helix node | snapshot_id, timescale, expert_id, family, method, fit_time, n_regions, cfg_hash |
-| `Region` | Helix node + vector | id, local_id, centroid (vector), scale, mass, density, persistence, born_at, died_at |
-| `MEMBER_OF` | Helix edge (Region → RegionSet) | — |
-| `DESCENDS_FROM` | Helix edge (Region → Region) | overlap weight, kind (carry, merge, split) |
-| `REFINES` | Helix edge (fine-timescale Region → coarse-timescale Region) | conditional co-occurrence P(coarse ∣ fine), support |
-| `NEIGHBOR` | Helix edge (Region ↔ Region, same set) | latent distance, boundary density |
+| `RegionSet` | Helix node | snapshot_id, timescale, expert_id, family, method, fit_time, n_regions, cfg_hash; **implemented** as `RegionSet{region_set_id = expert_space_id}` with the serialised online set (`state`) and kernel (`kernel_state`), linked `ExpertSpace -HasRegionSet->` |
+| `Region` | Helix node + vector | id, local_id, centroid (vector), scale, mass, density, persistence, born_at, died_at; **implemented** as `LatentRegion` (`region_id`, `lineage_id`, `radius`, `status`, `mass`, `occupancy`, `spread`, `age`, `created_at`, `died_at`, `retire_reason`) + `LatentVec{kind: centroid, ref_id: region_id}` (replaced, not appended) |
+| `MEMBER_OF` | Helix edge (Region → RegionSet) | — ; **implemented** as `InSpace` (Region → ExpertSpace, 1:1 with the set) |
+| `DESCENDS_FROM` | Helix edge (Region → Region) | overlap weight, kind (carry, merge, split); **implemented** as `DescendsFrom` child → parent (`kind = carry \| split \| merge \| partial`, `overlap`), plus the trainer's `RegionMatch{score}` (carry) |
+| `REFINES` | Helix edge (fine-timescale Region → coarse-timescale Region) | conditional co-occurrence P(coarse ∣ fine), support; **implemented** as `Hier` (`p_coarse_given_fine`, `p_fine_given_coarse`, `support`, `pmi_bits`, `mi_bits`) |
+| `NEIGHBOR` | Helix edge (Region ↔ Region, same set) | latent distance, boundary density; *not stored*: neighbours are answered from the kernel (spec 33 `neighbors`) and the centroids |
 | `Occupancy` | VictoriaMetrics series | `region_weight{ts,expert,region,instrument}` sampled at the timescale's step |
 | Region episode | Helix node (optional) | region, instrument, t_enter, t_exit, max weight. Used by retrieval |
 
@@ -109,6 +113,8 @@ All methods must be implementable in Rust. HDBSCAN and Mapper need a Rust implem
 - High novelty (≥ `novelty_threshold`) marks the latent as **out-of-region**. The MCMC graph sees a special `Unknown` state per set, and strategies can read novelty. Sustained high novelty feeds the snapshot-refresh trigger (spec 36).
 - Membership is computed at each timescale step, per instrument (or per asset set where the encoder embeds sets).
 
+**Implemented:** novelty = distance to the nearest centroid / radius; `out_of_region` at `novelty_threshold` (3.0); the heartbeat counts `out_of_region`. Sustained novelty surfaces as occupancy drift (§6.6).
+
 ### 6.4 Region identity across refits and snapshots
 Regions must keep identity across retraining, otherwise the MCMC graph, strategy genomes and retrieval history break. **This is core blocker #1** (open question 1). Proposed default (proposal):
 1. Keep a fixed **probe set** of historical windows (stratified over time, assets and modalities).
@@ -119,14 +125,26 @@ Regions must keep identity across retraining, otherwise the MCMC graph, strategy
 6. Unmatched new regions get fresh ids; unmatched old regions are marked dead (`died_at`).
 7. Downstream components receive `RegionLifecycleEvent`s and remap: MCMC transfers kernel posteriors (spec 33), strategies holding region literals remap through `DESCENDS_FROM` (spec 35).
 
+**Implemented (D-007 fallback, both offline and online):**
+- *Snapshot alignment* — `fa_patterns::lineage::align`: Jaccard overlap matrix of the probe assignments, **Hungarian** maximum-weight assignment (`fa_patterns::hungarian`, exact, tested against brute force) on the entries ≥ `carry_threshold`; every other pair ≥ `split_threshold` is a lineage edge classified `carry | split | merge | partial` (partial = one partner between the two thresholds, new lineage). Unmatched new regions are born, parents without any partner die. The trainer's `align_expert` uses it unchanged; `region_map.json` gains per-region `ancestors`, per-expert `dead_parents`, `split_parents`, `regime_break` (all `serde(default)`, older maps load).
+- *Lineage ids*: a carried region inherits `lineage_id`; `region_id` stays unique per snapshot. On load / hot swap model-runtime announces the whole alignment on `latent.lifecycle.<ts>` (dead parents in the parent's space) and persists it as `DescendsFrom` edges and death marks.
+- *Online lifecycle* in `OnlineRegionSet`: birth (outside every radius), merge (centroids within `merge_radius`), **split** (streaming 2-means per region; when the sub-centroids are `split_distance · radius` apart and both hold `min_split_mass` points, the lighter mode becomes a new region and lineage with `DescendsFrom{kind: split, overlap = mass share}`), **death by support** (decayed occupancy, half-life `support_halflife`, share < `min_support` after `min_age`; reason `support`).
+- *Regime break* (§8): carried probe mass < 0.5 sets `regime_break`; model-runtime then restarts that expert's kernel from the prior instead of transferring and reports `regime_break.<ts>`.
+
 ### 6.5 Cross-timescale hierarchy
 - For each pair of adjacent timescales (s, s+1), estimate `P(region at s+1 | region at s)` over aligned time.
 - Edges with mutual information above `hier_mi_min` become `REFINES` edges.
 - This gives a multi-scale graph: a coarse (e.g. daily) regime contains finer (hourly) regions. Strategies and the MCMC can condition on it.
 
+**Implemented:** `fa_patterns::HierarchyTracker` per (fine timescale, next coarser served timescale, expert index): every closed fine bar of an instrument is paired with that instrument's current coarse region (latest state, previews included); joint counts are halved past `max_total` (forgetting); the plug-in MI is Miller–Madow corrected; when MI ≥ `hier_mi_min`, pairs with support ≥ 20 and `P(coarse | fine)` ≥ 0.05 are edges. A tracker resets when either snapshot changes; retired regions are forgotten. Published every `--graph-every-secs` (60 s) on `latent.hier.<fine>.<coarse>`, persisted as `Hier` edges, heartbeat `hier.<fine>.<coarse>.e<k>.mi_bits|edges`. Experts are paired by index (true for the statistical family; a family whose expert indices do not correspond across timescales gets a meaningless but harmless low MI).
+
 ### 6.6 Refit cadence
 - Full refit on every new encoder snapshot (spec 36).
 - Online adapters (spec 36) shift latents slightly. Membership stays computed against the snapshot's region set. A **drift monitor** tracks per-region occupancy vs the training distribution and triggers a partial refit when divergence exceeds `drift_refit_kl`.
+
+**Implemented:** `fa_patterns::DriftMonitor`: `KL(live occupancy ‖ reference)` with additive smoothing; the reference is the snapshot's fitted region masses, or (baseline without a map) the live occupancy captured after `drift_warmup` = 2000 observations. Checked with every kernel summary (`KernelUpdate.drift_kl / refit_due`, heartbeat `mcmc.<ts>.e<k>.drift_kl`). Three consecutive `refit_due` summaries request a partial refit: a `train.adapter` job (`{snapshot_id, timescale, window_hours, reason: region_drift}`) on `jobs.train.adapter`, at most once per `--drift-refit-cooldown-secs` (6 h) per timescale, so a single shock does not refit (§8).
+
+**Persistence and restart (§8 "never only in memory"):** every `--hub-state-secs` (120 s) model-runtime writes each expert's `RegionSet` (online set + kernel), region statistics and moved centroids; on start it restores the sets of the serving snapshots (`--no-region-restore` to skip), so region ids, lineages and posteriors survive a restart.
 
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
@@ -140,6 +158,11 @@ Regions must keep identity across retraining, otherwise the MCMC graph, strategy
 | `probe_set_size` | 50k windows / timescale | Fixed per probe-set version |
 | `hier_mi_min` | 0.05 bits | Cross-timescale edge cutoff |
 | `drift_refit_kl` | 0.1 | Occupancy KL that triggers partial refit |
+| `support_halflife` / `min_age` | 20 000 / 2 000 observations | Death by support (online) |
+| `split_distance` / `min_split_mass` | 1.5 radii / 30 points | Online split |
+| `membership_k` | 4 | Regions in a soft membership |
+
+Implemented defaults: `min_mass` → `min_support` 0.002, `max_regions_per_set` → `--max-regions` 64 (online cap), `novelty_threshold` 3.0, `carry_threshold` 0.5 (trainer `carry_threshold`), `split_threshold` 0.2, `hier_mi_min` 0.05 bits, `drift_refit_kl` 0.1. `coherence_alpha` and `probe_set_size` (trainer: the fit's window ends) are not used by the baseline.
 
 ## 8. Failure modes
 | Failure | Response |
@@ -157,6 +180,8 @@ Regions must keep identity across retraining, otherwise the MCMC graph, strategy
 5. Live membership latency per instrument per step ≤ 5 ms at the minute timescale on the reference workstation (placeholder).
 6. The latent explorer (spec 51) can render a region set with occupancy and hierarchy edges.
 
+**Status of the criteria:** 1 — `fa_patterns::conformance::assert_conformance` (6 clusters × 8 dims; recovery ≥ 90 %, determinism, self-alignment ≥ 0.9) passes for `LeaderClustering`; family crates call it from their tests. 2 — `snapshotGraph`, `regionSet`, `snapshotKernels`, `regionLineage`, `snapshotHierarchy` by business id. 3 — fits are deterministic in point order; online ids are deterministic and survive restarts via `RegionSet`. 4 — `lineage::align` + `latent.lifecycle`, tested. 5 — not benchmarked on the reference workstation. 6 — UI work (spec 51).
+
 ## 10. Open questions
 1. **[Core blocker #1] Region identity across retraining.** Blocks specs 33, 34 (retrieval history), 35 (region literals in genomes). Options:
    - (a) Probe-set alignment + Hungarian matching (default proposal, §6.4).
@@ -164,9 +189,10 @@ Regions must keep identity across retraining, otherwise the MCMC graph, strategy
    - (c) **Region ids defined in outcome space**: identify regions by their predictive signature (residual distribution, forward-return profile) instead of geometry, and match on signature.
    - (d) Accept discontinuity: every snapshot has a fresh graph and downstream components retrain each generation.
    - Likely answer: (b) + (a) as fallback.
+   - **Resolved for the baselines (D-007):** (a) is implemented end to end (Hungarian alignment, lineage ids, split/merge/death, regime break, kernel transfer). (b) needs a trainable family and lives with the neural encoders (spec 31/36).
 2. Is predictive coherence (§6.1, point 3) mandatory, or a soft score? Affects cost and region count.
-3. Soft or hard membership for MCMC transitions? Soft keeps information but complicates count-based kernels (spec 33).
-4. Rust availability of HDBSCAN / Mapper / persistent homology. Write our own in `fa-patterns`, or restrict v1 to codebook and k-means/GMM-style methods?
+3. Soft or hard membership for MCMC transitions? Soft keeps information but complicates count-based kernels (spec 33). *Both exist:* memberships are published soft; the serving kernel observes hard transitions; `MarkovGraph::observe_soft` implements the soft update for a kernel that wants it.
+4. Rust availability of HDBSCAN / Mapper / persistent homology. Write our own in `fa-patterns`, or restrict v1 to codebook and k-means/GMM-style methods? *v1: leader clustering (online + batch) behind the conformance test; density/Mapper/codebook discovery arrive with the neural families.*
 5. Should regions be per instrument or per asset set? Depends on the asset-selection outcome in spec 31.
 6. Lifetime and storage cost of region episodes in Helix at the seconds timescale.
 
@@ -174,3 +200,13 @@ Regions must keep identity across retraining, otherwise the MCMC graph, strategy
 - Topological (persistent homology) summaries as strategy features.
 - Visual rendering of regions as decoder targets (could become a visual decoder family).
 - Cross-expert region products (joint regions across experts). Not needed while experts are decorrelated by design.
+
+## 12. Implementation map
+| Piece | Code |
+|---|---|
+| Discovery contracts, conformance test | `crates/fa-patterns/src/{lib,online,conformance}.rs` |
+| Alignment, Hungarian, region map | `crates/fa-patterns/src/{lineage,hungarian,region_map}.rs` |
+| Hierarchy, drift | `crates/fa-patterns/src/{hierarchy,drift}.rs` |
+| Live stage (memberships, lifecycle, persistence, restore, drift trigger) | `bins/model-runtime/src/{pipeline,regions,hub_sink}.rs` |
+| Helix rows | `crates/fa-hub/src/regions.rs`, `helix/schema.hx` (`RegionSet`, `DescendsFrom`, `Hier`, `LatentRegion` statistics) |
+| Read API | `bins/control-api/src/mcmc_routes.rs`: `GET /api/latent/regions/{region_id}/lineage`, `/api/mcmc/{snapshot}/hierarchy` |

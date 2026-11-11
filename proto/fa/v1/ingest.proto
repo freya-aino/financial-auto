@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package fa.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Ingestion operability frames (spec 10 §6.7, spec 21 §4.1, D-054). Until 2026-11-11 these
+// travelled as JSON; consumers accept both encodings (a JSON payload starts with '{', which
+// is never the first byte of a proto3 encoding: field 15 / wire type 3 is a deprecated group).
+
+enum HealthStatus {
+  HEALTH_STATUS_UNSPECIFIED = 0;
+  HEALTH_STATUS_OK = 1;
+  HEALTH_STATUS_DEGRADED = 2;
+  HEALTH_STATUS_DOWN = 3;
+}
+
+// `ingest.health.<source>`, every 5 s per running connector plus a final frame on stop.
+// `down` = no activity for 3 × expected period or the connector exited; `degraded` = any
+// error in the window or limiter saturation > 0.8. Ages are derived from `at`.
+message IngestHealth {
+  string source = 1;
+  HealthStatus status = 2;
+  bool running = 3;
+  string mode = 4; // stream | poll | none
+  google.protobuf.Timestamp at = 5;
+  string reason = 6; // why degraded/down; empty when ok
+  bool halted = 7; // a risk.halt.source:<id> is outstanding
+  google.protobuf.Timestamp started_at = 8;
+  double expected_period_s = 9;
+  google.protobuf.Timestamp last_activity_at = 10; // last successful poll or stream message
+  google.protobuf.Timestamp last_event_at = 11; // last canonical event published
+  int64 events_total = 12;
+  int64 errors_total = 13;
+  double window_s = 14; // window since the previous frame
+  int64 events_window = 15;
+  int64 errors_window = 16;
+  double error_rate = 17; // errors per minute over the window
+  double limiter_saturation = 18;
+  int64 limiter_requests = 19;
+  string last_error = 20;
+  google.protobuf.Timestamp last_error_at = 21;
+}
+
+// `ingest.gap.<source>`: consecutive live bars of one instrument/timeframe more than one
+// period apart (also the first bar after a restart against the persisted cursor).
+message IngestGap {
+  string source = 1;
+  string instrument_id = 2;
+  string timeframe = 3;
+  google.protobuf.Timestamp from = 4;
+  google.protobuf.Timestamp to = 5;
+  int64 missing_periods = 6;
+  google.protobuf.Timestamp at = 7;
+}
+
+// `ingest.unresolved.<source>`: a provisioned instrument (D-050, `instrument_id` set) or a
+// symbol that could not be resolved at all.
+message IngestUnresolved {
+  string source = 1;
+  string venue_symbol = 2;
+  string instrument_id = 3;
+  string reason = 4;
+  google.protobuf.Timestamp at = 5;
+}
+
+// `ref.changed.<entity>` and `catalog.changed.<id>` (spec 12 §6, spec 11 §4): cache
+// invalidation and Helix sync notices. `entity` is the subject token (instrument, listing,
+// identifier, venue, contract_spec, calendar, corporate_action, fx_rate, source).
+message RefChanged {
+  string entity = 1;
+  repeated string ids = 2; // instrument UUIDs, source ids, venue codes ...
+  string change = 3; // created | updated | deleted | merged | provisioned | status
+  google.protobuf.Timestamp at = 4;
+  string actor = 5; // system:<service> | ui
+  string source_id = 6;
+  map<string, string> attrs = 7; // small change details (old/new status, merged_into, ...)
+}
