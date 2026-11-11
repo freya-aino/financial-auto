@@ -14,7 +14,12 @@ use std::collections::HashMap;
 use fa_core::{Timescale, rng::Rng};
 use fa_encoders::{EncoderFamily, EncoderInput, MarketBar, StatisticalEncoder};
 use fa_expert_space::{EvidenceSoftmaxRouter, Router};
-use fa_mcmc::{MarkovGraph, RegionCarry, calibration::SamplerStanding};
+use fa_mcmc::{
+    MarkovGraph, RegionCarry,
+    calibration::SamplerStanding,
+    kernel::KernelCtx,
+    refit::{COV_DIM, ObsDump, ObsRecord, ObsWindow, RefitOutcome},
+};
 use fa_patterns::{
     DriftMonitor, OnlineRegionCfg, OnlineRegionDiscovery, OnlineRegionSet, RegionLifecycle, RegionMap, RegionStat,
 };
@@ -94,6 +99,49 @@ pub trait TransitionModel: Send {
     }
     /// Replaces the evidence (kernel transfer, restore from Helix).
     fn replace_graph(&mut self, _g: MarkovGraph) {}
+    /// Observation with its context (asset, previous region, dwell, covariates; spec 33 §6.2).
+    fn observe_ctx(&mut self, from: &str, to: &str, _ctx: &KernelCtx) {
+        self.observe(from, to);
+    }
+    /// Row summary under the step's context (the serving kernel may condition on it).
+    fn summarize_ctx(&mut self, from: &str, _ctx: &KernelCtx) -> Vec<TransitionProb> {
+        self.summarize(from)
+    }
+    /// Serialised kernel for Helix `RegionSet.kernel_state`: the `MarkovGraph` JSON (what
+    /// control-api reads), optionally with extra keys a model restores itself.
+    fn kernel_state(&self) -> Option<String> {
+        self.graph().and_then(|g| serde_json::to_string(g).ok())
+    }
+    fn restore_kernel(&mut self, state: &str) {
+        if let Ok(g) = serde_json::from_str::<MarkovGraph>(state) {
+            self.replace_graph(g);
+        }
+    }
+    /// A batch refit for this space (`jobs.mcmc.refit`); returns the samplers that took it.
+    fn apply_refit(&mut self, _o: &RefitOutcome) -> Vec<String> {
+        Vec::new()
+    }
+    /// Garage keys of the refits in use (reloaded after a restart).
+    fn refit_refs(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// Chain position of one instrument at its last closed bar, per expert (spec 33 §6.2 context).
+#[derive(Debug, Clone, Default)]
+struct ChainPos {
+    regions: Vec<String>,
+    prev: Vec<Option<String>>,
+    dwell: Vec<u32>,
+    x: Vec<[f64; COV_DIM]>,
+    close: f64,
+}
+
+/// A due batch refit of one expert space (`jobs.mcmc.refit`, spec 33 §6.3 step 4).
+#[derive(Debug, Clone)]
+pub struct RefitRequest {
+    pub space: ExpertSpaceRef,
+    pub dump: ObsDump,
 }
 
 /// One encoding step.
@@ -119,6 +167,12 @@ pub struct StepOutput {
     pub lifecycle: Vec<RegionLifecycleEvent>,
     /// Graph-level kernel summaries due at this step (`latent.mcmc.<ts>.<expert>`).
     pub kernels: Vec<KernelUpdate>,
+    /// Batch refits due at this step (the caller uploads the dump and enqueues the job).
+    pub refits: Vec<RefitRequest>,
+    /// What a learned encoder adds to the step (spec 32 `ExpertView`; `latent.expert.*`).
+    pub extras: Option<fa_encoders::ExpertExtras>,
+    /// Encoder family of the serving snapshot (`fa_encoders::FamilyId`).
+    pub family: &'static str,
 }
 
 /// What the Helix sink persists per expert space (spec 30 §8, spec 33 §8).
@@ -160,8 +214,15 @@ pub struct TimescalePipeline {
     router: Box<dyn Router>,
     regions: Vec<Box<dyn OnlineRegionDiscovery>>,
     transitions: Vec<Box<dyn TransitionModel>>,
-    /// Region per expert at the last closed bar, per instrument.
-    last_closed: HashMap<String, Vec<String>>,
+    /// Chain position (region, previous region, dwell, covariates) per expert at the last
+    /// closed bar, per instrument.
+    last_closed: HashMap<String, ChainPos>,
+    /// EWMA of |closed-bar log return| per instrument (volatility covariate).
+    vol: HashMap<String, f64>,
+    /// Observation window per expert for the batch refits.
+    windows: Vec<ObsWindow>,
+    /// Event time of the last refit request per expert.
+    last_refit_ms: Vec<i64>,
     /// Occupancy drift per expert (spec 30 §6.6).
     drift: Vec<DriftMonitor>,
     /// Observations per expert (drift warm-up).
@@ -199,6 +260,9 @@ impl TimescalePipeline {
             regions,
             transitions,
             last_closed: HashMap::new(),
+            vol: HashMap::new(),
+            windows: (0..n_experts).map(|_| ObsWindow::new(cfg.kernel.refit_window)).collect(),
+            last_refit_ms: vec![i64::MIN; n_experts],
             drift: Self::drift_monitors(cfg, n_experts, region_map),
             observed: vec![0; n_experts],
             last_kernel_ms: vec![i64::MIN; n_experts],
@@ -359,6 +423,8 @@ impl TimescalePipeline {
         self.regions = regions;
         self.transitions = transitions;
         self.last_closed.clear();
+        self.windows = (0..n_experts).map(|_| ObsWindow::new(cfg.kernel.refit_window)).collect();
+        self.last_refit_ms = vec![i64::MIN; n_experts];
         self.drift = Self::drift_monitors(cfg, n_experts, region_map);
         self.observed = vec![0; n_experts];
         self.last_kernel_ms = vec![i64::MIN; n_experts];
@@ -388,7 +454,7 @@ impl TimescalePipeline {
                     .and_then(|v| v.as_str().map(str::to_owned))
                     .unwrap_or_default(),
                 region_state: set.export_state(),
-                kernel_state: model.graph().and_then(|g| serde_json::to_string(g).ok()),
+                kernel_state: model.kernel_state(),
                 stats: set.stats(),
             })
             .collect()
@@ -402,9 +468,7 @@ impl TimescalePipeline {
         if !set.restore_state(region_state) {
             return false;
         }
-        if let Ok(g) = serde_json::from_str::<MarkovGraph>(kernel_state) {
-            self.transitions[k].replace_graph(g);
-        }
+        self.transitions[k].restore_kernel(kernel_state);
         for s in self.regions[k].stats() {
             self.transitions[k].register_region(&s.region_id);
             if self.kcfg.geo_prior {
@@ -416,6 +480,25 @@ impl TimescalePipeline {
 
     pub fn n_experts(&self) -> usize {
         self.regions.len()
+    }
+
+    /// Hands a batch refit to the expert space it was computed for (same snapshot); returns the
+    /// samplers that took it, `None` when the refit is for another snapshot or expert.
+    pub fn apply_refit(&mut self, o: &RefitOutcome) -> Option<Vec<String>> {
+        if o.snapshot_id != self.snapshot_id() || o.timescale != self.ts.to_string() {
+            return None;
+        }
+        Some(self.transitions.get_mut(o.expert_index as usize)?.apply_refit(o))
+    }
+
+    /// Garage keys of the refits each expert's samplers use (reloaded after a restore).
+    pub fn refit_refs(&self) -> Vec<String> {
+        self.transitions.iter().flat_map(|t| t.refit_refs()).collect()
+    }
+
+    /// Observations in the refit windows (heartbeat gauge).
+    pub fn refit_window_len(&self) -> usize {
+        self.windows.iter().map(ObsWindow::len).sum()
     }
 
     /// Replaces only the encoder (an online adapter of the same snapshot, spec 36 §6.5): region
@@ -465,7 +548,8 @@ impl TimescalePipeline {
     }
 
     pub fn step(&mut self, input: &StepInput<'_>) -> Result<StepOutput, fa_encoders::EncoderError> {
-        let mut view = self.encoder.encode(&EncoderInput::from_bars(input.as_of_ms, input.bars))?;
+        let (mut view, extras) =
+            self.encoder.encode_with_extras(&EncoderInput::from_bars(input.as_of_ms, input.bars))?;
         // A neural encoder ships its learned top-k gates (spec 32 §6.1); only encoders without a
         // learned gate (the statistical family) are routed by the baseline router.
         if view.router_weights.len() != view.experts.len() {
@@ -476,6 +560,7 @@ impl TimescalePipeline {
         let mut current = Vec::with_capacity(view.experts.len());
         let mut experts = Vec::with_capacity(view.experts.len());
         let mut memberships = Vec::with_capacity(view.experts.len());
+        let mut novelty = Vec::with_capacity(view.experts.len());
         let novelty_threshold = self.novelty_threshold;
         for e in &view.experts {
             let k = e.expert_index as usize;
@@ -517,6 +602,7 @@ impl TimescalePipeline {
                 novelty: a.novelty,
                 out_of_region: a.novelty >= novelty_threshold,
             });
+            novelty.push(f64::from(a.novelty));
             current.push(a.region_id.clone());
             experts.push(ExpertLatent {
                 expert_index: e.expert_index,
@@ -528,22 +614,64 @@ impl TimescalePipeline {
         }
 
         if input.bar_closed {
-            if let Some(prev) = self.last_closed.remove(input.instrument_id) {
-                for (k, (from, to)) in prev.iter().zip(&current).enumerate() {
+            let close = input.bars.last().map_or(0.0, |b| b.close);
+            let prev_pos = self.last_closed.remove(input.instrument_id);
+            // volatility covariate: |log return| relative to its EWMA (spec 33 §6.2)
+            let ret = prev_pos
+                .as_ref()
+                .filter(|p| p.close > 0.0 && close > 0.0)
+                .map_or(0.0, |p| (close / p.close).ln().abs());
+            let ewma = self.vol.entry(input.instrument_id.to_owned()).or_insert(ret);
+            let vol_ratio = ((ret + 1e-6) / (*ewma + 1e-6)).ln().clamp(-3.0, 3.0);
+            *ewma = 0.95 * *ewma + 0.05 * ret;
+            let mut pos = ChainPos { regions: current.clone(), close, ..ChainPos::default() };
+            for (k, to) in current.iter().enumerate() {
+                let (prev, dwell) = match &prev_pos {
+                    Some(p) if p.regions.get(k) == Some(to) => (p.prev[k].clone(), p.dwell[k] + 1),
+                    Some(p) => (p.regions.get(k).cloned(), 1),
+                    None => (None, 1),
+                };
+                let w = view.router_weights.get(k).copied().map_or(0.0, f64::from);
+                pos.prev.push(prev);
+                pos.dwell.push(dwell);
+                pos.x.push([f64::from(dwell).ln(), vol_ratio, novelty.get(k).copied().unwrap_or(0.0).min(10.0), w]);
+            }
+            if let Some(prev) = prev_pos {
+                for (k, (from, to)) in prev.regions.iter().zip(&current).enumerate() {
+                    let ctx = KernelCtx {
+                        instrument: input.instrument_id.to_owned(),
+                        prev: prev.prev.get(k).cloned().flatten(),
+                        dwell: prev.dwell.get(k).copied().unwrap_or(1),
+                        x: prev.x.get(k).copied().unwrap_or([0.0; COV_DIM]),
+                    };
                     let space = self.space(k as u32);
                     let model = &mut self.transitions[k];
-                    model.observe(from, to);
+                    model.observe_ctx(from, to, &ctx);
                     out.transitions.push(TransitionUpdate {
                         space,
                         from_region_id: from.clone(),
-                        to: model.summarize(from),
+                        to: model.summarize_ctx(from, &ctx),
                         sampler_id: model.sampler_id().to_owned(),
                         as_of: Some(ms_to_ts(input.as_of_ms)),
                     });
+                    if self.kcfg.refit_every_ms > 0
+                        && let Some(w) = self.windows.get_mut(k)
+                    {
+                        w.push(ObsRecord {
+                            t_ms: input.as_of_ms,
+                            instrument: ctx.instrument,
+                            prev: ctx.prev,
+                            from: from.clone(),
+                            to: to.clone(),
+                            dwell: ctx.dwell,
+                            x: ctx.x.map(|v| v as f32),
+                        });
+                    }
                 }
             }
-            self.last_closed.insert(input.instrument_id.to_owned(), current);
+            self.last_closed.insert(input.instrument_id.to_owned(), pos);
             out.kernels = self.kernels_due(input.as_of_ms);
+            out.refits = self.refits_due(input.as_of_ms);
         }
 
         out.membership = Some(RegionMembership {
@@ -554,6 +682,8 @@ impl TimescalePipeline {
             experts: memberships,
         });
 
+        out.extras = extras;
+        out.family = self.encoder.descriptor().id.as_str();
         out.state = Some(LatentState {
             snapshot_id: view.snapshot_id,
             timescale: self.ts.to_string(),
@@ -575,6 +705,9 @@ impl TimescalePipeline {
         for k in 0..self.regions.len() {
             if self.last_kernel_ms[k] != i64::MIN && as_of_ms - self.last_kernel_ms[k] < self.kcfg.kernel_every_ms {
                 continue;
+            }
+            if !out.is_empty() {
+                break; // one expert space per step: summaries are staggered, the step stays short
             }
             self.last_kernel_ms[k] = as_of_ms;
             let stats = self.regions[k].stats();
@@ -600,6 +733,32 @@ impl TimescalePipeline {
             ) {
                 out.push(u);
             }
+        }
+        out
+    }
+
+    /// Batch refits due (spec 33 §6.3 step 4): the first once a window holds
+    /// `refit_min_obs` transitions, then every `refit_every_ms` of event time with at least
+    /// `refit_min_obs / 4` fresh transitions.
+    fn refits_due(&mut self, as_of_ms: i64) -> Vec<RefitRequest> {
+        if self.kcfg.refit_every_ms <= 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for k in 0..self.windows.len() {
+            let w = &self.windows[k];
+            let first = self.last_refit_ms[k] == i64::MIN;
+            let due = if first {
+                w.len() >= self.kcfg.refit_min_obs
+            } else {
+                as_of_ms - self.last_refit_ms[k] >= self.kcfg.refit_every_ms && w.fresh >= self.kcfg.refit_min_obs / 4
+            };
+            let Some(g) = due.then(|| self.transitions[k].graph().cloned()).flatten() else { continue };
+            self.last_refit_ms[k] = as_of_ms;
+            let space = self.space_ref(k as u32);
+            let kernel_id = crate::hub_sink::expert_space_id(&space.snapshot_id, space.expert_index);
+            let dump = self.windows[k].take_dump(&kernel_id, as_of_ms, &g);
+            out.push(RefitRequest { space, dump });
         }
         out
     }
@@ -883,10 +1042,122 @@ mod tests {
         // first closed step emits for every expert, then every 10 bars: 59 closed steps → 6 rounds
         assert_eq!(kernels.len(), 3 * 6, "{}", kernels.len());
         let last = kernels.last().unwrap();
-        assert_eq!(last.samplers.len(), 2);
+        // conjugate, smc and the four richer kernels of spec 33 §6.2
+        assert_eq!(last.samplers.len(), 6);
         assert!(last.samplers.iter().any(|s| s.serving));
         assert!(!last.stationary.is_empty());
         assert!(last.observation_mass > 0.0);
+    }
+
+    /// Spec 33 §6.2–6.3: windows fill with contextual transitions, a refit becomes due, its
+    /// NUTS/Gibbs outcome enters the arena of the right expert space.
+    #[test]
+    fn refits_are_requested_with_context_and_their_outcome_enters_the_arena() {
+        let mut cfg = PipelineConfig::default();
+        cfg.kernel.refit_min_obs = 60;
+        cfg.kernel.refit_every_ms = 3_600_000;
+        let mut pl = TimescalePipeline::baseline(Timescale::Minute, &cfg);
+        let a = bars(90, 11);
+        let b = bars(90, 12);
+        let mut requests = Vec::new();
+        for end in 2..=a.len() {
+            for (inst, series) in [("i1", &a), ("i2", &b)] {
+                let out = pl
+                    .step(&StepInput {
+                        instrument_id: inst,
+                        as_of_ms: end as i64 * 60_000,
+                        bars: &series[..end],
+                        bar_closed: true,
+                    })
+                    .unwrap();
+                requests.extend(out.refits);
+            }
+        }
+        assert_eq!(requests.len(), 3, "one first refit per expert");
+        let req = &requests[0];
+        assert_eq!(req.space.expert_index, 0);
+        assert!(req.dump.records.len() >= 60);
+        assert_eq!(req.dump.kernel_id, crate::hub_sink::expert_space_id(pl.snapshot_id(), 0));
+        assert!(req.dump.records.iter().all(|r| r.dwell >= 1 && r.x[0] >= 0.0));
+        assert!(req.dump.records.iter().any(|r| r.instrument == "i2"));
+        assert!(pl.refit_window_len() >= 3 * 60);
+        // the worker's computation (fast settings) and the arena hand-off
+        let rcfg = fa_mcmc::refit::RefitCfg {
+            nuts: fa_mcmc::nuts::NutsCfg { warmup: 60, samples: 60, max_depth: 4, ..Default::default() },
+            min_row_obs: 5,
+            gibbs_burn: 50,
+            gibbs_iters: 100,
+            min_ess: 10.0,
+            max_rhat: 2.0,
+            gibbs_max_rhat: 2.0,
+            ..Default::default()
+        };
+        let spec = fa_mcmc::refit::RefitSpec {
+            kernel_id: req.dump.kernel_id.clone(),
+            snapshot_id: req.space.snapshot_id.clone(),
+            timescale: req.space.timescale.clone(),
+            expert_index: 0,
+            obs_ref: String::new(),
+            kernels: vec![],
+            seed: 1,
+            cfg: rcfg,
+        };
+        let mut o = fa_mcmc::refit::run(&req.dump, &spec);
+        o.samples_ref = "mcmc/x/1.bin".into();
+        let taken = pl.apply_refit(&o).expect("same snapshot");
+        assert!(taken.contains(&"logit_cov".to_owned()), "{taken:?} {:?}", o.summary());
+        assert_eq!(pl.refit_refs(), vec!["mcmc/x/1.bin".to_owned()]);
+        let other = fa_mcmc::refit::RefitOutcome { snapshot_id: "other".into(), ..o };
+        assert!(pl.apply_refit(&other).is_none());
+    }
+
+    /// Spec 30 §9.5: live membership latency per instrument per step at the minute timescale
+    /// (encode + route + regions + six-kernel arena + summaries). Run:
+    /// `cargo test -p model-runtime --release -- --ignored --nocapture bench_`.
+    #[test]
+    #[ignore = "benchmark: run with --release --ignored"]
+    fn bench_step_latency_per_instrument() {
+        let mut cfg = PipelineConfig::default();
+        if std::env::var("BENCH_NO_KERNEL").is_ok() {
+            cfg.kernel.kernel_every_ms = 0;
+        }
+        if std::env::var("BENCH_NO_RICH").is_ok() {
+            cfg.kernel.rich_kernels = false;
+        }
+        let mut pl = TimescalePipeline::baseline(Timescale::Minute, &cfg);
+        let ctx = pl.context_steps().max(2);
+        let n = ctx + 300;
+        let series: Vec<Vec<MarketBar>> = (0..20).map(|i| bars(n, 100 + i)).collect();
+        let mut times = Vec::new();
+        for end in ctx..n {
+            for (i, s) in series.iter().enumerate() {
+                let lo = end.saturating_sub(ctx);
+                let t0 = std::time::Instant::now();
+                pl.step(&StepInput {
+                    instrument_id: &format!("inst{i}"),
+                    as_of_ms: end as i64 * 60_000,
+                    bars: &s[lo..end],
+                    bar_closed: true,
+                })
+                .unwrap();
+                if end > ctx + 50 {
+                    times.push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        let q = |p: f64| times[((times.len() - 1) as f64 * p) as usize];
+        let mean = times.iter().sum::<f64>() / times.len() as f64;
+        eprintln!(
+            "pipeline step (1m, 20 instruments, {} steps): mean {mean:.3} ms, p50 {:.3}, p99 {:.3}, max {:.3}; regions {}, rows {}",
+            times.len(),
+            q(0.5),
+            q(0.99),
+            q(1.0),
+            pl.live_regions(),
+            pl.transition_rows()
+        );
+        assert!(q(0.99) < 5.0, "spec 30 §9.5: p99 {} ms > 5 ms", q(0.99));
     }
 
     fn out_created(pl: &TimescalePipeline) -> usize {
@@ -920,6 +1191,15 @@ mod tests {
         let g0 = pl.transitions[0].graph().unwrap();
         let g1 = fresh.transitions[0].graph().unwrap();
         assert!((g0.total_mass() - g1.total_mass()).abs() < 1e-9);
+        // the richer kernels' own state travels with the kernel (and MarkovGraph readers ignore it)
+        let ks = rows[0].kernel_state.as_ref().unwrap();
+        let v: serde_json::Value = serde_json::from_str(ks).unwrap();
+        assert!(v["arena_states"]["second_order"]["rows"].is_object(), "{}", &ks[..ks.len().min(300)]);
+        assert!(v["arena_states"]["hier_asset"]["assets"].is_object());
+        assert!(serde_json::from_str::<MarkovGraph>(ks).is_ok());
+        let again: serde_json::Value = serde_json::from_str(&fresh.transitions[0].kernel_state().unwrap()).unwrap();
+        assert_eq!(again["arena_states"]["second_order"], v["arena_states"]["second_order"]);
+        assert_eq!(again["arena_states"]["semi_markov"], v["arena_states"]["semi_markov"]);
         // a state of another snapshot is refused
         let stats = StatisticalEncoder::fit(Timescale::Minute, &all, &fa_encoders::FitConfig::default()).unwrap();
         let mut other = TimescalePipeline::with_encoder(

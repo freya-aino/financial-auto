@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 async-nats.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 fa-core.workspace = true
 fa-metrics.workspace = true
 fa-proto.workspace = true

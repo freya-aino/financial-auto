@@ -24,7 +24,7 @@
 use candle_core::{D, DType, Device, Result, Tensor};
 use serde::{Deserialize, Serialize};
 
-use crate::nn::{Init, Linear, ParamStore, softmax_last};
+use crate::nn::{Init, Linear, ParamStore, Weights, linear_w, softmax_last};
 
 /// Hyper-parameters of a learned expert space (spec 32 §7; small CPU defaults).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -83,9 +83,6 @@ pub struct MoeExpertSpace {
     pub cfg: MoeConfig,
     pub d_in: usize,
     pub n_targets: usize,
-    router: Linear,
-    proj: Vec<Linear>,
-    pred: Vec<Linear>,
     /// Expert ids in output order (after pruning / reordering a subset of `0..max_experts`).
     pub active: Vec<usize>,
 }
@@ -93,18 +90,16 @@ pub struct MoeExpertSpace {
 impl MoeExpertSpace {
     pub fn new(ps: &mut ParamStore, cfg: &MoeConfig, d_in: usize, n_targets: usize) -> Result<Self> {
         let k = cfg.max_experts.max(1);
-        let router = Linear::new(ps, "moe.router", d_in, k, true)?;
-        let mut proj = Vec::with_capacity(k);
-        let mut pred = Vec::with_capacity(k);
+        Linear::new(ps, "moe.router", d_in, k, true)?;
         for e in 0..k {
-            proj.push(Linear::new(ps, &format!("moe.proj{e}"), d_in, 2 * cfg.expert_dim, true)?);
-            pred.push(Linear::new(ps, &format!("moe.pred{e}"), cfg.expert_dim, n_targets, true)?);
+            Linear::new(ps, &format!("moe.proj{e}"), d_in, 2 * cfg.expert_dim, true)?;
+            Linear::new(ps, &format!("moe.pred{e}"), cfg.expert_dim, n_targets, true)?;
         }
         // logvar bias starts at −2 (tight-ish posteriors), not 0.
         for e in 0..k {
             ps.get(&format!("moe.lvbias{e}"), &[cfg.expert_dim], Init::Const(-2.0))?;
         }
-        Ok(Self { cfg: cfg.clone(), d_in, n_targets, router, proj, pred, active: (0..k).collect() })
+        Ok(Self { cfg: cfg.clone(), d_in, n_targets, active: (0..k).collect() })
     }
 
     pub fn n_active(&self) -> usize {
@@ -118,7 +113,18 @@ impl MoeExpertSpace {
 
     /// Forward pass. `noise` = router noise `[B, K_max]` (training) or `None` (inference).
     pub fn forward(&self, ps: &ParamStore, h: &Tensor, noise: Option<&Tensor>) -> Result<MoeOutput> {
-        let logits_all = self.router.forward(h)?; // [B, K_max]
+        self.forward_w(ps, h, noise)
+    }
+
+    /// Weight names of the expert projectors of the active experts (`moe.proj<e>.w`): the
+    /// targets of expert-level low-rank adapters (spec 36 §6.5).
+    pub fn projector_weights(&self) -> Vec<String> {
+        self.active.iter().map(|e| format!("moe.proj{e}.w")).collect()
+    }
+
+    /// [`Self::forward`] reading every parameter through `w` (EMA copies, adapted views).
+    pub fn forward_w(&self, ps: &dyn Weights, h: &Tensor, noise: Option<&Tensor>) -> Result<MoeOutput> {
+        let logits_all = linear_w(ps, "moe.router", h)?; // [B, K_max]
         let logits_all = match noise {
             Some(n) => (logits_all + n)?,
             None => logits_all,
@@ -134,9 +140,9 @@ impl MoeExpertSpace {
         let mut codes = Vec::new();
         let d = self.cfg.expert_dim;
         for &e in &self.active {
-            let out = self.proj[e].forward(h)?; // [B, 2d]
+            let out = linear_w(ps, &format!("moe.proj{e}"), h)?; // [B, 2d]
             let raw = out.narrow(1, 0, d)?;
-            let lvb = ps.tensor(&format!("moe.lvbias{e}")).ok_or_else(|| candle_core::Error::Msg("lvbias".into()))?;
+            let lvb = ps.w(&format!("moe.lvbias{e}"))?;
             let lv = out.narrow(1, d, d)?.broadcast_add(&lvb)?.clamp(-8.0f32, 4.0f32)?;
             let bounded = raw.tanh()?;
             let mu = if self.cfg.fsq_levels.is_empty() {
@@ -147,7 +153,7 @@ impl MoeExpertSpace {
                 codes.push(code);
                 if q < d { Tensor::cat(&[zq, bounded.narrow(1, q, d - q)?], 1)? } else { zq }
             };
-            preds.push(self.pred[e].forward(&mu)?);
+            preds.push(linear_w(ps, &format!("moe.pred{e}"), &mu)?);
             mus.push(mu);
             raws.push(raw);
             lvs.push(lv);

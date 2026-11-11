@@ -15,6 +15,7 @@ pub mod latents;
 pub mod replay;
 pub mod stats;
 pub mod validation;
+pub mod venue;
 
 /// A replay source drives the same pipeline as live, in event-time order with
 /// point-in-time (publish_time ≤ decision time) semantics.

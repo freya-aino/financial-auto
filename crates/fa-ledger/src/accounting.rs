@@ -86,6 +86,10 @@ pub struct TradeEvent {
     pub filled_at: DateTime<Utc>,
     #[serde(default)]
     pub attribution: Vec<Attribution>,
+    /// The fill's venue settles in the fill currency ([`crate::settlement::Settlement::Native`]):
+    /// its cash moves the native balance of `ccy` instead of EUR cash (fees stay in EUR).
+    #[serde(default)]
+    pub settle_native: bool,
 }
 
 impl TradeEvent {
@@ -399,9 +403,21 @@ impl BookState {
         }
         self.fills += 1;
         let fx = if is_eur(&t.ccy) { 1.0 } else { t.fx_to_eur };
-        self.cash_eur -= t.qty * t.price * fx + t.fee_eur;
-        self.fees_eur += t.fee_eur;
         let ccy = if t.ccy.is_empty() { fa_core::BASE_CURRENCY.to_owned() } else { t.ccy.to_ascii_uppercase() };
+        if t.settle_native && !is_eur(&ccy) {
+            // spec 42 §10 Q5: native settlement — the trade moves the native cash balance at its
+            // booking value; revaluing that balance is FX P&L on cash (`fx_cash_eur`)
+            let b = self
+                .foreign_cash
+                .entry(ccy.clone())
+                .or_insert_with(|| CashBalance { ccy: ccy.clone(), ..Default::default() });
+            b.balance -= t.qty * t.price;
+            b.booked_eur -= t.qty * t.price * fx;
+            self.cash_eur -= t.fee_eur;
+        } else {
+            self.cash_eur -= t.qty * t.price * fx + t.fee_eur;
+        }
+        self.fees_eur += t.fee_eur;
         let last = Last { price: t.price, fx, ccy: ccy.clone(), at: t.filled_at };
         let key = (t.venue, t.instrument);
         self.last_by_key.insert(key, last.clone());
@@ -768,6 +784,7 @@ mod tests {
             fee_eur: 0.5,
             filled_at: ts(at),
             attribution: Vec::new(),
+            settle_native: false,
         }
     }
 
@@ -836,6 +853,29 @@ mod tests {
         assert!(close(p.fx_unrealised_eur, 6.0 * 100.0 * -0.1));
         assert!(close(p.fees_eur, 1.0));
         assert!(close(s.equity_eur(&marks) - s.external_eur, p.net_eur));
+    }
+
+    /// spec 42 §10 Q5: the same trades settled natively hold USD cash; equity and net P&L
+    /// still reconcile, and the USD cash revaluation shows as `fx_cash_eur`.
+    #[test]
+    fn native_settlement_keeps_fx_on_trading_cash() {
+        let i = InstrumentId::new();
+        let mut t = vec![tr(1, i, 10.0, 100.0, 0.9, "USD", 0), tr(2, i, -4.0, 110.0, 0.95, "USD", 1)];
+        let c = vec![cash("deposit", "initial", 10_000.0, "EUR", 1.0, -1)];
+        let eur = replay(LotMethod::Fifo, &t, &c, None);
+        for x in &mut t {
+            x.settle_native = true;
+        }
+        let native = replay(LotMethod::Fifo, &t, &c, None);
+        assert!(close(native.cash_eur, 10_000.0 - 1.0), "only fees leave EUR cash");
+        let usd = &native.foreign_cash["USD"];
+        assert!(close(usd.balance, -1000.0 + 440.0));
+        let marks = Marks { prices: BTreeMap::from([(i, 120.0)]), fx: BTreeMap::from([("USD".into(), 0.8)]) };
+        let (pe, pn) = (eur.pnl(&marks), native.pnl(&marks));
+        assert!(close(pe.realised_eur, pn.realised_eur) && close(pe.unrealised_eur, pn.unrealised_eur));
+        assert!(close(pe.fx_cash_eur, 0.0));
+        assert!(close(pn.fx_cash_eur, usd.balance * 0.8 - usd.booked_eur));
+        assert!(close(native.equity_eur(&marks) - native.external_eur, pn.net_eur));
     }
 
     #[test]
@@ -964,7 +1004,7 @@ mod tests {
         let s = replay(LotMethod::Average, &t, &c, None);
         let mut l = crate::Ledger::with_cash(0.0);
         for x in c.iter().filter(|x| x.ccy == "EUR") {
-            l.cash_eur += x.amount_eur();
+            l.apply_cash(&format!("{}:{}", x.kind, x.reference), &x.kind, crate::dec(x.amount_eur()));
         }
         let mut sorted = t.clone();
         sorted.sort_by_key(|x| x.filled_at);

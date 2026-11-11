@@ -26,6 +26,7 @@ type StreamSpec struct {
 	Name        string   `json:"name"`
 	Subjects    []string `json:"subjects"`
 	MaxAgeHours uint64   `json:"max_age_hours"`
+	MaxMiB      uint64   `json:"max_mib"` // disk cap (spec 21 §10.1); 0 = unlimited
 	Storage     string   `json:"storage"`
 	Description string   `json:"description"`
 }
@@ -63,8 +64,26 @@ func (s StreamSpec) Config() jetstream.StreamConfig {
 		Subjects:    s.Subjects,
 		Retention:   jetstream.LimitsPolicy,
 		MaxAge:      time.Duration(s.MaxAgeHours) * time.Hour,
+		MaxBytes:    s.MaxBytes(),
 		Storage:     storage,
 	}
+}
+
+// MaxBytes is max_mib in bytes, -1 (unlimited) when absent.
+func (s StreamSpec) MaxBytes() int64 {
+	if s.MaxMiB == 0 {
+		return -1
+	}
+	return int64(s.MaxMiB) * 1024 * 1024
+}
+
+// safeMaxBytes never applies a cap below the bytes a stream already holds (JetStream would
+// purge the oldest messages at once); the current cap stays and the caller logs nothing.
+func safeMaxBytes(have, want int64, used uint64) int64 {
+	if want > 0 && used > uint64(want) {
+		return have
+	}
+	return want
 }
 
 // WorkQueueName is the stream for a job kind: "evo" → "JOBS_EVO", "media.asr" → "JOBS_MEDIA_ASR".
@@ -89,7 +108,8 @@ func WorkQueueConsumer(durable string) jetstream.ConsumerConfig {
 }
 
 // EnsureStreams creates every spec 21 §5 stream and updates the ones whose live config drifted
-// (subjects, max age, storage, description). Idempotent. Returns the names created or updated.
+// (subjects, max age, max bytes, storage, description). Idempotent. A max_bytes cap below a
+// stream's current size is not applied (it would purge), mirroring fa_bus::streams. Returns the names created or updated.
 func EnsureStreams(ctx context.Context, js jetstream.JetStream) ([]string, error) {
 	var changed []string
 	for _, spec := range Table().Streams {
@@ -122,13 +142,16 @@ func ensureStream(ctx context.Context, js jetstream.JetStream, want jetstream.St
 	if err != nil {
 		return false, err
 	}
-	have := s.CachedInfo().Config
+	info := s.CachedInfo()
+	have := info.Config
+	want.MaxBytes = safeMaxBytes(have.MaxBytes, want.MaxBytes, info.State.Bytes)
 	if configMatches(have, want) {
 		return false, nil
 	}
 	// Keep server-side fields we do not manage and overlay ours.
 	have.Subjects = want.Subjects
 	have.MaxAge = want.MaxAge
+	have.MaxBytes = want.MaxBytes
 	have.Description = want.Description
 	have.Retention = want.Retention
 	have.Storage = want.Storage
@@ -148,7 +171,7 @@ func configMatches(have, want jetstream.StreamConfig) bool {
 			return false
 		}
 	}
-	return have.MaxAge == want.MaxAge && have.Retention == want.Retention &&
+	return have.MaxAge == want.MaxAge && have.MaxBytes == want.MaxBytes && have.Retention == want.Retention &&
 		have.Storage == want.Storage && have.Description == want.Description
 }
 

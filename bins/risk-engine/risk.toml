@@ -107,8 +107,9 @@ portfolio_gross_cap = 2.0   # risk.portfolio_gross_cap: total gross / deployable
 liquidity_k = 0.01          # |position| ≤ k × horizon volume (EUR)
 max_order_frac = 0.10       # pre-trade (manual / foreign orders): notional ≤ this × deployable (fat finger)
 limit_price_band = 0.10     # pre-trade: limit price within ±10 % of the mark
-daily_payout_quota_eur = 0  # payout rule still open (spec 42 Q1); the larger of this and today's ledger.payout_quota row is reserved
+daily_payout_quota_eur = 0  # floor of the reserve; the [payout] rule writes today's ledger.payout_quota row; the larger is reserved
                             # (deployable = equity − reserve); ctl.risk.limits {set: {daily_payout_quota_eur}} raises both (tighten-only)
+short_margin_budget_frac = 0.5 # Σ |short| × short_margin(class) ≤ this × deployable (spec 40 §10 Q5, paper answer)
 
 [limits.leverage_cap]       # risk.gross_leverage_cap.<class>
 equity = 1.5
@@ -120,3 +121,55 @@ rates = 1.0
 index = 1.0
 derivative = 1.0
 prediction_market = 1.0
+
+[limits.short_margin]       # initial margin per short as a fraction of its notional; a class absent here cannot be
+equity = 0.5                # shorted (no borrow), nor can an instrument whose ref.contract_spec.shortable is false.
+etf = 0.5                   # Reg-T style 50 % for cash equities / ETFs
+crypto = 1.0                # fully collateralised
+fx = 0.05                   # 20:1
+index = 0.1
+commodity = 0.2
+derivative = 0.2            # delta-1 notionals (spec 40 §11)
+                            # rates, prediction_market: not shortable
+
+# Execution-algorithm choice per intent (spec 40 §6.4, fa_risk::exec): urgent (halts, flattens) and
+# short-horizon (< market_below_horizon_secs) orders cross the spread; otherwise by participation in
+# the horizon volume: ≥ pov_participation → pov, ≥ twap_participation with a horizon ≥
+# sliced_min_horizon_secs → vwap/twap over half the horizon, else smart_limit (timeout horizon/4,
+# 5..smart_limit_timeout_secs); orders under market_below_eur go market.
+[exec]
+enabled = true
+market_below_horizon_secs = 60
+market_below_eur = 250
+smart_limit_timeout_secs = 30   # exec.smart_limit_timeout
+twap_participation = 0.01
+pov_participation = 0.05
+pov_rate = 0.1
+sliced_min_horizon_secs = 600
+max_slice_dur_secs = 3600
+slice_secs = 30
+
+# Model-drift alarm (spec 40 §6.5): kernel updates on latent.mcmc.* whose occupancy drift_kl stays
+# ≥ halt_kl for `sustain` updates raise `model:<snapshot>` — only the strategies of that snapshot's
+# timescale pause; ≤ clear_kl for `clear_sustain` updates of every expert clears it (only halts
+# this alarm raised; operator/bus halts need risk.resume.model:<snapshot>). halt_kl is 10× the
+# adapter-refit trigger (KL > 0.1 × 3, spec 33): refit first, halt only on gross drift.
+[model_drift]
+enabled = true
+halt_kl = 1.0
+sustain = 5
+clear_kl = 0.25
+clear_sustain = 10
+
+# Daily payout quota rule (spec 42 §10 Q1, fa_ledger::payout). At the first check of each UTC day
+# the risk-engine computes the quota from the book as of midnight and raises today's
+# ledger.payout_quota row to it (never lowers): rule = fixed_eur (amount_eur) | pct_equity |
+# pct_profit (pct of the previous day's positive net P&L); rollover carries yesterday's unpaid
+# quota; capped at max_equity_frac × previous close equity. The quota is reserved (deployable =
+# equity − reserve); booking the payout is an operator action (POST /api/trading/payouts).
+[payout]
+rule = "fixed_eur"
+amount_eur = 0.0
+pct = 0.0
+rollover = false
+max_equity_frac = 0.05

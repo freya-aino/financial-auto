@@ -65,6 +65,8 @@ rand = "0.9.2"
 candle-core = { version = "0.10.2", default-features = false }
 candle-nn = { version = "0.10.2", default-features = false }
 safetensors = "0.7.0"
+# Exact money in the ledger (spec 42 §4: `Decimal`); NUMERIC I/O via sqlx `rust_decimal`.
+rust_decimal = "1.40.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

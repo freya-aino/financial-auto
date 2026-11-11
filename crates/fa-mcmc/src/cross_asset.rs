@@ -16,6 +16,16 @@
 //!   t-statistic (Bayesian linear regression with a flat prior).
 //!
 //! Proposals are the pairs with positive gain ranked by `gain / uncertainty` (= `|t|`), top `N`.
+//!
+//! **Expert residuals** (spec 33 §6.5): when the caller also pushes the residual of each return
+//! against the instrument's own expert view ([`CrossAssetPriors::push_with_residual`]; model-runtime
+//! uses `r_t − Σ_k w_k · μ_k(region_k at t−1)`, the router-weighted region-conditional mean return),
+//! the shrunk residual correlation is reported next to the return correlation and the lead-lag,
+//! predictive gain and uncertainty are computed on the residuals: the gain then measures what
+//! `a`'s view adds to `b`'s **expert** next-step model, not to a bare AR(1). Pairs without
+//! residuals fall back to returns (`basis = "return"`).
+//!
+//! The tracker is `serde` (model-runtime persists it to Garage and restores it on start).
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -57,12 +67,21 @@ pub struct CrossPrior {
     pub uncertainty: f64,
     /// `predictive_gain / uncertainty` (ranking key).
     pub score: f64,
+    /// Ledoit–Wolf shrunk correlation of the expert residuals (= `correlation` on basis `return`).
+    #[serde(default)]
+    pub residual_correlation: f64,
+    /// `residual` (lead-lag and gain on expert residuals) or `return`.
+    #[serde(default)]
+    pub basis: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CrossAssetPriors {
     cfg: CrossAssetCfg,
     series: BTreeMap<String, VecDeque<(i64, f64)>>,
+    /// Expert residuals at the same closes (optional per instrument).
+    #[serde(default)]
+    resid: BTreeMap<String, VecDeque<(i64, f64)>>,
 }
 
 /// Real observations each side needs inside the overlap (the rest may be filled with 0).
@@ -172,7 +191,30 @@ fn invert(mut a: Vec<Vec<f64>>) -> Option<Vec<Vec<f64>>> {
 
 impl CrossAssetPriors {
     pub fn new(cfg: CrossAssetCfg) -> Self {
-        Self { cfg, series: BTreeMap::new() }
+        Self { cfg, series: BTreeMap::new(), resid: BTreeMap::new() }
+    }
+
+    /// Keeps the series but adopts `cfg` (a restored tracker follows the current tunables).
+    pub fn set_cfg(&mut self, cfg: CrossAssetCfg) {
+        self.cfg = cfg;
+    }
+
+    /// A closed-bar log return and its residual against the instrument's expert view.
+    pub fn push_with_residual(&mut self, instrument: &str, t_ms: i64, ret: f64, resid: f64) {
+        if !ret.is_finite() || !resid.is_finite() {
+            return;
+        }
+        let before = self.series.get(instrument).map_or(0, VecDeque::len);
+        let last = self.series.get(instrument).and_then(|s| s.back().map(|x| x.0));
+        self.push(instrument, t_ms, ret);
+        if last.is_some_and(|t| t >= t_ms) && before > 0 {
+            return; // stale: ignored by `push` too
+        }
+        let r = self.resid.entry(instrument.to_owned()).or_default();
+        r.push_back((t_ms, resid));
+        while r.len() > self.cfg.window {
+            r.pop_front();
+        }
     }
 
     /// A closed-bar log return of `instrument` at bar close `t_ms`.
@@ -219,6 +261,18 @@ impl CrossAssetPriors {
         let x: Vec<f64> = ts.iter().map(|t| am.get(t).copied().unwrap_or(0.0)).collect();
         let y: Vec<f64> = ts.iter().map(|t| bm.get(t).copied().unwrap_or(0.0)).collect();
         let (correlation, shrinkage) = ledoit_wolf(&x, &y);
+        // expert residuals on the same timeline when both sides have them
+        let (basis, x, y) = match (self.resid.get(source), self.resid.get(target)) {
+            (Some(ra), Some(rb)) if ra.len() >= MIN_OWN_OBS && rb.len() >= MIN_OWN_OBS => {
+                let ra: BTreeMap<i64, f64> = ra.iter().copied().collect();
+                let rb: BTreeMap<i64, f64> = rb.iter().copied().collect();
+                let xr: Vec<f64> = ts.iter().map(|t| ra.get(t).copied().unwrap_or(0.0)).collect();
+                let yr: Vec<f64> = ts.iter().map(|t| rb.get(t).copied().unwrap_or(0.0)).collect();
+                ("residual", xr, yr)
+            }
+            _ => ("return", x, y),
+        };
+        let residual_correlation = if basis == "residual" { ledoit_wolf(&x, &y).0 } else { correlation };
         let max_lag = self.cfg.max_lag.max(1).min(ts.len() / 4);
         let (lead_lag, lead_corr) = (1..=max_lag)
             .map(|l| (l, corr(&x[..x.len() - l], &y[l..])))
@@ -245,6 +299,8 @@ impl CrossAssetPriors {
             predictive_gain: gain,
             uncertainty,
             score,
+            residual_correlation,
+            basis: basis.into(),
         })
     }
 
@@ -302,6 +358,31 @@ mod tests {
         // stale or duplicate timestamps are ignored
         cp.push("lead", 0, 1.0);
         assert_eq!(cp.instruments(), 3);
+    }
+
+    #[test]
+    fn residuals_reveal_a_lead_hidden_by_a_shared_regime_mean() {
+        // Both assets move with a large shared regime mean the experts explain; only the residual
+        // of `a` leads the residual of `b` by one bar.
+        let mut rng = Rng::seed(21);
+        let mut cp = CrossAssetPriors::new(CrossAssetCfg::default());
+        let mut prev_ea = 0.0;
+        for t in 0..400i64 {
+            let regime = if (t / 20) % 2 == 0 { 0.02 } else { -0.02 };
+            let ea = 0.002 * rng.normal();
+            let eb = 0.9 * prev_ea + 0.0005 * rng.normal();
+            cp.push_with_residual("a", t, regime + 0.01 * rng.normal() + ea, ea);
+            cp.push_with_residual("b", t, regime + 0.01 * rng.normal() + eb, eb);
+            prev_ea = ea;
+        }
+        let p = cp.pair("a", "b").unwrap();
+        assert_eq!((p.basis.as_str(), p.lead_lag), ("residual", 1));
+        assert!(p.lead_corr > 0.9 && p.score > 10.0, "{p:?}");
+        assert!(p.correlation > 0.5, "returns share the regime: {p:?}");
+        assert!(p.residual_correlation.abs() < 0.2, "{p:?}");
+        // serde round trip (persistence)
+        let back: CrossAssetPriors = serde_json::from_str(&serde_json::to_string(&cp).unwrap()).unwrap();
+        assert_eq!(back.pair("a", "b").unwrap().lead_lag, 1);
     }
 
     #[test]

@@ -16,7 +16,15 @@ const pages = {
 	ops: () => import('../routes/+page.svelte'),
 	latent: () => import('../routes/latent/+page.svelte'),
 	evolution: () => import('../routes/evolution/+page.svelte'),
-	trading: () => import('../routes/trading/+page.svelte')
+	trading: () => import('../routes/trading/+page.svelte'),
+	alerts: () => import('../routes/alerts/+page.svelte'),
+	refdata: () => import('../routes/refdata/+page.svelte'),
+	mcmc: () => import('../routes/latent/mcmc/+page.svelte'),
+	snapshots: () => import('../routes/latent/snapshots/+page.svelte'),
+	decoders: () => import('../routes/evolution/decoders/+page.svelte'),
+	pipeline: () => import('../routes/trading/pipeline/+page.svelte'),
+	risk: () => import('../routes/trading/risk/+page.svelte'),
+	ledger: () => import('../routes/trading/ledger/+page.svelte')
 };
 
 describe('views render at their empty state', () => {

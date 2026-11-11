@@ -18,6 +18,9 @@ pub mod calibration;
 pub mod cross_asset;
 pub mod inference;
 pub mod kernel;
+pub mod nuts;
+pub mod refit;
+pub mod rich;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

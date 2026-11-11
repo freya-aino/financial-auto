@@ -53,6 +53,17 @@ use crate::{
 pub const BUNDLE_FORMAT: &str = "fa-decoder-bundle/v1";
 /// Name of the metadata tensor (UTF-8 JSON as `u8`) inside a bundle.
 pub const META_TENSOR: &str = "__meta__";
+/// Version of the latent normaliser a bundle was trained with (`BundleMeta.norm_version`).
+/// 1 = the first-generation normaliser (no std floor, no clipping; bundles written before the
+/// field existed deserialise as 1); 2 = std floored at [`data::LATENT_STD_FLOOR`] and values
+/// clipped to ±[`data::LATENT_CLIP`] in training, serving and feedback alike (D-068). Bundles
+/// below this version are refused by [`NeuralDecoder::from_bundle`], skipped by
+/// [`feedback::select_top_k`] and re-trained ([`feedback::stale_cards`]).
+pub const NORM_VERSION: u32 = 2;
+
+fn legacy_norm_version() -> u32 {
+    1
+}
 /// Rows per forward pass at inference.
 const INFER_BATCH: usize = 1024;
 
@@ -70,6 +81,8 @@ pub enum NeuralError {
     Bundle(String),
     #[error("interrupted after {0} steps")]
     Interrupted(usize),
+    #[error("stale bundle: latent normaliser v{0} < v{NORM_VERSION} (re-train the genome)")]
+    StaleNormaliser(u32),
 }
 
 /// Everything about a trained decoder except its weights (stored as JSON inside the bundle and
@@ -85,6 +98,13 @@ pub struct BundleMeta {
     pub output_family: String,
     pub layout: Layout,
     pub norm: Norm,
+    /// Latent normaliser version ([`NORM_VERSION`]; absent = 1, the first generation).
+    #[serde(default = "legacy_norm_version")]
+    pub norm_version: u32,
+    /// Expert layout `(expert_index, len)` of the **full** latent the decoder was trained on
+    /// (before its expert mask); empty for unconditioned decoders and pre-mask bundles.
+    #[serde(default)]
+    pub latent_layout: Vec<(u32, u32)>,
     /// Mean training target (the reconstruction baseline).
     pub target_mean: Vec<f32>,
     /// Text families: mean / std of `dot(target, sentiment_direction)` over training targets.
@@ -105,6 +125,22 @@ pub struct BundleMeta {
     pub job_id: String,
     #[serde(default)]
     pub generation: String,
+}
+
+impl BundleMeta {
+    /// Whether the bundle uses the current latent normaliser.
+    pub fn is_current(&self) -> bool {
+        self.norm_version >= NORM_VERSION
+    }
+
+    /// Dimension of the full (unmasked) latent the decoder reads from (0 = unconditioned).
+    pub fn full_latent_dim(&self) -> usize {
+        if self.layout.latent == 0 {
+            return 0;
+        }
+        let full: usize = self.latent_layout.iter().map(|(_, l)| *l as usize).sum();
+        if full > 0 { full } else { self.layout.latent }
+    }
 }
 
 /// Reconstruction quality on the evaluation window.
@@ -170,9 +206,10 @@ impl NeuralDecoder {
         self
     }
 
-    /// Replaces the latent / text context (serving, re-evaluation).
+    /// Replaces the latent / text context (serving, re-evaluation); the latents are masked to
+    /// the genome's experts.
     pub fn with_context(mut self, ctx: Arc<DecodeCtx>, text: Arc<TextTimeline>) -> Self {
-        self.ctx = ctx;
+        self.ctx = if self.genome.expert_mask != 0 { Arc::new(ctx.masked(self.genome.expert_mask)) } else { ctx };
         self.text = text;
         self.clear_cache();
         self
@@ -197,10 +234,23 @@ impl NeuralDecoder {
         self.params.iter().map(|(_, t)| t.elem_count()).sum()
     }
 
-    /// Input row at step `t` with the decoder's own latent / text context.
+    /// Input row at step `t` with the decoder's own latent / text context (latents of the `src`
+    /// instrument for a cross-asset genome; the context is already expert-masked).
     pub fn input_at(&self, s: &Series, t: usize) -> Option<(Vec<f32>, f64)> {
-        let lat = self.ctx.latent_as_of(&s.instrument_id, *s.ts_ms.get(t)?).map(|l| l.vec.as_slice());
+        let lat =
+            self.ctx.latent_as_of(data::latent_instrument(&self.genome, s), *s.ts_ms.get(t)?).map(|l| l.vec.as_slice());
         data::input_at(&self.genome, &self.meta.layout, &self.meta.norm, s, t, lat, &self.text)
+    }
+
+    /// The decoder's own (masked) latent as of step `t` from its context.
+    pub fn own_latent(&self, s: &Series, t: usize) -> Option<Vec<f32>> {
+        if self.meta.layout.latent == 0 {
+            return None;
+        }
+        self.ctx
+            .latent_as_of(data::latent_instrument(&self.genome, s), *s.ts_ms.get(t)?)
+            .map(|l| l.vec.clone())
+            .filter(|v| v.len() == self.meta.layout.latent)
     }
 
     /// Family head applied to raw outputs: quantiles in `z` units, normalised embeddings, raster
@@ -212,7 +262,9 @@ impl NeuralDecoder {
             }
             BaselineFamily::NnChart | BaselineFamily::NnFuture => {
                 let b = raw.dim(0)?;
-                net::raster_logp(raw, self.genome.nn.res)?.exp()?.reshape((b, self.genome.nn.res * self.genome.nn.res))?
+                net::raster_logp(raw, self.genome.nn.res)?
+                    .exp()?
+                    .reshape((b, self.genome.nn.res * self.genome.nn.res))?
             }
             _ => net::monotone(raw)?,
         })
@@ -306,10 +358,14 @@ impl NeuralDecoder {
         let scale = sigma_t * (g.horizon as f64).sqrt();
         let wsum: f64 = scored.iter().map(|x| x.0).sum();
         let mut pairs: Vec<(f64, f64)> = scored.iter().map(|(w, _, z)| (z * scale, w.max(1e-300))).collect();
-        let quantiles: Vec<f64> =
-            g.levels.iter().map(|&l| weighted_quantile(&mut pairs, l).unwrap_or(0.0)).collect();
+        let quantiles: Vec<f64> = g.levels.iter().map(|&l| weighted_quantile(&mut pairs, l).unwrap_or(0.0)).collect();
         let point = if wsum > 0.0 { scored.iter().map(|(w, _, z)| w * z * scale).sum::<f64>() / wsum } else { 0.0 };
-        Some(SeriesForecast { quantiles, levels: g.levels.clone(), point, analogs: scored.into_iter().map(|x| x.1).collect() })
+        Some(SeriesForecast {
+            quantiles,
+            levels: g.levels.clone(),
+            point,
+            analogs: scored.into_iter().map(|x| x.1).collect(),
+        })
     }
 
     /// All forecasts of a series (index = step), computed in batches once per series.
@@ -353,8 +409,7 @@ impl NeuralDecoder {
             for (t, y) in idx.into_iter().zip(ys) {
                 embs[t] = Some(y);
             }
-            let zs: Vec<Option<f32>> =
-                (0..n).map(|t| sig[t].and_then(|sg| data::z_at(s, t, g.horizon, sg))).collect();
+            let zs: Vec<Option<f32>> = (0..n).map(|t| sig[t].and_then(|sg| data::z_at(s, t, g.horizon, sg))).collect();
             for (t, sg) in sig.iter().enumerate().skip(g.lookback) {
                 if s.ts_ms[t] < from {
                     continue;
@@ -387,7 +442,12 @@ impl NeuralDecoder {
 
     /// Reconstruction quality on steps with `ts ≥ from_ms` whose target is known (at most
     /// `max_rows`, evenly strided). `None` for families without a reconstruction target.
-    pub fn recon_eval(&self, series: &[Series], from_ms: i64, max_rows: usize) -> Result<Option<ReconReport>, NeuralError> {
+    pub fn recon_eval(
+        &self,
+        series: &[Series],
+        from_ms: i64,
+        max_rows: usize,
+    ) -> Result<Option<ReconReport>, NeuralError> {
         let g = &self.genome;
         if !g.family.reconstructs() {
             return Ok(None);
@@ -429,11 +489,7 @@ impl NeuralDecoder {
         match self.genome.family {
             BaselineFamily::NnChart | BaselineFamily::NnFuture => {
                 let res = self.genome.nn.res;
-                -pred
-                    .iter()
-                    .zip(target)
-                    .map(|(p, t)| f64::from(*t) * f64::from(p.max(1e-12)).ln())
-                    .sum::<f64>()
+                -pred.iter().zip(target).map(|(p, t)| f64::from(*t) * f64::from(p.max(1e-12)).ln()).sum::<f64>()
                     / res as f64
             }
             _ => {
@@ -445,11 +501,29 @@ impl NeuralDecoder {
         }
     }
 
+    /// The decoder's latent from `(expert_index, mean)` pairs of a latent state: the experts of
+    /// its mask, concatenated in index order. `None` when the decoder is unconditioned or the
+    /// result does not have the trained dimension.
+    pub fn select_latent<'a>(&self, experts: impl IntoIterator<Item = (u32, &'a [f32])>) -> Option<Vec<f32>> {
+        if self.meta.layout.latent == 0 {
+            return None;
+        }
+        crate::masked_latent(experts, self.genome.expert_mask).filter(|v| v.len() == self.meta.layout.latent)
+    }
+
     /// Serving: the decoder's output at the last step of `s` with an explicit latent / text
-    /// context (model-runtime). `None` when the series is too short.
+    /// context (model-runtime). `latent` is the decoder's own (already masked, see
+    /// [`Self::select_latent`]). `None` when the series is too short.
     pub fn serve(&self, s: &Series, latent: Option<&[f32]>, text: &TextTimeline) -> Option<Served> {
+        self.serve_at(s, s.len().checked_sub(1)?, latent, text)
+    }
+
+    /// [`Self::serve`] at step `t` (reads `s[..=t]` and the news up to `ts[t]` only).
+    pub fn serve_at(&self, s: &Series, t: usize, latent: Option<&[f32]>, text: &TextTimeline) -> Option<Served> {
         let g = &self.genome;
-        let t = s.len().checked_sub(1)?;
+        if t >= s.len() {
+            return None;
+        }
         let (x, sigma) = data::input_at(g, &self.meta.layout, &self.meta.norm, s, t, latent, text)?;
         let y = self.predict_rows(&[x]).ok()?.pop()?;
         let mut out = Served { levels: g.levels.clone(), ..Default::default() };
@@ -516,11 +590,11 @@ impl NeuralDecoder {
     /// Serialises weights + metadata into one safetensors blob.
     pub fn to_bundle(&self) -> Result<Vec<u8>, NeuralError> {
         let meta = serde_json::to_vec(&self.meta).map_err(|e| NeuralError::Bundle(e.to_string()))?;
-        let mut map: HashMap<String, Tensor> =
-            self.params
-                .iter()
-                .map(|(k, t)| Ok((k.clone(), t.to_device(&Device::Cpu)?)))
-                .collect::<Result<_, candle_core::Error>>()?;
+        let mut map: HashMap<String, Tensor> = self
+            .params
+            .iter()
+            .map(|(k, t)| Ok((k.clone(), t.to_device(&Device::Cpu)?)))
+            .collect::<Result<_, candle_core::Error>>()?;
         let n = meta.len();
         map.insert(META_TENSOR.to_owned(), Tensor::from_vec(meta, n, &Device::Cpu)?);
         let path = std::env::temp_dir().join(format!(
@@ -551,8 +625,19 @@ impl NeuralDecoder {
     }
 
     /// Loads a bundle as a **frozen** decoder (weights are constants: no gradient flows into
-    /// them, gradients still flow through them into the inputs).
+    /// them, gradients still flow through them into the inputs). Bundles trained with an older
+    /// latent normaliser are refused ([`NeuralError::StaleNormaliser`]); use
+    /// [`Self::from_bundle_any`] to inspect them.
     pub fn from_bundle(bytes: &[u8], dev: &Device) -> Result<Self, NeuralError> {
+        let d = Self::from_bundle_any(bytes, dev)?;
+        if !d.meta.is_current() {
+            return Err(NeuralError::StaleNormaliser(d.meta.norm_version));
+        }
+        Ok(d)
+    }
+
+    /// [`Self::from_bundle`] without the normaliser-version check (warm starts, inspection).
+    pub fn from_bundle_any(bytes: &[u8], dev: &Device) -> Result<Self, NeuralError> {
         let map = candle_core::safetensors::load_buffer(bytes, dev)?;
         let meta = Self::meta_from(&map)?;
         let genome = DecoderGenome::parse(&meta.genome)?;

@@ -19,5 +19,6 @@ PostgreSQL warehouse + ledger schema, in sqlx format (`<timestamp>_<name>.sql`, 
 | `20261111000051_risk_state.sql` | `ledger.risk_state` (restart-safe halt state machine, calibration history, tournament records) | 40 §8 |
 | `20261111000010_refdata_asof.sql` | bitemporal-lite columns on `ref.entity/venue/calendar_session/fx_rate`, corporate-action lifecycle + symbol changes + natural key, `ref.instrument_relation`, as-of indexes, reference venues, repair of Yahoo fx/crypto classification, `wh.fundamental`, macro as-of index | 12, 20 |
 | `20261111000045_wh_filings.sql` | `wh.filing` (FilingEvent metadata, idempotent on source + accession) | 10, 20 |
+| `20261112000010_ledger_settlement_payout.sql` | `ledger.venue_settlement` (settlement `eur`/`native` + margin model per venue; paper venue seeded `eur`), `ledger.payout_quota.rule` (rule + inputs that set the quota); idempotent | 42 §10 Q1/Q5 |
 
 Apply with `just migrate`, which needs `sqlx-cli`: `cargo install sqlx-cli --no-default-features --features rustls,postgres`.

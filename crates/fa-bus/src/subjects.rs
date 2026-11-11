@@ -59,6 +59,14 @@ pub fn latent_crossprior(ts: Timescale) -> String {
     format!("latent.crossprior.{ts}")
 }
 
+/// The decoder-facing expert view of one instrument / asset set (`ExpertView`, spec 32 §4.3).
+pub fn latent_expert(ts: Timescale, asset_set: &str) -> String {
+    format!("latent.expert.{ts}.{asset_set}")
+}
+
+/// Expert-space health (`ExpertHealth`, spec 32 §4.3).
+pub const LATENT_EXPERT_HEALTH: &str = "latent.expert.health";
+
 pub fn decoder_output(family: &str) -> String {
     format!("decoder.output.{family}")
 }
@@ -118,6 +126,17 @@ pub fn catalog_changed(source: &str) -> String {
     format!("catalog.changed.{source}")
 }
 
+/// Ops alert transitions (JSON, D-066): control-api's vmalert receiver and the dead-letter forwarder.
+pub const OPS_ALERT: &str = "ops.alert";
+
+/// Dead-letter copy of a poison message (spec 21 §8): `dlq.<stream>.<original subject>`.
+pub fn dead_letter(stream: &str, subject: &str) -> String {
+    format!("dlq.{stream}.{subject}")
+}
+
+/// Batch MCMC refits of the richer kernels (spec 33 §6.3); work queue `JOBS_MCMC`.
+pub const JOBS_MCMC_REFIT: &str = "jobs.mcmc.refit";
+
 /// Wildcards for consumers that aggregate whole families (risk-engine, control-api).
 pub const ALL_SIGNALS: &str = "signal.exposure.>";
 pub const ALL_ORDERS: &str = "order.>";
@@ -176,5 +195,10 @@ mod tests {
         assert_eq!(md_bar(Timescale::Hour, "lemon", &i), format!("md.bar.1h.lemon.{t}"));
         assert_eq!(heartbeat("ingestor"), "svc.heartbeat.ingestor");
         assert_eq!(job_result("evo.eval.decoder"), "jobs.result.evo.eval.decoder");
+        assert_eq!(latent_membership(Timescale::Minute, &t), format!("latent.membership.1m.{t}"));
+        assert_eq!(latent_mcmc(Timescale::Minute, 2), "latent.mcmc.1m.2");
+        assert_eq!(latent_hier(Timescale::Minute, Timescale::Hour), "latent.hier.1m.1h");
+        assert_eq!(dead_letter("LATENT", "latent.state.1m.x"), "dlq.LATENT.latent.state.1m.x");
+        assert_eq!(jobs("mcmc.refit"), JOBS_MCMC_REFIT);
     }
 }

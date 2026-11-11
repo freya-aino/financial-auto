@@ -103,6 +103,8 @@ pub struct Worker {
     pub cost: Arc<fa_backtest::cost::CostModel>,
     /// Recorded `LATENT` traffic for strategy replays (bounded per-window cache, D-059).
     pub recorded: crate::recorded::RecordedStore,
+    /// News → instrument matcher for the text genomes (`ninst`), refreshed from Postgres.
+    pub news_refs: crate::news::NewsRefs,
 }
 
 /// What `handle` produces; the caller publishes the result and acks.
@@ -361,10 +363,16 @@ impl Worker {
         let (ctx, latent_block) = self.decoder_latents(&window, data_src.window_start_ms, data_src.window_end_ms).await;
         let (latent_inst, latent_points) = ctx.stats();
 
-        // 4. evaluate within budget, preemptible / cancellable
+        // 4. evaluate within budget, preemptible / cancellable; the naive policy pays the venue
+        //    cost model (spec 35, costs.yaml) per unit of position change
         run.start_budget();
         let eval_inputs: Vec<Series> = usable;
+        let cost_bps: Vec<f64> = eval_inputs
+            .iter()
+            .map(|s| crate::news::trade_cost_bp(&self.cost, crate::news::venue_of(&venues, &s.instrument_id), s))
+            .collect();
         let eval_task = {
+            let cost_bps = cost_bps.clone();
             let genome = genome.clone();
             let ctx = ctx.clone();
             let run = run.clone();
@@ -378,6 +386,7 @@ impl Worker {
                         should_stop: Some(run.stopper()),
                         on_progress: Some(Box::new(move |done, total| progress(done + total * i, total * n))),
                         progress_every: 16,
+                        cost_bp: cost_bps[i],
                         ..EvalSpec::standard()
                     };
                     reports.push(evaluate(decoder.as_ref(), s, &spec));
@@ -442,10 +451,12 @@ impl Worker {
         let instruments: Vec<Value> = reports
             .iter()
             .map(|r| {
-                let venue = venues.iter().find(|(i, _)| *i == r.instrument_id).map(|(_, v)| v.as_str()).unwrap_or("");
+                let venue = crate::news::venue_of(&venues, &r.instrument_id);
+                let cost_bp = eval_inputs_cost(&cost_bps, &reports, &r.instrument_id);
                 json!({
                     "instrument_id": r.instrument_id, "venue": venue, "n_steps": r.n_series, "n_eval": r.n_eval,
                     "stop": r.stop, "crps_skill": r.crps_skill, "coverage": r.coverage, "last_ts_ms": r.last_ts_ms,
+                    "cost_bp": cost_bp,
                 })
             })
             .collect();
@@ -462,6 +473,8 @@ impl Worker {
                      "instruments": instruments},
             "generation_stats": generation_stats,
             "budget": {"budget_ms": budget_ms, "elapsed_ms": elapsed_ms, "truncated": truncated},
+            "trade_cost": {"model": self.cost.id, "notional_eur": crate::news::TRADE_NOTIONAL_EUR,
+                           "basis": "costs.yaml taker fill per unit of position change (half spread + impact + commission)"},
             "stop": pooled.stop,
             // Written below when a Garage store is configured; the stored document says
             // `persisted: true` about itself.
@@ -574,6 +587,11 @@ impl Worker {
 }
 
 /// `output_refs` of a published `DecoderOutput`: `inst:<id>`, `job:<id>`, `h:<horizon bars>`.
+/// Cost (bp) the report's series was charged: reports are in input order, so position `i`.
+pub(crate) fn eval_inputs_cost(cost_bps: &[f64], reports: &[EvalReport], instrument: &str) -> Option<f64> {
+    reports.iter().position(|r| r.instrument_id == instrument).and_then(|i| cost_bps.get(i).copied())
+}
+
 pub fn horizon_refs(instrument_id: &str, job_id: &str, horizon: usize) -> Vec<String> {
     vec![format!("inst:{instrument_id}"), format!("job:{job_id}"), format!("h:{horizon}")]
 }

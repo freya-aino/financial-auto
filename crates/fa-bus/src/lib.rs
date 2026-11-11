@@ -1,6 +1,7 @@
 //! NATS JetStream access: subject taxonomy, typed protobuf pub/sub and the JetStream
 //! stream table (spec 21).
 
+pub mod dlq;
 pub mod ingest;
 pub mod replay;
 pub mod streams;

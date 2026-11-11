@@ -195,3 +195,64 @@ message CrossAssetPriors {
   uint32 instruments = 4;
   uint32 pairs_evaluated = 5;
 }
+
+// ── Expert-space contract (spec 32 §4.2–§4.3) ──
+
+// One expert's own next-step prediction (spec 32 §4.2 PredictiveDist) on the normalised
+// next-step targets of the timescale (spec 31 §6.5).
+message PredictiveDist {
+  repeated string targets = 1; // next_ret | next_abs_ret | next_range
+  repeated float mean = 2;
+  repeated float log_var = 3;  // empty: point prediction only
+}
+
+// One expert of an ExpertView (spec 32 §4.2 ExpertLatent; named apart from LatentState's).
+message ExpertViewLatent {
+  uint32 expert_id = 1;           // stable across generations where aligned (§6.5)
+  repeated float mu = 2;          // expert_dim
+  repeated float logvar = 3;
+  float gate = 4;                 // router weight of this window (top-k renormalised)
+  ExpertMembership region = 5;    // soft membership (spec 30)
+  PredictiveDist next_step = 6;
+  repeated uint32 codes = 7;      // FSQ code index (fsq_hybrid)
+}
+
+// Current region per expert + where the kernel posterior is published (spec 33).
+message McmcStateRef {
+  repeated string region_ids = 1; // by expert position
+  string kernel_subject = 2;      // latent.mcmc.<timescale>.<expert> prefix
+  string sampler_id = 3;
+}
+
+// latent.expert.<timescale>.<asset_set>: the one structure decoders, MCMC and strategies
+// consume (spec 32 §4.2). `experts` holds only the experts the mask selects.
+message ExpertView {
+  string snapshot_id = 1;
+  string timescale = 2;
+  google.protobuf.Timestamp t = 3;  // window end (point in time)
+  string instrument_set = 4;        // instrument or asset-set id
+  repeated ExpertViewLatent experts = 5;
+  repeated bool expert_mask = 6;
+  McmcStateRef mcmc_state = 7;
+  string encoder_family = 8;
+  // Novelty under the family's learned prior (hier_vae_flow: −log p(z_top); latent_diffusion:
+  // denoising score); has_prior_score = false for families without one.
+  double prior_score = 9;
+  bool has_prior_score = 10;
+}
+
+// latent.expert.health (spec 32 §4.3, §6.4): per-expert usage, skill and the residual
+// correlation matrix of an expert space.
+message ExpertHealth {
+  string snapshot_id = 1;
+  string timescale = 2;
+  google.protobuf.Timestamp as_of = 3;
+  string source = 4;              // validation (fit) | live (served windows)
+  repeated uint32 expert_ids = 5;
+  repeated double usage = 6;
+  repeated double skill = 7;
+  repeated double resid_corr = 8; // row-major K × K
+  double k_eff = 9;
+  double resid_corr_max = 10;
+  uint64 n_windows = 11;
+}

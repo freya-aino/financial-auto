@@ -328,6 +328,9 @@ pub struct LiveContext<'a> {
     prices: Option<&'a dyn PriceLookup>,
     /// Current region per expert 0 as of the view (cached for `current_region`).
     cur0: Option<String>,
+    /// Encoder snapshot the strategy's region literals refer to (spec 35 §6.5); a literal
+    /// resolves only while the graph serves that snapshot. `None` = unbound (any snapshot).
+    snapshot: Option<&'a str>,
     graph_n: Cell<u64>,
     decoder_n: Cell<u64>,
     fallback_n: Cell<u64>,
@@ -367,6 +370,7 @@ impl<'a> LiveContext<'a> {
             decoders: None,
             prices: None,
             cur0,
+            snapshot: None,
             graph_n: Cell::new(0),
             decoder_n: Cell::new(0),
             fallback_n: Cell::new(0),
@@ -395,6 +399,12 @@ impl<'a> LiveContext<'a> {
 
     /// Bar timescale the decoder `k` arguments are measured in (defaults to the graph view's
     /// timescale, else 1 s).
+    /// Binds region literals to an encoder snapshot (`StrategyDef::snapshot`).
+    pub fn with_snapshot(mut self, snapshot: Option<&'a str>) -> Self {
+        self.snapshot = snapshot;
+        self
+    }
+
     pub fn with_bar(mut self, bar: Timescale) -> Self {
         self.bar = bar;
         self
@@ -491,6 +501,16 @@ impl<'a> LiveContext<'a> {
                     None => None,
                 }?;
                 Some((e, id))
+            }
+            RegionRef::Lit(e, k) => {
+                let g = self.graph?;
+                // a literal of another snapshot names a different region: never resolve it
+                if let Some(bound) = self.snapshot
+                    && g.snapshot() != Some(bound)
+                {
+                    return None;
+                }
+                Some((e, g.region_literal(e, k)?))
             }
         }
     }
@@ -595,8 +615,16 @@ impl StrategyContext for LiveContext<'_> {
     }
 
     fn dwell(&self, r: RegionRef) -> f64 {
-        let RegionRef::Cur(e) = r;
-        let real = self.graph_q(|g| g.dwell(self.inst, e));
+        let real = match r {
+            RegionRef::Cur(e) => self.graph_q(|g| g.dwell(self.inst, e)),
+            // spec 35 §4.2: dwell in `r` if it is the asset's current region, else 0
+            RegionRef::Lit(e, _) => (|| {
+                let (_, lit) = self.region(r)?;
+                let g = self.graph?;
+                let cur = g.cur_region(self.inst, e)?;
+                if cur == lit { g.dwell(self.inst, e) } else { Some(0.0) }
+            })(),
+        };
         self.pick("dwell", real, Source::Graph, || self.fallback.latent.as_ref().map_or(0.0, |l| f64::from(l.dwell)))
     }
 

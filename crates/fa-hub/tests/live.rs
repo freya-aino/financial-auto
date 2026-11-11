@@ -424,6 +424,45 @@ async fn genome_business_id_writes_for_evo_worker() {
 }
 
 #[tokio::test]
+async fn genome_status_mirrors_and_creates_missing_genomes() {
+    let Some(c) = client() else { return };
+    c.ensure_schema_ready(WAIT).await.expect("schema");
+    let p = prefix();
+    let st = |id: &str, status: &str, since: i64| GenomeStatus {
+        genome_id: format!("{p}{id}"),
+        kind: "strategy".into(),
+        family: "gp".into(),
+        params: "{ id = \"x\" }".into(),
+        strategy_id: format!("{p}{id}"),
+        status: status.into(),
+        reason: format!("test {status}"),
+        since_ms: since,
+    };
+    // existing genome (written by the evo-worker) gets the status properties
+    let g = c
+        .upsert_genome(&NewGenome {
+            genome_id: format!("{p}a"),
+            kind: "strategy".into(),
+            family: "gp".into(),
+            params: "{}".into(),
+        })
+        .await
+        .expect("upsert");
+    assert_eq!(g.status, None);
+    let a = c.set_genome_status(&st("a", "candidate", 1)).await.expect("set status");
+    assert_eq!((a.id, a.status.as_deref(), a.status_since_ms), (g.id, Some("candidate"), Some(1)));
+    assert_eq!(a.params, "{}", "params of an existing genome are kept");
+    let a = c.set_genome_status(&st("a", "shadow", 2)).await.expect("transition");
+    assert_eq!((a.id, a.status.as_deref(), a.status_reason.as_deref()), (g.id, Some("shadow"), Some("test shadow")));
+    // a missing genome is created with the status
+    let b = c.set_genome_status(&st("b", "retired", 3)).await.expect("create");
+    assert_eq!((b.kind.as_str(), b.status.as_deref()), ("strategy", Some("retired")));
+    let read = c.genome_by_id(&format!("{p}b")).await.expect("read").expect("exists");
+    assert_eq!(read.status.as_deref(), Some("retired"));
+    cleanup(&c, &p).await;
+}
+
+#[tokio::test]
 async fn space_latents_read_back_vectors_newest_first() {
     let Some(c) = client() else { return };
     c.ensure_schema_ready(WAIT).await.expect("schema");

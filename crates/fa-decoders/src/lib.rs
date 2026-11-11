@@ -11,6 +11,7 @@
 //!   weighting.
 
 pub mod baseline;
+pub mod decoder;
 pub mod genome;
 pub mod neural;
 pub mod render;
@@ -19,8 +20,9 @@ pub mod visual_baseline;
 
 use std::collections::HashMap;
 
-use fa_expert_space::ExpertView;
 use serde::{Deserialize, Serialize};
+
+pub use self::decoder::{DecodeError, DecodeOutput, DecodeTarget, DecodeView, Decoder, build_decoder};
 
 /// One latent observation of an instrument (concatenated expert means of a `LatentState`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,9 +35,71 @@ pub struct LatentPoint {
 /// instrument (key = instrument token, lowercase UUID without dashes), sorted by `as_of_ms`.
 /// Decoders look latents up **as of** the step they forecast at, never later, so results stay
 /// deterministic and leakage-free. An empty context disables conditioning.
+///
+/// `layouts` records, per instrument, which expert each segment of the concatenated vector
+/// belongs to (`(expert_index, len)` in vector order, spec 32); [`Self::masked`] uses it to give
+/// a decoder only the experts its genome's expert mask selects (spec 34 §4.2 `expert_mask`).
+/// An instrument without a layout is one expert (index 0) spanning the whole vector.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DecodeCtx {
     pub latents: HashMap<String, Vec<LatentPoint>>,
+    #[serde(default)]
+    pub layouts: HashMap<String, ExpertLayout>,
+}
+
+/// `(expert_index, len)` segments of a concatenated latent, in vector order.
+pub type ExpertLayout = Vec<(u32, u32)>;
+
+/// Bits of an expert mask (`expert_mask` gene): bit `i` selects expert index `i`; `0` = every
+/// expert (the unmasked, concatenated latent).
+pub const EXPERT_MASK_BITS: u32 = 16;
+
+/// Concatenation of the experts `mask` selects (`0` = all) from `(expert_index, mean)` pairs,
+/// in expert-index order. `None` when nothing is selected or the vector is empty.
+pub fn masked_latent<'a>(experts: impl IntoIterator<Item = (u32, &'a [f32])>, mask: u32) -> Option<Vec<f32>> {
+    let mut ex: Vec<(u32, &[f32])> = experts.into_iter().collect();
+    ex.sort_by_key(|(i, _)| *i);
+    let v: Vec<f32> = ex
+        .into_iter()
+        .filter(|(i, _)| mask == 0 || (*i < 32 && mask & (1u32 << *i) != 0))
+        .flat_map(|(_, m)| m.iter().copied())
+        .collect();
+    (!v.is_empty()).then_some(v)
+}
+
+/// Splits a concatenated latent by its layout (no layout or a mismatched one = one expert 0).
+pub fn split_latent<'a>(vec: &'a [f32], layout: &[(u32, u32)]) -> Vec<(u32, &'a [f32])> {
+    let total: usize = layout.iter().map(|(_, l)| *l as usize).sum();
+    if layout.is_empty() || total != vec.len() {
+        return vec![(0, vec)];
+    }
+    let mut out = Vec::with_capacity(layout.len());
+    let mut at = 0usize;
+    for (i, l) in layout {
+        let l = *l as usize;
+        out.push((*i, &vec[at..at + l]));
+        at += l;
+    }
+    out
+}
+
+/// Column indices of the experts `mask` selects inside a concatenated latent of `layout`
+/// (the feedback path selects columns of the encoder's latent tensor with them).
+pub fn mask_columns(layout: &[(u32, u32)], full_dim: usize, mask: u32) -> Vec<u32> {
+    if mask == 0 {
+        return (0..full_dim as u32).collect();
+    }
+    let total: usize = layout.iter().map(|(_, l)| *l as usize).sum();
+    let segs: Vec<(u32, u32)> =
+        if layout.is_empty() || total != full_dim { vec![(0, full_dim as u32)] } else { layout.to_vec() };
+    let mut order: Vec<(u32, u32, u32)> = Vec::new(); // (index, start, len)
+    let mut at = 0u32;
+    for (i, l) in segs {
+        order.push((i, at, l));
+        at += l;
+    }
+    order.sort_by_key(|(i, _, _)| *i);
+    order.into_iter().filter(|(i, _, _)| *i < 32 && mask & (1u32 << *i) != 0).flat_map(|(_, s, l)| s..s + l).collect()
 }
 
 /// Lowercase UUID without dashes (D-017 subject token), the key of [`DecodeCtx::latents`].
@@ -60,6 +124,48 @@ impl DecodeCtx {
 
     pub fn is_empty(&self) -> bool {
         self.latents.values().all(Vec::is_empty)
+    }
+
+    /// Records the expert layout of an instrument's latents.
+    pub fn set_layout(&mut self, instrument: &str, layout: ExpertLayout) {
+        self.layouts.insert(instrument_token(instrument), layout);
+    }
+
+    /// Expert layout of an instrument (empty = unknown, one expert).
+    pub fn layout(&self, instrument: &str) -> &[(u32, u32)] {
+        self.layouts.get(&instrument_token(instrument)).map_or(&[], Vec::as_slice)
+    }
+
+    /// A copy whose latents hold only the experts `mask` selects (`0` = unchanged copy).
+    /// Points without a selected expert are dropped.
+    pub fn masked(&self, mask: u32) -> Self {
+        if mask == 0 {
+            return self.clone();
+        }
+        let mut out = Self::default();
+        for (inst, pts) in &self.latents {
+            let layout = self.layouts.get(inst).map_or(&[][..], Vec::as_slice);
+            let kept: Vec<LatentPoint> = pts
+                .iter()
+                .filter_map(|p| {
+                    let v = masked_latent(split_latent(&p.vec, layout), mask)?;
+                    Some(LatentPoint { as_of_ms: p.as_of_ms, vec: v })
+                })
+                .collect();
+            if !kept.is_empty() {
+                out.latents.insert(inst.clone(), kept);
+                let mut segs: ExpertLayout = if layout.is_empty() {
+                    vec![(0, 0)]
+                } else {
+                    layout.iter().copied().filter(|(i, _)| *i < 32 && mask & (1u32 << *i) != 0).collect()
+                };
+                segs.sort_by_key(|(i, _)| *i);
+                if !layout.is_empty() {
+                    out.layouts.insert(inst.clone(), segs);
+                }
+            }
+        }
+        out
     }
 
     /// `(instruments, points)`.
@@ -126,18 +232,6 @@ impl Family {
     }
 }
 
-/// What a decoder produced for one expert view.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DecodeOutput {
-    /// Forecast quantiles (levels given by `quantile_levels`), if the family forecasts.
-    pub quantiles: Vec<f64>,
-    pub quantile_levels: Vec<f64>,
-    /// Retrieved analogs (retrieval family).
-    pub analogs: Vec<Analog>,
-    /// Garage keys of rendered images / generated text.
-    pub artifact_refs: Vec<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Analog {
     pub window_id: String,
@@ -145,20 +239,6 @@ pub struct Analog {
     pub time_distance_days: f64,
     /// Realised forward outcome of the analog window (e.g. return over the horizon).
     pub outcome: f64,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum DecodeError {
-    #[error("ML backend not enabled (build with feature `burn`/`candle`)")]
-    BackendDisabled,
-    #[error("expert view does not contain the experts this decoder needs")]
-    MissingExperts,
-}
-
-pub trait Decoder: Send + Sync {
-    fn id(&self) -> &str;
-    fn family(&self) -> Family;
-    fn decode(&self, view: &ExpertView) -> Result<DecodeOutput, DecodeError>;
 }
 
 /// CRPS of an ensemble forecast: E|X−y| − ½ E|X−X'| (lower is better).

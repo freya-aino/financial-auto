@@ -1,5 +1,6 @@
 //! `GET /api/bus/streams` (spec 50 §4.3): JetStream streams, consumers and lag, straight from
-//! `fa_bus::streams::list_streams`. Also provisions the spec 21 §5 streams once NATS is up.
+//! `fa_bus::streams::list_streams`. Also provisions the spec 21 §5 streams once NATS is up and
+//! then runs the dead-letter forwarder (`fa_bus::dlq`, spec 21 §8).
 use std::time::Duration;
 
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
@@ -26,6 +27,8 @@ pub fn spawn_ensure_streams(state: &AppState) {
                 match streams::ensure_streams(&js).await {
                     Ok(changed) => {
                         tracing::info!(?changed, "JetStream streams ensured (spec 21 §5)");
+                        // poison messages → `dlq.<stream>.<subject>` + `ops.alert` (spec 21 §8)
+                        fa_bus::dlq::spawn_forwarder(client.clone());
                         return;
                     }
                     Err(e) => tracing::warn!(error = %e, "ensuring JetStream streams failed; retrying"),

@@ -108,6 +108,12 @@ Point 3 ties regions to what matters for trading. It is a **(proposal)** and may
 
 All methods must be implementable in Rust. HDBSCAN and Mapper need a Rust implementation or crate (see open question 4).
 
+**Implemented (2026-11-11, `fa_patterns::methods`, pure Rust, on any encoder output — they see only the per-expert latent means):**
+- `DensityClusters` (`density`): HDBSCAN — core distance to the `min_samples` = 5th neighbour, Prim MST on mutual-reachability distance, single-linkage dendrogram, condensed tree with `min_cluster_size` = max(10, 1 % of the points), excess-of-mass selection (root only when nothing else qualifies), noise points unlabelled; ≤ 4000 points per fit (even stride over the canonical order).
+- `MapperCover` (`mapper`): filter = first principal component (power iteration, sign-normalised), 10 intervals with 30 % overlap, single-linkage clusters per interval at 2 × the median 5-NN distance, nerve over shared points; regions = connected components of the nerve holding ≥ 1 % of the points.
+- `CodebookRegions` (`codebook`): VQ codebook of 32 codes by deterministic k-means++ / Lloyd; codes with ≥ 0.5 % usage are candidates, codes whose centroid distance ≤ the sum of their RMS spreads merge (union-find), a code whose 2-means halves are ≥ 4 pooled sds apart splits.
+- All are deterministic and order-free (canonical point order, rounded centroids emitted sorted) and pass `conformance::assert_conformance` (6 clusters, recovery 100 %, self-alignment ≥ 0.9) plus a 16-d unequal-size mixture; `discovery_for_method(name, radius, max_regions)` maps `FamilyDescriptor::region_discovery` (`density | mapper | codebook | leader`) to an implementation and `methods::fit_assign` fits + assigns any of them like `LeaderClustering::fit_assign`. (`fa_encoders::neural::regions::DensityModes`, the mean-shift density of D-070, remains the families' current default; the codebook and Mapper families can switch from the leader fallback to these through `discovery_for_method`.)
+
 ### 6.3 Online membership
 - The live latent `z_t` from the active snapshot is assigned via `RegionDiscovery::assign`, giving soft weights plus a **novelty** score (distance to nearest centroid normalised by scale, or prior log-density below threshold).
 - High novelty (≥ `novelty_threshold`) marks the latent as **out-of-region**. The MCMC graph sees a special `Unknown` state per set, and strategies can read novelty. Sustained high novelty feeds the snapshot-refresh trigger (spec 36).
@@ -180,7 +186,7 @@ Implemented defaults: `min_mass` → `min_support` 0.002, `max_regions_per_set` 
 5. Live membership latency per instrument per step ≤ 5 ms at the minute timescale on the reference workstation (placeholder).
 6. The latent explorer (spec 51) can render a region set with occupancy and hierarchy edges.
 
-**Status of the criteria:** 1 — `fa_patterns::conformance::assert_conformance` (6 clusters × 8 dims; recovery ≥ 90 %, determinism, self-alignment ≥ 0.9) passes for `LeaderClustering`; family crates call it from their tests. 2 — `snapshotGraph`, `regionSet`, `snapshotKernels`, `regionLineage`, `snapshotHierarchy` by business id. 3 — fits are deterministic in point order; online ids are deterministic and survive restarts via `RegionSet`. 4 — `lineage::align` + `latent.lifecycle`, tested. 5 — not benchmarked on the reference workstation. 6 — UI work (spec 51).
+**Status of the criteria:** 1 — `fa_patterns::conformance::assert_conformance` (6 clusters × 8 dims; recovery ≥ 90 %, determinism, self-alignment ≥ 0.9) passes for `LeaderClustering`, `DensityClusters` (HDBSCAN), `MapperCover` and `CodebookRegions` (and fa-encoders' `DensityModes`); family crates call it from their tests. 2 — `snapshotGraph`, `regionSet`, `snapshotKernels`, `regionLineage`, `snapshotHierarchy` by business id. 3 — fits are deterministic in point order; online ids are deterministic and survive restarts via `RegionSet`. 4 — `lineage::align` + `latent.lifecycle`, tested. 5 — **benchmarked** (`cargo test -p model-runtime --release -- --ignored --nocapture bench_step_latency_per_instrument`: 1m baseline pipeline, 20 instruments, ~5000 timed closed-bar steps of encode + route + region assignment + soft memberships + six-kernel arena + transition summaries + the staggered kernel summaries): mean 0.37–1.0 ms, p50 0.27–0.79 ms, **p99 1.3–3.6 ms ≤ 5 ms**, max 7–16 ms (a once-a-minute `KernelUpdate`; summaries are staggered to one expert space per step) on the 12-core workstation, the upper figures under a load average of ~25 from parallel builds. 6 — UI work (spec 51).
 
 ## 10. Open questions
 1. **[Core blocker #1] Region identity across retraining.** Blocks specs 33, 34 (retrieval history), 35 (region literals in genomes). Options:
@@ -192,7 +198,7 @@ Implemented defaults: `min_mass` → `min_support` 0.002, `max_regions_per_set` 
    - **Resolved for the baselines (D-007):** (a) is implemented end to end (Hungarian alignment, lineage ids, split/merge/death, regime break, kernel transfer). (b) needs a trainable family and lives with the neural encoders (spec 31/36).
 2. Is predictive coherence (§6.1, point 3) mandatory, or a soft score? Affects cost and region count.
 3. Soft or hard membership for MCMC transitions? Soft keeps information but complicates count-based kernels (spec 33). *Both exist:* memberships are published soft; the serving kernel observes hard transitions; `MarkovGraph::observe_soft` implements the soft update for a kernel that wants it.
-4. Rust availability of HDBSCAN / Mapper / persistent homology. Write our own in `fa-patterns`, or restrict v1 to codebook and k-means/GMM-style methods? *v1: leader clustering (online + batch) behind the conformance test; density/Mapper/codebook discovery arrive with the neural families.*
+4. Rust availability of HDBSCAN / Mapper / persistent homology. Write our own in `fa-patterns`, or restrict v1 to codebook and k-means/GMM-style methods? *Resolved: our own HDBSCAN, Mapper and codebook discovery in `fa_patterns::methods` (§6.2); persistent homology stays deferred (§11).*
 5. Should regions be per instrument or per asset set? Depends on the asset-selection outcome in spec 31.
 6. Lifetime and storage cost of region episodes in Helix at the seconds timescale.
 
@@ -205,6 +211,7 @@ Implemented defaults: `min_mass` → `min_support` 0.002, `max_regions_per_set` 
 | Piece | Code |
 |---|---|
 | Discovery contracts, conformance test | `crates/fa-patterns/src/{lib,online,conformance}.rs` |
+| HDBSCAN / Mapper / codebook discovery | `crates/fa-patterns/src/methods.rs` |
 | Alignment, Hungarian, region map | `crates/fa-patterns/src/{lineage,hungarian,region_map}.rs` |
 | Hierarchy, drift | `crates/fa-patterns/src/{hierarchy,drift}.rs` |
 | Live stage (memberships, lifecycle, persistence, restore, drift trigger) | `bins/model-runtime/src/{pipeline,regions,hub_sink}.rs` |

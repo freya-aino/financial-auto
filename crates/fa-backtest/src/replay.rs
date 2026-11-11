@@ -909,6 +909,7 @@ mod tests {
             step_secs: None,
             signal: signal.into(),
             uncertainty: "region_entropy".into(),
+            snapshot: None,
         }
     }
 

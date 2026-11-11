@@ -166,13 +166,13 @@ impl TrialStore {
         sqlx::query(
             "insert into validation.generation_stats \
              (generation, gen_index, kind, n_trials, sharpe_mean, sharpe_var, best_candidate, best_sharpe, \
-              expected_max_sharpe, deflated_sharpe, pbo, pbo_trials, pbo_blocks, computed_at) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now()) \
+              expected_max_sharpe, deflated_sharpe, pbo, pbo_trials, pbo_blocks, effective_trials, computed_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now()) \
              on conflict (generation, gen_index) do update set kind = excluded.kind, n_trials = excluded.n_trials, \
              sharpe_mean = excluded.sharpe_mean, sharpe_var = excluded.sharpe_var, best_candidate = excluded.best_candidate, \
              best_sharpe = excluded.best_sharpe, expected_max_sharpe = excluded.expected_max_sharpe, \
              deflated_sharpe = excluded.deflated_sharpe, pbo = excluded.pbo, pbo_trials = excluded.pbo_trials, \
-             pbo_blocks = excluded.pbo_blocks, computed_at = now()",
+             pbo_blocks = excluded.pbo_blocks, effective_trials = excluded.effective_trials, computed_at = now()",
         )
         .bind(generation)
         .bind(gen_index)
@@ -187,6 +187,7 @@ impl TrialStore {
         .bind(f(s.pbo))
         .bind(i32::try_from(s.pbo_trials).unwrap_or(i32::MAX))
         .bind(i32::try_from(s.pbo_blocks).unwrap_or(16))
+        .bind(f(s.effective_trials))
         .execute(&self.pool)
         .await?;
         Ok(s)

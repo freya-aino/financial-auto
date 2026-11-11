@@ -8,7 +8,8 @@
 //! `(p_to_set r S k)`, `(hitting_time r S)`, `(dwell r)`, `(novelty expert)`,
 //! `(region_feature r mass|mean_fwd_return|vol)`, `(path_value (sample_walk r k n) up|mass|mean_fwd_return|vol)`,
 //! `(fc_quantile q k)`, `(fc_dist k)`, `(analog_outcome k)`, `analog_age`, `(text_score topic)`,
-//! `(visual_score kind)`. Typed sub-expressions: `(cur_region expert)` is `Region`,
+//! `(visual_score kind)`. Typed sub-expressions: `(cur_region expert)` and the region literal
+//! `(region expert ordinal)` (spec 35 §6.5, bound to the strategy's snapshot) are `Region`,
 //! `(neighbors r n)` is `RegionSet`, `(sample_walk r k n)` is `[Path]`; they are only valid as
 //! arguments of the primitives above (a `Region` where a `Num` is expected is a type error).
 use std::fmt;
@@ -110,7 +111,7 @@ impl Parser<'_> {
         }
     }
 
-    /// Parses `(cur_region e)`, `(neighbors r n)` or `(sample_walk r k n)`.
+    /// Parses `(cur_region e)`, `(region e k)`, `(neighbors r n)` or `(sample_walk r k n)`.
     fn typed(&mut self) -> Result<Arg, ParseError> {
         self.pos += 1; // Open
         let Tok::Atom(op) = self.next()?.clone() else { unreachable!("checked by arg") };
@@ -137,6 +138,10 @@ impl Parser<'_> {
                 arity(1)?;
                 Arg::Region(RegionRef::Cur(uint(&op, &args[0])?))
             }
+            "region" => {
+                arity(2)?;
+                Arg::Region(RegionRef::Lit(uint(&op, &args[0])?, uint(&op, &args[1])?))
+            }
             "neighbors" => {
                 arity(2)?;
                 Arg::Set(SetRef::Neighbors(region(&op, &args[0])?, uint(&op, &args[1])?))
@@ -149,7 +154,7 @@ impl Parser<'_> {
     }
 }
 
-const TYPED_FORMS: [&str; 3] = ["cur_region", "neighbors", "sample_walk"];
+const TYPED_FORMS: [&str; 4] = ["cur_region", "region", "neighbors", "sample_walk"];
 
 enum Arg {
     Expr(Expr),
@@ -322,7 +327,7 @@ fn form(op: &str, args: Vec<Arg>) -> Result<Expr, ParseError> {
             };
             Expr::Graph(GraphOp::PathValue(*r, *k, *n, f))
         }
-        "cur_region" | "neighbors" | "sample_walk" => {
+        "cur_region" | "region" | "neighbors" | "sample_walk" => {
             return Err(ParseError::Type(format!("`{op}` is not Num-typed; use it as an argument")));
         }
         // spec 35 §4.2 decoder primitives (asset = the evaluated instrument)
@@ -365,6 +370,7 @@ impl fmt::Display for RegionRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RegionRef::Cur(e) => write!(f, "(cur_region {e})"),
+            RegionRef::Lit(e, k) => write!(f, "(region {e} {k})"),
         }
     }
 }
@@ -465,6 +471,11 @@ mod tests {
                 Expr::Graph(GraphOp::HittingTime(r, SetRef::Neighbors(r, 2))),
             ),
             ("(dwell (cur_region 0))", Expr::Graph(GraphOp::Dwell(r))),
+            (
+                "(p_trans (cur_region 1) (region 1 7) 3)",
+                Expr::Graph(GraphOp::PTrans(RegionRef::Cur(1), RegionRef::Lit(1, 7), 3)),
+            ),
+            ("(dwell (region 0 2))", Expr::Graph(GraphOp::Dwell(RegionRef::Lit(0, 2)))),
             ("(novelty 2)", Expr::Graph(GraphOp::Novelty(2))),
             (
                 "(region_feature (cur_region 0) mean_fwd_return)",
@@ -491,6 +502,8 @@ mod tests {
             assert_eq!(e.to_string(), src);
             assert_eq!(parse(&e.to_string()).unwrap(), e);
         }
+        assert!(matches!(parse("(add 1 (region 0 1))"), Err(ParseError::Type(_))), "a Region is not Num");
+        assert_eq!(parse("(dwell (region 0))"), Err(ParseError::Arity { op: "region".into(), expected: 2, got: 1 }));
         let nested = parse("(mul 4 (sub (p_to_set (cur_region 0) (neighbors (cur_region 0) 3) 1) 0.5))").unwrap();
         assert_eq!(nested.size(), 5);
     }

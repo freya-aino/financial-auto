@@ -124,16 +124,18 @@ pub fn pareto_ranks(objs: &[Vec<f64>]) -> Vec<usize> {
 
 /// Top-`k` cards per output family: Pareto rank over [`OBJECTIVE_DIRECTIONS`] within the family,
 /// then family score (`crps_skill` / `recon_skill`), newest first on ties. Only decoders that beat
-/// their naive baseline (`score > 0`) qualify; with `latent_dim`, only latent-conditioned decoders
-/// of exactly that dimension (the feedback path needs them). Result is grouped by family.
+/// their naive baseline (`score > 0`) and use the current latent normaliser
+/// ([`super::NORM_VERSION`]) qualify; with `latent_dim`, only latent-conditioned decoders whose
+/// **full** (pre-mask) latent has exactly that dimension and that read the step's own instrument
+/// (no cross-asset `src`), as the feedback path needs. Result is grouped by family.
 pub fn select_top_k(cards: &[EliteCard], k: usize, latent_dim: Option<usize>) -> Vec<EliteCard> {
     let mut by_family: BTreeMap<&str, Vec<&EliteCard>> = BTreeMap::new();
     for c in cards {
-        if !(c.meta.score.is_finite() && c.meta.score > 0.0) {
+        if !(c.meta.score.is_finite() && c.meta.score > 0.0) || !c.meta.is_current() {
             continue;
         }
         if let Some(d) = latent_dim
-            && c.meta.layout.latent != d
+            && (c.meta.full_latent_dim() != d || c.meta.layout.latent == 0 || is_cross_asset(c))
         {
             continue;
         }
@@ -153,6 +155,23 @@ pub fn select_top_k(cards: &[EliteCard], k: usize, latent_dim: Option<usize>) ->
         out.extend(idx.into_iter().take(k).map(|i| fam[i].clone()));
     }
     out
+}
+
+fn is_cross_asset(c: &EliteCard) -> bool {
+    crate::genome::DecoderGenome::parse(&c.meta.genome).is_ok_and(|g| g.source.is_some())
+}
+
+/// Cards trained with an older latent normaliser (first-generation elites, D-068) that would
+/// otherwise qualify (`score > 0`): they are never served nor used for feedback; their genomes
+/// are re-trained (model-runtime `ctl.decoders.retrain`). Best score first.
+pub fn stale_cards(cards: &[EliteCard]) -> Vec<EliteCard> {
+    let mut v: Vec<EliteCard> = cards
+        .iter()
+        .filter(|c| !c.meta.is_current() && c.meta.score.is_finite() && c.meta.score > 0.0)
+        .cloned()
+        .collect();
+    v.sort_by(|a, b| b.meta.score.total_cmp(&a.meta.score).then(b.created_ms.cmp(&a.created_ms)));
+    v
 }
 
 /// Feedback weights `w_d` ∝ family quota × rank (§6.6): every family present gets an equal share,
@@ -178,6 +197,8 @@ pub struct FrozenElite {
     pub weight: f64,
     lat_mean: Tensor,
     lat_std: Tensor,
+    /// Columns of the encoder latent this elite reads (its expert mask); `None` = all.
+    cols: Option<Tensor>,
 }
 
 /// The loaded elite set.
@@ -232,16 +253,31 @@ impl FeedbackSet {
                     continue;
                 }
             };
-            if d.meta.layout.latent != latent_dim || latent_dim == 0 {
-                skipped.push((
-                    d.decoder_id(),
-                    format!("latent dimension {} ≠ {latent_dim}", d.meta.layout.latent),
-                ));
+            if d.meta.full_latent_dim() != latent_dim || latent_dim == 0 || d.meta.layout.latent == 0 {
+                skipped.push((d.decoder_id(), format!("latent dimension {} ≠ {latent_dim}", d.meta.full_latent_dim())));
                 continue;
             }
-            let lat_mean = Tensor::from_vec(d.meta.norm.lat_mean.clone(), (1, latent_dim), dev)?;
-            let lat_std = Tensor::from_vec(d.meta.norm.lat_std.clone(), (1, latent_dim), dev)?;
-            elites.push(FrozenElite { decoder: d, weight: w.max(0.0), lat_mean, lat_std });
+            if d.genome().source.is_some() {
+                skipped.push((d.decoder_id(), "cross-asset decoder (reads another instrument's latent)".into()));
+                continue;
+            }
+            let own = d.meta.layout.latent;
+            let cols = if d.genome().expert_mask != 0 || own != latent_dim {
+                let c = crate::mask_columns(&d.meta.latent_layout, latent_dim, d.genome().expert_mask);
+                if c.len() != own {
+                    skipped.push((
+                        d.decoder_id(),
+                        format!("expert mask selects {} columns, decoder reads {own}", c.len()),
+                    ));
+                    continue;
+                }
+                Some(Tensor::from_vec(c, own, dev)?)
+            } else {
+                None
+            };
+            let lat_mean = Tensor::from_vec(d.meta.norm.lat_mean.clone(), (1, own), dev)?;
+            let lat_std = Tensor::from_vec(d.meta.norm.lat_std.clone(), (1, own), dev)?;
+            elites.push(FrozenElite { decoder: d, weight: w.max(0.0), lat_mean, lat_std, cols });
         }
         let s: f64 = elites.iter().map(|e| e.weight).sum();
         if s > 0.0 {
@@ -316,8 +352,12 @@ impl FeedbackSet {
             let d = &e.decoder;
             let g = d.genome();
             // same standardisation + clipping as the decoder saw in training (data::Norm::latent_block)
-            let lat = latents
-                .index_select(&p.rows, 0)?
+            let rows = latents.index_select(&p.rows, 0)?;
+            let rows = match &e.cols {
+                Some(c) => rows.index_select(c, 1)?,
+                None => rows,
+            };
+            let lat = rows
                 .broadcast_sub(&e.lat_mean)?
                 .broadcast_div(&e.lat_std)?
                 .clamp(-data::LATENT_CLIP, data::LATENT_CLIP)?;

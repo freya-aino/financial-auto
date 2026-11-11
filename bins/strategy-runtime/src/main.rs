@@ -33,7 +33,8 @@ use fa_core::{InstrumentId, config::PlatformConfig, secrets::Secrets};
 use fa_proto::{
     Message,
     v1::{
-        CtlReply, CtlRequest, DecoderOutput, Envelope, Heartbeat, LatentState, RegionEvent, TransitionUpdate,
+        CtlReply, CtlRequest, DecoderOutput, Envelope, Heartbeat, LatentState, RegionEvent, RegionLifecycleEvent,
+        TransitionUpdate,
         envelope::Payload,
     },
 };
@@ -290,6 +291,44 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             while let Some((_, tu)) = transitions.next().await {
                 rt.lock().await.on_transition(&tu);
+            }
+        });
+    }
+    // snapshot-swap lineage for region-literal remapping (spec 35 §6.5): live events, plus the
+    // recorded ones of the LATENT stream (7 d) so a restart still knows the last swaps
+    {
+        let live_rt = rt.clone();
+        let mut lifecycle = bus.subscribe::<RegionLifecycleEvent>("latent.lifecycle.>".into()).await?;
+        tokio::spawn(async move {
+            while let Some((_, ev)) = lifecycle.next().await {
+                live_rt.lock().await.on_lifecycle(&ev);
+            }
+        });
+        let (bus, rt) = (bus.clone(), rt.clone());
+        tokio::spawn(async move {
+            let opts = fa_bus::replay::ReadOptions { max_messages: 50_000, ..Default::default() };
+            let now = now_ms();
+            match fa_bus::replay::read_range(
+                &bus.jetstream(),
+                fa_bus::replay::LATENT_STREAM,
+                "latent.lifecycle.>",
+                now - 7 * 86_400_000,
+                now,
+                &opts,
+            )
+            .await
+            {
+                Ok(recs) => {
+                    let mut used = 0usize;
+                    let mut r = rt.lock().await;
+                    for rec in &recs {
+                        if let Ok(ev) = RegionLifecycleEvent::decode(rec.payload.as_slice()) {
+                            used += usize::from(r.on_lifecycle(&ev));
+                        }
+                    }
+                    tracing::info!(read = recs.len(), used, snapshots = r.lineage.snapshots(), "region lineage seeded from LATENT");
+                }
+                Err(e) => tracing::warn!(error = %e, "region lineage not seeded from the LATENT stream"),
             }
         });
     }

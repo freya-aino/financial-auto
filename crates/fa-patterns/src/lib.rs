@@ -1,8 +1,8 @@
 //! Latent regions: discovery trait, lineage, and region identity across retraining (spec 30, D-007).
 //!
 //! [`online`] holds the streaming leader-clustering baseline (`OnlineRegionSet`) that the
-//! live runtime uses for region discovery and membership until the family-specific
-//! density/Mapper methods exist. [`lineage`] aligns region sets across refits (Hungarian
+//! live runtime uses for region discovery and membership; [`methods`] holds the family-specific
+//! batch discoveries of spec 30 §6.2 (HDBSCAN density, Mapper, codebook) for any encoder output. [`lineage`] aligns region sets across refits (Hungarian
 //! matching on probe overlap, [`hungarian`]) and classifies carry / split / merge / birth /
 //! death; [`region_map`] stores the result per snapshot. [`hierarchy`] estimates the
 //! cross-timescale `REFINES` edges, [`drift`] the occupancy drift monitor, and [`conformance`]
@@ -13,12 +13,14 @@ pub mod drift;
 pub mod hierarchy;
 pub mod hungarian;
 pub mod lineage;
+pub mod methods;
 pub mod online;
 pub mod region_map;
 
 pub use drift::{DriftMonitor, DriftReport};
 pub use hierarchy::{HierEdge, HierarchyCfg, HierarchyTracker, HierarchyUpdate};
 pub use lineage::{AlignCfg, Alignment, Descent, DescentKind, align};
+pub use methods::{CodebookRegions, DensityClusters, MapperCover, discovery_for_method};
 pub use online::{
     Assignment, LeaderClustering, OnlineRegionCfg, OnlineRegionDiscovery, OnlineRegionSet, RegionLifecycle, RegionStat,
     RetireReason,

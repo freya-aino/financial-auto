@@ -186,7 +186,7 @@ export interface BusFrame {
 	data: { subject: string; size: number; decoded: unknown };
 }
 
-async function getJson<T>(path: string): Promise<T> {
+export async function getJson<T>(path: string): Promise<T> {
 	const res = await fetch(path);
 	if (!res.ok) throw new Error(`${path}: ${res.status} ${res.statusText}`);
 	return (await res.json()) as T;
@@ -811,7 +811,7 @@ async function sendJson<T>(method: 'POST' | 'PUT', path: string, body: unknown):
 	return data as T;
 }
 
-async function postJson<T>(path: string, body: unknown = {}): Promise<T> {
+export async function postJson<T>(path: string, body: unknown = {}): Promise<T> {
 	return sendJson<T>('POST', path, body);
 }
 

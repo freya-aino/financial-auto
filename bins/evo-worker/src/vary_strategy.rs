@@ -136,7 +136,12 @@ pub fn produce(req: &VaryRequest) -> Result<Outcome, String> {
             }
             let mut g = c.genome.0;
             g.generation = req.generation; // crossover + mutation each bumped it; children belong to this loop
-            lineage.push(Lineage { child: g.to_string(), parents: c.parents.clone(), op: leak(&c.op) });
+            lineage.push(Lineage {
+                child: g.to_string(),
+                parents: c.parents.clone(),
+                op: leak(&c.op),
+                parents_as_sent: Vec::new(),
+            });
             children.push(g);
         }
         round += 1;
@@ -154,7 +159,12 @@ pub fn produce(req: &VaryRequest) -> Result<Outcome, String> {
         if !seen.insert(key) {
             continue;
         }
-        lineage.push(Lineage { child: g.to_string(), parents: Vec::new(), op: "immigrant" });
+        lineage.push(Lineage {
+            child: g.to_string(),
+            parents: Vec::new(),
+            op: "immigrant",
+            parents_as_sent: Vec::new(),
+        });
         children.push(g);
         immigrants += 1;
     }

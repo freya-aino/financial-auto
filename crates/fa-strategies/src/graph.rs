@@ -42,6 +42,18 @@ fn ms(t: Option<&fa_proto::Timestamp>) -> Option<i64> {
     t.map(|t| t.seconds * 1000 + i64::from(t.nanos) / 1_000_000)
 }
 
+/// `-e<expert>-r<nnn>`: the id suffix a region literal matches.
+pub fn literal_suffix(expert: u32, ordinal: u32) -> String {
+    format!("-e{expert}-r{ordinal:03}")
+}
+
+/// `(expert, ordinal)` of a region id `<prefix>-e<k>-r<nnn>`, if it has that shape.
+pub fn parse_region_id(id: &str) -> Option<(u32, u32)> {
+    let (head, ord) = id.rsplit_once("-r")?;
+    let (_, expert) = head.rsplit_once("-e")?;
+    Some((expert.parse().ok()?, ord.parse().ok()?))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionStatus {
     Live,
@@ -107,6 +119,8 @@ pub struct LatentGraph {
     states: BTreeMap<(Timescale, InstrumentId), VecDeque<StateObs>>,
     /// Last bar close per `(timescale, instrument)`: `(at_ms, price)`.
     last_close: BTreeMap<(Timescale, InstrumentId), (i64, f64)>,
+    /// Encoder snapshot of the newest `LatentState` per timescale (spec 35 §6.5).
+    snapshots: BTreeMap<Timescale, String>,
     pub seen: GraphCounters,
 }
 
@@ -141,6 +155,9 @@ impl LatentGraph {
             })
             .collect();
         hist.push_back(StateObs { as_of_ms, experts });
+        if !st.snapshot_id.is_empty() && self.snapshots.get(&ts) != Some(&st.snapshot_id) {
+            self.snapshots.insert(ts, st.snapshot_id.clone());
+        }
         while hist.len() > MAX_STATES_PER_INSTRUMENT {
             hist.pop_front();
         }
@@ -277,6 +294,11 @@ impl LatentGraph {
     /// Point-in-time view at `at_ms` for one timescale.
     pub fn at(&self, ts: Timescale, at_ms: i64) -> GraphAt<'_> {
         GraphAt { g: self, ts, at_ms, spaces: RefCell::new(BTreeMap::new()) }
+    }
+
+    /// Encoder snapshot of the newest `LatentState` of `ts`.
+    pub fn snapshot(&self, ts: Timescale) -> Option<&str> {
+        self.snapshots.get(&ts).map(String::as_str)
     }
 }
 
@@ -457,6 +479,25 @@ impl GraphAt<'_> {
     }
 
     // ---- kernel queries
+
+    /// Encoder snapshot currently served on this timescale (newest `LatentState`).
+    pub fn snapshot(&self) -> Option<&str> {
+        self.g.snapshots.get(&self.ts).map(String::as_str)
+    }
+
+    /// Resolves the literal `(region expert ordinal)` to a region id of this timescale: the live
+    /// region whose id ends in `-e<expert>-r<nnn>` (ids are `<prefix>-e<k>-r<nnn>`, the prefix
+    /// being the snapshot or, for the in-process baseline, the timescale). `None` when no such
+    /// region is known as of the view time.
+    pub fn region_literal(&self, expert: u32, ordinal: u32) -> Option<String> {
+        let suffix = literal_suffix(expert, ordinal);
+        let sp = self.g.spaces.get(&(self.ts, expert))?;
+        sp.regions
+            .values()
+            .filter(|r| r.created_ms <= self.at_ms && r.region_id.ends_with(&suffix))
+            .max_by_key(|r| (r.status == RegionStatus::Live, r.created_ms))
+            .map(|r| r.region_id.clone())
+    }
 
     /// Registry entry of a region (any status) if known.
     pub fn region_info(&self, expert: u32, region: &str) -> Option<&RegionInfo> {
@@ -725,5 +766,48 @@ pub(crate) mod tests {
         let v3 = g.at(Timescale::Second, 3_000);
         let (n, _, _) = v3.with_space(0, |s| s.stats["a"]);
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn region_literals_resolve_by_suffix_and_bind_to_the_snapshot() {
+        use crate::{
+            StrategyContext,
+            features::{FallbackContext, LiveContext},
+            sexpr,
+        };
+        let inst = InstrumentId::new();
+        let mut g = LatentGraph::new();
+        for r in ["1s-e0-r000", "1s-e0-r001", "1s-e0-r002"] {
+            g.on_region(&region(r, region_event::Kind::Created), 0);
+        }
+        g.on_transition(&row("1s-e0-r000", 1_000, &[("1s-e0-r001", 0.7), ("1s-e0-r002", 0.2), (UNKNOWN, 0.1)]));
+        for t in 0..4 {
+            g.on_state(&state(inst, 1_000 + t * 1_000, &["1s-e0-r000"]));
+        }
+        assert_eq!(parse_region_id("stat-v1-1m-e3-r012"), Some((3, 12)));
+        assert_eq!(parse_region_id("nope"), None);
+        assert_eq!(g.snapshot(Timescale::Second), Some("stat-v1-1s"));
+        let v = g.at(Timescale::Second, 10_000);
+        assert_eq!(v.region_literal(0, 1).as_deref(), Some("1s-e0-r001"));
+        assert_eq!(v.region_literal(0, 9), None);
+        let e = sexpr::parse("(p_trans (cur_region 0) (region 0 1) 1)").unwrap();
+        let ctx = |snap: Option<&'static str>| {
+            LiveContext::new(FallbackContext::new(&[1.0, 1.0], None, Default::default()), inst, 1)
+                .with_graph(&v)
+                .with_snapshot(snap)
+        };
+        for snap in [None, Some("stat-v1-1s")] {
+            let p = e.eval(&ctx(snap));
+            assert!((p - 0.7).abs() < 1e-3, "{snap:?}: {p}");
+        }
+        // bound to another snapshot: the literal does not resolve (fallback 0, counted)
+        let other = ctx(Some("stat-v2-1s"));
+        assert_eq!(e.eval(&other), 0.0);
+        assert_eq!(other.sources().fallback, 1);
+        // dwell in a literal region: only when it is the current one
+        let dwell_cur = sexpr::parse("(dwell (region 0 0))").unwrap().eval(&ctx(None));
+        let dwell_other = sexpr::parse("(dwell (region 0 2))").unwrap().eval(&ctx(None));
+        assert_eq!((dwell_cur, dwell_other), (3.0, 0.0));
+        let _ = ctx(None).current_region();
     }
 }

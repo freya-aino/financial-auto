@@ -9,9 +9,10 @@ import (
 	"testing"
 )
 
-// fixturePath is crates/fa-evolution/testdata/nsga_fixture.json, shared with the Rust tests.
+// fixturePath is shared with the Rust tests (crates/fa-evolution reads it from here); it lives
+// under go/ so `just go-test`, which mounts only go/, finds it.
 // Run Go tests with the repository root mounted (see README) so the file is reachable.
-const fixturePath = "../../../crates/fa-evolution/testdata/nsga_fixture.json"
+const fixturePath = "testdata/nsga_fixture.json"
 
 type fxNum float64
 
@@ -52,7 +53,7 @@ func close(a, b float64) bool {
 func TestNSGAMatchesSharedFixture(t *testing.T) {
 	raw, err := os.ReadFile(filepath.FromSlash(fixturePath))
 	if err != nil {
-		t.Fatalf("shared fixture missing (mount the repo root, not only go/): %v", err)
+		t.Fatalf("shared fixture missing: %v", err)
 	}
 	var fx struct {
 		Cases []struct {

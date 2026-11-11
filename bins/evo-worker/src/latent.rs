@@ -26,6 +26,14 @@ pub fn vector_of(state: &LatentState) -> Option<Vec<f32>> {
     (!v.is_empty()).then_some(v)
 }
 
+/// `(expert_index, len)` of each expert in [`vector_of`]'s concatenation (the expert mask of a
+/// decoder genome selects experts by index, `fa_decoders::DecodeCtx::masked`).
+pub fn layout_of(state: &LatentState) -> fa_decoders::ExpertLayout {
+    let mut experts: Vec<_> = state.experts.iter().filter(|e| !e.mean.is_empty()).collect();
+    experts.sort_by_key(|e| e.expert_index);
+    experts.iter().map(|e| (e.expert_index, e.mean.len() as u32)).collect()
+}
+
 impl LatentBuffer {
     pub fn push(&self, state: &LatentState) {
         let Some(vec) = vector_of(state) else { return };
@@ -35,6 +43,7 @@ impl LatentBuffer {
         let as_of_ms = state.as_of.as_ref().map(|t| t.seconds * 1000 + i64::from(t.nanos) / 1_000_000).unwrap_or(0);
         let mut ctx = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let key = instrument_token(&state.instrument_id);
+        ctx.set_layout(&key, layout_of(state));
         ctx.push(&key, LatentPoint { as_of_ms, vec });
         if let Some(v) = ctx.latents.get_mut(&key)
             && v.len() > MAX_POINTS_PER_INSTRUMENT

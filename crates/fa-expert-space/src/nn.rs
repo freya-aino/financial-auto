@@ -172,6 +172,29 @@ impl ParamStore {
     }
 }
 
+/// Where a forward pass reads its parameters by name: the trainable store, an EMA copy, a frozen
+/// parent, or a low-rank adapted view ([`crate::lora::LoraView`]).
+pub trait Weights {
+    fn w(&self, name: &str) -> Result<Tensor>;
+}
+
+impl Weights for ParamStore {
+    fn w(&self, name: &str) -> Result<Tensor> {
+        self.tensor(name).ok_or_else(|| candle_core::Error::Msg(format!("missing parameter {name}")))
+    }
+}
+
+impl Weights for BTreeMap<String, Tensor> {
+    fn w(&self, name: &str) -> Result<Tensor> {
+        self.get(name).cloned().ok_or_else(|| candle_core::Error::Msg(format!("missing parameter {name}")))
+    }
+}
+
+/// `x W + b` with `W`, `b` read from `w` as `<name>.w` / `<name>.b`.
+pub fn linear_w(w: &dyn Weights, name: &str, x: &Tensor) -> Result<Tensor> {
+    x.broadcast_matmul(&w.w(&format!("{name}.w"))?)?.broadcast_add(&w.w(&format!("{name}.b"))?)
+}
+
 /// safetensors bytes of named tensors plus string metadata.
 pub fn to_safetensors(tensors: Vec<(String, Tensor)>, meta: HashMap<String, String>) -> Result<Vec<u8>> {
     let cpu: Vec<(String, Tensor)> =

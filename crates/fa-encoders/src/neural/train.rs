@@ -41,6 +41,9 @@ pub struct FeedbackBatch<'a> {
     pub targets: &'a Tensor,
     /// Expert id (pre-pruning index) of each output position.
     pub experts: &'a [usize],
+    /// `(series index in the dataset, window end)` of each row: the latent of row `i` is as of
+    /// bar `end − 1` of series `s` (decoders build their own context from it).
+    pub windows: &'a [(usize, usize)],
 }
 
 /// **D-009 hook**: decoder → encoder feedback as auxiliary losses of *frozen* elite decoders
@@ -103,6 +106,14 @@ pub struct LossLog {
     pub ssl: f64,
     pub anchor: f64,
     pub feedback: f64,
+    #[serde(default)]
+    pub skill_hinge: f64,
+    /// Flow-matching / diffusion loss of the family prior (families 2 and 4).
+    #[serde(default)]
+    pub prior: f64,
+    /// Effective `λ_dec` of the step (differs from the genome with dual ascent).
+    #[serde(default)]
+    pub lambda_dec: f64,
     pub grad_norm: f64,
 }
 
@@ -113,6 +124,13 @@ pub struct EvalReport {
     pub health: HealthReport,
     /// Mixture next-step MSE / naive MSE.
     pub mix_skill: f64,
+    /// Mixture skill per next-step target (`1 − mse_t / naive_t`).
+    #[serde(default)]
+    pub target_skill: Vec<f64>,
+    /// Variance of the mixture's scalarised residual (mean over targets): an estimate of the
+    /// irreducible scalarised noise `V` every expert shares (spec 32 §6.3 feasibility bound).
+    #[serde(default)]
+    pub mix_resid_var: f64,
     pub n: usize,
 }
 
@@ -125,9 +143,13 @@ pub struct NeuralTrainer {
     pub anchors: Anchors,
     pub feedback: Vec<Box<dyn DecoderFeedback>>,
     pub log: Vec<LossLog>,
+    /// Current `λ_dec` under dual ascent (`decor_dual_lr > 0`); `None` = the genome's value.
+    pub lambda_dec: Option<f64>,
 }
 
 const META_FORMAT: &str = "fa-neural-v1";
+/// Prior noise of evaluations (deterministic validation losses).
+const EVAL_PRIOR_SEED: u64 = 0x00E7_A1E7;
 
 impl NeuralTrainer {
     /// Fresh trainer; the input normalisation is fitted on `ds`.
@@ -145,7 +167,17 @@ impl NeuralTrainer {
                 .collect()
         });
         let opt = Adam::new(model.cfg.lr, model.cfg.weight_decay);
-        Self { model, opt, step: 0, seed, ema, anchors: Anchors::default(), feedback: Vec::new(), log: Vec::new() }
+        Self {
+            model,
+            opt,
+            step: 0,
+            seed,
+            ema,
+            anchors: Anchors::default(),
+            feedback: Vec::new(),
+            log: Vec::new(),
+            lambda_dec: None,
+        }
     }
 
     /// Warm start (spec 36 §6.3) from parent weights with the same parameter shapes; returns how
@@ -179,30 +211,49 @@ impl NeuralTrainer {
             ys.extend(t.iter().enumerate().map(|(j, v)| m.norm.target(j, *v)));
         }
         let y = Tensor::from_vec(ys, (idx.len(), N_TARGETS), m.device())?;
-        let (recon, future) = match m.cfg.family {
-            NeuralFamily::FsqHybrid => (Some(recon_target(&x, m.cfg.recon_steps)?), None),
-            NeuralFamily::JepaVae => {
-                let h = m.cfg.jepa_horizon.max(1);
-                let fw: Vec<(&[[f32; N_FEATURES]], usize)> =
-                    idx.iter().map(|&(s, e)| (ds.series[s].feats.as_slice(), e + h)).collect();
-                (None, Some(m.input(&fw)?))
-            }
+        let recon = if m.cfg.reconstructs() { Some(recon_target(&x, m.cfg.recon_steps)?) } else { None };
+        let future = if m.cfg.needs_future() {
+            let h = m.cfg.horizon();
+            let fw: Vec<(&[[f32; N_FEATURES]], usize)> =
+                idx.iter().map(|&(s, e)| (ds.series[s].feats.as_slice(), e + h)).collect();
+            Some(m.input(&fw)?)
+        } else {
+            None
         };
-        Ok(Batch { x, y, recon, future })
+        Ok(Batch { x, y, recon, future, windows: idx.to_vec() })
     }
 
     /// Loss of a batch (`train` adds router noise).
     fn losses(&self, b: &Batch, noise_seed: Option<u64>) -> Result<(Tensor, LossLog, super::model::Forward)> {
+        self.losses_w(&self.model.ps, b, noise_seed)
+    }
+
+    /// [`Self::losses`] with the parameters read through `w` (a low-rank adapted view).
+    pub fn losses_w(
+        &self,
+        w: &dyn Weights,
+        b: &Batch,
+        noise_seed: Option<u64>,
+    ) -> Result<(Tensor, LossLog, super::model::Forward)> {
         let m = &self.model;
         let c = &m.cfg;
         let k = m.moe.n_active();
+        let bsz = b.x.dim(0)?;
         let noise = match noise_seed {
             Some(s) if c.moe.router_noise > 0.0 => {
-                Some(router_noise(b.x.dim(0)?, c.moe.max_experts, c.moe.router_noise, s, m.device())?)
+                Some(router_noise(bsz, c.moe.max_experts, c.moe.router_noise, s, m.device())?)
             }
             _ => None,
         };
-        let f = m.forward(&b.x, noise.as_ref())?;
+        // prior / reparameterisation noise: seeded per step in training, fixed in evaluation
+        let prior_seed = noise_seed.map_or(EVAL_PRIOR_SEED, |s| s ^ 0x9E37_79B9);
+        let top_eps = match (c.family, noise_seed) {
+            (NeuralFamily::HierVaeFlow, Some(_)) => {
+                Some(router_noise(bsz, c.top_dim, 1.0, prior_seed ^ 1, m.device())?)
+            }
+            _ => None,
+        };
+        let f = m.forward_w(w, &b.x, noise.as_ref(), top_eps.as_ref())?;
         let resid = f.out.pred.broadcast_sub(&b.y.unsqueeze(1)?)?; // [B, K, T]
         // Σ_k L_pred,k: every expert is scored on every window (each must carry information,
         // spec 32 §6.3 gen 0) plus, with weight `gated_pred`, on the windows it is routed to
@@ -212,28 +263,59 @@ impl NeuralTrainer {
         let pred_gated = (&per * &f.out.probs)?.sum(1)?.mean_all()?;
         let pred = (pred_all.affine(1.0 - c.gated_pred, 0.0)? + pred_gated.affine(c.gated_pred * k as f64, 0.0)?)?;
         let mix = mse(&NeuralModel::mixture(&f)?, &b.y)?;
-        let decor = decorrelation_loss_gated(&resid, &f.out.probs)?;
+        let decor = if c.decor_scalar {
+            decorrelation_loss_gated(&resid.mean_keepdim(2)?, &f.out.probs)?
+        } else {
+            decorrelation_loss_gated(&resid, &f.out.probs)?
+        };
+        let lambda_dec = self.lambda_dec.unwrap_or(c.moe.lambda_dec);
         let balance = load_balance_loss(&f.out.probs)?;
-        let kl = gaussian_kl(&f.out.mu_raw, &f.out.logvar)?;
-        let head = m.ssl_head(&f)?;
+        let mut kl = gaussian_kl(&f.out.mu_raw, &f.out.logvar)?;
+        if let Some(t) = &f.top {
+            kl = (kl + gaussian_kl(&t.mu.unsqueeze(1)?, &t.logvar.unsqueeze(1)?)?)?;
+        }
+        let head = m.ssl_head_w(w, &f)?;
         let ssl = match c.family {
-            NeuralFamily::FsqHybrid => mse(&head, b.recon.as_ref().expect("recon target"))?,
             NeuralFamily::JepaVae => {
                 let fut = b.future.as_ref().expect("future window");
                 let target = match &self.ema {
                     Some(e) => backbone_forward(e as &dyn Weights, c, fut)?,
-                    None => backbone_forward(&m.ps, c, fut)?,
+                    None => backbone_forward(w, c, fut)?,
                 }
                 .detach();
                 mse(&head, &target)?
             }
+            _ => mse(&head, b.recon.as_ref().expect("recon target"))?,
+        };
+        // family priors (stop-gradient into the encoder: they model the latents, the encoder is
+        // trained by reconstruction / prediction)
+        let prior = match c.family {
+            NeuralFamily::HierVaeFlow => {
+                let z1 = f.top.as_ref().expect("top latent").mu.detach();
+                Some(super::prior::flow_matching_loss(w, &z1, prior_seed)?)
+            }
+            NeuralFamily::LatentDiffusion => {
+                let fut = b.future.as_ref().expect("future window");
+                let ff = m.forward_w(w, fut, None, None)?;
+                let x0 = m.full_latent(&ff.out.mu)?.detach();
+                let cond = m.full_latent(&f.out.mu)?.detach();
+                Some(super::prior::diffusion_loss(w, &x0, &cond, c.diffusion_steps, c.cond_drop, prior_seed)?)
+            }
+            _ => None,
         };
         let mut total = (pred.affine(c.lambda_next, 0.0)?
             + mix.affine(c.lambda_mix, 0.0)?
-            + decor.affine(c.moe.lambda_dec, 0.0)?
+            + decor.affine(lambda_dec, 0.0)?
             + balance.affine(c.moe.lambda_bal, 0.0)?
             + kl.affine(c.moe.beta_kl, 0.0)?
             + ssl.affine(c.lambda_ssl, 0.0)?)?;
+        let prior_v = match &prior {
+            Some(p) => {
+                total = (total + p.affine(c.lambda_prior, 0.0)?)?;
+                scalar(p)?
+            }
+            None => 0.0,
+        };
         let mut log = LossLog {
             step: self.step,
             pred: scalar(&pred)?,
@@ -242,8 +324,27 @@ impl NeuralTrainer {
             balance: scalar(&balance)?,
             kl: scalar(&kl)?,
             ssl: scalar(&ssl)?,
+            lambda_dec,
+            prior: prior_v,
             ..Default::default()
         };
+        if c.lambda_ncl > 0.0 && k > 1 {
+            let sp = f.out.pred.mean(2)?; // [B, K]
+            let spread = sp.broadcast_sub(&sp.mean_keepdim(1)?)?.sqr()?.sum(1)?.mean_all()?;
+            total = (total - spread.affine(c.lambda_ncl, 0.0)?)?;
+        }
+        if c.lambda_skill > 0.0 {
+            // routed error vs routed naive error per expert, gates detached (the router is not
+            // rewarded for hiding an expert)
+            let p = f.out.probs.detach();
+            let den = (p.sum(0)? + 1e-6)?; // [K]
+            let mse_k = (&per * &p)?.sum(0)?.div(&den)?;
+            let y2 = b.y.sqr()?.mean_keepdim(1)?; // [B, 1]
+            let naive_k = (p.broadcast_mul(&y2)?.sum(0)?.div(&den)? + 1e-6)?;
+            let hinge = mse_k.div(&naive_k)?.affine(1.0, c.skill_floor - 1.0)?.relu()?.sum_all()?;
+            log.skill_hinge = scalar(&hinge)?;
+            total = (total + hinge.affine(c.lambda_skill, 0.0)?)?;
+        }
         if c.lambda_anchor > 0.0 && self.anchors.n_anchored() > 0 {
             let mut acc: Option<Tensor> = None;
             for (pos, cent) in self.anchors.centroids.iter().enumerate().take(k) {
@@ -262,7 +363,13 @@ impl NeuralTrainer {
             }
         }
         if c.lambda_feedback > 0.0 && !self.feedback.is_empty() {
-            let fb = FeedbackBatch { mu: &f.out.mu, probs: &f.out.probs, targets: &b.y, experts: &m.moe.active };
+            let fb = FeedbackBatch {
+                mu: &f.out.mu,
+                probs: &f.out.probs,
+                targets: &b.y,
+                experts: &m.moe.active,
+                windows: &b.windows,
+            };
             let mut acc: Option<Tensor> = None;
             for d in &self.feedback {
                 if let Some(l) = d.aux_loss(&fb)? {
@@ -295,6 +402,11 @@ impl NeuralTrainer {
             let (loss, mut log, _) = self.losses(&b, Some(rng.next_u64()))?;
             log.grad_norm = self.opt.step(&self.model.ps, &loss)?;
             self.step += 1;
+            let c = &self.model.cfg;
+            if c.decor_dual_lr > 0.0 {
+                let lam = self.lambda_dec.unwrap_or(c.moe.lambda_dec);
+                self.lambda_dec = Some((lam + c.decor_dual_lr * (log.decor - c.decor_eps)).max(0.0));
+            }
             if let Some(ema) = &mut self.ema {
                 let tau = self.model.cfg.ema;
                 for (name, t) in ema.iter_mut() {
@@ -308,6 +420,71 @@ impl NeuralTrainer {
             }
             last = log;
         }
+        Ok(last)
+    }
+
+    /// Full-batch refit of the per-expert next-step heads (`moe.pred<e>`) on frozen latents of
+    /// up to `max_windows` training windows: `Σ_k mse_k + λ_dec · L_decor(scalarised, gated) +
+    /// λ_skill · hinge`, Adam at the genome's learning rate. Returns the last objective value.
+    pub fn refit_heads(&mut self, ds: &Dataset, steps: usize, max_windows: usize) -> Result<f64> {
+        if steps == 0 || ds.train.is_empty() {
+            return Ok(0.0);
+        }
+        let stride = (ds.train.len() / max_windows.max(1)).max(1);
+        let idx: Vec<(usize, usize)> = ds.train.iter().step_by(stride).copied().collect();
+        let mut mus = Vec::new();
+        let mut probs = Vec::new();
+        let mut ys = Vec::new();
+        for chunk in idx.chunks(256) {
+            let b = self.batch(ds, chunk)?;
+            let f = self.model.forward(&b.x, None)?;
+            mus.push(f.out.mu.detach());
+            probs.push(f.out.probs.detach());
+            ys.push(b.y);
+        }
+        let mu = Tensor::cat(&mus, 0)?; // [N, K, d]
+        let p = Tensor::cat(&probs, 0)?;
+        let y = Tensor::cat(&ys, 0)?;
+        let c = self.model.cfg.clone();
+        let names: Vec<String> = self.model.moe.active.iter().map(|e| format!("moe.pred{e}")).collect();
+        let mut heads = fa_expert_space::nn::ParamStore::new(self.seed, self.model.device());
+        let mut init = HashMap::new();
+        for n in &names {
+            for suf in ["w", "b"] {
+                let k = format!("{n}.{suf}");
+                let t = self.model.ps.w(&k)?;
+                heads.get(&k, t.dims(), fa_expert_space::nn::Init::Zeros)?;
+                init.insert(k, t);
+            }
+        }
+        heads.load(&init)?;
+        let mut opt = Adam::new(c.lr, 0.0);
+        let k = names.len();
+        let y2 = (y.sqr()?.mean_keepdim(1)? + 1e-6)?; // [N, 1]
+        let mut last = 0.0;
+        for _ in 0..steps {
+            let preds: Vec<Tensor> = names
+                .iter()
+                .enumerate()
+                .map(|(pos, n)| fa_expert_space::nn::linear_w(&heads, n, &mu.narrow(1, pos, 1)?.squeeze(1)?))
+                .collect::<Result<_>>()?;
+            let pred = Tensor::stack(&preds, 1)?; // [N, K, T]
+            let resid = pred.broadcast_sub(&y.unsqueeze(1)?)?;
+            let per = resid.sqr()?.mean(2)?; // [N, K]
+            let mut loss = per.mean_all()?.affine(k as f64, 0.0)?;
+            loss = (loss + decorrelation_loss_gated(&resid.mean_keepdim(2)?, &p)?.affine(c.moe.lambda_dec, 0.0)?)?;
+            if c.lambda_skill > 0.0 {
+                let den = (p.sum(0)? + 1e-6)?;
+                let mse_k = (&per * &p)?.sum(0)?.div(&den)?;
+                let naive_k = p.broadcast_mul(&y2)?.sum(0)?.div(&den)?;
+                let hinge = mse_k.div(&naive_k)?.affine(1.0, c.skill_floor - 1.0)?.relu()?.sum_all()?;
+                loss = (loss + hinge.affine(c.lambda_skill, 0.0)?)?;
+            }
+            last = scalar(&loss)?;
+            opt.step(&heads, &loss)?;
+        }
+        let fitted: HashMap<String, Tensor> = heads.snapshot()?.into_iter().collect();
+        self.model.ps.load(&fitted)?;
         Ok(last)
     }
 
@@ -325,6 +502,9 @@ impl NeuralTrainer {
         let mut gates: Vec<Vec<f32>> = Vec::new();
         let mut usage = vec![0.0; k];
         let (mut naive, mut mixsq, mut n) = (0.0, 0.0, 0usize);
+        let mut t_naive = [0.0f64; N_TARGETS];
+        let mut t_sq = [0.0f64; N_TARGETS];
+        let mut mix_scalar: Vec<f64> = Vec::new();
         let mut sum = LossLog::default();
         let mut chunks = 0.0;
         for chunk in windows.chunks(256) {
@@ -341,6 +521,7 @@ impl NeuralTrainer {
                 (&mut sum.ssl, log.ssl),
                 (&mut sum.anchor, log.anchor),
                 (&mut sum.feedback, log.feedback),
+                (&mut sum.prior, log.prior),
             ] {
                 *acc += v * w;
             }
@@ -361,6 +542,12 @@ impl NeuralTrainer {
                 naive += yy;
                 mixsq +=
                     y[bi].iter().zip(&mixp[bi]).map(|(a, b)| f64::from(a - b).powi(2)).sum::<f64>() / N_TARGETS as f64;
+                for t in 0..N_TARGETS {
+                    t_naive[t] += f64::from(y[bi][t]).powi(2);
+                    t_sq[t] += f64::from(y[bi][t] - mixp[bi][t]).powi(2);
+                }
+                mix_scalar
+                    .push(y[bi].iter().zip(&mixp[bi]).map(|(a, b)| f64::from(a - b)).sum::<f64>() / N_TARGETS as f64);
                 n += 1;
             }
         }
@@ -378,6 +565,7 @@ impl NeuralTrainer {
             &mut sum.ssl,
             &mut sum.anchor,
             &mut sum.feedback,
+            &mut sum.prior,
         ] {
             *v /= chunks.max(1.0);
         }
@@ -385,7 +573,18 @@ impl NeuralTrainer {
         // spec 32 §6.3/§6.4: residual correlation over windows where both experts are active,
         // skill of each expert over the windows routed to it (top-k gate weighted)
         let health = HealthReport::compute_gated(&resid, &sq, &y2, &gates, usage.iter().map(|u| u / nf).collect(), 30);
-        Ok(EvalReport { loss: sum, health, mix_skill: if naive > 0.0 { 1.0 - mixsq / naive } else { 0.0 }, n })
+        let ms = mix_scalar.iter().sum::<f64>() / nf;
+        let mix_resid_var = mix_scalar.iter().map(|v| (v - ms).powi(2)).sum::<f64>() / nf;
+        let target_skill =
+            t_sq.iter().zip(&t_naive).map(|(s, n0)| if *n0 > 0.0 { 1.0 - s / n0 } else { 0.0 }).collect();
+        Ok(EvalReport {
+            loss: sum,
+            health,
+            mix_skill: if naive > 0.0 { 1.0 - mixsq / naive } else { 0.0 },
+            target_skill,
+            mix_resid_var,
+            n,
+        })
     }
 
     /// Emergent expert count (spec 32 §6.1): drops experts whose validation usage is below
@@ -419,6 +618,9 @@ impl NeuralTrainer {
         meta.insert("step".into(), self.step.to_string());
         meta.insert("seed".into(), self.seed.to_string());
         meta.insert("adam_t".into(), self.opt.t.to_string());
+        if let Some(l) = self.lambda_dec {
+            meta.insert("lambda_dec".into(), format!("{l:e}"));
+        }
         meta.insert("log".into(), serde_json::to_string(&self.log).unwrap_or_default());
         to_safetensors(t, meta)
     }
@@ -437,6 +639,7 @@ impl NeuralTrainer {
             );
         }
         tr.log = meta.get("log").and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+        tr.lambda_dec = meta.get("lambda_dec").and_then(|s| s.parse().ok());
         Ok(tr)
     }
 

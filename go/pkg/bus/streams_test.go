@@ -14,7 +14,7 @@ import (
 // Mirrors crates/fa-bus/src/streams.rs tests.
 func TestStreamTableMatchesSpec21(t *testing.T) {
 	tb := Table()
-	want := []string{"MD", "TEXT", "MEDIA", "MACRO", "LATENT", "SIGNAL", "ORDERS", "JOB_RESULTS"}
+	want := []string{"MD", "TEXT", "MEDIA", "MACRO", "LATENT", "SIGNAL", "ORDERS", "JOB_RESULTS", "DLQ"}
 	if len(tb.Streams) != len(want) {
 		t.Fatalf("streams = %d", len(tb.Streams))
 	}
@@ -30,6 +30,17 @@ func TestStreamTableMatchesSpec21(t *testing.T) {
 	}
 	if by["ORDERS"].Storage != "file" || by["ORDERS"].Config().Storage != jetstream.FileStorage {
 		t.Errorf("ORDERS storage: %+v", by["ORDERS"])
+	}
+	for _, sp := range tb.Streams {
+		if sp.MaxMiB < 1024 {
+			t.Errorf("%s is not capped: %d MiB", sp.Name, sp.MaxMiB)
+		}
+	}
+	if by["LATENT"].Config().MaxBytes != 24<<30 {
+		t.Errorf("LATENT cap: %d", by["LATENT"].Config().MaxBytes)
+	}
+	if safeMaxBytes(-1, 100, 50) != 100 || safeMaxBytes(-1, 100, 150) != -1 || safeMaxBytes(200, -1, 150) != -1 {
+		t.Error("safeMaxBytes must never purge")
 	}
 	if tb.WorkQueue != (WorkQueueSpec{AckWaitSecs: 60, MaxDeliver: 5}) {
 		t.Errorf("work queue: %+v", tb.WorkQueue)
@@ -65,7 +76,9 @@ func TestNoStreamSubjectsOverlap(t *testing.T) {
 			filters = append(filters, f{s.Name, sub})
 		}
 	}
-	filters = append(filters, f{WorkQueueName("evo"), WorkQueueSubject("evo")})
+	for _, k := range []string{"evo", "mcmc", "ingest", "train"} {
+		filters = append(filters, f{WorkQueueName(k), WorkQueueSubject(k)})
+	}
 	for i, a := range filters {
 		for _, b := range filters[i+1:] {
 			if a.stream != b.stream && SubjectsOverlap(a.filter, b.filter) {
@@ -79,6 +92,9 @@ func TestNoStreamSubjectsOverlap(t *testing.T) {
 		"risk.halt.portfolio":          "ORDERS",
 		"jobs.result.evo.eval.decoder": "JOB_RESULTS",
 		"jobs.evo.eval.decoder":        "JOBS_EVO",
+		"jobs.mcmc.refit":              "JOBS_MCMC",
+		"dlq.LATENT.latent.state.1m.x": "DLQ",
+		"ops.alert":                    "",
 		"jobs.progress.01J":            "",
 		"svc.heartbeat.ingestor":       "",
 	}

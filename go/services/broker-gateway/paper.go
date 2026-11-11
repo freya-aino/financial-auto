@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"strings"
 	"sync"
@@ -58,12 +59,18 @@ type resting struct {
 // with the schedule's commission; limit orders fill when marketable (at the limit,
 // commission only) or rest as ACKED until crossed or cancelled.
 type PaperEngine struct {
-	mu      sync.Mutex
-	markets map[string]*market // subject token -> market
-	seen    map[string]bool    // intent ids, for idempotency (spec 42)
-	resting map[string]*resting
-	now     func() time.Time
-	Costs   *CostModel
+	mu       sync.Mutex
+	markets  map[string]*market // subject token -> market
+	seen     map[string]bool    // intent ids, for idempotency (spec 42)
+	resting  map[string]*resting
+	working  map[string]*working  // algo orders in progress
+	profiles map[string][]float64 // token -> traded notional per time-of-day bucket (VWAP)
+	now      func() time.Time
+	Costs    *CostModel
+	// Calib collects taker fills for the live slippage recalibration (nil = off).
+	Calib *Calibrator
+	// Counters receives slippage / algo metrics (nil = none).
+	Counters *bus.Counters
 	// Rolling volume window; the sum is extrapolated to 24 h for the ADV.
 	VolumeWindow time.Duration
 	// EWMA decay of the return variance.
@@ -76,6 +83,7 @@ func NewPaperEngine(costs *CostModel) *PaperEngine {
 	}
 	return &PaperEngine{
 		markets: map[string]*market{}, seen: map[string]bool{}, resting: map[string]*resting{},
+		working: map[string]*working{}, profiles: map[string][]float64{},
 		now: time.Now, Costs: costs, VolumeWindow: time.Hour, SigmaDecay: 0.97,
 	}
 }
@@ -160,6 +168,17 @@ func (p *PaperEngine) ObserveTrade(subject string, price, size float64, at time.
 			i++
 		}
 		m.vol = m.vol[i:]
+		prof := p.profiles[token]
+		if prof == nil {
+			prof = make([]float64, profileBuckets)
+			p.profiles[token] = prof
+		}
+		prof[bucketOf(at)] += price * size
+		for _, w := range p.working {
+			if w.token == token && w.algo.Name == "pov" && !at.Before(w.start) {
+				w.allowance += w.algo.Rate * size
+			}
+		}
 	}
 	var out []Published
 	for id, r := range p.resting {
@@ -167,8 +186,9 @@ func (p *PaperEngine) ObserveTrade(subject string, price, size float64, at time.
 			continue
 		}
 		delete(p.resting, id)
-		out = append(out, Published{Account: r.intent.AccountId, Event: p.fill(r.intent, m, r.arrival, true)})
+		out = append(out, Published{Account: r.intent.AccountId, Event: p.fill(r.intent, m, r.arrival, r.arrival, true, "limit")})
 	}
+	out = append(out, p.progress(token, p.now())...)
 	return out
 }
 
@@ -231,21 +251,23 @@ func side(in *fav1.OrderIntent) string {
 
 // fill prices a fill with the cost model. Passive fills (crossed resting limits) fill at the
 // limit price with commission only; taker fills pay half spread + impact.
-func (p *PaperEngine) fill(in *fav1.OrderIntent, m *market, arrival float64, passive bool) *fav1.OrderEvent {
+// px is the taker reference price (the then-last trade); arrival the parent's arrival price.
+func (p *PaperEngine) fill(in *fav1.OrderIntent, m *market, px, arrival float64, passive bool, algo string) *fav1.OrderEvent {
 	now := p.now()
 	var spread float64
 	if m.ask > m.bid && m.bid > 0 {
 		spread = m.ask - m.bid
 	}
-	price := arrival
+	price := px
 	if passive && in.LimitPrice != nil {
 		price = *in.LimitPrice
 	}
-	res := p.Costs.Price(CostInputs{
+	ci := CostInputs{
 		Venue: m.venue, Class: p.Costs.ClassOf(in.InstrumentId), Side: side(in),
 		Price: price, Qty: in.Quantity, Spread: spread, Sigma: m.sigma(), ADV: m.adv(now, p.VolumeWindow),
 		Passive: passive,
-	})
+	}
+	res := p.Costs.Price(ci)
 	var bps float64
 	if arrival > 0 {
 		dir := 1.0
@@ -253,6 +275,7 @@ func (p *PaperEngine) fill(in *fav1.OrderIntent, m *market, arrival float64, pas
 			dir = -1
 		}
 		bps = dir * (res.FillPrice - arrival) / arrival * 10_000
+		p.observeSlippage(ci, res, arrival, bps, algo)
 	}
 	return &fav1.OrderEvent{
 		IntentId: in.IntentId, VenueOrderId: "paper-" + in.IntentId, Kind: fav1.OrderEvent_KIND_FILL,
@@ -288,18 +311,50 @@ func (p *PaperEngine) Execute(in *fav1.OrderIntent) *fav1.OrderEvent {
 		ev.Kind, ev.Reason = fav1.OrderEvent_KIND_REJECTED, "no market price observed"
 		return ev
 	}
+	algo, err := ParseAlgo(in.ExecAlgo)
+	if err != nil {
+		ev.Kind, ev.Reason = fav1.OrderEvent_KIND_REJECTED, err.Error()
+		return ev
+	}
+	if algo.Name == "auto" {
+		var spreadBps float64
+		if m.ask > m.bid && m.bid > 0 {
+			spreadBps = (m.ask - m.bid) / ((m.ask + m.bid) / 2) * 10_000
+		} else {
+			spreadBps = p.Costs.Schedule(m.venue, p.Costs.ClassOf(in.InstrumentId)).SpreadBps
+		}
+		algo = chooseAlgo(in.Quantity*m.last, m.adv(p.now(), p.VolumeWindow), spreadBps)
+		if p.Counters != nil {
+			p.Counters.Add("algo.auto."+algo.Name, 1)
+		}
+	}
+	switch algo.Name {
+	case "smart_limit", "twap", "vwap", "pov":
+		return p.startAlgo(in, algo, m, token)
+	}
+	// market, or limit (with or without a price): an explicit limit_price always rests
 	if !marketable(in, m.last) {
 		p.resting[in.IntentId] = &resting{intent: in, arrival: m.last, token: token}
 		ev.Kind, ev.Reason, ev.ArrivalPrice = fav1.OrderEvent_KIND_ACK, "limit not marketable; resting", m.last
 		return ev
 	}
-	return p.fill(in, m, m.last, false)
+	return p.fill(in, m, m.last, m.last, false, algo.Name)
 }
 
 // CancelResting cancels a resting limit order; nil when there is none for the id.
 func (p *PaperEngine) CancelResting(intentID string) *Published {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if w, ok := p.working[intentID]; ok {
+		delete(p.working, intentID)
+		p.algoCount(w.algo.Name, "working", -1)
+		p.algoCount(w.algo.Name, "cancelled", 1)
+		return &Published{Account: w.intent.AccountId, Event: &fav1.OrderEvent{
+			IntentId: intentID, VenueOrderId: "paper-" + intentID, Kind: fav1.OrderEvent_KIND_CANCELED,
+			EventTime: timestamppb.New(p.now()), ArrivalPrice: w.arrival,
+			Reason: fmt.Sprintf("cancelled by request; %s filled %g of %g in %d children", w.algo.Name, w.filled, w.intent.Quantity, w.seq),
+		}}
+	}
 	r, ok := p.resting[intentID]
 	if !ok {
 		return nil

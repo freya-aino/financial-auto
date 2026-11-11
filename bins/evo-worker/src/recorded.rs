@@ -349,6 +349,7 @@ pub fn decode_ctx(rec: &RecordedLatents) -> DecodeCtx {
         {
             let as_of_ms =
                 s.as_of.as_ref().map_or(r.published_ms, |t| t.seconds * 1000 + i64::from(t.nanos) / 1_000_000);
+            ctx.set_layout(&s.instrument_id, crate::latent::layout_of(s));
             ctx.push(&s.instrument_id, LatentPoint { as_of_ms, vec });
         }
     }

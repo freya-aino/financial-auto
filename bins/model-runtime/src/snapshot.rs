@@ -208,7 +208,17 @@ impl SnapshotLoader {
                 let base = NeuralEncoder::from_manifest_on(m, &weights, &dev)?;
                 let mut model = base.model().clone();
                 model.norm = norm.clone();
-                Box::new(NeuralEncoder::new(model, ts, snapshot_id.to_owned()))
+                let mut enc = NeuralEncoder::new(model, ts, snapshot_id.to_owned());
+                // weight-level LoRA (spec 36 §6.5), unless its own guard froze it
+                if let Some(l) = art.lora.as_ref().filter(|l| !l.frozen)
+                    && let Some(lk) = l.key.as_deref().filter(|k| !k.is_empty())
+                {
+                    let bytes =
+                        blob.get(&fa_blob::ObjectKey { bucket: fa_blob::buckets::MODELS, key: lk.to_owned() }).await?;
+                    enc = enc.with_lora(&bytes)?;
+                    tracing::info!(snapshot = snapshot_id, lora = lk, "LoRA adapter folded into the serving encoder");
+                }
+                Box::new(enc)
             }
             (Some(m), Some(stats), _) => Box::new(StatisticalEncoder::from_manifest(m, &stats.to_bytes())?),
             (None, Some(stats), _) => {
@@ -270,10 +280,22 @@ pub struct AdapterArtifact {
     /// Neural families: re-fitted input normalisation (`fa_encoders::neural::InputNorm`).
     #[serde(default)]
     pub input_norm: Option<InputNorm>,
+    /// Neural families: the LoRA layer (`fa-lora-v1` safetensors next to the JSON).
+    #[serde(default)]
+    pub lora: Option<LoraRef>,
     #[serde(default)]
     pub drift: Option<f64>,
     #[serde(default)]
     pub max_drift: Option<f64>,
+    #[serde(default)]
+    pub frozen: bool,
+}
+
+/// The `lora` part of a neural adapter artifact.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoraRef {
+    #[serde(default)]
+    pub key: Option<String>,
     #[serde(default)]
     pub frozen: bool,
 }
@@ -408,7 +430,16 @@ mod tests {
             "snapshot_id": "fsq-v1-1m-g0-1", "timescale": "1m", "ts_ms": 1, "input_norm": InputNorm::default(), "frozen": false
         });
         let n = AdapterArtifact::from_json(&serde_json::to_vec(&neural).unwrap()).unwrap();
-        assert!(n.stats.is_none() && n.input_norm.is_some());
+        assert!(n.stats.is_none() && n.input_norm.is_some() && n.lora.is_none());
+        // with the LoRA layer (trainer run_adapter, spec 36 §6.5)
+        let mut with_lora = neural.clone();
+        with_lora["lora"] = serde_json::json!({
+            "key": "adapters/fsq-v1-1m-g0-1/1.lora.safetensors", "rank": 8, "alpha": 8.0, "frozen": false,
+            "report": {"delta_norm": 0.01}
+        });
+        let l = AdapterArtifact::from_json(&serde_json::to_vec(&with_lora).unwrap()).unwrap().lora.unwrap();
+        assert_eq!((l.key.as_deref(), l.frozen), (Some("adapters/fsq-v1-1m-g0-1/1.lora.safetensors"), false));
+        assert_eq!(adapter_ms("adapters/x/1.lora.safetensors"), None, "the LoRA weights are not an artifact");
         assert_eq!(adapter_ms("adapters/stat-v1-1m/1700000000000.json"), Some(1_700_000_000_000));
         assert_eq!(adapter_ms("adapters/stat-v1-1m/notes.txt"), None);
     }

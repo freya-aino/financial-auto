@@ -34,6 +34,7 @@
 mod engine;
 mod persist;
 mod pipeline;
+mod recon;
 mod settings;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -470,6 +471,7 @@ async fn main() -> anyhow::Result<()> {
                 let with_books = states.iter().filter(|(_, b)| b.is_some()).count();
                 tracing::info!(strategies = states.len(), with_books, "strategy lifecycle rows and sub-books loaded");
                 let refs = p.load_refdata().await;
+                let shortable = p.load_shortable().await;
                 let fx = p.load_fx(&fx_settings.source, fx_settings.history_days).await;
                 let reserve = p.payout_reserve_today().await;
                 let risk_state = p.load_risk_state().await;
@@ -484,6 +486,9 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(r) = refs {
                     tracing::info!(instruments = r.len(), "reference data loaded");
                     e.set_refdata(r);
+                }
+                if let Some(m) = shortable {
+                    e.set_shortable(m);
                 }
                 if let Some(t) = fx {
                     tracing::info!(rates = t.len(), currencies = ?t.currencies().collect::<Vec<_>>(), "fx table loaded");
@@ -524,6 +529,9 @@ async fn main() -> anyhow::Result<()> {
                     c.insert("halted".into(), if e.halted() { 1.0 } else { 0.0 });
                     for (venue, eur) in e.exposure_by_venue() {
                         c.insert(format!("exposure_eur.venue.{venue}"), eur);
+                    }
+                    for (k, v) in e.headroom(now_ms()) {
+                        c.insert(k, v);
                     }
                     if let Some(rows) = e.tournament_view()["entries"].as_array() {
                         for r in rows {
@@ -595,10 +603,17 @@ async fn main() -> anyhow::Result<()> {
     {
         let (bus, engine, store) = (bus.clone(), engine.clone(), store.clone());
         let mut sub = bus.subscribe_raw("order.>".into()).await?;
+        let account = settings.account.clone();
         tokio::spawn(async move {
             use fa_proto::Message;
             while let Some(m) = sub.next().await {
                 let subject = m.subject.as_str();
+                // order.<stage>.<account>: only this engine's account is gated and booked. Other
+                // accounts (e.g. a `paper-test` harness) used to be booked into the paper book,
+                // which Postgres files under their own book — a real reconciliation diff.
+                if !recon::own_account(subject, &account) {
+                    continue;
+                }
                 let stage = if subject.starts_with("order.intent.") {
                     Some(false)
                 } else if subject.starts_with("order.approved.") {
@@ -621,15 +636,16 @@ async fn main() -> anyhow::Result<()> {
                     },
                     None if subject.starts_with("order.event.") => match OrderEvent::decode(m.payload.as_ref()) {
                         Ok(ev) => {
-                            let (outs, booked) = {
+                            let (mut outs, booked, unknown) = {
                                 let mut e = engine.lock().await;
                                 let outs = e.on_order_event(&ev, now_ms());
-                                (outs, e.take_booked_fills())
+                                (outs, e.take_booked_fills(), e.take_unknown_fills())
                             };
-                            if let Some(p) = &store
-                                && !booked.is_empty()
-                            {
-                                p.fills(booked).await;
+                            // spec 42: fills go through fa_ledger record_fill_event; fills for
+                            // unknown intents are recovered from Postgres or parked as orphans
+                            if let Some(p) = &store {
+                                outs.extend(recon::persist_fills(p, &engine, booked).await);
+                                outs.extend(recon::resolve_unknown(p, &engine, unknown).await);
                             }
                             outs
                         }
@@ -641,6 +657,52 @@ async fn main() -> anyhow::Result<()> {
                     None => continue,
                 };
                 publish_outs(&bus, &store, &engine, outs).await;
+            }
+        });
+    }
+
+    // latent.mcmc.<ts>.<expert> kernel updates: snapshot → timescale and the model-drift alarm
+    // (spec 40 §6.5: strategies depending on a drifted snapshot are paused, not everything)
+    {
+        let mut sub = bus.subscribe_raw("latent.mcmc.>".into()).await?;
+        let (bus_k, engine_k, store_k) = (bus.clone(), engine.clone(), store.clone());
+        tokio::spawn(async move {
+            while let Some(m) = sub.next().await {
+                let Ok(k) = fa_proto::v1::KernelUpdate::decode(m.payload.as_ref()) else { continue };
+                let Some(space) = k.space.as_ref() else { continue };
+                let Ok(ts) = space.timescale.parse::<fa_core::Timescale>() else { continue };
+                let outs = engine_k.lock().await.on_kernel_update(
+                    &space.snapshot_id,
+                    ts,
+                    space.expert_index,
+                    k.drift_kl,
+                    now_ms(),
+                );
+                if !outs.is_empty() {
+                    publish_outs(&bus_k, &store_k, &engine_k, outs).await;
+                }
+            }
+        });
+    }
+
+    // calibration history: hourly closes of the last 30 days from VictoriaMetrics (spec 40 §6.5)
+    if !cfg.victoriametrics.url.is_empty() {
+        let (tsdb, engine_c) = (fa_tsdb::Tsdb::new(cfg.victoriametrics.url.clone()), engine.clone());
+        tokio::spawn(async move {
+            let end = now_ms() / 1000;
+            match tsdb.trade_prices(None, end - 30 * 86_400, end, "1h").await {
+                Ok(series) => {
+                    let mut by_inst: std::collections::BTreeMap<InstrumentId, Vec<(i64, f64)>> = Default::default();
+                    for s in series {
+                        if let Ok(u) = Uuid::parse_str(&s.inst) {
+                            // longest series first: one venue's closes per instrument
+                            by_inst.entry(InstrumentId(u)).or_insert(s.points);
+                        }
+                    }
+                    let n = engine_c.lock().await.seed_hourly_marks(by_inst);
+                    tracing::info!(instruments = n, "calibration history seeded from VictoriaMetrics hourly closes");
+                }
+                Err(e) => tracing::warn!(error = %e, "calibration history not seeded"),
             }
         });
     }
@@ -723,7 +785,14 @@ async fn main() -> anyhow::Result<()> {
                 });
             let tsdb =
                 (!cfg.victoriametrics.url.is_empty()).then(|| fa_tsdb::Tsdb::new(cfg.victoriametrics.url.clone()));
-            Some(Arc::new(Pipeline::new(bus.clone(), p.clone(), blob, tsdb, engine.clone(), &settings)))
+            // spec 35 §5: lifecycle status mirrored onto Helix `Genome` nodes (best-effort)
+            let hub = (!cfg.helix.url.is_empty()).then(|| {
+                fa_hub::HubClient::with_timeout(
+                    fa_hub::HubClient::url_from_env_or(&cfg.helix.url),
+                    Duration::from_secs(5),
+                )
+            });
+            Some(Arc::new(Pipeline::new(bus.clone(), p.clone(), blob, tsdb, engine.clone(), &settings).with_hub(hub)))
         }
         None => None,
     };
@@ -832,6 +901,9 @@ async fn main() -> anyhow::Result<()> {
                     tracing::debug!(instruments = r.len(), "reference data reloaded");
                     engine_f.lock().await.set_refdata(r);
                 }
+                if let Some(m) = p_f.load_shortable().await {
+                    engine_f.lock().await.set_shortable(m);
+                }
             }
         });
         // ECB daily reference rates → ref.fx_rate → in-memory FX table (spec 12 §6, spec 42 §6)
@@ -870,39 +942,46 @@ async fn main() -> anyhow::Result<()> {
             }
         });
         // today's payout quota (spec 40 §6.5: deployable = equity − reserved quota)
-        let (engine_q, p_q) = (engine.clone(), p.clone());
+        // and the [payout] rule writes today's quota (spec 42 §10 Q1; raise-only, idempotent)
+        let (engine_q, p_q, payout_rule) = (engine.clone(), p.clone(), settings.payout.clone());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(30));
+            let mut ruled: Option<chrono::NaiveDate> = None;
             loop {
                 tick.tick().await;
+                let today = chrono::Utc::now().date_naive();
+                if ruled != Some(today)
+                    && let Some(q) = recon::apply_payout_rule(&p_q, &payout_rule).await
+                {
+                    tracing::info!(%today, quota_eur = q, "payout rule applied");
+                    ruled = Some(today);
+                }
                 let r = p_q.payout_reserve_today().await;
                 engine_q.lock().await.set_reserved_payout(r);
             }
         });
+        // unconfirmed fill writes are retried (spec 42 §6)
+        let (engine_u, bus_u, p_u) = (engine.clone(), bus.clone(), p.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let outs = recon::retry_unconfirmed(&p_u, &engine_u).await;
+                publish_outs(&bus_u, &Some(p_u.clone()), &engine_u, outs).await;
+            }
+        });
+        // open orphan fills halt the venue (at start and every pass); reconciliation at one cut
         let (engine_r, bus_r) = (engine.clone(), bus.clone());
         tokio::spawn(async move {
+            let outs = recon::check_orphans(&p, &engine_r).await;
+            publish_outs(&bus_r, &Some(p.clone()), &engine_r, outs).await;
             let mut tick = tokio::time::interval(Duration::from_secs(reconcile_secs.max(1)));
             tick.tick().await;
             loop {
                 tick.tick().await;
-                let ledger = engine_r.lock().await.ledger().clone();
-                if let Some(d) = p.reconcile(&ledger).await {
-                    p.audit("reconciliation.diff", Some(p.book()), serde_json::to_value(&d).unwrap_or_default()).await;
-                    // spec 42 §6: a diff halts the venue until resolved (risk.resume.broker re-arms)
-                    let h = Halt {
-                        scope: "broker".into(),
-                        reason: format!(
-                            "reconciliation diff: cash memory {:.2} vs postgres {:.2}, {} position diffs",
-                            d.cash_ours,
-                            d.cash_theirs,
-                            d.positions.len()
-                        ),
-                        since: Some(fa_proto::now()),
-                        manual: false,
-                    };
-                    engine_r.lock().await.on_halt(&h, now_ms());
-                    publish_outs(&bus_r, &Some(p.clone()), &engine_r, vec![Out::Halt(h)]).await;
-                }
+                let mut outs = recon::check_orphans(&p, &engine_r).await;
+                outs.extend(recon::reconcile(&p, &engine_r).await);
+                publish_outs(&bus_r, &Some(p.clone()), &engine_r, outs).await;
             }
         });
     }

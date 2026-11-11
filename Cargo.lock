@@ -97,6 +97,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "async-nats"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -280,6 +286,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "borsh"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "553c5d846a6ba5150c65e3b1b8ec073bcf1abc20f9b7220de384a4443ea4e20a"
+dependencies = [
+ "borsh-derive",
+ "bytes",
+ "cfg_aliases",
+]
+
+[[package]]
+name = "borsh-derive"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12cdfe656708a01f89b451a7d36466e6fe6c414de0aa18fc54f864f6f9ca9f56"
+dependencies = [
+ "once_cell",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -1066,11 +1096,14 @@ dependencies = [
  "fa-decoders",
  "fa-proto",
  "fa-strategies",
+ "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.21",
  "tokio",
+ "ulid",
  "uuid",
 ]
 
@@ -1098,6 +1131,7 @@ version = "0.1.0"
 dependencies = [
  "async-nats",
  "bytes",
+ "chrono",
  "fa-core",
  "fa-metrics",
  "fa-proto",
@@ -1142,6 +1176,7 @@ dependencies = [
  "candle-core",
  "fa-core",
  "fa-expert-space",
+ "fa-patterns",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -1187,6 +1222,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "fa-core",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sqlx",
@@ -1201,6 +1237,7 @@ version = "0.1.0"
 dependencies = [
  "fa-core",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -2827,6 +2864,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "proc-macro-crate"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
+dependencies = [
+ "toml_edit",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3293,6 +3339,7 @@ dependencies = [
  "fa-blob",
  "fa-bus",
  "fa-core",
+ "fa-hub",
  "fa-ledger",
  "fa-proto",
  "fa-risk",
@@ -3311,6 +3358,23 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "uuid",
+]
+
+[[package]]
+name = "rust_decimal"
+version = "1.43.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7653272e75dcac41dc199fbea6f5797633994fafd339943c06c9af16bf29cd3a"
+dependencies = [
+ "arrayvec",
+ "borsh",
+ "bytes",
+ "num-traits",
+ "rand 0.8.8",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3836,6 +3900,7 @@ dependencies = [
  "log",
  "memchr",
  "percent-encoding",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3906,6 +3971,7 @@ dependencies = [
  "generic-array",
  "log",
  "percent-encoding",
+ "rust_decimal",
  "serde",
  "sha1 0.11.0",
  "sha2 0.11.1",
@@ -3940,6 +4006,7 @@ dependencies = [
  "md-5",
  "memchr",
  "rand 0.10.3",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -4367,6 +4434,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_edit"
+version = "0.25.19+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd43688c4858d7264ae1cf9a9f874a67c3feb74a883b1cd7bebd6a4ea8307218"
+dependencies = [
+ "indexmap",
+ "toml_datetime",
+ "toml_parser",
+ "winnow",
+]
+
+[[package]]
 name = "toml_parser"
 version = "1.1.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4526,6 +4605,7 @@ dependencies = [
  "fa-blob",
  "fa-bus",
  "fa-core",
+ "fa-decoders",
  "fa-encoders",
  "fa-expert-space",
  "fa-hub",
@@ -4810,6 +4890,7 @@ checksum = "a0181c14ddd6c7b8b0b0132a5f1ea2f32be0d893cd3ea97b6e3b28886b8a3d1c"
 dependencies = [
  "cfg-if",
  "rustversion",
+ "serde",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
 ]
@@ -5081,6 +5162,9 @@ name = "winnow"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "winsafe"

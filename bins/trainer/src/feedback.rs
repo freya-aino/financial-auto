@@ -278,6 +278,167 @@ impl DecoderFeedback for FrozenProbeFeedback {
     }
 }
 
+// ── D-068 elite decoders as the D-009 feedback (replaces the probe stand-in) ──
+
+use fa_decoders::neural::{
+    data::TextTimeline,
+    feedback::{self as elite, EliteCard, FeedbackSet},
+};
+
+/// Elites per output family taken from Garage.
+pub const ELITES_PER_FAMILY: usize = 4;
+
+/// **D-009 with the real elite decoders** (D-068, `fa_decoders::neural::feedback`): the top
+/// [`ELITES_PER_FAMILY`] cards per output family whose decoders read a latent of exactly the
+/// trained snapshot's width (`n_experts × expert_dim`, concatenated expert means in output order —
+/// the `LatentState` layout they were trained on) and the fit's step, loaded frozen; per batch
+/// their context and targets are built from the row's own price series and the loss is
+/// back-propagated into the expert means only. News-reading elites sit out: the trainer has no
+/// news timeline (rows without news are skipped by `FeedbackSet::prepare`).
+pub struct EliteFeedback {
+    set: FeedbackSet,
+    /// Decoder price series per dataset series (bar ends, ln close).
+    series: Vec<fa_decoders::baseline::Series>,
+    text: TextTimeline,
+    cards: Vec<Value>,
+    latent_dim: usize,
+}
+
+impl EliteFeedback {
+    pub fn n_elites(&self) -> usize {
+        self.set.elites.len()
+    }
+}
+
+/// Decoder price series of a fit's histories (same order as the dataset's series).
+pub fn decoder_series(history: &[crate::data::BarHistory], step_ms: i64) -> Vec<fa_decoders::baseline::Series> {
+    history
+        .iter()
+        .map(|h| fa_decoders::baseline::Series {
+            instrument_id: h.instrument.clone(),
+            ts_ms: h.ends_ms.clone(),
+            log_price: h.bars.iter().map(|b| b.close.max(1e-12).ln()).collect(),
+            step_ms,
+        })
+        .collect()
+}
+
+/// Cards eligible for a fit: same step, current normaliser, latent width `latent_dim`; then the
+/// D-068 top-k per family and quota weights.
+pub fn eligible(cards: &[EliteCard], step_ms: i64, latent_dim: usize) -> Vec<(EliteCard, f64)> {
+    let same_step: Vec<EliteCard> = cards.iter().filter(|c| c.meta.step_ms == step_ms).cloned().collect();
+    elite::quota_weights(&elite::select_top_k(&same_step, ELITES_PER_FAMILY, Some(latent_dim)))
+}
+
+/// Lists the decoder cards in Garage, loads the eligible elites frozen. `Ok(None)` when none fit.
+pub async fn load_elites(
+    blob: &fa_blob::S3BlobStore,
+    history: &[crate::data::BarHistory],
+    step_ms: i64,
+    latent_dim: usize,
+    dev: &candle_core::Device,
+) -> anyhow::Result<Option<EliteFeedback>> {
+    use fa_blob::BlobStore;
+    let listed = blob.list(fa_blob::buckets::MODELS, elite::PREFIX).await?;
+    let mut cards = Vec::new();
+    for o in listed.iter().filter(|o| o.key.ends_with(elite::CARD_SUFFIX)) {
+        let key = fa_blob::ObjectKey { bucket: fa_blob::buckets::MODELS, key: o.key.clone() };
+        if let Ok(b) = blob.get(&key).await
+            && let Ok(c) = serde_json::from_slice::<EliteCard>(&b)
+        {
+            cards.push(c);
+        }
+    }
+    let chosen = eligible(&cards, step_ms, latent_dim);
+    // what the cards offer: (step_ms, full latent width, current normaliser, beats naive) → count
+    let mut shapes: std::collections::BTreeMap<(i64, usize, bool, bool), usize> = Default::default();
+    for c in &cards {
+        *shapes
+            .entry((c.meta.step_ms, c.meta.full_latent_dim(), c.meta.is_current(), c.meta.score > 0.0))
+            .or_default() += 1;
+    }
+    tracing::info!(
+        cards = cards.len(),
+        eligible = chosen.len(),
+        latent_dim,
+        step_ms,
+        offered = ?shapes,
+        "decoder elites for D-009 feedback ((step_ms, latent width, current normaliser, score > 0) → n)"
+    );
+    if chosen.is_empty() {
+        return Ok(None);
+    }
+    let mut bundles = Vec::with_capacity(chosen.len());
+    let mut summary = Vec::with_capacity(chosen.len());
+    for (c, w) in &chosen {
+        let key = fa_blob::ObjectKey { bucket: fa_blob::buckets::MODELS, key: c.key.clone() };
+        match blob.get(&key).await {
+            Ok(b) => {
+                bundles.push((b, *w));
+                summary.push(json!({
+                    "key": c.key, "family": c.meta.family, "output_family": c.meta.output_family,
+                    "score": c.meta.score, "weight": w, "generation": c.meta.generation,
+                }));
+            }
+            Err(e) => tracing::warn!(key = %c.key, error = %e, "elite bundle unreadable"),
+        }
+    }
+    let set = FeedbackSet::load(&bundles, latent_dim, dev).map_err(|e| anyhow::anyhow!("elite bundles: {e}"))?;
+    if set.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(EliteFeedback {
+        series: decoder_series(history, step_ms),
+        text: TextTimeline::new(),
+        cards: summary,
+        latent_dim,
+        set,
+    }))
+}
+
+#[cfg(test)]
+impl EliteFeedback {
+    /// For tests: a loaded set over given series.
+    pub fn from_parts(set: FeedbackSet, series: Vec<fa_decoders::baseline::Series>) -> Self {
+        let latent_dim = set.latent_dim();
+        Self { set, series, text: TextTimeline::new(), cards: Vec::new(), latent_dim }
+    }
+}
+
+impl DecoderFeedback for EliteFeedback {
+    fn name(&self) -> &str {
+        "elite_decoders"
+    }
+
+    fn aux_loss(&self, b: &FeedbackBatch<'_>) -> candle_core::Result<Option<Tensor>> {
+        let (bsz, k, d) = b.mu.dims3()?;
+        if k * d != self.latent_dim || b.windows.len() != bsz {
+            return Ok(None);
+        }
+        let latents = b.mu.reshape((bsz, k * d))?;
+        let steps: Vec<(&fa_decoders::baseline::Series, usize)> = b
+            .windows
+            .iter()
+            .map(|&(s, end)| (&self.series[s.min(self.series.len().saturating_sub(1))], end.saturating_sub(1)))
+            .collect();
+        let msg = |e: fa_decoders::neural::NeuralError| candle_core::Error::Msg(format!("elite feedback: {e}"));
+        let batch = self.set.prepare(&steps, &self.text).map_err(msg)?;
+        let out = self.set.aux_loss(&latents, &batch).map_err(msg)?;
+        Ok((!out.parts.is_empty()).then_some(out.total))
+    }
+
+    fn summary(&self) -> Value {
+        json!({
+            "name": self.name(),
+            "kind": "D-009 frozen elite decoders (D-068 fa_decoders::neural::feedback)",
+            "latent_dim": self.latent_dim,
+            "elites": self.cards,
+            "skipped": self.set.skipped,
+            "text_timeline": "empty (news-reading elites sit out)",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +451,91 @@ mod tests {
         assert!((w[0][0] - 2.0).abs() < 1e-5 && (w[1][0] + 1.0).abs() < 1e-5 && (w[2][0] - 0.5).abs() < 1e-4, "{w:?}");
         assert!((w[1][1] - 1.0).abs() < 1e-6);
         assert_eq!(group(&[(0, 1), (0, 2), (1, 5), (0, 3)]), vec![(0, vec![1, 2]), (1, vec![5]), (0, vec![3])]);
+    }
+
+    /// D-009 end to end on SYNTHETIC data: an `nn_forecast` decoder trained on an encoder's
+    /// concatenated expert means (the `LatentState` layout) becomes a frozen elite; plugged into
+    /// the trainer it adds a finite, non-zero auxiliary loss whose gradient reaches the encoder,
+    /// and `eligible` keeps only elites of the fit's step and latent width.
+    #[test]
+    fn elite_decoders_feed_back_into_a_neural_fit() {
+        use std::sync::Arc;
+
+        use fa_decoders::{DecodeCtx, LatentPoint, genome::DecoderGenome, neural as dn};
+        use fa_encoders::{
+            MarketBar,
+            neural::{NeuralConfig, NeuralFamily, NeuralTrainer, Series as ESeries},
+        };
+
+        let dev = candle_core::Device::Cpu;
+        let mut rng = fa_core::rng::Rng::seed(4);
+        let mut p = 100.0;
+        let bars: Vec<MarketBar> = (0..900)
+            .map(|i| {
+                let vol = if (i / 60) % 2 == 0 { 0.001 } else { 0.004 };
+                let o = p;
+                p *= 1.0 + vol * rng.normal() + if (i / 60) % 2 == 0 { 0.0004 } else { -0.0004 };
+                MarketBar {
+                    open: o,
+                    high: o.max(p) * 1.0005,
+                    low: o.min(p) * 0.9995,
+                    close: p,
+                    volume: 10.0,
+                    trade_count: 2,
+                }
+            })
+            .collect();
+        let hist = crate::data::BarHistory {
+            instrument: "syn".into(),
+            timescale: fa_core::Timescale::Minute,
+            source: crate::data::Source::Bars,
+            start_ms: 0,
+            end_ms: 900 * 60_000,
+            ends_ms: (1..=900).map(|i| i as i64 * 60_000).collect(),
+            bars: bars.clone(),
+        };
+        let cfg = NeuralConfig {
+            context_steps: 16,
+            d_model: 8,
+            layers: 2,
+            steps: 40,
+            batch: 32,
+            lambda_feedback: 0.5,
+            moe: fa_expert_space::moe::MoeConfig { max_experts: 2, expert_dim: 3, ..Default::default() },
+            ..NeuralConfig::new(NeuralFamily::JepaVae)
+        };
+        let ds = fa_encoders::neural::Dataset::build(vec![ESeries::new("syn", bars.clone())], 16, cfg.horizon(), 0.1);
+        let mut tr = NeuralTrainer::new(cfg, &ds, 1, &dev).unwrap();
+        tr.train_steps(&ds, 20).unwrap();
+        // the latents the decoder trains on: concatenated expert means as of every bar end
+        let enc = fa_encoders::neural::NeuralEncoder::new(tr.model.clone(), fa_core::Timescale::Minute, "parent");
+        let ends: Vec<usize> = (16..=900).collect();
+        let lat = enc.encode_windows(&bars, &ends).unwrap();
+        let mut ctx = DecodeCtx::default();
+        for (e, l) in ends.iter().zip(&lat) {
+            ctx.push("syn", LatentPoint { as_of_ms: hist.ends_ms[e - 1], vec: l.mu.concat() });
+        }
+        let series = decoder_series(std::slice::from_ref(&hist), 60_000);
+        let g = DecoderGenome::parse("nn_forecast:h=3;lb=12;width=8;steps=40;lr=0.01").unwrap();
+        let mut d =
+            dn::train(&g, &series, Arc::new(ctx), Arc::new(TextTimeline::new()), &dn::TrainOptions::default()).unwrap();
+        assert_eq!(d.meta.full_latent_dim(), 6);
+        d.meta.score = 0.1;
+        let card = EliteCard {
+            meta: d.meta.clone(),
+            bucket: elite::BUCKET.into(),
+            key: "decoders/t/x.safetensors".into(),
+            created_ms: 1,
+        };
+        assert_eq!(eligible(std::slice::from_ref(&card), 60_000, 6).len(), 1);
+        assert!(eligible(std::slice::from_ref(&card), 1_000, 6).is_empty(), "other step");
+        assert!(eligible(std::slice::from_ref(&card), 60_000, 9).is_empty(), "other latent width");
+        let set = FeedbackSet::load(&[(d.to_bundle().unwrap(), 1.0)], 6, &dev).unwrap();
+        let fb = EliteFeedback::from_parts(set, series);
+        assert_eq!(fb.n_elites(), 1);
+        tr.feedback.push(Box::new(fb));
+        let log = tr.train_steps(&ds, 5).unwrap();
+        assert!(log.feedback.is_finite() && log.feedback > 0.0, "{log:?}");
+        assert_eq!(tr.feedback[0].summary()["name"], "elite_decoders");
     }
 }

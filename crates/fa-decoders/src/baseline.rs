@@ -101,6 +101,8 @@ pub fn build(genome: &DecoderGenome) -> Box<dyn SeriesDecoder> {
 /// stand-in of the same output contract (the retrieval baseline for `nn_retrieval`, the quantile
 /// forecaster otherwise), which is also what their warm-up/data needs are sized against.
 pub fn build_with(genome: &DecoderGenome, ctx: Arc<DecodeCtx>) -> Box<dyn SeriesDecoder> {
+    // expert mask (spec 34 §4.2): the decoder only sees the selected experts
+    let ctx = if genome.expert_mask != 0 { Arc::new(ctx.masked(genome.expert_mask)) } else { ctx };
     match genome.family {
         BaselineFamily::Retrieval | BaselineFamily::NnRetrieval => {
             Box::new(AnalogRetriever { genome: genome.clone(), ctx })
@@ -208,7 +210,11 @@ pub struct AnalogRetriever {
 impl AnalogRetriever {
     /// Whether the context can condition this series at all.
     pub fn conditioned(&self, s: &Series) -> bool {
-        self.genome.latent_weight > 0.0 && self.ctx.latents.contains_key(&crate::instrument_token(&s.instrument_id))
+        self.genome.latent_weight > 0.0
+            && self
+                .ctx
+                .latents
+                .contains_key(&crate::instrument_token(self.genome.source.as_deref().unwrap_or(&s.instrument_id)))
     }
 
     fn combined_similarity(
@@ -221,7 +227,7 @@ impl AnalogRetriever {
     ) -> f64 {
         let base = self.similarity(query_shape, shape);
         let Some(q) = query_latent else { return base };
-        match self.ctx.latent_as_of(&s.instrument_id, s.ts_ms[e]) {
+        match self.ctx.latent_as_of(self.genome.source.as_deref().unwrap_or(&s.instrument_id), s.ts_ms[e]) {
             Some(l) => {
                 let w = self.genome.latent_weight;
                 (1.0 - w) * base + w * cosine(q, &l.vec)
@@ -274,7 +280,9 @@ impl SeriesDecoder for AnalogRetriever {
         }
         let query = Self::shape(s, t, g.lookback)?;
         let query_latent = if self.conditioned(s) {
-            self.ctx.latent_as_of(&s.instrument_id, s.ts_ms[t]).map(|l| l.vec.as_slice())
+            self.ctx
+                .latent_as_of(self.genome.source.as_deref().unwrap_or(&s.instrument_id), s.ts_ms[t])
+                .map(|l| l.vec.as_slice())
         } else {
             None
         };

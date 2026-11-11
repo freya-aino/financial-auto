@@ -48,6 +48,8 @@ Conventions: `/api/v1/...` **(proposal: version prefix)**; JSON; time as RFC3339
 | WS | `/ws/bus?subjects=md.>,risk.event` | live tap of NATS subjects (decoded proto → JSON), server-side sampling/rate limit |
 | GET | `/api/bus/streams` | JetStream streams, consumers, lag |
 
+`/api/bus/streams` lists every stream (spec 21 §5 limits streams incl. `DLQ`, the `JOBS_<kind>` work queues incl. `JOBS_MCMC`) with `max_bytes` (the `max_mib` cap, `-1` = none), messages, bytes, sequences and per-consumer lag. control-api also runs the dead-letter forwarder (spec 21 §8): poison messages land on `dlq.<STREAM>.<subject>` and raise a `DeadLetter` alert on `ops.alert` (seen on the bus tap) and `fa_bus_dead_letters_total{stream,consumer,reason}`; `GET /api/alerts` lists vmalert alerts only, so a vmalert rule on that counter is the way to surface dead letters there.
+
 ### 4.4 Hub / graph
 | GET | `/api/graph/neighborhood?node=&depth=` | Helix subgraph around a node |
 | POST | `/api/graph/query` | run a named query from the Helix query catalog with params |
@@ -87,6 +89,32 @@ Conventions: `/api/v1/...` **(proposal: version prefix)**; JSON; time as RFC3339
 Envelope: `{ "stream": "...", "seq": n, "ts": "...", "data": {...} }`. Client may send `{ "op": "subscribe" | "unsubscribe", "topics": [...] }`. Server applies backpressure by dropping to latest-value for high-rate topics and signals `{ "op": "lagged", "dropped": n }`.
 
 **Implemented today (D-055):** every route of §4 is implemented except `POST /api/services/{name}/start|stop|restart` (no process supervisor). The four sockets share one loop: `{stream, seq, ts, topic, data}` frames, `{op: subscribe|unsubscribe, topics}` filtering, latest-value coalescing for state streams (10 Hz latent/evolution, 5 Hz trading) and a bounded queue for the bus tap, `{op:"lagged",dropped}` after any drop. `PUT /api/config/runtime` is the only writable config section (bounded, persisted to git-ignored `config/runtime.toml`, audited). Routes are listed with their state in `bins/control-api/README.md`.
+
+### 4.9 Alerts, MCMC queries, neural models, pipeline, halts, reference data (D-066..D-071)
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/alerts?limit=` | active alerts, recent transitions, alert-pipeline health (`pipeline.ok` = Watchdog fresh; false is itself an alert) |
+| POST | `/api/alerts/vmalert/api/v2/alerts`, `/api/alerts/webhook` | vmalert / Alertmanager receivers → `ops.alert` (JSON) + `audit.log` |
+| GET | `/api/mcmc/{snapshot}/kernels` | kernel per expert space: serving sampler, prequential scores, stationary, relaxation, drift |
+| GET | `/api/mcmc/{snapshot}/transition\|k-step\|neighbors\|paths\|path-prob\|hitting\|stationary` | spec 33 §4.2 queries, each a posterior `{mean, sd, lower, upper, median, level, n}` |
+| GET | `/api/mcmc/{snapshot}/hierarchy`, `/api/mcmc/cross-priors?timescale=&limit=` | REFINES edges; ranked cross-asset priors (gain, lead-lag and score on expert residuals, spec 33 §6.5) |
+| GET | `/api/latent/regions/{id}/lineage?depth=` | ancestors, descendants, lineage members (DescendsFrom) |
+| GET | `/api/latent/snapshots/{id}` | snapshot, manifest, promotion checklist (incl. neural `expert_k_eff`, `expert_resid_corr`, `expert_min_skill`), not-evaluated items, shadow gauges |
+| POST/DELETE | `/api/latent/snapshots/{id}/shadow`, `POST .../shadow/stop` | shadow serving via `ctl.model` (audited) |
+| GET | `/api/decoders/serving` | `ctl.decoders.status`: slots per (family, timescale), serving vs shadow, online n / loss, pins, disabled |
+| GET | `/api/decoders/cards?limit=` | decoder cards in `fa-models/decoders/**/*.card.json`, newest first |
+| POST | `/api/decoders/reload\|promote\|pin\|unpin\|off\|on` | `ctl.decoders.<verb>` with the JSON body as args; audited `decoders.<verb>` |
+| GET | `/api/trading/pipeline`, POST `/api/trading/pipeline/run` | `ctl.risk.pipeline {status\|run}` (spec 35 §6.4 round: holdouts, actions, rejections, live set, policy) |
+| GET | `/api/trading/allocators` | `ctl.risk.allocators`: live paper allocator tournament |
+| GET | `/api/trading/halts` | halts persisted in `ledger.risk_state` merged with those seen on `risk.halt.*`; `rearmable` per scope |
+| POST | `/api/trading/halts/{scope}/rearm` | `{"confirm": true, "reason"?}` → `fa.v1.Resume` on `risk.resume.<scope>` for any family risk-engine re-arms (portfolio, daily_loss, source[:id], model, broker, fx, …); 428 without confirm, 400 unknown family, 404 not halted; audited `halt.rearm` / `halt.rearm.refused` |
+| GET | `/api/trading/risk-events?since=&limit=&kind=` | `RiskEvent`s, halts, resumes, re-arms, reconciliation diffs from `audit.log`, newest first, with counts |
+| GET | `/api/refdata/instruments/{id}`, `/resolve`, `/session`, `/fx` (`at`, `known_at`) | point-in-time reference data (spec 12) |
+| GET | `/api/refdata/venues`, `/api/refdata/calendar/{venue}?from=&to=` | venues with calendar rule and materialised range; sessions per day (`table` row, else built-in `rule`) |
+| GET/POST | `/api/refdata/corporate-actions` (`?instrument_id=&known_at=`), POST `.../{id}/cancel`, `/symbol-change`, `/identifiers`, `/contract-specs`, `/calendar/{venue}/materialize` | corporate actions (as-of when an instrument is given) and audited overrides |
+| GET | `/api/trading/lots`, `/statement?format=json\|csv`, `/pnl/breakdown`, `/orphans`; POST `/orphans/{id}/resolve`, `/payouts` | ledger reports (spec 42) |
+
+The bus tap (`/ws/bus`) decodes `ops.alert` (JSON), `latent.membership.*`, `latent.lifecycle.*`, `latent.mcmc.*`, `latent.hier.*` and `latent.crossprior.*` (proto) and passes any other JSON payload through.
 
 ## 5. Data model
 Stateless except a small cache. Reads: Postgres (catalog, ledger, audit, jobs), Helix (graph, latent, lineage), VictoriaMetrics (series via PromQL/MetricsQL passthrough `/api/metrics/query` **(proposal)**), Garage (presigned URLs for blobs).

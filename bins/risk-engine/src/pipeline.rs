@@ -20,6 +20,18 @@
 //!    `fa-artifacts/live/strategies.toml` is rewritten and strategy-runtime reloaded with
 //!    `ctl.strategy.reload {artifact_key: managed}`.
 //!
+//! 5. **Snapshot changes** (spec 35 §6.5): strategy-runtime reports per strategy whether its
+//!    region literals were remapped onto a new encoder snapshot (`snapshot.remapped_ms`) or are
+//!    unmappable (pause code 4); an **active** strategy promoted before that remap, or suspended,
+//!    goes back to `shadow` (`strategy.snapshot_shadow`) and must pass the gate again. A
+//!    suspended shadow strategy stays suspended (flat) — not a runtime auto-pause, so it is not
+//!    retired for it.
+//! 6. **Helix mirror** (spec 35 §5): every evolved strategy's status (incl. `retired`) is
+//!    mirrored onto its `Genome` node (`fa_hub::set_genome_status`, created when missing);
+//!    best-effort — Helix down is counted (`helix.mirror_failed`) and retried next round, since
+//!    the round reconciles every row against what was last mirrored. Hand-written baselines are
+//!    not genomes (D-040) and are not mirrored.
+//!
 //! Failed holdout jobs (`jobs.result.evo.eval.strategy.holdout` with a non-OK status) are noted
 //! on the strategy and retried next round up to `holdout_max_attempts`.
 
@@ -39,7 +51,7 @@ use fa_proto::{
 };
 use fa_risk::{
     pipeline::{Decision, FrontMember, Observation, PipelinePolicy, Selection, decide, select_candidates},
-    strategy::StrategyStatus,
+    strategy::{StrategyAction, StrategyStatus},
 };
 use fa_strategies::{
     genome::StrategyGenome,
@@ -79,6 +91,10 @@ pub struct Pipeline {
     round_lock: Mutex<()>,
     /// Latest rejected front members across rounds (a generation is read once).
     rejected_log: Mutex<std::collections::VecDeque<Value>>,
+    /// Helix client for the genome status mirror (None = not mirrored).
+    hub: Option<fa_hub::HubClient>,
+    /// `strategy id → (status, since_ms)` last mirrored successfully.
+    mirrored: Mutex<BTreeMap<String, (String, i64)>>,
 }
 
 fn now_ms() -> i64 {
@@ -114,7 +130,15 @@ impl Pipeline {
             status: Mutex::new(json!({"rounds": 0})),
             round_lock: Mutex::new(()),
             rejected_log: Mutex::new(std::collections::VecDeque::new()),
+            hub: None,
+            mirrored: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Enables the Helix genome status mirror (spec 35 §5).
+    pub fn with_hub(mut self, hub: Option<fa_hub::HubClient>) -> Self {
+        self.hub = hub;
+        self
     }
 
     pub async fn status(&self) -> Value {
@@ -313,8 +337,8 @@ impl Pipeline {
 
     // ------------------------------------------------------------------- runtime status
 
-    /// `strategy_id → auto-pause reason` (`budget` / `nan`) from `ctl.strategy.status`.
-    async fn runtime_pauses(&self) -> Option<BTreeMap<String, String>> {
+    /// strategy-runtime's `ctl.strategy.status` JSON.
+    async fn runtime_status(&self) -> Option<Value> {
         let req = CtlRequest { verb: "status".into(), args: Default::default() };
         let msg = tokio::time::timeout(
             Duration::from_secs(3),
@@ -324,7 +348,11 @@ impl Pipeline {
         .ok()?
         .ok()?;
         let reply = CtlReply::decode(msg.payload.as_ref()).ok()?;
-        let v: Value = serde_json::from_str(&reply.message).ok()?;
+        serde_json::from_str(&reply.message).ok()
+    }
+
+    /// `strategy_id → auto-pause reason` (`budget` / `nan`) from `ctl.strategy.status`.
+    fn runtime_pauses(v: &Value) -> Option<BTreeMap<String, String>> {
         Some(
             v["strategies"]
                 .as_array()?
@@ -420,8 +448,12 @@ impl Pipeline {
             }
             log.iter().rev().take(50).cloned().collect()
         };
-        let pauses = self.runtime_pauses().await;
+        let runtime = self.runtime_status().await;
+        let pauses = runtime.as_ref().and_then(Self::runtime_pauses);
         let mut actions = Vec::new();
+        if let Some(v) = &runtime {
+            actions.extend(self.snapshot_shadow(v).await);
+        }
         let mut waiting = serde_json::Map::new();
         let ids = self.engine.lock().await.pipeline_ids();
         for id in ids {
@@ -511,6 +543,7 @@ impl Pipeline {
             }
         }
         let live = self.sync_live_set().await;
+        let helix = self.mirror_genomes().await;
         let summary = {
             let e = self.engine.lock().await;
             let mut by_status: BTreeMap<&str, usize> = BTreeMap::new();
@@ -533,6 +566,7 @@ impl Pipeline {
             "waiting": waiting,
             "evolved_by_status": summary,
             "live_set": live,
+            "helix_mirror": helix,
             "runtime_reachable": pauses.is_some(),
             "policy": self.policy,
         });
@@ -543,6 +577,121 @@ impl Pipeline {
             s["rounds"] = json!(rounds);
         }
         st
+    }
+
+    /// Spec 35 §6.5: an active strategy whose region literals were remapped onto a new snapshot
+    /// after it was promoted, or that strategy-runtime suspended because they are unmappable
+    /// (pause code 4), re-enters shadow. Returns the actions taken.
+    async fn snapshot_shadow(&self, runtime: &Value) -> Vec<Value> {
+        let Some(rows) = runtime["strategies"].as_array() else { return Vec::new() };
+        let mut out = Vec::new();
+        for r in rows {
+            let Some(id) = r["id"].as_str() else { continue };
+            let remapped_ms = r["snapshot"]["remapped_ms"].as_i64();
+            let suspended = r["paused_reason_code"].as_f64() == Some(4.0);
+            if remapped_ms.is_none() && !suspended {
+                continue;
+            }
+            let now = now_ms();
+            let reason = {
+                let mut e = self.engine.lock().await;
+                let Some(st) = e.strategy(id) else { continue };
+                if st.status != StrategyStatus::Active {
+                    continue;
+                }
+                let reason = match (suspended, remapped_ms) {
+                    (true, _) => format!(
+                        "snapshot change: region lineage breaks ({})",
+                        r["paused_reason"].as_str().unwrap_or("unmappable literal")
+                    ),
+                    (false, Some(at)) if at > st.since_ms => format!(
+                        "snapshot change: region literals remapped {} -> {}; revalidate in shadow",
+                        r["snapshot"]["remap"]["from"].as_str().unwrap_or("?"),
+                        r["snapshot"]["remap"]["to"].as_str().unwrap_or("?")
+                    ),
+                    _ => continue,
+                };
+                if let Err(err) = e.strategy_action(id, StrategyAction::Shadow, &Evidence::default(), now) {
+                    tracing::warn!(strategy = %id, error = %err, "snapshot shadow refused");
+                    continue;
+                }
+                e.pipeline_note(id, &reason);
+                reason
+            };
+            tracing::warn!(strategy = %id, %reason, "strategy back to shadow (spec 35 §6.5)");
+            let row = self.engine.lock().await.strategy_row_pub(id);
+            if let Some((s, book)) = row {
+                self.store.strategy_state(&s, Some(&book), None).await;
+            }
+            let payload = json!({"reason": reason, "snapshot": r["snapshot"].clone()});
+            self.store.audit_as(ACTOR, "strategy.snapshot_shadow", Some(id), payload.clone()).await;
+            out.push(json!({"strategy_id": id, "action": "strategy.snapshot_shadow", "detail": payload}));
+        }
+        out
+    }
+
+    /// Mirrors every evolved strategy's lifecycle status onto its Helix `Genome` (spec 35 §5).
+    /// Rows whose `(status, since)` differ from the last successful mirror are written; failures
+    /// stay pending and are retried next round.
+    async fn mirror_genomes(&self) -> Value {
+        let Some(hub) = &self.hub else { return json!({"enabled": false}) };
+        let want: Vec<(String, fa_hub::GenomeStatus)> = {
+            let e = self.engine.lock().await;
+            e.strategy_ids()
+                .into_iter()
+                .filter_map(|id| {
+                    let st = e.strategy(&id)?;
+                    let p = st.pipeline.as_ref()?;
+                    let genome_id = genome_id_of(&p.genome).unwrap_or(&id).to_owned();
+                    let reason = if st.last_reason.is_empty() { p.note.clone() } else { st.last_reason.clone() };
+                    Some((
+                        id.clone(),
+                        fa_hub::GenomeStatus {
+                            genome_id,
+                            kind: "strategy".into(),
+                            family: "gp".into(),
+                            params: p.genome.clone(),
+                            strategy_id: id,
+                            status: st.status.as_str().to_owned(),
+                            reason,
+                            since_ms: st.since_ms,
+                        },
+                    ))
+                })
+                .collect()
+        };
+        let mut mirrored = self.mirrored.lock().await;
+        let (mut written, mut failed, mut last_error) = (0usize, 0usize, None::<String>);
+        for (id, g) in &want {
+            if mirrored.get(id).is_some_and(|(s, since)| *s == g.status && *since == g.since_ms) {
+                continue;
+            }
+            if failed > 0 && last_error.as_deref().is_some_and(|e| e.contains("unreachable")) {
+                failed += 1; // Helix is down: do not hammer it this round
+                continue;
+            }
+            match hub.set_genome_status(g).await {
+                Ok(_) => {
+                    mirrored.insert(id.clone(), (g.status.clone(), g.since_ms));
+                    written += 1;
+                }
+                Err(err) => {
+                    failed += 1;
+                    let unreachable = err.is_unreachable();
+                    last_error = Some(if unreachable { format!("unreachable: {err}") } else { err.to_string() });
+                }
+            }
+        }
+        if let Some(err) = &last_error {
+            tracing::warn!(failed, error = %err, "helix genome status mirror incomplete; retried next round");
+        }
+        {
+            let mut e = self.engine.lock().await;
+            e.counters.insert("helix.mirror_written", written as f64);
+            e.counters.insert("helix.mirror_failed", failed as f64);
+            e.counters.insert("helix.mirrored", mirrored.len() as f64);
+        }
+        json!({"enabled": true, "evolved": want.len(), "written": written, "failed": failed, "in_sync": mirrored.len(), "last_error": last_error})
     }
 
     /// Rewrites the managed live set when it differs from Garage and reloads strategy-runtime.

@@ -11,6 +11,7 @@
 //! deterministic parameter store / Adam shared with `fa-encoders::neural`.
 
 pub mod health;
+pub mod lora;
 pub mod moe;
 pub mod nn;
 pub mod router;

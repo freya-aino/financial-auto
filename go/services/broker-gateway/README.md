@@ -2,7 +2,27 @@
 
 Execution adapters: order intents → venues; paper mode first.
 
-**Status:** implemented (paper only, D-051) — fills `order.approved.>` intents against the live tape with the cost + slippage model of spec 41 §6.3 (`costs.yaml`), publishes `OrderEvent` on `order.event.<account>` with `fee`, `arrival_price` and the realised `slippage_bps`, idempotent by `intent_id`. Limit orders fill when marketable, otherwise rest as `ACK` until a trade crosses the limit (passive fill at the limit, commission only) or they are cancelled. Live mode is rejected; `VenueAdapter` is the interface the paper engine implements and a live adapter will share.
+**Status:** implemented (paper only, D-051 + execution algorithms) — executes `order.approved.>` intents against the live tape with the cost + slippage model of spec 41 §6.3 (`costs.yaml`), publishes `OrderEvent` on `order.event.<account>` with `fee`, `arrival_price` and the realised `slippage_bps`, idempotent by `intent_id`. Execution algorithms (`algo.go`): market, limit, smart-limit, TWAP, VWAP, POV and an `auto` choice; working orders can be cancelled with `OrderCancel`. Live fills recalibrate the impact coefficient (`calib.go`). Live mode is rejected; `VenueAdapter` is the interface the paper engine implements and a live adapter will share.
+
+## Execution algorithms (`exec_algo`, spec 40 §6.4)
+Grammar: `name` or `name:k=v,k=v`; empty = `market`. Unknown names, unknown parameters or out-of-range values → `REJECTED` with the reason.
+
+| Algo | Parameters (default) | Behaviour |
+|---|---|---|
+| `market` | — | one taker fill at last ± costs (`paper-<intent>`) |
+| `limit` | `limit_price` | marketable → taker fill; else rests as `ACK` until a trade crosses it (passive fill at the limit, commission only). Any intent carrying `limit_price` with `market`/empty behaves the same (back-compat) |
+| `smart_limit` | `timeout_s` 30, `offset_bps` 0 | `ACK`, then rests passively at the touch (bid for buys, ask for sells, last without a quote) improved by `offset_bps`; a crossing trade fills it passively, otherwise it crosses as a taker at the timeout. Single fill `paper-<intent>` |
+| `twap` | `dur_s` 300, `slices` 10 | `ACK`; equal child slices, the first at acceptance, then every `dur_s/slices` |
+| `vwap` | `dur_s` 300, `slices` 10 | as TWAP, child sizes weighted by the learned time-of-day volume profile of the instrument (traded notional per 5-min UTC bucket observed on the tape since start); uniform when nothing is known |
+| `pov` | `rate` 0.1, `max_dur_s` 900 | `ACK`; children execute `rate` × traded size observed on the tape since acceptance; the remainder crosses at `max_dur_s` |
+| `auto` | — | gateway fallback choice from participation = notional / learned ADV and spread: ≤ 0.1 % and spread ≤ 10 bps → market; ≤ 0.1 % with a wider spread → smart_limit; ≤ 1 % → twap; above → pov (defaults). Counted as `algo.auto.<chosen>` |
+
+Children are driven by a 1 s ticker (`-algo-tick`) and by trades of the instrument; a slice waits while no price has been seen. Each child is priced by the cost model at the then-last price with the child quantity (σ / ADV from the tape) and published as `PARTIAL_FILL` with `venue_order_id = paper-<intent>-<n>` (n from 1); the last child is `FILL`. `arrival_price` is the **parent** arrival (last trade when the intent was accepted) and `slippage_bps` the implementation shortfall against it. A cancel of a working algo order cancels the remainder: `CANCELED`, `fill_quantity` 0, reason with the quantity filled so far. Working orders are in memory: a gateway restart drops them (the risk-engine's pending-intent TTL covers it).
+
+## Live slippage recalibration (`calib.go`, spec 41 §6.3)
+Each taker fill adds a sample per (venue, asset class): `x = 1e4 · σ_day · sqrt(notional/ADV)`, `y = realised_bps − half_spread_bps` (realised vs the parent arrival). Every `-recalibrate-every` (15 min) a key with ≥ `-recalibrate-min-samples` (30) informative samples in its rolling window (500) gets `k̂ = Σxy/Σx²`, shrunk toward the prior `k` of the base costs file with weight `n/(n+50)` and clamped to `[0.5, 2] ×` prior; a prior of 0 (costless `sim`) stays 0. The calibrated model (base + `venues.<v>.classes.<c>.impact_k`) is written to `-costs-calibrated` (default `$FA_STATE_DIR/costs.calibrated.yaml`, compose: named volume `broker-gateway-state` at `/var/lib/fa`) with `<file>.report.json`, applied in memory when `-recalibrate-apply` (default true), loaded at start when present (the base file always stays the prior), and the report JSON is published on `exec.costs.calibrated`.
+
+**Honest limit in paper:** a fill priced at the arrival price itself (market orders, single crosses) is the model echoing itself (`y = k_in_use · x`), so such samples are counted (`echo`) and excluded from the fit; only algo children, whose price drifted from the parent arrival, carry information — and in paper that information is market drift over the algo's horizon, not real impact. With a live venue adapter every fill is informative through the same code path. The Rust backtester still prices with `testdata/cost_fixture.json` (the base model), not the calibrated overlay.
 
 ## Cost model (`costs.yaml`, `-costs` / `FA_COSTS`)
 Per venue / asset class fee schedule, looked up in this order: `venues.<venue>.classes.<class>`, `venues.<venue>.default`, `default.classes.<class>`, `default.default` (first table found wins). The venue is the one of the latest `md.trade.<venue>.<token>` for the instrument; the class comes from the `instruments:` map (`default_class` otherwise — the gateway has no reference data).
@@ -26,15 +46,18 @@ Without a costs file the built-in default applies (5 bps commission, 1 EUR minim
 | `order.approved.>` | in | `OrderIntent`; non-paper → `REJECTED`, no price seen → `REJECTED`, unmarketable limit → `ACK` (resting) |
 | `md.trade.>` | in | `Envelope{Trade}`: mark, σ, volume; fills resting limits that became marketable |
 | `md.quote.>` | in | `Envelope{Quote}`: spread for the next fills |
-| `order.cancel.<account>` | in | `OrderIntent` carrying the `intent_id` to cancel (provisional: there is no cancel message in `fa.v1`); `CANCELED` event, or ignored when nothing rests |
-| `order.event.<account>` | out | `OrderEvent` (`FILL` / `ACK` / `CANCELED` / `REJECTED`) |
+| `order.cancel.<account>` | in | `OrderCancel{intent_id, account_id, reason, at, actor}` (a legacy `OrderIntent` payload still decodes: field 1 is the intent id in both); cancels a resting limit or a working algo order → `CANCELED`, ignored (`cancels.unknown`) when nothing is working |
+| `order.event.<account>` | out | `OrderEvent` (`ACK` / `PARTIAL_FILL` / `FILL` / `CANCELED` / `REJECTED`) |
+| `exec.costs.calibrated` | out | JSON calibration report `{at, applied, path, error?, entries[{venue, class, fills, informative, echo, k_prior, k_fit, weight, k_new, clamped, realised_bps_ewma, model_bps_ewma, status}]}` |
 
-Heartbeat counters: `events.<KIND>`, `resting`, `quotes`, `intents.duplicate`, `cancels.unknown`, `errors.decode`.
+Heartbeat counters (also `fa_heartbeat_counter{service="broker-gateway",key=…}` on `/metrics`, spec 60 §6.5): `events.<KIND>`, `resting`, `working`, `quotes`, `intents.duplicate`, `cancels.unknown`, `errors.decode`, `algo.<name>.working|done|cancelled`, `algo.auto.<chosen>`, `slippage.<venue>.<class>.bps_mean` (realised vs arrival, EWMA α 0.05), `slippage.<venue>.<class>.model_bps_mean` (modelled half spread + impact), `slippage.<venue>.<class>.n`, `exec_slippage_bps.<algo>` (EWMA), `costs.k.<venue>.<class>` (impact coefficient in use), `calibrations`.
+
+In compose the gateway loads the repo `costs.yaml` baked into the image (`FA_COSTS=/app/config/costs.yaml`; before this it ran on the built-in default model).
 
 ## Run
 ```sh
 go/bin/broker-gateway -nats nats://127.0.0.1:4222 -costs go/services/broker-gateway/costs.yaml
-go test ./services/broker-gateway        # cost model, fixture, limit/cancel paths, estimators
+go test ./services/broker-gateway        # cost model, fixture, limit/cancel paths, algos, cancel decode, recalibration
 ```
 
 ## Owns

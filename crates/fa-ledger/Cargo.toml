@@ -10,7 +10,8 @@ chrono.workspace = true
 fa-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlx.workspace = true
+rust_decimal.workspace = true
+sqlx = { workspace = true, features = ["rust_decimal"] }
 thiserror.workspace = true
 uuid = { workspace = true, features = ["v5"] }
 

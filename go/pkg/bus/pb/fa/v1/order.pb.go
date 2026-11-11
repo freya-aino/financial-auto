@@ -375,6 +375,85 @@ func (x *OrderEvent) GetSlippageBps() float64 {
 	return 0
 }
 
+// `order.cancel.<account>`: cancels a working order (resting limit or the unfilled remainder of
+// an algo order) by its intent id (spec 40 §6.4). Field 1 is wire-compatible with
+// `OrderIntent.intent_id`, so senders still publishing an `OrderIntent` keep working.
+type OrderCancel struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	IntentId      string                 `protobuf:"bytes,1,opt,name=intent_id,json=intentId,proto3" json:"intent_id,omitempty"`
+	AccountId     string                 `protobuf:"bytes,2,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
+	Reason        string                 `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	At            *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=at,proto3" json:"at,omitempty"`
+	Actor         string                 `protobuf:"bytes,5,opt,name=actor,proto3" json:"actor,omitempty"` // ui | system:<service>
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OrderCancel) Reset() {
+	*x = OrderCancel{}
+	mi := &file_fa_v1_order_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OrderCancel) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OrderCancel) ProtoMessage() {}
+
+func (x *OrderCancel) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_order_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OrderCancel.ProtoReflect.Descriptor instead.
+func (*OrderCancel) Descriptor() ([]byte, []int) {
+	return file_fa_v1_order_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *OrderCancel) GetIntentId() string {
+	if x != nil {
+		return x.IntentId
+	}
+	return ""
+}
+
+func (x *OrderCancel) GetAccountId() string {
+	if x != nil {
+		return x.AccountId
+	}
+	return ""
+}
+
+func (x *OrderCancel) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *OrderCancel) GetAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.At
+	}
+	return nil
+}
+
+func (x *OrderCancel) GetActor() string {
+	if x != nil {
+		return x.Actor
+	}
+	return ""
+}
+
 var File_fa_v1_order_proto protoreflect.FileDescriptor
 
 const file_fa_v1_order_proto_rawDesc = "" +
@@ -418,7 +497,14 @@ const file_fa_v1_order_proto_rawDesc = "" +
 	"\x11KIND_PARTIAL_FILL\x10\x02\x12\r\n" +
 	"\tKIND_FILL\x10\x03\x12\x11\n" +
 	"\rKIND_CANCELED\x10\x04\x12\x11\n" +
-	"\rKIND_REJECTED\x10\x05*s\n" +
+	"\rKIND_REJECTED\x10\x05\"\xa3\x01\n" +
+	"\vOrderCancel\x12\x1b\n" +
+	"\tintent_id\x18\x01 \x01(\tR\bintentId\x12\x1d\n" +
+	"\n" +
+	"account_id\x18\x02 \x01(\tR\taccountId\x12\x16\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x12*\n" +
+	"\x02at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x02at\x12\x14\n" +
+	"\x05actor\x18\x05 \x01(\tR\x05actor*s\n" +
 	"\vTradingMode\x12\x1c\n" +
 	"\x18TRADING_MODE_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12TRADING_MODE_PAPER\x10\x01\x12\x17\n" +
@@ -440,26 +526,28 @@ func file_fa_v1_order_proto_rawDescGZIP() []byte {
 }
 
 var file_fa_v1_order_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_fa_v1_order_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_fa_v1_order_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_fa_v1_order_proto_goTypes = []any{
 	(TradingMode)(0),              // 0: fa.v1.TradingMode
 	(OrderEvent_Kind)(0),          // 1: fa.v1.OrderEvent.Kind
 	(*OrderIntent)(nil),           // 2: fa.v1.OrderIntent
 	(*OrderEvent)(nil),            // 3: fa.v1.OrderEvent
-	(Side)(0),                     // 4: fa.v1.Side
-	(*timestamppb.Timestamp)(nil), // 5: google.protobuf.Timestamp
+	(*OrderCancel)(nil),           // 4: fa.v1.OrderCancel
+	(Side)(0),                     // 5: fa.v1.Side
+	(*timestamppb.Timestamp)(nil), // 6: google.protobuf.Timestamp
 }
 var file_fa_v1_order_proto_depIdxs = []int32{
-	4, // 0: fa.v1.OrderIntent.side:type_name -> fa.v1.Side
+	5, // 0: fa.v1.OrderIntent.side:type_name -> fa.v1.Side
 	0, // 1: fa.v1.OrderIntent.mode:type_name -> fa.v1.TradingMode
-	5, // 2: fa.v1.OrderIntent.created_at:type_name -> google.protobuf.Timestamp
+	6, // 2: fa.v1.OrderIntent.created_at:type_name -> google.protobuf.Timestamp
 	1, // 3: fa.v1.OrderEvent.kind:type_name -> fa.v1.OrderEvent.Kind
-	5, // 4: fa.v1.OrderEvent.event_time:type_name -> google.protobuf.Timestamp
-	5, // [5:5] is the sub-list for method output_type
-	5, // [5:5] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	6, // 4: fa.v1.OrderEvent.event_time:type_name -> google.protobuf.Timestamp
+	6, // 5: fa.v1.OrderCancel.at:type_name -> google.protobuf.Timestamp
+	6, // [6:6] is the sub-list for method output_type
+	6, // [6:6] is the sub-list for method input_type
+	6, // [6:6] is the sub-list for extension type_name
+	6, // [6:6] is the sub-list for extension extendee
+	0, // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_fa_v1_order_proto_init() }
@@ -475,7 +563,7 @@ func file_fa_v1_order_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_fa_v1_order_proto_rawDesc), len(file_fa_v1_order_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   2,
+			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -78,11 +78,32 @@ pub struct AdapterGuard {
     pub window_hours: f64,
     /// `adapter_checkpoint_interval`: how often an `AdapterState` version is expected.
     pub checkpoint_interval_secs: u64,
+    /// Neural LoRA adapters: `‖ΔW‖_F / ‖W‖_F` beyond which the adapter is frozen.
+    #[serde(default = "default_max_delta_norm")]
+    pub max_delta_norm: f64,
+    /// Neural LoRA adapters: mean expert-latent shift relative to the latent spread beyond which
+    /// the adapter is frozen ("must not move latents across region boundaries en masse").
+    #[serde(default = "default_max_latent_shift")]
+    pub max_latent_shift: f64,
+}
+
+fn default_max_delta_norm() -> f64 {
+    0.1
+}
+
+fn default_max_latent_shift() -> f64 {
+    0.25
 }
 
 impl Default for AdapterGuard {
     fn default() -> Self {
-        Self { max_drift: 1.0, window_hours: 1.0, checkpoint_interval_secs: 900 }
+        Self {
+            max_drift: 1.0,
+            window_hours: 1.0,
+            checkpoint_interval_secs: 900,
+            max_delta_norm: default_max_delta_norm(),
+            max_latent_shift: default_max_latent_shift(),
+        }
     }
 }
 
@@ -434,7 +455,8 @@ mod tests {
     fn adapter_guard_and_instrument_refs_in_params() {
         let mut params = serde_json::json!({ "context_steps": 64 });
         assert!(AdapterGuard::from_params(&params).is_none());
-        AdapterGuard { max_drift: 0.4, window_hours: 2.0, checkpoint_interval_secs: 600 }.write_params(&mut params);
+        AdapterGuard { max_drift: 0.4, window_hours: 2.0, checkpoint_interval_secs: 600, ..Default::default() }
+            .write_params(&mut params);
         assert_eq!(params["adapter_guard"]["max_drift"], 0.4);
         assert_eq!(params["context_steps"], 64);
         let m = SnapshotManifest {

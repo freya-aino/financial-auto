@@ -98,6 +98,9 @@ const ENVELOPE_PREFIXES: [&str; 6] = ["md.", "news.", "media.", "macro.", "oncha
 
 /// Decodes known payloads to JSON; unknown subjects yield `null`.
 pub fn decode(subject: &str, payload: &[u8]) -> Value {
+    if let Some(v) = crate::console_routes::decode_extra(subject, payload) {
+        return v; // ops.alert, latent.membership|lifecycle|mcmc|hier|crossprior (D-066, D-069)
+    }
     if subject.starts_with("svc.heartbeat.") {
         return Heartbeat::decode(payload).map(heartbeat_json).unwrap_or(Value::Null);
     }

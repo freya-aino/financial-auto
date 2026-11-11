@@ -147,10 +147,16 @@ impl Norm {
     }
 }
 
-/// Market-wide news timeline: one sparse hashed term-frequency vector per item, by knowledge time.
+/// One timeline item: knowledge time, sparse hashed tf vector, matched instrument tokens.
+type Doc = (i64, Vec<(u32, f32)>, Vec<String>);
+
+/// News timeline: one sparse hashed term-frequency vector per item, by knowledge time, tagged
+/// with the instruments the item was matched to (`text_baseline::InstrumentIndex`, symbol / name
+/// / entity). Market-wide reads use every item; genomes with `ninst=1` read only the items of the
+/// series' instrument ([`Self::embedding_for`]).
 #[derive(Debug, Clone, Default)]
 pub struct TextTimeline {
-    docs: Vec<(i64, Vec<(u32, f32)>)>,
+    docs: Vec<Doc>,
     sorted: bool,
 }
 
@@ -161,6 +167,11 @@ impl TextTimeline {
 
     /// Adds one item (title + body) known at `ts_ms`. Items without content tokens are skipped.
     pub fn push(&mut self, ts_ms: i64, title: &str, body: &str) {
+        self.push_tagged(ts_ms, title, body, &[]);
+    }
+
+    /// [`Self::push`] with the instruments (UUIDs, any case / dashes) the item mentions.
+    pub fn push_tagged(&mut self, ts_ms: i64, title: &str, body: &str, instruments: &[String]) {
         let mut tf: HashMap<u32, f32> = HashMap::new();
         for tok in tokenize(&format!("{title} {body}")) {
             if STOPWORDS.contains(&tok.as_str()) || tok.chars().all(|c| c.is_ascii_digit()) {
@@ -173,15 +184,23 @@ impl TextTimeline {
         }
         let mut v: Vec<(u32, f32)> = tf.into_iter().map(|(b, c)| (b, 1.0 + c.ln())).collect();
         v.sort_by_key(|(b, _)| *b);
-        if self.docs.last().is_some_and(|(t, _)| *t > ts_ms) {
+        if self.docs.last().is_some_and(|(t, _, _)| *t > ts_ms) {
             self.sorted = false;
         }
-        self.docs.push((ts_ms, v));
+        let mut tags: Vec<String> = instruments.iter().map(|i| crate::instrument_token(i)).collect();
+        tags.sort();
+        tags.dedup();
+        self.docs.push((ts_ms, v, tags));
+    }
+
+    /// Items tagged with at least one instrument.
+    pub fn matched(&self) -> usize {
+        self.docs.iter().filter(|d| !d.2.is_empty()).count()
     }
 
     fn ensure_sorted(&mut self) {
         if !self.sorted {
-            self.docs.sort_by_key(|(t, _)| *t);
+            self.docs.sort_by_key(|(t, _, _)| *t);
             self.sorted = true;
         }
     }
@@ -202,7 +221,7 @@ impl TextTimeline {
     /// Drops items older than `ms`.
     pub fn prune_before(&mut self, ms: i64) {
         self.ensure_sorted();
-        let n = self.docs.partition_point(|(t, _)| *t < ms);
+        let n = self.docs.partition_point(|(t, _, _)| *t < ms);
         self.docs.drain(..n);
     }
 
@@ -213,29 +232,52 @@ impl TextTimeline {
 
     /// Items with `from_ms < ts ≤ to_ms`.
     pub fn count(&self, from_ms: i64, to_ms: i64) -> usize {
-        let a = self.docs.partition_point(|(t, _)| *t <= from_ms);
-        let b = self.docs.partition_point(|(t, _)| *t <= to_ms);
+        let a = self.docs.partition_point(|(t, _, _)| *t <= from_ms);
+        let b = self.docs.partition_point(|(t, _, _)| *t <= to_ms);
         b.saturating_sub(a)
     }
 
     /// L2-normalised folded embedding (`bucket mod tdim`) of the items with `from_ms < ts ≤ to_ms`;
     /// `None` when there are none. Requires a sorted timeline ([`Self::finish`]).
     pub fn embedding(&self, from_ms: i64, to_ms: i64, tdim: usize) -> Option<Vec<f32>> {
+        self.embedding_for(None, from_ms, to_ms, tdim)
+    }
+
+    /// [`Self::embedding`] over the items tagged with `instrument` (`None` = every item).
+    pub fn embedding_for(&self, instrument: Option<&str>, from_ms: i64, to_ms: i64, tdim: usize) -> Option<Vec<f32>> {
         debug_assert!(self.sorted, "TextTimeline::finish() before reading");
-        let a = self.docs.partition_point(|(t, _)| *t <= from_ms);
-        let b = self.docs.partition_point(|(t, _)| *t <= to_ms);
+        let a = self.docs.partition_point(|(t, _, _)| *t <= from_ms);
+        let b = self.docs.partition_point(|(t, _, _)| *t <= to_ms);
         if b <= a || tdim == 0 {
             return None;
         }
+        let tok = instrument.map(crate::instrument_token);
         let mut v = vec![0.0f32; tdim];
-        for (_, doc) in &self.docs[a..b] {
+        let mut any = false;
+        for (_, doc, tags) in &self.docs[a..b] {
+            if let Some(tok) = &tok
+                && tags.binary_search(tok).is_err()
+            {
+                continue;
+            }
+            any = true;
             for (bucket, w) in doc {
                 v[*bucket as usize % tdim] += w;
             }
         }
         let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        (n > 0.0).then(|| v.into_iter().map(|x| x / n).collect())
+        (any && n > 0.0).then(|| v.into_iter().map(|x| x / n).collect())
     }
+}
+
+/// Instrument whose news a genome reads (`ninst=1`: the series' own; else market-wide).
+pub fn text_scope<'a>(g: &DecoderGenome, s: &'a Series) -> Option<&'a str> {
+    g.nn.news_inst.then_some(s.instrument_id.as_str())
+}
+
+/// Instrument whose latents condition a genome on series `s` (`src` gene, else `s` itself).
+pub fn latent_instrument<'a>(g: &'a DecoderGenome, s: &'a Series) -> &'a str {
+    g.source.as_deref().unwrap_or(&s.instrument_id)
 }
 
 /// Unit sentiment direction in the folded embedding space (+ lexicon-positive, − negative
@@ -300,7 +342,9 @@ pub fn input_at(
     }
     if lay.extra > 0 {
         let now = s.ts_ms[t];
-        let e = text.embedding(now - text_window_ms(g), now, g.nn.tdim).unwrap_or_else(|| vec![0.0; g.nn.tdim]);
+        let e = text
+            .embedding_for(text_scope(g, s), now - text_window_ms(g), now, g.nn.tdim)
+            .unwrap_or_else(|| vec![0.0; g.nn.tdim]);
         x.extend(e);
     }
     x.extend(norm.latent_block(latent, lay.latent));
@@ -330,7 +374,7 @@ pub fn target_at(g: &DecoderGenome, s: &Series, t: usize, sigma: f64, text: &Tex
         }
         BaselineFamily::NnNews => {
             let now = *s.ts_ms.get(t)?;
-            Some((text.embedding(now - text_window_ms(g), now, g.nn.tdim)?, now))
+            Some((text.embedding_for(text_scope(g, s), now - text_window_ms(g), now, g.nn.tdim)?, now))
         }
         BaselineFamily::NnNarrative => {
             let now = *s.ts_ms.get(t)?;
@@ -339,7 +383,7 @@ pub fn target_at(g: &DecoderGenome, s: &Series, t: usize, sigma: f64, text: &Tex
             if text.span().is_none_or(|(_, last)| last < end) {
                 return None;
             }
-            Some((text.embedding(now, end, g.nn.tdim)?, end))
+            Some((text.embedding_for(text_scope(g, s), now, end, g.nn.tdim)?, end))
         }
         _ => {
             let y = s.forward_return(t, h)?;
@@ -355,11 +399,12 @@ pub fn z_at(s: &Series, t: usize, h: usize, sigma: f64) -> Option<f32> {
     Some((y / (sigma * (h as f64).sqrt())).clamp(-Z_CLIP, Z_CLIP) as f32)
 }
 
-/// Most common latent length among the instruments of `series` in `ctx` (0 = none).
-pub fn latent_dim(series: &[Series], ctx: &crate::DecodeCtx) -> usize {
+/// Most common latent length among the instruments of `series` in `ctx` (0 = none); with a
+/// `src` gene the source instrument's latents count instead.
+pub fn latent_dim(series: &[Series], ctx: &crate::DecodeCtx, source: Option<&str>) -> usize {
     let mut counts: HashMap<usize, usize> = HashMap::new();
     for s in series {
-        if let Some(v) = ctx.latents.get(&crate::instrument_token(&s.instrument_id)) {
+        if let Some(v) = ctx.latents.get(&crate::instrument_token(source.unwrap_or(&s.instrument_id))) {
             for p in v {
                 *counts.entry(p.vec.len()).or_default() += 1;
             }
@@ -390,6 +435,26 @@ mod tests {
         assert!(dot(&up) > dot(&down), "{} vs {}", dot(&up), dot(&down));
         t.prune_before(2_500);
         assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn instrument_scoped_news() {
+        let mut t = TextTimeline::new();
+        t.push_tagged(1_000, "Apple beats estimates", "", &["0190-AAAA".into()]);
+        t.push_tagged(2_000, "Oil slumps", "", &["0190bbbb".into()]);
+        t.push(3_000, "Markets drift", "");
+        t.finish();
+        assert_eq!(t.matched(), 2);
+        let all = t.embedding_for(None, 0, 3_000, 64).unwrap();
+        let a = t.embedding_for(Some("0190aaaa"), 0, 3_000, 64).unwrap();
+        assert_eq!(a, t.embedding(0, 1_000, 64).unwrap(), "only the tagged item");
+        assert_ne!(a, all);
+        assert!(t.embedding_for(Some("0190cccc"), 0, 3_000, 64).is_none());
+        let g = DecoderGenome::parse("nn_news:ninst=1;src=src1").unwrap();
+        let s = Series { instrument_id: "0190-AAAA".into(), ..Default::default() };
+        assert_eq!(text_scope(&g, &s), Some("0190-AAAA"));
+        assert_eq!(latent_instrument(&g, &s), "src1");
+        assert_eq!(text_scope(&DecoderGenome::parse("nn_news").unwrap(), &s), None);
     }
 
     #[test]

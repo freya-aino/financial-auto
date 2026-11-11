@@ -34,7 +34,7 @@ use fa_expert_space::{
     health::{linear_cka, match_experts},
     nn::{device_from_str, device_label},
 };
-use fa_patterns::{AlignInput, LeaderClustering, ParentIds, RegionMap, align_expert};
+use fa_patterns::{AlignInput, ParentIds, RegionMap, align_expert};
 use fa_proto::v1::job_result::Status;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -59,15 +59,20 @@ pub fn family_of(spec: &FitSpec) -> anyhow::Result<Option<NeuralFamily>> {
     match spec.family.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(None),
         Some(f) if f.eq_ignore_ascii_case(STATISTICAL_FAMILY) || f.eq_ignore_ascii_case("stat_baseline") => Ok(None),
-        Some(f) => NeuralFamily::parse(f)
-            .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("unknown encoder family `{f}` (statistical | fsq_hybrid | jepa_vae)")),
+        Some(f) => NeuralFamily::parse(f).map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown encoder family `{f}` (statistical | fsq_hybrid | hier_vae_flow | jepa_vae | latent_diffusion)"
+            )
+        }),
     }
 }
 
 /// Per-timescale genome defaults (spec 31 §6.1 ladder scaled to CPU), then the job's overrides
 /// (`spec.neural`, merged into the config JSON; `moe` merges as an object).
 pub fn config_for(family: NeuralFamily, ts: Timescale, overrides: Option<&Value>) -> anyhow::Result<NeuralConfig> {
+    if !family.allows(ts) {
+        anyhow::bail!("{} is only enabled at the day/week timescales (D-010), not {ts}", family.as_str());
+    }
     let mut cfg = NeuralConfig::new(family);
     cfg.context_steps = match ts {
         Timescale::Second | Timescale::Minute => 64,
@@ -370,15 +375,40 @@ pub async fn run(
             if tr.model.cfg.lambda_anchor <= 0.0 && tr.anchors.n_anchored() > 0 {
                 tr.model.cfg.lambda_anchor = 0.1;
             }
+        }
+    }
+    // D-009: the real elite decoders (D-068) when elites reading this latent width exist, else
+    // the frozen-probe stand-in of a neural parent
+    let mut feedback_source = "none";
+    if kind == Kind::Generation {
+        let latent_dim = tr.model.moe.n_active() * cfg.moe.expert_dim;
+        let elites = match &svc.stores.blob {
+            Some(blob) => {
+                match crate::feedback::load_elites(blob, &history, data::step_ms(ts), latent_dim, &dev).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "decoder elites unavailable; falling back to the probe stand-in");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        if let Some(fb) = elites {
+            tracing::info!(elites = fb.n_elites(), latent_dim, "D-009 feedback from elite decoders");
+            tr.feedback.push(Box::new(fb));
+            feedback_source = "elite_decoders";
+        } else if let Some(p) = parent.as_ref().filter(|p| cfg.moe.expert_dim == p.encoder.model().cfg.moe.expert_dim) {
             match crate::feedback::FrozenProbeFeedback::fit(&p.encoder, &tr.model, &ds, PROBE_FIT_WINDOWS) {
                 Ok(fb) => {
                     tr.feedback.push(Box::new(fb));
-                    if tr.model.cfg.lambda_feedback <= 0.0 {
-                        tr.model.cfg.lambda_feedback = 0.5;
-                    }
+                    feedback_source = "frozen_linear_probe";
                 }
                 Err(e) => tracing::warn!(error = %e, "frozen probe feedback unavailable"),
             }
+        }
+        if !tr.feedback.is_empty() && tr.model.cfg.lambda_feedback <= 0.0 {
+            tr.model.cfg.lambda_feedback = 0.5;
         }
     }
     let n_params = tr.model.ps.n_params();
@@ -435,6 +465,11 @@ pub async fn run(
         return Ok(stop_outcome(kind, &meta.snapshot_id, Status::Cancelled, "cancelled", None, tr.step, started));
     }
 
+    // 3b. optional full-batch refit of the next-step heads (spec 32 §6.3 decorrelation)
+    if cfg.head_refit_steps > 0 {
+        (ctl.progress)(0.85, format!("head refit ({} full-batch steps)", cfg.head_refit_steps));
+        tokio::task::block_in_place(|| tr.refit_heads(&ds, cfg.head_refit_steps, 4096))?;
+    }
     // 4. validation, pruning, parent regression
     (ctl.progress)(0.86, "validation and expert pruning".into());
     let val = if ds.val.is_empty() { ds.train.clone() } else { ds.val.clone() };
@@ -462,6 +497,8 @@ pub async fn run(
     let child = NeuralEncoder::new(tr.model.clone(), ts, meta.snapshot_id.clone());
     let child_lat = encode_probes(&child, &history, &ends, &probes)?;
     let mut alignment = json!(null);
+    // (final position, parent position, cka) of every expert that continues a parent expert
+    let mut aligned: Vec<(usize, usize, f64)> = Vec::new();
     if let Some(p) = &parent {
         let parent_lat = encode_probes(&p.encoder, &history, &ends, &probes)?;
         let cka: Vec<Vec<f64>> =
@@ -470,6 +507,13 @@ pub async fn run(
         let order_pos = reorder_by_parent(&matches, child_lat.len());
         let active = tr.model.moe.active.clone();
         tr.model.moe.select(order_pos.iter().map(|&p| active[p]).collect());
+        for (pos, &c) in order_pos.iter().enumerate() {
+            if let Some(m) = matches.get(c)
+                && let Some(j) = m.parent_expert
+            {
+                aligned.push((pos, j, m.cka));
+            }
+        }
         alignment = json!({
             "parent": p.manifest.snapshot_id,
             "threshold": EXPERT_MATCH_CKA,
@@ -478,16 +522,19 @@ pub async fn run(
             "order": order_pos,
         });
     }
-    let child = NeuralEncoder::new(tr.model.clone(), ts, meta.snapshot_id.clone());
-    let latents = encode_probes(&child, &history, &ends, &probes)?;
+    let child_final = NeuralEncoder::new(tr.model.clone(), ts, meta.snapshot_id.clone());
+    let latents = encode_probes(&child_final, &history, &ends, &probes)?;
     let probe_keys: Vec<ProbeKey> =
         probes.iter().map(|&(i, p)| (history[i].instrument.clone(), history[i].ends_ms[ends[i][p] - 1])).collect();
     let parent_assign = artifact::parent_assignment(hub, parent_graph.as_ref(), &history, &probe_keys).await;
-    let disc = LeaderClustering { radius: spec.region_radius, max_regions: spec.max_regions };
+    // the region discovery the family declares (density modes for families 2 and 4)
+    let disc = fa_encoders::neural::regions::discovery_for(family, spec.region_radius, spec.max_regions);
     let mut experts = Vec::new();
     let mut regions = Vec::new();
     for (k, points) in latents.iter().enumerate() {
-        let (centroids, new_assign) = disc.fit_assign(points);
+        let centroids = disc.discover(points);
+        let new_assign: Vec<Option<usize>> =
+            points.iter().map(|p| disc.assign(&centroids, p).or_else(|| fa_patterns::nearest(&centroids, p))).collect();
         let empty = Vec::new();
         let no_ids = ParentIds::new();
         let m = align_expert(AlignInput {
@@ -572,6 +619,7 @@ pub async fn run(
     let feedback = json!({
         "decoder_stats": decoder_stats,
         "decoders": tr.feedback.iter().map(|f| f.summary()).collect::<Vec<_>>(),
+        "source": feedback_source,
         "lambda_feedback": tr.model.cfg.lambda_feedback,
         "anchors": { "experts": tr.anchors.n_anchored(), "lambda_anchor": tr.model.cfg.lambda_anchor, "source": parent.as_ref().map(|p| p.manifest.snapshot_id.clone()) },
         "warm_start": warm,
@@ -637,6 +685,24 @@ pub async fn run(
     }
     (ctl.progress)(0.95, "writing snapshot".into());
     let written = artifact::write_bundle(svc.stores, &bundle, parent_graph.as_ref(), kind.as_str()).await?;
+    // spec 32 §5: Expert nodes, ExpertOf, AlignedTo (identity across generations)
+    let expert_nodes = match hub {
+        Some(h) if written.helix => {
+            let spec_by_expert = specialisation(&child_final, &history, &ends, &probes)?;
+            write_expert_nodes(
+                h,
+                &bundle.manifest,
+                &tr.model,
+                &post.health,
+                &pos_of,
+                &aligned,
+                parent.as_ref().map(|p| (p.manifest.snapshot_id.as_str(), p.encoder.model().moe.n_active())),
+                &spec_by_expert,
+            )
+            .await
+        }
+        _ => json!(null),
+    };
     if let (Some(blob), Some(_)) = (&svc.stores.blob, &ckpt_key) {
         for key in [artifact::checkpoint_key(&ctl.job_id), weights_key(&ctl.job_id)] {
             let _ = fa_blob::BlobStore::delete(blob, &key).await;
@@ -669,6 +735,7 @@ pub async fn run(
                 "note": bundle.region_map.note,
             },
             "feedback": m.feedback,
+            "experts": expert_nodes,
             "resumed_from": resumed_from,
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }),
@@ -677,6 +744,109 @@ pub async fn run(
         error: String::new(),
         snapshot_id: Some(m.snapshot_id.clone()),
     })
+}
+
+/// Gate mass per instrument of every expert (output position) on the probe windows: the
+/// specialisation summary of the `Expert` node (spec 32 §5).
+fn specialisation(
+    enc: &NeuralEncoder,
+    history: &[BarHistory],
+    ends: &[Vec<usize>],
+    probes: &[(usize, usize)],
+) -> anyhow::Result<Vec<Value>> {
+    let k = enc.sizing().max_experts as usize;
+    let mut mass: Vec<BTreeMap<String, f64>> = vec![BTreeMap::new(); k];
+    let mut i = 0;
+    while i < probes.len() {
+        let inst = probes[i].0;
+        let j = probes[i..].iter().position(|p| p.0 != inst).map_or(probes.len(), |d| i + d);
+        let win_ends: Vec<usize> = probes[i..j].iter().map(|&(s, p)| ends[s][p]).collect();
+        for e in tokio::task::block_in_place(|| enc.encode_windows(&history[inst].bars, &win_ends))? {
+            for (pos, g) in e.gates.iter().enumerate().take(k) {
+                *mass[pos].entry(history[inst].instrument.clone()).or_default() += f64::from(*g);
+            }
+        }
+        i = j;
+    }
+    Ok(mass
+        .into_iter()
+        .map(|m| {
+            let total: f64 = m.values().sum();
+            let mut top: Vec<(String, f64)> =
+                m.into_iter().map(|(i, v)| (i, if total > 0.0 { v / total } else { 0.0 })).collect();
+            top.sort_by(|a, b| b.1.total_cmp(&a.1));
+            top.truncate(5);
+            json!({ "gate_mass": total, "top_instruments": top })
+        })
+        .collect())
+}
+
+/// Writes the `Expert` nodes of a neural snapshot with `ExpertOf`, the `AlignedTo` edges of
+/// matched experts and `died_gen` on parent experts no child continues.
+#[allow(clippy::too_many_arguments)]
+async fn write_expert_nodes(
+    hub: &fa_hub::HubClient,
+    m: &SnapshotManifest,
+    model: &fa_encoders::neural::NeuralModel,
+    h: &fa_expert_space::health::HealthReport,
+    pos_of: &[usize],
+    aligned: &[(usize, usize, f64)],
+    parent: Option<(&str, usize)>,
+    spec_by_expert: &[Value],
+) -> Value {
+    let mut written = 0usize;
+    let mut errors = Vec::new();
+    for (pos, &src) in pos_of.iter().enumerate() {
+        let continued = aligned.iter().find(|a| a.0 == pos);
+        let born_gen = match (continued, parent) {
+            (Some(a), Some((pid, _))) => match hub.snapshot_experts(pid).await {
+                Ok(rows) => rows
+                    .iter()
+                    .find(|r| r.expert_id as usize == a.1)
+                    .map_or(m.generation.saturating_sub(1), |r| r.born_gen),
+                Err(_) => m.generation.saturating_sub(1),
+            },
+            _ => m.generation,
+        };
+        let e = fa_hub::NewExpert {
+            snapshot_id: m.snapshot_id.clone(),
+            timescale: m.timescale.to_string(),
+            expert_id: pos as u32,
+            dim: model.cfg.moe.expert_dim as u32,
+            usage: h.usage.get(src).copied().unwrap_or(0.0),
+            skill: h.skill.get(src).copied().unwrap_or(0.0),
+            born_gen,
+            specialisation: spec_by_expert.get(pos).map(Value::to_string).unwrap_or_default(),
+        };
+        match hub.upsert_expert(&e).await {
+            Ok(()) => written += 1,
+            Err(err) => errors.push(err.to_string()),
+        }
+    }
+    let mut edges = 0usize;
+    let mut retired = Vec::new();
+    if let Some((pid, n_parent)) = parent {
+        for &(pos, j, cka) in aligned {
+            let a = fa_hub::NewAlignment {
+                child_snapshot_id: m.snapshot_id.clone(),
+                child_expert_id: pos as u32,
+                parent_snapshot_id: pid.to_owned(),
+                parent_expert_id: j as u32,
+                cka,
+                kind: "carry".into(),
+            };
+            match hub.align_expert(&a).await {
+                Ok(()) => edges += 1,
+                Err(err) => errors.push(err.to_string()),
+            }
+        }
+        for j in (0..n_parent).filter(|j| !aligned.iter().any(|a| a.1 == *j)) {
+            if hub.retire_expert(pid, j as u32, m.generation).await.is_ok() {
+                retired.push(j);
+            }
+        }
+    }
+    json!({ "written": written, "aligned_to": edges, "parent_experts_retired": retired, "errors": errors })
 }
 
 fn dataset(history: &[BarHistory], cfg: &NeuralConfig) -> Dataset {
@@ -727,6 +897,83 @@ pub fn reorder_by_parent(matches: &[fa_expert_space::health::ExpertMatch], n: us
     slots.into_iter().map(|s| s.or_else(|| rest.next()).unwrap_or(0)).collect()
 }
 
+// ── genome sweep (no writes) ────────────────────────────────────────────────
+
+/// Spec 32 §6.3 feasibility bound of the promotion checklist for two experts sharing windows.
+/// Write each expert's prediction as `ŷ_k = f + d_k` (`f` = the conditional mean, `d_k` any
+/// function of the window, so `d_k ⟂ ε` out of sample). The scalarised residual is `ē − d̄_k`,
+/// its correlation is smallest for `d̄_j = −d̄_i`: `(V − D) / (V + D)` with `V = var(ē)` and
+/// `D = var(d̄)` ≤ the mean per-target deviation energy, while skill is `R̄² − D` at best. Both
+/// `|corr| ≤ c` and `skill ≥ s` are reachable only if `R̄² − s ≥ V·(1 − c)/(1 + c)`. Returns
+/// `R̄² − s − V·(1 − c)/(1 + c)` with `R̄²` and `V` estimated by the trained mixture (best
+/// predictor at hand: it under-estimates `R̄²` and over-estimates `V` by the same deficit).
+pub fn feasibility_margin(r2: f64, v: f64, min_skill: f64, max_corr: f64) -> f64 {
+    r2 - min_skill - v * (1.0 - max_corr) / (1.0 + max_corr)
+}
+
+/// Trains every genome override of `grid` on the same history and reports the spec 32 §6.4
+/// health and the promotion-checklist verdict of each (`trainer sweep`). Nothing is written:
+/// this is how a genome that passes the checklist is searched for before a real `pretrain`.
+pub fn sweep(
+    family: NeuralFamily,
+    ts: Timescale,
+    history: &[BarHistory],
+    grid: &[Value],
+    seed: u64,
+    dev: &candle_core::Device,
+    mut report: impl FnMut(&Value),
+) -> anyhow::Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(grid.len());
+    for (i, over) in grid.iter().enumerate() {
+        let started = Instant::now();
+        let cfg = config_for(family, ts, Some(over))?;
+        let ds = dataset(history, &cfg);
+        if ds.train.is_empty() {
+            anyhow::bail!("no training windows");
+        }
+        let mut tr = NeuralTrainer::new(cfg.clone(), &ds, seed, dev)?;
+        tr.train_steps(&ds, cfg.steps)?;
+        tr.refit_heads(&ds, cfg.head_refit_steps, 4096)?;
+        let val = if ds.val.is_empty() { ds.train.clone() } else { ds.val.clone() };
+        let pre = tr.evaluate(&ds, &val)?;
+        tr.prune(&pre.health.usage, 2);
+        let post = tr.evaluate(&ds, &val)?;
+        let h = &post.health;
+        let pass = h.k_eff >= 2.0 && h.resid_corr_max <= 0.1 && h.skill_min() >= 0.02;
+        // the same measures in sample (generalisation gap vs optimisation failure)
+        let train_sub: Vec<(usize, usize)> =
+            crate::fit::evenly(ds.train.len(), 2000).into_iter().map(|i| ds.train[i]).collect();
+        let tr_eval = tr.evaluate(&ds, &train_sub)?;
+        let row = json!({
+            "i": i,
+            "overrides": over,
+            "pass": pass,
+            "k_eff": h.k_eff,
+            "resid_corr_max": h.resid_corr_max,
+            "skill_min": h.skill_min(),
+            "skill": h.skill,
+            "usage": h.usage,
+            "mix_skill": post.mix_skill,
+            "target_skill": post.target_skill,
+            "mix_resid_var": post.mix_resid_var,
+            "feasibility_margin": feasibility_margin(post.mix_skill, post.mix_resid_var, 0.02, 0.1),
+            "pre_prune": { "k_eff": pre.health.k_eff, "resid_corr_max": pre.health.resid_corr_max, "skill": pre.health.skill },
+            "n_experts": tr.model.moe.n_active(),
+            "train_health": {
+                "k_eff": tr_eval.health.k_eff, "resid_corr_max": tr_eval.health.resid_corr_max,
+                "skill": tr_eval.health.skill, "mix_skill": tr_eval.mix_skill,
+            },
+            "val_loss": post.loss,
+            "train_windows": ds.train.len(),
+            "val_windows": val.len(),
+            "seconds": started.elapsed().as_secs_f64(),
+        });
+        report(&row);
+        out.push(row);
+    }
+    Ok(out)
+}
+
 // ── online adapter of a neural snapshot ─────────────────────────────────────
 
 /// Mean over features of `|mean_new − mean_ref| / std_ref` of two input normalisations.
@@ -742,12 +989,16 @@ pub fn norm_drift(reference: &fa_encoders::neural::InputNorm, new: &fa_encoders:
         / n as f64
 }
 
-/// Online adapter of a neural snapshot (spec 36 §6.5): the **input adapter** — the market
-/// front-end's normalisation re-fitted on the recent window, which re-centres the frozen backbone
-/// on the live distribution without touching its weights. Same artifact path, `AdapterState` node
-/// and drift guard (`max_drift` on the mean |Δμ|/σ of the inputs) as the statistical adapter;
-/// model-runtime applies `input_norm` to the serving neural encoder. Weight-level (LoRA) adapters
-/// remain open.
+/// Online adapter of a neural snapshot (spec 36 §6.5), two layers:
+/// 1. the **input adapter** — the market front-end's normalisation re-fitted on the recent
+///    window (drift guard `max_drift` on the mean |Δμ|/σ of the inputs);
+/// 2. a **LoRA adapter** on `bb.out` and the expert projectors trained on the recent windows
+///    with the SSL next-step objective ([`fa_encoders::neural::adapter`]), stored as
+///    `adapters/<snapshot>/<ms>.lora.safetensors`; frozen (not served) beyond
+///    `max_delta_norm` / `max_latent_shift` of the snapshot's adapter guard.
+///
+/// Same artifact path, `AdapterState` node and runtime application path as the statistical
+/// adapter; model-runtime applies `input_norm` and folds a non-frozen LoRA into the weights.
 pub async fn run_adapter(
     spec: crate::run::AdapterSpec,
     svc: &Services<'_>,
@@ -763,8 +1014,7 @@ pub async fn run_adapter(
     let guard = manifest.adapter_guard();
     let max_drift = spec.max_drift.unwrap_or(guard.max_drift);
     (ctl.progress)(0.1, format!("adapting {snapshot_id} (input normalisation) on the last {:.2} h", spec.window_hours));
-    let now = data::now_ms();
-    let (start_ms, end_ms) = data::window(ts, spec.window_hours, now);
+    let (start_ms, end_ms) = data::window(ts, spec.window_hours, data::now_ms());
     let history = data::load_one(svc.tsdb, ts, spec.instrument.as_deref(), start_ms, end_ms, None).await?;
     match ctl.stop.load(Ordering::Relaxed) {
         CANCEL => {
@@ -789,6 +1039,53 @@ pub async fn run_adapter(
     let norm = fa_encoders::neural::InputNorm::fit(&ds);
     let drift = norm_drift(&enc.model().norm, &norm);
     let frozen = drift > max_drift;
+    // weight-level LoRA on top of the re-fitted input normalisation (spec 36 §6.5)
+    let now = data::now_ms();
+    let mut lora = Value::Null;
+    if !spec.no_lora && !frozen && !ds.train.is_empty() {
+        let mut model = enc.model().clone();
+        model.norm = norm.clone();
+        let lcfg = spec.lora.clone().unwrap_or_default();
+        let ads = Dataset::build(
+            vec![Series::new(history.instrument.clone(), history.bars.clone())],
+            cfg.min_window,
+            cfg.horizon(),
+            0.0,
+        );
+        (ctl.progress)(0.3, format!("LoRA rank {} on {} windows ({} steps)", lcfg.rank, ads.train.len(), lcfg.steps));
+        let fitted = tokio::task::block_in_place(|| {
+            fa_encoders::neural::adapter::train_lora(&model, &ads, &lcfg, now as u64, &dev)
+        });
+        lora = match fitted {
+            Ok((set, rep)) => {
+                let lora_frozen = rep.delta_norm > guard.max_delta_norm || rep.latent_shift > guard.max_latent_shift;
+                let key = fa_blob::ObjectKey {
+                    bucket: fa_blob::buckets::MODELS,
+                    key: format!("adapters/{snapshot_id}/{now}.lora.safetensors"),
+                };
+                let bytes = set.to_bytes(
+                    [("snapshot_id".to_owned(), snapshot_id.clone()), ("ts_ms".to_owned(), now.to_string())].into(),
+                )?;
+                let mut stored = false;
+                if let Some(blob) = &svc.stores.blob {
+                    fa_blob::BlobStore::put(blob, &key, bytes.clone(), fa_blob::OCTET_STREAM).await?;
+                    stored = true;
+                }
+                if let Some(dir) = &svc.stores.out_dir {
+                    let path = dir.join("adapters").join(&snapshot_id);
+                    std::fs::create_dir_all(&path)?;
+                    std::fs::write(path.join(format!("{now}.lora.safetensors")), &bytes)?;
+                }
+                json!({
+                    "key": if stored { Value::String(key.key) } else { Value::Null },
+                    "rank": set.rank, "alpha": set.alpha, "config": lcfg, "seed": now, "report": rep,
+                    "frozen": lora_frozen,
+                    "guard": { "max_delta_norm": guard.max_delta_norm, "max_latent_shift": guard.max_latent_shift },
+                })
+            }
+            Err(e) => json!({ "error": e.to_string() }),
+        };
+    }
     let artifact = json!({
         "protocol": PROTOCOL,
         "snapshot_id": snapshot_id,
@@ -799,6 +1096,7 @@ pub async fn run_adapter(
         "window": { "start_ms": history.start_ms, "end_ms": history.end_ms, "instrument": history.instrument, "source": history.source.as_str(), "n_bars": history.bars.len() },
         "n_windows": ds.train.len(),
         "input_norm": norm,
+        "lora": lora,
         "reference": "snapshot input normalisation",
         "drift": drift,
         "max_drift": max_drift,
@@ -846,7 +1144,9 @@ pub async fn run_adapter(
         result: json!({
             "protocol": PROTOCOL, "kind": "train.adapter", "family": manifest.encoder_family, "snapshot_id": snapshot_id,
             "timescale": ts, "artifact_key": key.key, "persisted": persisted, "n_bars": history.bars.len(),
-            "source": history.source.as_str(), "adapter_state": adapter_state, "adapter": "input_norm",
+            "source": history.source.as_str(), "adapter_state": adapter_state,
+            "adapter": if lora.get("key").is_some_and(|k| !k.is_null()) { "input_norm+lora" } else { "input_norm" },
+            "lora": lora,
             "n_windows": ds.train.len(), "drift": drift, "frozen": frozen, "max_drift": max_drift,
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }),

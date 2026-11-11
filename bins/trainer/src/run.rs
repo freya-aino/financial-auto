@@ -85,6 +85,12 @@ pub struct AdapterSpec {
     pub max_drift: Option<f64>,
     #[serde(default)]
     pub fit: FitConfig,
+    /// Neural snapshots: skip the weight-level LoRA adapter (input normalisation only).
+    #[serde(default)]
+    pub no_lora: bool,
+    /// Neural snapshots: LoRA hyper-parameters (default rank 8, 150 steps).
+    #[serde(default)]
+    pub lora: Option<fa_encoders::neural::adapter::LoraConfig>,
 }
 
 fn one_hour() -> f64 {
@@ -100,6 +106,8 @@ impl Default for AdapterSpec {
             instrument: None,
             max_drift: None,
             fit: FitConfig::default(),
+            no_lora: false,
+            lora: None,
         }
     }
 }

@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use fa_backtest::holdout::HoldoutPolicy;
 use fa_core::{AssetClass, Timescale};
-use fa_risk::{RiskConfig, health::FeedGuardConfig, pipeline::PipelinePolicy, strategy::PromotionGate};
+use fa_risk::{
+    RiskConfig, exec::ExecPolicy, health::FeedGuardConfig, pipeline::PipelinePolicy, strategy::PromotionGate,
+};
 use serde::{Deserialize, Serialize};
 
 /// Starting paper cash (D-028).
@@ -64,6 +66,33 @@ pub struct Settings {
     pub feed: FeedGuardConfig,
     /// Cost charged on weight turnover in the live allocator tournament (bps).
     pub tournament_cost_bps: f64,
+    /// Execution-algorithm choice per intent (spec 40 §6.4).
+    pub exec: ExecPolicy,
+    /// Snapshot-scoped model-drift alarm (spec 40 §6.5).
+    pub model_drift: ModelDriftSettings,
+    /// Daily payout quota rule (spec 42 §10 Q1, `fa_ledger::payout`); default reserves nothing.
+    pub payout: fa_ledger::payout::PayoutRule,
+}
+
+/// `[model_drift]`: the risk-engine raises `model:<snapshot>` when a served snapshot's region
+/// occupancy drifts far beyond the adapter-refit trigger (spec 33: KL > 0.1 × 3 requests a
+/// refit); only the strategies of that snapshot's timescale are paused.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelDriftSettings {
+    pub enabled: bool,
+    /// `drift_kl` at or above this for `sustain` consecutive kernel updates raises the halt.
+    pub halt_kl: f64,
+    pub sustain: u32,
+    /// Every expert at or below this for `clear_sustain` updates clears a halt this path raised.
+    pub clear_kl: f64,
+    pub clear_sustain: u32,
+}
+
+impl Default for ModelDriftSettings {
+    fn default() -> Self {
+        Self { enabled: true, halt_kl: 1.0, sustain: 5, clear_kl: 0.25, clear_sustain: 10 }
+    }
 }
 
 impl Default for Settings {
@@ -94,6 +123,9 @@ impl Default for Settings {
             holdout: HoldoutSettings::default(),
             feed: FeedGuardConfig::default(),
             tournament_cost_bps: 5.0,
+            exec: ExecPolicy::default(),
+            model_drift: ModelDriftSettings::default(),
+            payout: fa_ledger::payout::PayoutRule::default(),
         }
     }
 }
@@ -196,6 +228,8 @@ pub enum SettingsError {
     Allocator(String),
     #[error("new_strategy_status `{0}` must be active or shadow")]
     NewStatus(String),
+    #[error("{0}")]
+    Payout(String),
     #[error("holdout timescale `{0}` is not one of 1s | 1m | 1h | 1d | 1w")]
     Timescale(String),
 }
@@ -220,6 +254,7 @@ impl Settings {
         if let Some(t) = self.holdout.timescales.iter().find(|t| t.parse::<Timescale>().is_err()) {
             return Err(SettingsError::Timescale(t.clone()));
         }
+        self.payout.validate().map_err(SettingsError::Payout)?;
         Ok(())
     }
 }
@@ -241,6 +276,8 @@ mod tests {
         assert!(matches!(Settings::parse("mode = 'live'"), Err(SettingsError::Mode(_))));
         assert!(matches!(Settings::parse("allocator = 'evolved'"), Err(SettingsError::Allocator(_))));
         assert!(matches!(Settings::parse("new_strategy_status = 'live'"), Err(SettingsError::NewStatus(_))));
+        assert_eq!(s.payout, fa_ledger::payout::PayoutRule::default(), "no payout reserved by default");
+        assert!(matches!(Settings::parse("[payout]\npct = 1.5"), Err(SettingsError::Payout(_))));
         assert_eq!(s.new_strategy_status, "active");
         assert_eq!((s.promotion.min_shadow_days, s.promotion.min_horizons), (30.0, 20));
         assert_eq!(
@@ -259,5 +296,9 @@ mod tests {
         assert_eq!((s.feed.stale_freeze_bars, s.feed.stale_flatten_secs, s.feed.jump_max), (3.0, 0.0, 0.15));
         assert!(matches!(Settings::parse("[holdout]\ntimescales = ['5s']"), Err(SettingsError::Timescale(_))));
         assert!(Settings::parse("allocator = 'thompson_rp'").is_ok());
+        assert_eq!(s.limits.short_margin, fa_risk::default_short_margin(), "risk.toml repeats the default schedule");
+        assert_eq!(s.limits.short_margin_budget_frac, 0.5);
+        assert_eq!(s.exec, fa_risk::exec::ExecPolicy::default());
+        assert_eq!(s.model_drift, ModelDriftSettings::default());
     }
 }

@@ -117,6 +117,12 @@ type Summary struct {
 	VaryJobID    string          `json:"vary_job_id,omitempty"`
 	// Latest trial-registry statistics of this generation (spec 41 §6.5), when a worker has a registry.
 	Validation *ValidationStats `json:"validation,omitempty"`
+	// Per-loop GPU budget accounting (spec 34 §6.4).
+	Budget *Budget `json:"budget,omitempty"`
+	// Cross-asset pair genomes (latent.crossprior) seeded into this loop's population.
+	PairsSeeded int `json:"pairs_seeded,omitempty"`
+	// Genomes of this rung that were sent a warm-start bundle (neural decoders).
+	WarmStarted int `json:"warm_started,omitempty"`
 	// Garage key of the promoted population file (`fa-artifacts/strategies/<generation>.toml`),
 	// set on the final summary of a strategy generation (spec 35 §6.4).
 	ArtifactKey string `json:"artifact_key,omitempty"`
@@ -147,6 +153,11 @@ type GenerationConfig struct {
 	OnSummary func(Summary)
 	// Promote is called with the final front when the generation ends (may be nil).
 	Promote Promote
+	// PairProposals returns up to n MCMC cross-asset pairs (latent.crossprior) to seed as
+	// `nn_forecast` src→target genomes at the start of every loop (decoder kinds only; may be nil).
+	PairProposals func(n int) []PairProposal
+	// MaxPairs caps the pair genomes added per loop (spec 34 §7 rnn_pairs_from_mcmc).
+	MaxPairs int
 }
 
 // Generation runs successive halving over a population and, when MaxGenerations > 1,
@@ -179,7 +190,14 @@ type Generation struct {
 	deferred   bool
 	stopped    bool
 	validation *ValidationStats
-	Summaries  []Summary
+	// weights: genome → Garage ref of its latest trained bundle (neural decoders); warm: genome →
+	// the bundle its next evaluation warm-starts from (own previous rung, or its parent's).
+	weights     map[string]string
+	warm        map[string]string
+	budget      Budget
+	pairsSeeded int
+	rungWarm    int // eval jobs of the current rung sent with a warm-start bundle
+	Summaries   []Summary
 }
 
 // NewGeneration plans rungs for the given genomes.
@@ -191,6 +209,12 @@ func NewGeneration(kind, snapshotID string, genomes []string, eta int, minBudget
 
 // NewGenerationWith plans the first halving from a full config.
 func NewGenerationWith(c GenerationConfig) (*Generation, error) {
+	pairs := 0
+	if c.PairProposals != nil && c.MaxPairs > 0 && strings.HasSuffix(c.Kind, ".decoder") {
+		extra := PairGenomes(c.PairProposals(c.MaxPairs), c.Genomes)
+		c.Genomes = append(append([]string(nil), c.Genomes...), extra...)
+		pairs = len(extra)
+	}
 	rungs := Plan(len(c.Genomes), c.Eta, c.MinBudgetMs, c.MaxBudgetMs)
 	if len(rungs) == 0 {
 		return nil, fmt.Errorf("invalid: empty plan for %d genomes", len(c.Genomes))
@@ -204,6 +228,8 @@ func NewGenerationWith(c GenerationConfig) (*Generation, error) {
 		Priority: uint32(EvolutionEval), cfg: c, eta: max(c.Eta, 2), popSize: len(c.Genomes), rungs: rungs,
 		pending: map[string]*fav1.Job{}, best: map[string]Candidate{},
 		alive: append([]string(nil), c.Genomes...), started: now, loopStart: now,
+		weights: map[string]string{}, warm: map[string]string{}, pairsSeeded: pairs,
+		budget: Budget{TotalMs: c.TotalBudgetMs, PlannedMs: TotalBudget(rungs)},
 	}, nil
 }
 
@@ -223,8 +249,29 @@ func (g *Generation) evalSpec(genome string) []byte {
 	if g.cfg.DataWindowHours > 0 {
 		spec["data_window"] = map[string]any{"hours": g.cfg.DataWindowHours}
 	}
+	if strings.HasSuffix(g.Kind, ".decoder") && isNeural(genome) {
+		// spec 34 §6.2 step 3: children inherit their parent's weights, a survivor continues from
+		// its previous rung's bundle (rung checkpoint)
+		if ref := g.warm[genome]; ref != "" {
+			spec["warm_start"] = ref
+		}
+		// step 4: rung r of R trains η^-(R−1−r) of the genome's SGD steps (full fidelity last)
+		if n := len(g.rungs); n > 1 {
+			spec["train_steps_fraction"] = math.Pow(float64(g.eta), -float64(n-1-g.rung))
+		}
+	}
 	b, _ := json.Marshal(spec)
 	return b
+}
+
+// overBudgetLocked reports whether running the next rung (survivors × its per-candidate budget)
+// would take this loop beyond its total budget by more than 10 % (spec 34 §9 criterion 3).
+func (g *Generation) overBudgetLocked(survivors int) bool {
+	if g.cfg.TotalBudgetMs == 0 || g.rung+1 >= len(g.rungs) {
+		return false
+	}
+	next := uint64(survivors) * g.rungs[g.rung+1].BudgetMs
+	return float64(g.budget.LoopUsedMs+next) > 1.1*float64(g.cfg.TotalBudgetMs)
 }
 
 func (g *Generation) submitRungLocked(pub PublishJob) error {
@@ -235,7 +282,11 @@ func (g *Generation) submitRungLocked(pub PublishJob) error {
 	g.deferred = false
 	r := g.rungs[g.rung]
 	g.scores = nil
+	g.rungWarm = 0
 	for i, genome := range g.alive {
+		if strings.HasSuffix(g.Kind, ".decoder") && isNeural(genome) && g.warm[genome] != "" {
+			g.rungWarm++
+		}
 		job := &fav1.Job{
 			JobId: ulid.Make().String(), Kind: g.Kind, ParentJobId: g.ID, Priority: g.Priority,
 			SnapshotId: g.SnapshotID, GenomeId: genome, BudgetGpuMs: r.BudgetMs, Spec: g.evalSpec(genome),
@@ -379,6 +430,8 @@ func (g *Generation) OnResult(r *fav1.JobResult, pub PublishJob) (bool, error) {
 	if !ok {
 		return g.done, nil
 	}
+	g.budget.LoopUsedMs += r.UsedGpuMs
+	g.budget.UsedMs += r.UsedGpuMs
 	if r.Status == fav1.JobResult_STATUS_PREEMPTED {
 		job.CheckpointRef = r.CheckpointRef
 		return false, pub(bus.Jobs(job.Kind), job.JobId+"-"+r.CheckpointRef, job)
@@ -388,6 +441,10 @@ func (g *Generation) OnResult(r *fav1.JobResult, pub PublishJob) (bool, error) {
 		return g.onVaryLocked(r, pub)
 	}
 	c := CandidateOf(job.GenomeId, r)
+	if ref := weightsRefOf(r); ref != "" {
+		g.weights[c.ID] = ref
+		g.warm[c.ID] = ref // the next rung continues from this bundle
+	}
 	g.scores = append(g.scores, c)
 	g.best[c.ID] = c
 	if v := validationOf(r); v != nil {
@@ -397,7 +454,17 @@ func (g *Generation) OnResult(r *fav1.JobResult, pub PublishJob) (bool, error) {
 		return false, nil
 	}
 	final := g.rung == len(g.rungs)-1
+	truncated := false
+	if !final && g.overBudgetLocked((len(g.scores)+g.eta-1)/g.eta) {
+		// the next rung would overrun the loop budget: end the loop here with partial results
+		final, truncated = true, true
+		g.budget.Truncated = true
+		g.budget.Truncations++
+	}
 	s := g.summaryLocked(final)
+	if truncated {
+		s.Note = fmt.Sprintf("budget: %d of %d ms used, rungs %d..%d truncated", g.budget.LoopUsedMs, g.cfg.TotalBudgetMs, g.rung+1, len(g.rungs)-1)
+	}
 	if !final {
 		survivors := Halve(g.scores, g.eta)
 		g.alive = g.alive[:0]
@@ -455,7 +522,7 @@ func (g *Generation) OnResult(r *fav1.JobResult, pub PublishJob) (bool, error) {
 	spec := map[string]any{
 		"protocol":   "evo.vary.decoder/v0",
 		"parents":    parents,
-		"n_children": max(0, g.popSize-len(g.elites)),
+		"n_children": max(0, g.popSize-g.pairsSeeded-len(g.elites)), // pairs are re-proposed, not bred into the size
 		"seed":       g.Seed + uint64(g.genIndex+1)*7_919,
 		"generation": g.genIndex + 1,
 	}
@@ -495,16 +562,40 @@ func (g *Generation) onVaryLocked(r *fav1.JobResult, pub PublishJob) (bool, erro
 		return true, fmt.Errorf("variation result unusable (%v, %d children); generation %s stops after loop %d", err, len(v.Children), g.ID, g.genIndex)
 	}
 	g.alive = g.alive[:0]
+	warm := map[string]string{}
+	weights := map[string]string{}
 	for _, e := range g.elites {
 		g.alive = append(g.alive, e.ID)
+		if ref := g.weights[e.ID]; ref != "" {
+			warm[e.ID], weights[e.ID] = ref, ref // elites are re-fine-tuned from their own bundle (§6.6)
+		}
+	}
+	// children warm-start from the first parent that has a bundle (§6.2 step 3)
+	lineage := lineageOf(r)
+	for _, c := range v.Children {
+		for _, p := range lineage[c] {
+			if ref := g.weights[p]; ref != "" {
+				warm[c] = ref
+				break
+			}
+		}
 	}
 	g.alive = append(g.alive, v.Children...)
+	// §6.2 step 1: MCMC-proposed cross-asset pairs join every loop's population
+	g.pairsSeeded = 0
+	if g.cfg.PairProposals != nil && g.cfg.MaxPairs > 0 && strings.HasSuffix(g.Kind, ".decoder") {
+		extra := PairGenomes(g.cfg.PairProposals(g.cfg.MaxPairs), g.alive)
+		g.alive = append(g.alive, extra...)
+		g.pairsSeeded = len(extra)
+	}
+	g.warm, g.weights = warm, weights
 	g.popSize = len(g.alive)
 	g.genIndex++
 	g.rung = 0
 	g.best = map[string]Candidate{}
 	g.loopStart = time.Now()
 	g.rungs = Plan(len(g.alive), g.eta, g.cfg.MinBudgetMs, g.cfg.MaxBudgetMs)
+	g.budget.LoopUsedMs, g.budget.Truncated, g.budget.PlannedMs = 0, false, TotalBudget(g.rungs)
 	return false, g.submitRungLocked(pub)
 }
 
@@ -526,6 +617,12 @@ func (g *Generation) summaryLocked(final bool) Summary {
 	if len(fronts) > 0 {
 		s.ParetoFront = fronts[0]
 	}
+	b := g.budget
+	s.Budget = &b
+	if g.rung == 0 {
+		s.PairsSeeded = g.pairsSeeded
+	}
+	s.WarmStarted = g.rungWarm
 	for _, f := range fronts {
 		s.FrontSizes = append(s.FrontSizes, len(f))
 	}

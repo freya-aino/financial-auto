@@ -37,10 +37,7 @@ use fa_decoders::{
         feedback::{self, EliteCard},
     },
 };
-use fa_proto::{
-    Message,
-    v1::{self, DecoderOutput, Envelope, Job, JobResult, envelope::Payload, job_result::Status},
-};
+use fa_proto::v1::{self, DecoderOutput, Job, JobResult, job_result::Status};
 use serde_json::{Value, json};
 
 use crate::{
@@ -100,21 +97,20 @@ pub fn family_score(genome: &DecoderGenome, obj: &[(String, f64)]) -> f64 {
     obj.iter().find(|(k, _)| k == key).map_or(0.0, |(_, v)| *v)
 }
 
-/// `TextTimeline` from recorded `news.item.*` envelopes (knowledge time = JetStream receive time).
-pub fn timeline_of(msgs: &[fa_bus::replay::RecordedMessage]) -> (TextTimeline, usize) {
-    let mut t = TextTimeline::new();
-    let mut bad = 0;
-    for m in msgs {
-        match Envelope::decode(m.payload.as_slice()) {
-            Ok(env) => match env.payload {
-                Some(Payload::News(n)) => t.push(m.published_ms, &n.title, &n.body),
-                _ => bad += 1,
-            },
-            Err(_) => bad += 1,
-        }
-    }
-    t.finish();
-    (t, bad)
+/// `TextTimeline` from recorded `news.item.*` envelopes, items tagged with the instruments
+/// `index` matches (see [`crate::news`]).
+pub fn timeline_of(
+    msgs: &[fa_bus::replay::RecordedMessage],
+    index: &fa_decoders::text_baseline::InstrumentIndex,
+) -> (TextTimeline, usize) {
+    crate::news::timeline_of(msgs, index)
+}
+
+/// Successive-halving share of the genome's SGD steps for this rung (`train_steps_fraction` in
+/// the eval envelope, `(0, 1]`; spec 34 §6.2 step 4: rung `r` of `R` trains `η^-(R−1−r)` of them).
+pub fn steps_fraction(job: &Job) -> Option<f64> {
+    let v: Value = serde_json::from_slice(&job.spec).ok()?;
+    v.get("train_steps_fraction").and_then(Value::as_f64).filter(|f| *f > 0.0 && *f <= 1.0)
 }
 
 /// Optional `warm_start` (`"<bucket>/<key>"`) of an eval envelope.
@@ -198,8 +194,11 @@ impl Worker {
             .await;
             match read {
                 Ok(Ok(msgs)) => {
-                    let (t, bad) = timeline_of(&msgs);
-                    let block = json!({"source": "TEXT", "messages": msgs.len(), "items": t.len(), "undecodable": bad, "from_ms": from});
+                    let index = self.news_refs.index();
+                    let (t, bad) = timeline_of(&msgs, &index);
+                    let block = json!({"source": "TEXT", "messages": msgs.len(), "items": t.len(), "matched": t.matched(),
+                                       "reference_instruments": index.len(), "scope": if genome.nn.news_inst { "instrument" } else { "market" },
+                                       "undecodable": bad, "from_ms": from});
                     (t, block)
                 }
                 Ok(Err(e)) => (TextTimeline::new(), json!({"source": "TEXT", "error": e.to_string()})),
@@ -209,7 +208,10 @@ impl Worker {
             (TextTimeline::new(), Value::Null)
         };
         let warm_ref = warm_start_ref(job);
-        let warm = match (&warm_ref, &self.blob) {
+        let train_steps = steps_fraction(job).map(|f| ((genome.nn.steps as f64 * f).ceil() as usize).max(1));
+        let cost_bps: Vec<f64> =
+            series.iter().map(|s| crate::news::trade_cost_bp(&self.cost, crate::news::venue_of(&venues, &s.instrument_id), s)).collect();
+        let warm: Option<Vec<u8>> = match (&warm_ref, &self.blob) {
             (Some(r), Some(blob)) => match object_key(r) {
                 Some(k) => match blob.get(&k).await {
                     Ok(b) => Some(b),
@@ -223,6 +225,8 @@ impl Worker {
             _ => None,
         };
 
+        let warm_loaded = warm.is_some();
+
         // train + evaluate (blocking)
         run.start_budget();
         run.progress(0.05, format!("training {} on {} series", genome.family.as_str(), series.len())).await;
@@ -231,6 +235,7 @@ impl Worker {
             let run = run.clone();
             let ctx = ctx.clone();
             let train_budget = Duration::from_millis((budget_ms as f64 * TRAIN_BUDGET_SHARE) as u64);
+            let cost_bps = cost_bps.clone();
             tokio::task::spawn_blocking(move || -> Result<Trained, String> {
                 let t0 = Instant::now();
                 let stop_run = run.clone();
@@ -242,6 +247,7 @@ impl Worker {
                             || t0.elapsed() > train_budget
                     })),
                     warm_start: warm,
+                    steps: train_steps,
                     ..Default::default()
                 };
                 let decoder = neural::train(&genome, &series, ctx, Arc::new(text), &opts).map_err(|e| e.to_string())?;
@@ -255,6 +261,7 @@ impl Worker {
                             should_stop: Some(run.stopper()),
                             on_progress: Some(Box::new(move |done, total| progress(done + total * i, total * n))),
                             progress_every: 64,
+                            cost_bp: cost_bps[i],
                             ..EvalSpec::standard()
                         };
                         reports.push(evaluate(&decoder, s, &spec));
@@ -339,9 +346,10 @@ impl Worker {
         let instruments: Vec<Value> = reports
             .iter()
             .map(|r| {
-                let venue = venues.iter().find(|(i, _)| *i == r.instrument_id).map(|(_, v)| v.as_str()).unwrap_or("");
+                let venue = crate::news::venue_of(&venues, &r.instrument_id);
                 json!({"instrument_id": r.instrument_id, "venue": venue, "n_steps": r.n_series, "n_eval": r.n_eval,
-                       "stop": r.stop, "crps_skill": r.crps_skill, "coverage": r.coverage, "last_ts_ms": r.last_ts_ms})
+                       "stop": r.stop, "crps_skill": r.crps_skill, "coverage": r.coverage, "last_ts_ms": r.last_ts_ms,
+                       "cost_bp": crate::job::eval_inputs_cost(&cost_bps, &reports, &r.instrument_id)})
             })
             .collect();
         let report_key = fa_blob::eval_report(&job.parent_job_id, &job.job_id);
@@ -370,7 +378,10 @@ impl Worker {
                      "instruments": instruments},
             "generation_stats": generation_stats,
             "budget": {"budget_ms": budget_ms, "elapsed_ms": elapsed_ms, "truncated": truncated,
-                       "train_ms": decoder.meta.train.elapsed_ms, "train_interrupted": decoder.meta.train.interrupted},
+                       "train_ms": decoder.meta.train.elapsed_ms, "train_interrupted": decoder.meta.train.interrupted,
+                       "train_steps": train_steps, "train_steps_fraction": steps_fraction(job)},
+            "warm_start": {"ref": warm_ref, "loaded": warm_loaded, "variables": decoder.meta.train.warm_started},
+            "trade_cost": {"model": self.cost.id, "notional_eur": crate::news::TRADE_NOTIONAL_EUR},
             "stop": pooled.as_ref().map_or(json!("complete"), |p| json!(p.stop)),
             "report_ref": {"planned": format!("{}/{}", report_key.bucket, report_key.key), "persisted": self.blob.is_some()},
             "worker_id": self.worker_id,
@@ -522,6 +533,10 @@ mod tests {
     #[test]
     fn news_envelopes_become_a_timeline() {
         use fa_bus::replay::RecordedMessage;
+        use fa_proto::{
+            Message,
+            v1::{Envelope, envelope::Payload},
+        };
         let env = |title: &str| Envelope {
             payload: Some(Payload::News(v1::NewsItem { title: title.into(), ..Default::default() })),
             ..Default::default()
@@ -531,7 +546,7 @@ mod tests {
             RecordedMessage { subject: "news.item.x".into(), stream_seq: 1, published_ms: 1000, payload: env("Shares plunge").encode_to_vec() },
             RecordedMessage { subject: "news.item.x".into(), stream_seq: 3, published_ms: 3000, payload: vec![0xff, 0xff] },
         ];
-        let (t, bad) = timeline_of(&msgs);
+        let (t, bad) = timeline_of(&msgs, &Default::default());
         assert_eq!((t.len(), bad), (2, 1));
         assert_eq!(t.span(), Some((1000, 2000)));
     }

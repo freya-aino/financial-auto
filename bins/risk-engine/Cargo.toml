@@ -19,6 +19,7 @@ fa-blob.workspace = true
 fa-tsdb.workspace = true
 fa-risk.workspace = true
 fa-ledger.workspace = true
+fa-hub.workspace = true
 fa-warehouse.workspace = true
 futures.workspace = true
 reqwest.workspace = true

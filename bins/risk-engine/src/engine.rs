@@ -48,6 +48,7 @@ use fa_proto::{
 use fa_risk::{
     HaltReason, HaltScope, MarketInfo, RiskConfig, RiskEngine,
     calibrate::{Calibration, CalibrationRules},
+    exec::{ExecInputs, choose as choose_exec},
     health::{FeedGuard, FeedState, TradeVerdict},
     pipeline::{Decision, FrontMember},
     pretrade::{OrderCheck, check_order},
@@ -119,6 +120,9 @@ struct Pending {
     instrument: InstrumentId,
     signed_eur: f64,
     created_ms: i64,
+    /// Expected working time of the chosen execution algorithm (0 for market orders): the
+    /// intent keeps counting as position for `pending_ttl_secs` beyond it.
+    working_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,12 +148,20 @@ pub struct RiskRecord {
     equity_history: VecDeque<(i64, f64)>,
     #[serde(default)]
     tournament: BTreeMap<String, fa_allocator::tournament::Record>,
+    /// Snapshot-scoped model-drift halts (`model:<snapshot_id>`).
+    #[serde(default)]
+    model_halts: BTreeMap<String, ActiveHalt>,
 }
 
 impl RiskRecord {
     /// Active halt scopes (for logs).
     pub fn halt_scopes(&self) -> Vec<String> {
-        self.halts.keys().cloned().chain(self.source_halts.keys().map(|s| format!("source:{s}"))).collect()
+        self.halts
+            .keys()
+            .cloned()
+            .chain(self.source_halts.keys().map(|s| format!("source:{s}")))
+            .chain(self.model_halts.keys().map(|s| format!("model:{s}")))
+            .collect()
     }
 }
 
@@ -205,12 +217,11 @@ impl VirtualBook {
 
     /// Applies an attributed share of a fill with the paper book's arithmetic.
     fn apply(&mut self, share: &Fill) {
-        let mut l = Ledger::with_cash(self.cash_eur);
-        l.positions = std::mem::take(&mut self.positions);
-        l.apply_fill(share);
-        self.cash_eur = l.cash_eur;
+        // attributed estimates stay f64 (not reconciled); the paper book itself is exact
+        let px = share.price * share.fx_to_eur;
+        self.cash_eur -= share.quantity * px + share.fee_eur;
         self.fees_eur += share.fee_eur;
-        self.positions = l.positions;
+        self.positions.entry(share.instrument).or_default().apply_f64(share.quantity, px);
         self.positions.retain(|_, p| p.quantity != 0.0 || p.realised_eur != 0.0);
     }
 
@@ -287,7 +298,24 @@ pub struct Engine {
     halts: BTreeMap<HaltScope, ActiveHalt>,
     /// Health halts per source id (`source:<id>`); `HaltScope::Source` is active while non-empty.
     source_halts: BTreeMap<String, ActiveHalt>,
+    /// Model-drift halts per encoder snapshot (`model:<snapshot_id>`, spec 40 §6.5): only the
+    /// strategies depending on that snapshot are paused; a bare `model` halt stays global.
+    model_halts: BTreeMap<String, ActiveHalt>,
+    /// Snapshot id → the timescale it serves (from `latent.mcmc.*` kernel updates).
+    snapshot_ts: BTreeMap<String, Timescale>,
+    /// Consecutive kernel updates above / below the drift thresholds per (snapshot, expert).
+    drift_streak: BTreeMap<(String, u32), (u32, u32)>,
+    /// `ref.contract_spec.shortable` per instrument (absent = unknown).
+    shortable: BTreeMap<InstrumentId, bool>,
+    /// Intents per chosen execution algorithm (heartbeat `exec.algo.<name>`).
+    algo_counts: BTreeMap<String, f64>,
     booked: Vec<BookedFill>,
+    /// Booked fills whose Postgres write is not confirmed yet: id → (fill, booked at, last
+    /// attempt) (spec 42 §6; excluded from reconciliation while young, retried while unconfirmed).
+    unconfirmed: BTreeMap<String, (BookedFill, i64, i64)>,
+    /// Fill events for intents this engine does not know (pending at a restart, evicted); the
+    /// I/O layer recovers the intent from Postgres or parks the fill as an orphan (spec 42 §8).
+    unknown_fills: Vec<OrderEvent>,
     day: Option<i64>,
     day_start_equity: f64,
     // strategy lifecycle (D-051)
@@ -328,6 +356,11 @@ fn parse_horizon(s: &str) -> Horizon {
         (Ok(steps), Ok(timescale)) => Horizon { timescale, steps: steps.max(1) },
         _ => fallback,
     }
+}
+
+/// Timescale suffix of a snapshot id (`stat-v1-1s` → 1s), when it has one.
+fn snapshot_timescale(snapshot: &str) -> Option<Timescale> {
+    snapshot.rsplit(['-', '_', '.', ':']).next().and_then(|t| t.parse().ok())
 }
 
 fn ms_of(t: Option<&Timestamp>) -> Option<i64> {
@@ -373,7 +406,14 @@ impl Engine {
             pending: BTreeMap::new(),
             halts: BTreeMap::new(),
             source_halts: BTreeMap::new(),
+            model_halts: BTreeMap::new(),
+            snapshot_ts: BTreeMap::new(),
+            drift_streak: BTreeMap::new(),
+            shortable: BTreeMap::new(),
+            algo_counts: BTreeMap::new(),
             booked: Vec::new(),
+            unconfirmed: BTreeMap::new(),
+            unknown_fills: Vec::new(),
             day: None,
             day_start_equity: cash,
             strategies: BTreeMap::new(),
@@ -549,6 +589,82 @@ impl Engine {
     }
 
     /// Venue → gross EUR exposure of the current book (heartbeat counters).
+    /// Limit headroom gauges (spec 60 §6.5 "limit headroom"): distance to every hard limit in
+    /// its own unit — fractions for drawdown / daily loss, EUR for the caps — plus the intents per
+    /// execution algorithm. Negative = in breach (the clip or halt is acting).
+    pub fn headroom(&self, now_ms: i64) -> Vec<(String, f64)> {
+        let cfg = &self.risk.cfg;
+        let equity = self.equity();
+        let deployable = self.risk.deployable(equity);
+        let peak = self.risk.peak_equity();
+        let dd = if peak > 0.0 { (1.0 - equity / peak).max(0.0) } else { 0.0 };
+        let day = self.risk.day_start_equity();
+        let dl = if day > 0.0 { (1.0 - equity / day).max(0.0) } else { 0.0 };
+        let current = self.current_eur();
+        let gross: f64 = current.values().map(|v| v.abs()).sum();
+        let mut out = vec![
+            ("headroom.drawdown".to_owned(), cfg.max_drawdown - dd),
+            ("headroom.daily_loss".to_owned(), cfg.max_daily_loss - dl),
+            ("headroom.gross_eur".to_owned(), cfg.portfolio_gross_cap * deployable - gross),
+            (
+                "headroom.short_margin_eur".to_owned(),
+                cfg.short_margin_budget_frac * deployable - self.short_margin_used(&current, now_ms),
+            ),
+        ];
+        let mut by_class: BTreeMap<String, (f64, f64)> = BTreeMap::new();
+        let mut by_venue: BTreeMap<String, f64> = BTreeMap::new();
+        let mut pos_min = f64::INFINITY;
+        for (i, v) in &current {
+            let m = self.market_info(*i, now_ms);
+            let cap = if m.provisional { cfg.provisional_position_frac() } else { cfg.max_position_frac } * deployable;
+            pos_min = pos_min.min(cap.min(cfg.liquidity_k * m.horizon_volume_eur) - v.abs());
+            let class_cap =
+                cfg.leverage_cap.get(&m.asset_class).copied().unwrap_or(0.0).min(cfg.max_class_frac) * deployable;
+            let e = by_class.entry(format!("{:?}", m.asset_class).to_lowercase()).or_insert((class_cap, 0.0));
+            e.1 += v.abs();
+            let venue = if m.venue.is_empty() { "unknown".to_owned() } else { m.venue.clone() };
+            *by_venue.entry(venue).or_insert(0.0) += v.abs();
+        }
+        if pos_min.is_finite() {
+            out.push(("headroom.position_min_eur".to_owned(), pos_min));
+        }
+        for (c, (cap, g)) in by_class {
+            out.push((format!("headroom.class.{c}_eur"), cap - g));
+        }
+        for (v, g) in by_venue {
+            out.push((format!("headroom.venue.{v}_eur"), cfg.max_venue_frac * deployable - g));
+        }
+        for (name, n) in &self.algo_counts {
+            out.push((format!("exec.algo.{name}"), *n));
+        }
+        out.push(("halts.model_snapshots".to_owned(), self.model_halts.len() as f64));
+        out
+    }
+
+    /// Seeds the hourly per-instrument mark history behind the limit calibration from stored
+    /// hourly closes (VictoriaMetrics), so `calibrate` works right after a restart. Only
+    /// instruments without in-memory history are seeded.
+    /// Points are `(ms, price in the quote currency)`, converted to EUR as of their time like
+    /// live marks (a seeded USD series must not meet live EUR marks with an FX jump).
+    pub fn seed_hourly_marks(&mut self, series: BTreeMap<InstrumentId, Vec<(i64, f64)>>) -> usize {
+        let mut n = 0;
+        for (i, pts) in series {
+            if self.hourly_marks.get(&i).is_some_and(|q| !q.is_empty()) {
+                continue;
+            }
+            let pts: Vec<f64> = pts
+                .into_iter()
+                .filter(|(_, p)| p.is_finite() && *p > 0.0)
+                .map(|(t, p)| p * self.fx_for(&i, t).rate_to_eur)
+                .collect();
+            let q = self.hourly_marks.entry(i).or_default();
+            q.extend(&pts[pts.len().saturating_sub(MAX_CALIBRATION_POINTS)..]);
+            n += 1;
+        }
+        self.counters.insert("calibration.seeded_instruments", n as f64);
+        n
+    }
+
     pub fn exposure_by_venue(&self) -> BTreeMap<String, f64> {
         self.exposure_view()["by_venue"]
             .as_object()
@@ -833,7 +949,26 @@ impl Engine {
             venue: r.and_then(|r| r.venue.clone()).unwrap_or_default(),
             horizon_volume_eur: self.horizon_volume_eur(i, now_ms),
             provisional: r.is_some_and(|r| r.provisional()),
+            shortable: self.shortable.get(&i).copied(),
         }
+    }
+
+    /// Replaces the per-instrument shortability (`ref.contract_spec.shortable`, borrow availability).
+    pub fn set_shortable(&mut self, m: BTreeMap<InstrumentId, bool>) {
+        self.counters.insert("refdata.not_shortable", m.values().filter(|v| !**v).count() as f64);
+        self.shortable = m;
+    }
+
+    /// Margin tied up by short positions (book + pending): Σ |short| × class margin.
+    fn short_margin_used(&self, current: &BTreeMap<InstrumentId, f64>, now_ms: i64) -> f64 {
+        current
+            .iter()
+            .filter(|(_, v)| **v < 0.0)
+            .map(|(i, v)| {
+                // a short the rules no longer allow ties up 100 % until covered
+                v.abs() * self.market_info(*i, now_ms).short_margin(&self.risk.cfg).unwrap_or(1.0)
+            })
+            .sum()
     }
 
     /// [`fa_risk::pretrade::check_order`] against the current book, plus the feed guard: a
@@ -864,6 +999,7 @@ impl Engine {
             }
         }
         let deployable = self.risk.deployable(self.equity());
+        let short_margin_used = self.short_margin_used(&current, now_ms);
         let o = OrderCheck {
             quantity: signed_qty,
             limit_price,
@@ -875,6 +1011,7 @@ impl Engine {
             class_gross_eur: class_gross,
             venue_gross_eur: venue_gross,
             portfolio_gross_eur: gross,
+            short_margin_used_eur: short_margin_used,
         };
         check_order(&self.risk.cfg, &o)?;
         let post = position_eur + signed_qty * mark.unwrap_or(0.0);
@@ -925,8 +1062,20 @@ impl Engine {
     /// Books fills into the paper ledger; clears pending state on any terminal event.
     pub fn on_order_event(&mut self, m: &OrderEvent, now_ms: i64) -> Vec<Out> {
         let kind = order_event::Kind::try_from(m.kind).unwrap_or_default();
-        if !matches!(kind, order_event::Kind::Ack) {
-            self.pending.remove(&m.intent_id);
+        match kind {
+            // a working algo order (smart limit, TWAP, VWAP, POV) keeps its remainder pending
+            order_event::Kind::Ack => {}
+            order_event::Kind::PartialFill => {
+                if let Some(p) = self.pending.get_mut(&m.intent_id) {
+                    let px = self.marks.get(&p.instrument).copied().unwrap_or(0.0);
+                    let filled = m.fill_quantity.max(0.0) * px;
+                    p.signed_eur = p.signed_eur.signum() * (p.signed_eur.abs() - filled).max(0.0);
+                    p.created_ms = now_ms; // still working: the TTL counts from the latest child
+                }
+            }
+            _ => {
+                self.pending.remove(&m.intent_id);
+            }
         }
         if !matches!(kind, order_event::Kind::Fill | order_event::Kind::PartialFill) || m.fill_quantity <= 0.0 {
             if matches!(kind, order_event::Kind::Rejected | order_event::Kind::Canceled) {
@@ -936,10 +1085,12 @@ impl Engine {
         }
         let Some(info) = self.intents.get(&m.intent_id).cloned() else {
             self.bump("events.unknown_intent");
+            if self.unknown_fills.len() < 10_000 {
+                self.unknown_fills.push(m.clone());
+            }
             return Vec::new();
         };
-        let fill_id =
-            format!("{}:{}:{}", m.intent_id, m.venue_order_id, ms_of(m.event_time.as_ref()).unwrap_or(now_ms));
+        let fill_id = fill_id_of(m, now_ms);
         let at_ms = ms_of(m.event_time.as_ref()).unwrap_or(now_ms);
         // spec 42 §6: the fill's quote currency → EUR as of the fill time, source recorded
         let fx = self.fx_for(&info.instrument, at_ms);
@@ -974,7 +1125,9 @@ impl Engine {
                 arrival_price: (m.arrival_price > 0.0).then_some(m.arrival_price),
                 slippage_bps: slippage,
             };
-            self.booked.push(BookedFill { fill, strategy_ids: info.strategy_ids.clone(), at_ms, details });
+            let booked = BookedFill { fill, strategy_ids: info.strategy_ids.clone(), at_ms, details };
+            self.unconfirmed.insert(booked.fill.fill_id.clone(), (booked.clone(), now_ms, now_ms));
+            self.booked.push(booked);
             out.extend(self.update_fx_halt(now_ms));
         }
         out.extend(self.check_equity(now_ms));
@@ -1016,8 +1169,14 @@ impl Engine {
             since_ms: ms_of(h.since.as_ref()).unwrap_or(now_ms),
             manual: h.manual,
         };
-        self.risk.halt(scope, reason);
         self.risk_dirty = true;
+        if let Some(snap) = Self::model_qualifier(scope, &h.scope) {
+            // spec 40 §6.5: a drift alarm on a snapshot pauses the strategies depending on it only
+            self.model_halts.entry(snap).or_insert(active);
+            self.bump("halts.received");
+            return;
+        }
+        self.risk.halt(scope, reason);
         if scope == HaltScope::Source {
             let id = h.scope.split_once(':').map_or(ANY_SOURCE, |(_, id)| id).to_owned();
             self.source_halts.entry(id).or_insert(active);
@@ -1070,12 +1229,31 @@ impl Engine {
         self.bump("resumes");
     }
 
+    /// `model:<snapshot>` (not `model` / `model:*`) is a snapshot-scoped drift halt.
+    fn model_qualifier(scope: HaltScope, raw: &str) -> Option<String> {
+        if scope != HaltScope::Model {
+            return None;
+        }
+        raw.split_once(':').map(|(_, id)| id.trim().to_owned()).filter(|id| !id.is_empty() && id != ANY_SOURCE)
+    }
+
     /// `risk.resume.<scope>` (D-030): manual re-arm. `source:<id>` clears one source, bare
-    /// `source` clears them all.
+    /// `source` clears them all; `model:<snapshot>` clears one snapshot's drift halt, bare `model`
+    /// clears the global model halt and every snapshot halt.
     pub fn on_resume(&mut self, scope: &str) {
         let Some(parsed) = HaltScope::parse(scope) else {
             return;
         };
+        if let Some(snap) = Self::model_qualifier(parsed, scope) {
+            if self.model_halts.remove(&snap).is_some() {
+                self.risk_dirty = true;
+                self.bump("resumes");
+            }
+            return;
+        }
+        if parsed == HaltScope::Model {
+            self.model_halts.clear();
+        }
         if parsed == HaltScope::Source {
             let id = scope.split_once(':').map_or(ANY_SOURCE, |(_, id)| id).to_owned();
             self.clear_source(&id);
@@ -1094,6 +1272,7 @@ impl Engine {
     /// Any health halt (source / model / broker) is active (promotion gate item 5).
     fn health_halted(&self) -> bool {
         !self.source_halts.is_empty()
+            || !self.model_halts.is_empty()
             || self.halts.contains_key(&HaltScope::Model)
             || self.halts.contains_key(&HaltScope::Broker)
     }
@@ -1436,6 +1615,98 @@ impl Engine {
         if elapsed < window { sum * window / elapsed } else { sum }
     }
 
+    /// Traded notional within the volume window and the window's effective length (seconds).
+    fn window_volume(&self, inst: InstrumentId, now_ms: i64) -> (f64, f64) {
+        let Some(v) = self.volume.get(&inst) else {
+            return (0.0, 0.0);
+        };
+        let window = self.settings.volume_window_secs as f64;
+        let elapsed = (now_ms - self.first_seen_ms.get(&inst).copied().unwrap_or(now_ms)).max(1000) as f64 / 1000.0;
+        (v.iter().map(|(_, e)| e).sum(), elapsed.min(window))
+    }
+
+    /// Timescales whose strategies are paused by snapshot-scoped model halts: `None` when no such
+    /// halt is active, an empty set when a halted snapshot's timescale is unknown (then every
+    /// strategy is paused — the conservative reading of "strategies depending on the snapshot").
+    fn model_paused_timescales(&self) -> Option<BTreeSet<Timescale>> {
+        if self.model_halts.is_empty() {
+            return None;
+        }
+        let mut out = BTreeSet::new();
+        for snap in self.model_halts.keys() {
+            match self.snapshot_ts.get(snap).copied().or_else(|| snapshot_timescale(snap)) {
+                Some(ts) => {
+                    out.insert(ts);
+                }
+                None => return Some(BTreeSet::new()),
+            }
+        }
+        Some(out)
+    }
+
+    /// A `latent.mcmc.<ts>.<expert>` kernel update: learns which timescale a snapshot serves and
+    /// runs the model-drift alarm (spec 40 §6.5): `drift_kl ≥ model_drift.halt_kl` for
+    /// `sustain` consecutive updates of any expert raises the snapshot-scoped halt
+    /// `model:<snapshot>` (non-manual); `≤ clear_kl` for `clear_sustain` updates of every expert
+    /// that raised it clears a halt this path raised (never a manual or bus one).
+    pub fn on_kernel_update(
+        &mut self,
+        snapshot: &str,
+        ts: Timescale,
+        expert: u32,
+        drift_kl: f64,
+        now_ms: i64,
+    ) -> Vec<Out> {
+        if snapshot.is_empty() {
+            return Vec::new();
+        }
+        self.snapshot_ts.insert(snapshot.to_owned(), ts);
+        let cfg = self.settings.model_drift.clone();
+        if !cfg.enabled || !drift_kl.is_finite() {
+            return Vec::new();
+        }
+        let streak = self.drift_streak.entry((snapshot.to_owned(), expert)).or_default();
+        if drift_kl >= cfg.halt_kl {
+            *streak = (streak.0 + 1, 0);
+        } else if drift_kl <= cfg.clear_kl {
+            *streak = (0, streak.1 + 1);
+        } else {
+            *streak = (0, 0);
+        }
+        let (high, _) = *streak;
+        self.counters.insert(
+            "model_drift.max_kl",
+            drift_kl.max(self.counters.get("model_drift.max_kl").copied().unwrap_or(0.0)),
+        );
+        let scope = format!("model:{snapshot}");
+        if high >= cfg.sustain && !self.model_halts.contains_key(snapshot) {
+            let reason = format!(
+                "model drift: {snapshot} expert {expert} occupancy KL {drift_kl:.3} ≥ {} for {high} kernel updates",
+                cfg.halt_kl
+            );
+            self.model_halts
+                .insert(snapshot.to_owned(), ActiveHalt { reason: reason.clone(), since_ms: now_ms, manual: false });
+            self.risk_dirty = true;
+            self.bump("halts.raised");
+            return vec![Out::Halt(Halt { scope, reason, since: Some(ts_of(now_ms)), manual: false })];
+        }
+        let raised_here =
+            self.model_halts.get(snapshot).is_some_and(|h| !h.manual && h.reason.starts_with("model drift:"));
+        let all_clear = self
+            .drift_streak
+            .iter()
+            .filter(|((s, _), _)| s == snapshot)
+            .all(|(_, (h, l))| *h == 0 && *l >= cfg.clear_sustain);
+        if raised_here && all_clear {
+            self.model_halts.remove(snapshot);
+            self.risk_dirty = true;
+            self.bump("resumes");
+            let reason = format!("model drift on {snapshot} back below KL {}", cfg.clear_kl);
+            return vec![Out::Resume(Halt { scope, reason, since: Some(ts_of(now_ms)), manual: false })];
+        }
+        Vec::new()
+    }
+
     /// Positions in EUR (book + pending intents).
     fn current_eur(&self) -> BTreeMap<InstrumentId, f64> {
         let mut cur: BTreeMap<InstrumentId, f64> = self
@@ -1488,14 +1759,25 @@ impl Engine {
         self.record_hour(now_ms, equity);
         let ttl = self.settings.signal_ttl_secs as i64 * 1000;
         self.signals.retain(|_, (_, seen)| now_ms - *seen <= ttl);
-        self.pending.retain(|_, p| now_ms - p.created_ms <= self.settings.pending_ttl_secs as i64 * 1000);
-        // only active strategies are allocated; paused / flattening / shadow contribute nothing
+        let ttl_ms = self.settings.pending_ttl_secs as i64 * 1000;
+        self.pending.retain(|_, p| now_ms - p.created_ms <= ttl_ms + p.working_ms);
+        // only active strategies are allocated; paused / flattening / shadow contribute nothing,
+        // nor do strategies whose encoder snapshot is under a model-drift halt (spec 40 §6.5)
+        let paused_ts = self.model_paused_timescales();
         let dists: Vec<ExposureDistribution> = self
             .signals
             .values()
             .filter(|(d, _)| self.strategies.get(&d.strategy_id).is_some_and(|s| s.status.allocates()))
+            .filter(|(d, _)| !paused_ts.as_ref().is_some_and(|p| p.is_empty() || p.contains(&d.horizon.timescale)))
             .map(|(d, _)| d.clone())
             .collect();
+        let model_paused = self
+            .signals
+            .values()
+            .filter(|(d, _)| self.strategies.get(&d.strategy_id).is_some_and(|s| s.status.allocates()))
+            .count()
+            - dists.len();
+        self.counters.insert("model_halt.paused_strategies", model_paused as f64);
         let stats = self.perf.stats_for(dists.iter().map(|d| d.strategy_id.as_str()));
         let mut alloc = self.allocator.allocate(&stats);
         // spec 40 §8: NaN / negative / over-allocated weights → previous allocation + risk event
@@ -1634,6 +1916,24 @@ impl Engine {
                 .map(|d| d.strategy_id.clone())
                 .collect()
         };
+        // urgent orders (spec 40 §6.4 "kill switch, flatten") cross the spread: any halt in force,
+        // or an instrument held by a strategy being flattened
+        let halt_urgent = !self.risk.trading_allowed();
+        let flattening_insts: BTreeSet<InstrumentId> = self
+            .strategies
+            .iter()
+            .filter(|(_, s)| s.status == StrategyStatus::Flattening)
+            .flat_map(|(id, _)| {
+                let book =
+                    self.books.get(id).map(|b| b.positions.keys().copied().collect::<Vec<_>>()).unwrap_or_default();
+                let sig = self
+                    .signals
+                    .get(id)
+                    .map(|(d, _)| d.exposures.iter().map(|e| e.instrument).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                book.into_iter().chain(sig)
+            })
+            .collect();
         for (inst, target) in gated {
             let Some(mark) = self.marks.get(&inst).copied() else {
                 continue;
@@ -1645,13 +1945,35 @@ impl Engine {
                 continue;
             }
             let intent_id = ulid::Ulid::generate().to_string();
+            // spec 40 §6.4: algorithm from urgency, horizon and size vs traded volume
+            let urgent = halt_urgent
+                || flattening_insts.contains(&inst)
+                || self.feed.state(&inst, now_ms, bar_ms.get(&inst).copied()) == FeedState::Flatten;
+            let horizon_secs = dists
+                .iter()
+                .filter(|d| d.exposures.iter().any(|e| e.instrument == inst && e.mean != 0.0))
+                .map(|d| d.horizon.duration().as_secs_f64())
+                .fold(f64::INFINITY, f64::min);
+            let (window_volume_eur, window_secs) = self.window_volume(inst, now_ms);
+            let choice = choose_exec(
+                &self.settings.exec,
+                &ExecInputs {
+                    notional_eur: delta.abs(),
+                    horizon_secs: if horizon_secs.is_finite() { horizon_secs } else { 0.0 },
+                    window_volume_eur,
+                    window_secs,
+                    urgent,
+                    volume_profile: self.first_seen_ms.get(&inst).is_some_and(|t| now_ms - t >= MS_PER_DAY),
+                },
+            );
+            *self.algo_counts.entry(choice.name().to_owned()).or_insert(0.0) += 1.0;
             let intent = OrderIntent {
                 intent_id: intent_id.clone(),
                 account_id: self.settings.account.clone(),
                 instrument_id: inst.to_string(),
                 side: if delta > 0.0 { Side::Buy } else { Side::Sell } as i32,
                 quantity: delta.abs() / mark,
-                exec_algo: "market".into(),
+                exec_algo: choice.algo.clone(),
                 limit_price: None,
                 mode: TradingMode::Paper as i32, // never anything else (D-029)
                 strategy_ids: if target == 0.0 { Vec::new() } else { contributors(inst) },
@@ -1667,7 +1989,15 @@ impl Engine {
                     strategy_ids: intent.strategy_ids.clone(),
                 },
             );
-            self.pending.insert(intent_id, Pending { instrument: inst, signed_eur: delta, created_ms: now_ms });
+            self.pending.insert(
+                intent_id,
+                Pending {
+                    instrument: inst,
+                    signed_eur: delta,
+                    created_ms: now_ms,
+                    working_ms: (choice.working_secs * 1000.0) as i64,
+                },
+            );
             self.bump("intents.ours");
             out.push(Out::Intent(intent.clone()));
             out.push(Out::Approved(intent));
@@ -1798,6 +2128,7 @@ impl Engine {
                         (if id == ANY_SOURCE { "source".to_owned() } else { format!("source:{id}") }, h)
                     }),
                 )
+                .chain(self.model_halts.iter().map(|(id, h)| (format!("model:{id}"), h)))
                 .map(|(scope, h)| Halt {
                     scope,
                     reason: h.reason.clone(),
@@ -2029,6 +2360,7 @@ impl Engine {
             day_start_equity: self.day_start_equity,
             equity_history: self.equity_history.clone(),
             tournament: self.tournament.records(),
+            model_halts: self.model_halts.clone(),
         }
     }
 
@@ -2041,6 +2373,7 @@ impl Engine {
         self.risk.cfg = cfg; // the payout reserve is re-read from the ledger every 30 s
         self.halts = r.halts.into_iter().filter_map(|(k, v)| HaltScope::parse(&k).map(|s| (s, v))).collect();
         self.source_halts = r.source_halts;
+        self.model_halts = r.model_halts;
         self.day = r.day;
         self.day_start_equity = r.day_start_equity;
         self.equity_history = r.equity_history;
@@ -2051,6 +2384,102 @@ impl Engine {
     /// Whether the risk record changed since the last call.
     pub fn take_risk_dirty(&mut self) -> bool {
         std::mem::take(&mut self.risk_dirty)
+    }
+}
+
+/// The ledger fill id of a fill event: `intent:venue_order:event ms` (idempotency key in both
+/// books, `ledger.fill.venue_fill_id`).
+pub fn fill_id_of(m: &OrderEvent, now_ms: i64) -> String {
+    format!("{}:{}:{}", m.intent_id, m.venue_order_id, ms_of(m.event_time.as_ref()).unwrap_or(now_ms))
+}
+
+/// Ledger ↔ engine interface (spec 42 §6, §8; I/O in `crate::recon`).
+impl Engine {
+    /// Fill events whose intent was unknown, since the last call.
+    pub fn take_unknown_fills(&mut self) -> Vec<OrderEvent> {
+        std::mem::take(&mut self.unknown_fills)
+    }
+
+    /// Re-registers an intent recovered from `ledger.order_intent` (foreign, so it is not
+    /// re-gated) so its fills can be booked.
+    pub fn recover_intent(
+        &mut self,
+        id: &str,
+        instrument: InstrumentId,
+        signed_quantity: f64,
+        strategy_ids: Vec<String>,
+    ) {
+        self.remember(id.to_owned(), IntentInfo { instrument, signed_quantity, ours: false, strategy_ids });
+        self.bump("intents.recovered");
+    }
+
+    /// Instrument, signed quantity and contributors of a known intent.
+    pub fn intent_info(&self, id: &str) -> Option<(InstrumentId, f64, Vec<String>)> {
+        self.intents.get(id).map(|i| (i.instrument, i.signed_quantity, i.strategy_ids.clone()))
+    }
+
+    /// Marks fills as written to Postgres.
+    pub fn confirm_fills(&mut self, ids: &[String]) {
+        for id in ids {
+            self.unconfirmed.remove(id);
+        }
+        self.counters.insert("fills.unconfirmed", self.unconfirmed.len() as f64);
+    }
+
+    /// Unconfirmed fills last attempted at least `min_age_ms` ago (their attempt time is reset).
+    pub fn retry_fills(&mut self, now_ms: i64, min_age_ms: i64) -> Vec<BookedFill> {
+        let queued: BTreeSet<&str> = self.booked.iter().map(|b| b.fill.fill_id.as_str()).collect();
+        let mut out = Vec::new();
+        for (id, (b, _, last)) in self.unconfirmed.iter_mut() {
+            if now_ms - *last >= min_age_ms && !queued.contains(id.as_str()) {
+                *last = now_ms;
+                out.push(b.clone());
+            }
+        }
+        out
+    }
+
+    /// The paper book and the fills booked within `grace_ms` whose write is still unconfirmed
+    /// (reconciliation excludes them; older unconfirmed fills count as missing in Postgres).
+    pub fn recon_cut(&self, now_ms: i64, grace_ms: i64) -> (Ledger, Vec<fa_ledger::ExactFill>) {
+        let in_flight = self
+            .unconfirmed
+            .values()
+            .filter(|(_, booked_at, _)| now_ms - *booked_at < grace_ms)
+            .map(|(b, _, _)| fa_ledger::ExactFill::of(&b.fill))
+            .collect();
+        (self.ledger.clone(), in_flight)
+    }
+
+    /// Applies ledger rows Postgres has and the paper book has not (fills booked by another
+    /// writer, e.g. an operator-booked orphan; cash movements such as payouts). Idempotent.
+    /// Returns the ids / keys actually applied.
+    pub fn sync_from_ledger(
+        &mut self,
+        fills: &[fa_ledger::ExactFill],
+        cash: &[fa_ledger::pg::CashRow],
+    ) -> (Vec<String>, Vec<String>) {
+        let mut f_ids = Vec::new();
+        for f in fills {
+            if self.ledger.apply_exact(f) {
+                self.marks.entry(f.instrument).or_insert(fa_ledger::money::f(f.price_eur()));
+                f_ids.push(f.fill_id.clone());
+            }
+        }
+        let mut c_keys = Vec::new();
+        for c in cash {
+            if self.ledger.apply_cash(&c.key, &c.kind, c.amount_eur) {
+                c_keys.push(c.key.clone());
+            }
+        }
+        *self.counters.entry("ledger.synced_fills").or_insert(0.0) += f_ids.len() as f64;
+        *self.counters.entry("ledger.synced_cash").or_insert(0.0) += c_keys.len() as f64;
+        (f_ids, c_keys)
+    }
+
+    /// Whether `scope` is halted.
+    pub fn has_halt(&self, scope: HaltScope) -> bool {
+        self.halts.contains_key(&scope)
     }
 }
 
@@ -3151,5 +3580,149 @@ mod tests {
         // calibration has hourly equity points too
         let cal = e.calibration(&fa_risk::calibrate::CalibrationRules { min_hours: 10, ..Default::default() });
         assert!(cal.hours >= 10, "{cal:?}");
+    }
+
+    fn signal_h(id: &str, inst: InstrumentId, mean: f64, horizon: &str) -> ProtoDist {
+        ProtoDist { horizon: horizon.into(), ..signal(id, inst, mean) }
+    }
+
+    fn intents_for(out: &[Out], inst: InstrumentId) -> Vec<OrderIntent> {
+        approved(out).into_iter().filter(|i| i.instrument_id == inst.to_string()).collect()
+    }
+
+    #[test]
+    fn model_drift_halts_pause_only_the_strategies_of_that_snapshot() {
+        let (a, b) = (InstrumentId::new(), InstrumentId::new());
+        let mut e = warm_many(&[a, b], settings());
+        e.on_signal(&signal("fast", a, 1.0), T0); // 5x1s
+        e.on_signal(&signal_h("slow", b, 1.0, "5x1m"), T0);
+        assert!(e.on_kernel_update("stat-v1-1s", Timescale::Second, 0, 0.0, T0).is_empty());
+        e.on_halt(&Halt { scope: "model:stat-v1-1s".into(), reason: "drift".into(), since: None, manual: true }, T0);
+        assert!(!e.halted(), "a snapshot-scoped model halt is not a portfolio halt");
+        let out = e.tick(T0 + 1000);
+        assert!(intents_for(&out, a).is_empty(), "the 1s strategy depends on the halted snapshot");
+        assert_eq!(intents_for(&out, b).len(), 1, "the 1m strategy keeps trading");
+        assert_eq!(e.counters["model_halt.paused_strategies"], 1.0);
+        let scopes: Vec<String> = e.state(T0).active_halts.iter().map(|h| h.scope.clone()).collect();
+        assert_eq!(scopes, vec!["model:stat-v1-1s"]);
+        // survives a restart, blocks promotion (health halt), clears only by its own resume
+        let rec: RiskRecord = serde_json::from_value(serde_json::to_value(e.risk_record()).unwrap()).unwrap();
+        assert_eq!(rec.halt_scopes(), vec!["model:stat-v1-1s"]);
+        assert!(e.health_halted());
+        e.on_resume("model:other");
+        assert!(e.health_halted());
+        e.on_resume("model:stat-v1-1s");
+        assert!(!e.health_halted());
+        assert_eq!(intents_for(&e.tick(T0 + 2000), a).len(), 1, "resumed");
+        // a bare `model` halt stays global
+        e.on_halt(&Halt { scope: "model".into(), reason: "all".into(), since: None, manual: true }, T0 + 2000);
+        assert!(e.halted());
+        e.on_resume("model");
+        assert!(!e.halted());
+        // an unknown snapshot (no timescale) pauses every strategy, conservatively
+        e.on_halt(&Halt { scope: "model:mystery".into(), reason: "x".into(), since: None, manual: true }, T0);
+        assert_eq!(e.model_paused_timescales(), Some(BTreeSet::new()));
+        e.on_resume("model:mystery");
+    }
+
+    #[test]
+    fn the_drift_alarm_raises_and_clears_its_own_snapshot_halt() {
+        let mut e = Engine::new(settings());
+        let (sustain, clear) = (e.settings.model_drift.sustain, e.settings.model_drift.clear_sustain);
+        for k in 0..sustain - 1 {
+            assert!(e.on_kernel_update("neural-7", Timescale::Minute, 1, 2.0, T0 + i64::from(k)).is_empty());
+        }
+        // another expert below the threshold does not reset expert 1's streak
+        assert!(e.on_kernel_update("neural-7", Timescale::Minute, 0, 0.0, T0).is_empty());
+        let out = e.on_kernel_update("neural-7", Timescale::Minute, 1, 2.0, T0 + 10);
+        assert!(matches!(&out[..], [Out::Halt(h)] if h.scope == "model:neural-7" && !h.manual), "{out:?}");
+        assert_eq!(e.model_paused_timescales(), Some(BTreeSet::from([Timescale::Minute])), "timescale learned");
+        // the echo of its own halt from the bus changes nothing
+        e.on_halt(&Halt { scope: "model:neural-7".into(), reason: "echo".into(), since: None, manual: false }, T0);
+        let mut cleared = Vec::new();
+        for k in 0..clear {
+            cleared.extend(e.on_kernel_update("neural-7", Timescale::Minute, 1, 0.1, T0 + 100 + i64::from(k)));
+            cleared.extend(e.on_kernel_update("neural-7", Timescale::Minute, 0, 0.1, T0 + 100 + i64::from(k)));
+        }
+        assert!(matches!(&cleared[..], [Out::Resume(h)] if h.scope == "model:neural-7"), "{cleared:?}");
+        assert!(e.model_paused_timescales().is_none());
+        // a manual model halt is never cleared by the alarm
+        e.on_halt(&Halt { scope: "model:neural-7".into(), reason: "operator".into(), since: None, manual: true }, T0);
+        for k in 0..clear {
+            assert!(e.on_kernel_update("neural-7", Timescale::Minute, 1, 0.0, T0 + 200 + i64::from(k)).is_empty());
+        }
+        assert!(e.model_paused_timescales().is_some());
+        assert_eq!(snapshot_timescale("stat-v1-1s"), Some(Timescale::Second));
+        assert_eq!(snapshot_timescale("neural-7"), None);
+    }
+
+    #[test]
+    fn slow_strategies_get_working_algos_and_partial_fills_keep_the_remainder_pending() {
+        let inst = InstrumentId::new();
+        let mut e = warm(inst);
+        e.on_signal(&signal_h("slow", inst, 1.0, "5x1m"), T0);
+        let out = e.tick(T0 + 1000);
+        let i = &approved(&out)[0];
+        assert_eq!(i.exec_algo, "smart_limit:timeout_s=30", "5 min horizon, small vs volume");
+        // past pending_ttl_secs but within the algo's working time: no duplicate order
+        assert!(approved(&e.tick(T0 + 1000 + 15_000)).is_empty());
+        let half = OrderEvent {
+            intent_id: i.intent_id.clone(),
+            venue_order_id: format!("paper-{}-1", i.intent_id),
+            kind: order_event::Kind::PartialFill as i32,
+            fill_price: PX,
+            fill_quantity: i.quantity / 2.0,
+            event_time: Some(ts_of(T0 + 20_000)),
+            ..Default::default()
+        };
+        e.on_order_event(&half, T0 + 20_000);
+        assert!((e.ledger().positions[&inst].quantity - i.quantity / 2.0).abs() < 1e-9);
+        assert!(approved(&e.tick(T0 + 21_000)).is_empty(), "book half + pending half = target");
+        let rest = OrderEvent {
+            venue_order_id: format!("paper-{}-2", i.intent_id),
+            kind: order_event::Kind::Fill as i32,
+            event_time: Some(ts_of(T0 + 22_000)),
+            ..half.clone()
+        };
+        e.on_order_event(&rest, T0 + 22_000);
+        assert!((e.ledger().positions[&inst].quantity - i.quantity).abs() < 1e-9);
+        assert!(approved(&e.tick(T0 + 23_000)).is_empty());
+        // fast strategies and halts cross the spread
+        e.on_signal(&signal("fast", inst, -1.0), T0 + 23_000);
+        e.on_halt(&Halt { scope: "portfolio".into(), reason: "kill".into(), since: None, manual: true }, T0 + 23_000);
+        let flat = approved(&e.tick(T0 + 24_000));
+        assert_eq!(flat[0].exec_algo, "market", "kill switch flatten is urgent");
+        let hr: BTreeMap<String, f64> = e.headroom(T0 + 24_000).into_iter().collect();
+        assert!(hr["headroom.drawdown"] > 0.0 && hr["headroom.gross_eur"] > 0.0);
+        assert_eq!(hr["exec.algo.smart_limit"], 1.0);
+        assert_eq!(hr["exec.algo.market"], 1.0);
+        assert!(hr.contains_key("headroom.position_min_eur") && hr.contains_key("headroom.short_margin_eur"));
+    }
+
+    #[test]
+    fn non_shortable_instruments_are_never_shorted() {
+        let (a, b) = (InstrumentId::new(), InstrumentId::new());
+        let mut e = warm_many(&[a, b], settings());
+        e.set_shortable(BTreeMap::from([(a, false), (b, true)]));
+        e.on_signal(&multi_signal("s", &[a, b], -1.0), T0);
+        let out = e.tick(T0 + 1000);
+        assert!(intents_for(&out, a).is_empty(), "no borrow");
+        assert_eq!(intents_for(&out, b)[0].side, Side::Sell as i32);
+        // a manual short on the non-shortable instrument is rejected pre-trade
+        let manual = OrderIntent {
+            intent_id: "m1".into(),
+            account_id: "paper".into(),
+            instrument_id: a.to_string(),
+            side: Side::Sell as i32,
+            quantity: 1.0,
+            exec_algo: "market".into(),
+            mode: TradingMode::Paper as i32,
+            ..Default::default()
+        };
+        let out = e.on_intent_seen(&manual, false, T0 + 1000);
+        assert!(
+            out.iter().any(|o| matches!(o, Out::Rejected { event, .. } if event.reason.contains("not shortable"))),
+            "{out:?}"
+        );
     }
 }

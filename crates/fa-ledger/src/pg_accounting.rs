@@ -24,6 +24,7 @@ use crate::{
         Attribution, BookPosition, BookState, CashEvent, Lot, LotClosing, LotMethod, Marks, PnlBreakdown, TradeEvent,
         UNATTRIBUTED, replay, strategy_pnls, strategy_trades,
     },
+    money::dec,
     pg::{CashMovement, FillDetails, IntentRecord, PAPER_VENUE, PgError, PgLedger, uuid_of},
     statement::{Statement, build_statement},
 };
@@ -181,6 +182,7 @@ fn trade_row(r: &PgRow) -> TradeEvent {
         fee_eur: fee,
         filled_at: r.get("filled_at"),
         attribution,
+        settle_native: false,
     }
 }
 
@@ -256,7 +258,14 @@ impl PgLedger {
         .bind(before)
         .fetch_all(self.pool())
         .await?;
-        Ok(rows.iter().map(trade_row).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let mut t = trade_row(r);
+                t.settle_native = self.settlement().of(&t.venue) == crate::settlement::Settlement::Native;
+                t
+            })
+            .collect())
     }
 
     /// Cash movements of a book with `occurred_at < before` (all when `None`), oldest first.
@@ -685,6 +694,7 @@ impl PgLedger {
 
     async fn record_orphan(&self, e: &FillEvent) -> Result<Recorded, PgError> {
         let f = &e.fill;
+        let x = crate::ExactFill::of(f);
         let id = uuid_of(&format!("orphan:{}:{}", f.intent_id, f.fill_id));
         let venue = e.venue.unwrap_or(PAPER_VENUE);
         let ccy = if e.details.ccy.is_empty() { fa_core::BASE_CURRENCY } else { e.details.ccy.as_str() };
@@ -693,8 +703,7 @@ impl PgLedger {
         let n = sqlx::query(
             "INSERT INTO ledger.orphan_fill (id, book, venue_id, client_order_id, venue_fill_id, instrument_id, qty, \
              price, ccy, fee, fee_ccy, fx_rate_eur, fx_source, arrival_price, slippage_bps, strategy_ids, filled_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7::float8::numeric, $8::float8::numeric, $9, $10::float8::numeric, 'EUR', \
-                     $11::float8::numeric, $12, $13::float8::numeric, $14::float8::numeric, $15, $16) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'EUR', $11, $12, $13, $14, $15, $16) \
              ON CONFLICT DO NOTHING",
         )
         .bind(id)
@@ -703,14 +712,14 @@ impl PgLedger {
         .bind(&f.intent_id)
         .bind(&f.fill_id)
         .bind(f.instrument.0)
-        .bind(f.quantity)
-        .bind(f.price)
+        .bind(x.qty)
+        .bind(x.price)
         .bind(ccy)
-        .bind(f.fee_eur)
-        .bind(f.fx_to_eur)
+        .bind(x.fee_eur)
+        .bind(x.fx_to_eur)
         .bind(src)
-        .bind(e.details.arrival_price.filter(|v| v.is_finite()))
-        .bind(e.details.slippage_bps.filter(|v| v.is_finite()))
+        .bind(e.details.arrival_price.filter(|v| v.is_finite()).map(dec))
+        .bind(e.details.slippage_bps.filter(|v| v.is_finite()).map(dec))
         .bind(json!(e.strategy_ids))
         .bind(e.filled_at)
         .execute(&mut *tx)
@@ -824,6 +833,47 @@ impl PgLedger {
 
     // ---------------------------------------------------------------- payouts
 
+    /// Computes `day`'s payout quota for `book` with `rule` ([`crate::payout`]) from the book
+    /// as of the start of `day` (previous close equity, previous day's net P&L, previous quota
+    /// and payouts) and stores it in `ledger.payout_quota` — only ever raising the stored quota
+    /// (tighten-only, spec 40 §6.5), with the rule and its inputs in `rule`. Returns the quota
+    /// now in force for the day.
+    pub async fn apply_payout_rule(
+        &self,
+        book: &str,
+        day: NaiveDate,
+        rule: &crate::payout::PayoutRule,
+    ) -> Result<f64, PgError> {
+        rule.validate().map_err(PgError::Invalid)?;
+        let start = day.and_time(NaiveTime::MIN).and_utc();
+        let prev = day.pred_opt().unwrap_or(day);
+        let prev_start = prev.and_time(NaiveTime::MIN).and_utc();
+        let equity = self.equity_eur(book, Some(start - Duration::microseconds(1)), None).await?;
+        let pnl = self.book_pnl(book, Some(prev_start), Some(start), None).await?;
+        let prev_q = self.payout_quota(prev).await?;
+        let inputs = crate::payout::PayoutInputs {
+            prev_equity_eur: dec(equity),
+            prev_net_pnl_eur: dec(pnl.net_eur),
+            prev_quota_eur: dec(prev_q.as_ref().map_or(0.0, |q| q.quota_eur)),
+            prev_paid_eur: dec(prev_q.as_ref().map_or(0.0, |q| q.paid_eur)),
+        };
+        let quota = rule.quota(&inputs);
+        let (q,): (rust_decimal::Decimal,) = sqlx::query_as(
+            "INSERT INTO ledger.payout_quota (day, quota_eur, reserved_eur, paid_eur, rule) VALUES ($1, $2, 0, 0, $3) \
+             ON CONFLICT (day) DO UPDATE SET \
+               rule = CASE WHEN excluded.quota_eur > ledger.payout_quota.quota_eur THEN excluded.rule \
+                           ELSE coalesce(ledger.payout_quota.rule, excluded.rule) END, \
+               quota_eur = greatest(ledger.payout_quota.quota_eur, excluded.quota_eur) \
+             RETURNING quota_eur",
+        )
+        .bind(day)
+        .bind(quota)
+        .bind(json!({"rule": rule, "inputs": inputs, "book": book, "quota_eur": quota}))
+        .fetch_one(self.pool())
+        .await?;
+        Ok(crate::money::f(q))
+    }
+
     /// Books a payout of `amount_eur` (> 0) for `day` as `cash_movement(kind = 'payout', ref = day)`
     /// and sets `ledger.payout_quota.paid_eur` of that day to the sum of all books' payouts with
     /// that reference (row created with quota 0 when missing). One payout per book and day:
@@ -840,12 +890,12 @@ impl PgLedger {
         let mut tx = self.pool().begin().await?;
         let n = sqlx::query(
             "INSERT INTO ledger.cash_movement (id, book, venue_id, kind, amount, ccy, fx_rate_eur, ref, occurred_at) \
-             VALUES ($1, $2, $3, 'payout', $4::float8::numeric, 'EUR', 1, $5, $6) ON CONFLICT DO NOTHING",
+             VALUES ($1, $2, $3, 'payout', $4, 'EUR', 1, $5, $6) ON CONFLICT DO NOTHING",
         )
         .bind(id)
         .bind(book)
         .bind(PAPER_VENUE)
-        .bind(-amount_eur)
+        .bind(-dec(amount_eur))
         .bind(&reference)
         .bind(occurred_at)
         .execute(&mut *tx)

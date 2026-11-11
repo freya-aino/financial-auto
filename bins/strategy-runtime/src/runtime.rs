@@ -9,19 +9,29 @@
 //! `prefetch.rs`) drains the queue between steps, reads the prices from VictoriaMetrics and
 //! fills the cache, so the next step resolves them (`analog.resolved_tsdb`). Point-in-time:
 //! only analogs whose outcome window ended at or before the step time are counted or queued.
+//!
+//! **Snapshot changes (spec 35 §6.5).** A strategy bound to an encoder snapshot
+//! (`StrategyDef::snapshot`) whose timescale starts serving another snapshot is remapped through
+//! the region lineage of that swap ([`fa_strategies::remap`], fed from `latent.lifecycle.>`):
+//! when every region literal maps, the remapped programs replace the old ones in place (books
+//! kept) and the remap is reported with its time (`ctl.strategy.status` `snapshot.remapped_ms`,
+//! the risk-engine pipeline sends an active strategy back to shadow); when a literal has no
+//! descendant (or the lineage was never seen) the strategy is suspended (`PauseReason::Snapshot`,
+//! code 4: flat, not evaluated) until a later lineage maps it or it is reloaded.
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     time::{Duration, Instant},
 };
 
 use fa_core::{InstrumentId, Timescale};
-use fa_proto::v1::{DecoderOutput, LatentState, RegionEvent, TransitionUpdate};
+use fa_proto::v1::{DecoderOutput, LatentState, RegionEvent, RegionLifecycleEvent, TransitionUpdate};
 use fa_strategies::{
     AssetExposure, ExposureDistribution, GpStrategy, Strategy, StrategyContext,
     decoders::{AnalogRequest, DEFAULT_MAX_AGE_MS, DecoderOutputs, PriceLookup},
     features::{FallbackContext, LatentInfo, LiveContext, PriceSeries, Sources, VirtualBook},
     graph::LatentGraph,
     population::{PopulationError, StrategyDef, StrategyFile},
+    remap::{LineageBook, RemapReport, remap_def},
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -74,6 +84,9 @@ pub enum PauseReason {
     StepBudget { breaches: u32, last_ms: f64, budget_ms: f64 },
     /// `N` consecutive steps with NaN / inf outputs (code 3).
     NonFinite { breaches: u32 },
+    /// The live encoder snapshot changed and a region literal could not be remapped through the
+    /// lineage (code 4, spec 35 §8 "Snapshot or region lineage breaks").
+    Snapshot { from: String, to: String, why: String },
 }
 
 impl PauseReason {
@@ -82,6 +95,7 @@ impl PauseReason {
             Self::Operator => 1.0,
             Self::StepBudget { .. } => 2.0,
             Self::NonFinite { .. } => 3.0,
+            Self::Snapshot { .. } => 4.0,
         }
     }
 
@@ -99,6 +113,9 @@ impl std::fmt::Display for PauseReason {
                 "step_budget: {breaches} consecutive steps over the {budget_ms} ms evaluation budget (last {last_ms:.1} ms)"
             ),
             Self::NonFinite { breaches } => write!(f, "non_finite: {breaches} consecutive steps with NaN/inf output"),
+            Self::Snapshot { from, to, why } => {
+                write!(f, "snapshot: bound to {from}, live snapshot is {to}; region literals unmappable ({why})")
+            }
         }
     }
 }
@@ -328,7 +345,25 @@ pub struct Runtime {
     pub analog_resolved_memory: u64,
     /// Strategies auto-paused so far (budget + NaN).
     pub auto_pauses: u64,
+    /// Snapshot-swap lineage from `latent.lifecycle.>` (spec 35 §6.5).
+    pub lineage: LineageBook,
+    /// Latest snapshot remap per strategy id (kept across reloads so a reload of the old genome
+    /// re-applies the same remap without reporting a new one).
+    remaps: BTreeMap<String, SnapshotRemap>,
     clock: Option<EvalClock>,
+}
+
+/// One snapshot remap attempt of a strategy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotRemap {
+    pub from: String,
+    pub to: String,
+    pub ok: bool,
+    /// When this outcome was first reached.
+    pub at_ms: i64,
+    pub report: Option<RemapReport>,
+    /// Lineage events seen when it was attempted (an unmappable one is retried on new lineage).
+    lineage_events: u64,
 }
 
 impl Runtime {
@@ -359,6 +394,8 @@ impl Runtime {
             analog_resolved_tsdb: 0,
             analog_resolved_memory: 0,
             auto_pauses: 0,
+            lineage: LineageBook::new(),
+            remaps: BTreeMap::new(),
             clock: None,
         })
     }
@@ -505,6 +542,80 @@ impl Runtime {
         self.graph.on_region(ev, now_ms);
     }
 
+    /// `latent.lifecycle.<ts>`: snapshot-alignment lineage for remapping (spec 35 §6.5).
+    pub fn on_lifecycle(&mut self, ev: &RegionLifecycleEvent) -> bool {
+        self.lineage.on_lifecycle(ev)
+    }
+
+    /// Remaps / suspends strategies bound to a snapshot their timescale no longer serves.
+    /// Returns the ids whose programs were replaced.
+    pub fn check_snapshots(&mut self, now_ms: i64) -> Vec<String> {
+        let mut replaced = Vec::new();
+        for m in &mut self.members {
+            let Some(bound) = m.def.snapshot.clone() else { continue };
+            let Some(live) = self.graph.snapshot(m.def.timescale).map(str::to_owned) else { continue };
+            if live == bound {
+                // a snapshot pause from an earlier mismatch no longer applies
+                if matches!(self.paused.get(&m.def.id), Some(PauseReason::Snapshot { .. })) {
+                    self.paused.remove(&m.def.id);
+                }
+                continue;
+            }
+            let prev = self.remaps.get(&m.def.id);
+            if prev.is_some_and(|p| {
+                !p.ok && p.from == bound && p.to == live && p.lineage_events == self.lineage.events
+            }) {
+                continue; // nothing new to try
+            }
+            let (def, report) = remap_def(&m.def, &live, &self.lineage);
+            let ok = def.is_some();
+            let at_ms = match prev {
+                Some(p) if p.from == bound && p.to == live && p.ok == ok => p.at_ms,
+                _ => now_ms,
+            };
+            match def.map(|d| d.build().map(|s| (d, s))) {
+                Some(Ok((d, strategy))) => {
+                    tracing::warn!(strategy = %m.def.id, from = %bound, to = %live, signal = %d.signal, "strategy remapped onto the new snapshot");
+                    m.def = d;
+                    m.strategy = strategy;
+                    m.fallback_since.clear();
+                    if matches!(self.paused.get(&m.def.id), Some(PauseReason::Snapshot { .. })) {
+                        self.paused.remove(&m.def.id);
+                    }
+                    replaced.push(m.def.id.clone());
+                }
+                _ => {
+                    let why = report
+                        .as_ref()
+                        .map(|r| {
+                            r.literals
+                                .iter()
+                                .filter(|l| l.to.is_none())
+                                .map(|l| format!("{}: {}", l.from_region, l.kind))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_else(|| "programs did not parse".into());
+                    if !matches!(self.paused.get(&m.def.id), Some(PauseReason::Snapshot { .. })) {
+                        tracing::warn!(strategy = %m.def.id, from = %bound, to = %live, %why, "strategy suspended: region lineage breaks");
+                        self.auto_pauses += 1;
+                    }
+                    self.paused.insert(m.def.id.clone(), PauseReason::Snapshot { from: bound.clone(), to: live.clone(), why });
+                }
+            }
+            self.remaps.insert(
+                m.def.id.clone(),
+                SnapshotRemap { from: bound, to: live, ok, at_ms, report, lineage_events: self.lineage.events },
+            );
+        }
+        replaced
+    }
+
+    #[cfg(test)]
+    pub fn remap_of(&self, id: &str) -> Option<&SnapshotRemap> {
+        self.remaps.get(id)
+    }
+
     pub fn on_transition(&mut self, tu: &TransitionUpdate) {
         self.graph.on_transition(tu);
     }
@@ -556,6 +667,7 @@ impl Runtime {
             return out;
         }
         self.feed_closes(now_ms);
+        self.check_snapshots(now_ms);
         let settings = self.settings;
         let (graph, decoders, prices, latent, analogs) =
             (&self.graph, &self.decoders, &self.prices, &self.latent, &self.analogs);
@@ -612,6 +724,7 @@ impl Runtime {
                     let info = latent.get(&(ts, *inst)).map(|l| l.info.clone());
                     let ctx = LiveContext::new(FallbackContext::new(&closes, info, book), *inst, m.def.steps)
                         .with_graph(&view)
+                        .with_snapshot(m.def.snapshot.as_deref())
                         .with_bar(ts)
                         .with_decoders(decoders.at(*inst, now_ms, settings.decoder_max_age_ms))
                         .with_prices(lookup as &dyn PriceLookup);
@@ -764,6 +877,13 @@ impl Runtime {
             ("paused".to_owned(), self.paused.len() as f64),
             ("auto_paused".to_owned(), self.paused.values().filter(|r| r.is_auto()).count() as f64),
             ("auto_pauses".to_owned(), self.auto_pauses as f64),
+            ("lineage.events".to_owned(), self.lineage.events as f64),
+            ("lineage.snapshots".to_owned(), self.lineage.snapshots() as f64),
+            ("snapshot.remapped".to_owned(), self.remaps.values().filter(|r| r.ok).count() as f64),
+            (
+                "snapshot.suspended".to_owned(),
+                self.paused.values().filter(|r| matches!(r, PauseReason::Snapshot { .. })).count() as f64,
+            ),
             ("starved".to_owned(), starved.iter().filter(|(_, p)| !p.is_empty()).count() as f64),
             ("reloads".to_owned(), self.reloads as f64),
             ("instruments".to_owned(), self.instruments() as f64),
@@ -846,6 +966,14 @@ impl Runtime {
                     "paused": self.is_paused(&m.def.id),
                     "paused_reason": self.paused.get(&m.def.id).map(ToString::to_string),
                     "paused_reason_code": self.paused.get(&m.def.id).map_or(0.0, PauseReason::code),
+                    "snapshot": {
+                        "bound": m.def.snapshot,
+                        "live": self.graph.snapshot(m.def.timescale),
+                        "remap": self.remaps.get(&m.def.id).map(|r| json!({
+                            "from": r.from, "to": r.to, "ok": r.ok, "at_ms": r.at_ms, "report": r.report,
+                        })),
+                        "remapped_ms": self.remaps.get(&m.def.id).filter(|r| r.ok).map(|r| r.at_ms),
+                    },
                     "starved": !starved.is_empty(),
                     "starved_primitives": starved,
                     "stats": {
@@ -1065,6 +1193,99 @@ mod tests {
         // region a now has a realised return → region_feature answers from the graph
         let view = rt.graph.at(Timescale::Second, 42_000);
         assert!(view.region_feature(0, "a", fa_strategies::RegionFeature::MeanFwdReturn).is_some());
+    }
+
+    fn state_of(snap: &str, inst: InstrumentId, at_ms: i64, region: &str) -> LatentState {
+        LatentState {
+            snapshot_id: snap.into(),
+            timescale: "1s".into(),
+            instrument_id: inst.to_string(),
+            as_of: Some(ts(at_ms)),
+            experts: vec![ExpertLatent {
+                expert_index: 0,
+                mean: vec![0.0],
+                log_var: vec![0.0],
+                region_id: region.into(),
+                region_lineage_id: region.into(),
+            }],
+            router_weights: vec![],
+        }
+    }
+
+    fn created(snap: &str, id: &str) -> RegionEvent {
+        RegionEvent {
+            kind: fa_proto::v1::region_event::Kind::Created as i32,
+            space: Some(ExpertSpaceRef { snapshot_id: snap.into(), timescale: "1s".into(), expert_index: 0 }),
+            region_id: id.into(),
+            lineage_id: id.into(),
+            related_region_ids: vec![],
+        }
+    }
+
+    fn carried(snap: &str, id: &str, parent: &str) -> RegionLifecycleEvent {
+        RegionLifecycleEvent {
+            kind: fa_proto::v1::region_lifecycle_event::Kind::Carried as i32,
+            space: Some(ExpertSpaceRef { snapshot_id: snap.into(), timescale: "1s".into(), expert_index: 0 }),
+            region_id: id.into(),
+            reason: "snapshot".into(),
+            ancestors: vec![fa_proto::v1::RegionAncestor {
+                region_id: parent.into(),
+                lineage_id: String::new(),
+                overlap: 0.9,
+                kind: "carry".into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn snapshot_change_remaps_literals_or_suspends() {
+        let file = StrategyFile::parse(
+            "[[strategy]]\nid='gp-lit'\ngenome_id='gp-lit'\ntimescale='1s'\nsnapshot='s1'\n\
+             signal='(mul 3 (sub 0.5 (dwell (region 0 2))))'\n\
+             [[strategy]]\nid='gp-dead'\ngenome_id='gp-dead'\ntimescale='1s'\nsnapshot='s1'\nsignal='(dwell (region 0 4))'\n",
+        )
+        .unwrap();
+        let mut rt = Runtime::new(&file).unwrap();
+        let inst = InstrumentId::new();
+        for i in 0..20 {
+            rt.on_trade(inst, i * 1_000, 100.0 + i as f64 * 0.1);
+        }
+        for r in ["s1-e0-r002", "s1-e0-r004"] {
+            rt.on_region(&created("s1", r), 0);
+        }
+        rt.on_latent(&state_of("s1", inst, 19_000, "s1-e0-r002"));
+        rt.tick(20_000);
+        assert!(rt.remap_of("gp-lit").is_none(), "bound snapshot is live: nothing to do");
+        assert!(!rt.is_paused("gp-lit"));
+
+        // the encoder swaps to s2: r002 is carried to r007, r004 has no descendant
+        rt.on_lifecycle(&carried("s2", "s2-e0-r007", "s1-e0-r002"));
+        rt.on_region(&created("s2", "s2-e0-r007"), 20_500);
+        rt.on_latent(&state_of("s2", inst, 21_000, "s2-e0-r007"));
+        rt.tick(22_000);
+        let m = rt.members.iter().find(|m| m.def.id == "gp-lit").unwrap();
+        assert_eq!(m.def.signal, "(mul 3 (sub 0.5 (dwell (region 0 7))))");
+        assert_eq!(m.def.snapshot.as_deref(), Some("s2"));
+        let r = rt.remap_of("gp-lit").unwrap();
+        assert!(r.ok && r.at_ms == 22_000 && r.from == "s1" && r.to == "s2");
+        assert!(!rt.is_paused("gp-lit"));
+        assert!(matches!(rt.paused.get("gp-dead"), Some(PauseReason::Snapshot { .. })));
+        let d = rt.tick(23_000);
+        let dead = d.iter().find(|d| d.strategy_id == "gp-dead").unwrap().exposures[0];
+        assert_eq!((dead.mean, dead.stddev), (0.0, 1.0), "suspended: flat");
+        let hb = rt.heartbeat_counters(23_000);
+        assert_eq!((hb["snapshot.remapped"], hb["snapshot.suspended"]), (1.0, 1.0));
+        assert_eq!(hb["strategy.gp-dead.paused_reason"], 4.0);
+        let st = rt.status(23_000);
+        let lit = st["strategies"].as_array().unwrap().iter().find(|s| s["id"] == "gp-lit").unwrap();
+        assert_eq!(lit["snapshot"]["remapped_ms"], 22_000);
+
+        // a reload brings the old genome back: same remap, same time (no new demotion signal)
+        rt.replace_population(&file, "reload").unwrap();
+        rt.tick(30_000);
+        assert_eq!(rt.remap_of("gp-lit").unwrap().at_ms, 22_000);
+        assert!(rt.members.iter().any(|m| m.def.signal.contains("(region 0 7)")));
     }
 
     #[test]

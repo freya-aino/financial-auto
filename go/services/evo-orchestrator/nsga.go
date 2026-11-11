@@ -8,7 +8,7 @@ import (
 // NSGA-II (Deb et al. 2002) over minimised objective vectors. This is a line-by-line port of
 // crates/fa-evolution/src/lib.rs (non_dominated_sort, crowding_distance, nsga2_select) and
 // crates/fa-evolution/src/objectives.rs (minimised); both test suites read
-// crates/fa-evolution/testdata/nsga_fixture.json so the two cannot drift. Sorts are stable in
+// go/services/evo-orchestrator/testdata/nsga_fixture.json so the two cannot drift. Sorts are stable in
 // both languages, so ties resolve identically.
 
 // Dominates reports whether a dominates b (all objectives minimised).

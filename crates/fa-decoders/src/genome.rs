@@ -182,6 +182,9 @@ pub struct NeuralGenes {
     pub tw_min: f64,
     /// Init / minibatch seed (`seed`; not mutated).
     pub seed: u64,
+    /// Text: read only the news matched to the series' own instrument (`ninst` ≥ 0.5; symbol,
+    /// name or entity match, `text_baseline::InstrumentIndex`) instead of the market-wide stream.
+    pub news_inst: bool,
 }
 
 impl Default for NeuralGenes {
@@ -203,6 +206,7 @@ impl Default for NeuralGenes {
             tdim: 128,
             tw_min: 60.0,
             seed: 7,
+            news_inst: false,
         }
     }
 }
@@ -251,6 +255,14 @@ pub struct DecoderGenome {
     /// Neural-family genes (ignored by the baselines).
     #[serde(default)]
     pub nn: NeuralGenes,
+    /// Experts the decoder reads (`mask` gene, bit `i` = expert index `i`, spec 34 §4.2
+    /// `expert_mask`); `0` = every expert (the concatenated latent).
+    #[serde(default)]
+    pub expert_mask: u32,
+    /// Cross-asset source (`src` gene, spec 34 §6.1 RNN prior): latents are read from this
+    /// instrument while the series (`inst`) is the target. `None` = the series' own latents.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 fn default_latent_weight() -> f64 {
@@ -260,8 +272,10 @@ fn default_latent_weight() -> f64 {
 /// Numeric gene names exposed to the evolution operators (`params()` keys of the baselines).
 pub const NUMERIC_GENES: [&str; 9] = ["h", "lb", "kernel", "scale", "shrink", "k", "tau", "gap", "lat"];
 /// Additional numeric genes of the neural families (`params()` adds them for those).
-pub const NEURAL_GENES: [&str; 15] =
-    ["width", "depth", "gru", "steps", "lr", "wd", "bs", "train", "emb", "temp", "pool", "res", "band", "tdim", "tw"];
+pub const NEURAL_GENES: [&str; 16] = [
+    "width", "depth", "gru", "steps", "lr", "wd", "bs", "train", "emb", "temp", "pool", "res", "band", "tdim", "tw",
+    "ninst",
+];
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum GenomeError {
@@ -296,6 +310,8 @@ impl DecoderGenome {
             latent_weight: 0.5,
             encoding: "default".into(),
             nn: NeuralGenes::default(),
+            expert_mask: 0,
+            source: None,
         }
     }
 
@@ -321,6 +337,7 @@ impl DecoderGenome {
                 ("band".to_owned(), n.band),
                 ("tdim".to_owned(), n.tdim as f64),
                 ("tw".to_owned(), n.tw_min),
+                ("ninst".to_owned(), if n.news_inst { 1.0 } else { 0.0 }),
             ]);
         }
         m
@@ -374,6 +391,7 @@ impl DecoderGenome {
                 "band" => g.nn.band = if v.is_finite() && *v > 0.0 { v.clamp(0.5, 10.0) } else { g.nn.band },
                 "tdim" => g.nn.tdim = int(*v, 16).min(1024),
                 "tw" => g.nn.tw_min = if v.is_finite() && *v > 0.0 { v.clamp(1.0, 10_080.0) } else { g.nn.tw_min },
+                "ninst" => g.nn.news_inst = v.is_finite() && *v >= 0.5,
                 _ => {}
             }
         }
@@ -528,6 +546,24 @@ impl DecoderGenome {
             "tdim" => self.nn.tdim = int(v)?,
             "tw" => self.nn.tw_min = num(v)?,
             "seed" => self.nn.seed = v.parse::<u64>().map_err(|_| err("not an unsigned integer"))?,
+            "ninst" | "news_inst" => {
+                self.nn.news_inst = match v.to_ascii_lowercase().as_str() {
+                    "inst" | "true" => true,
+                    "all" | "market" | "false" => false,
+                    _ => num(v)? >= 0.5,
+                }
+            }
+            "mask" | "expert_mask" => {
+                let m = match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                    Some(hex) => u32::from_str_radix(hex, 16).map_err(|_| err("not a hex mask"))?,
+                    None => v.parse::<u32>().map_err(|_| err("not an unsigned integer mask"))?,
+                };
+                if m >> crate::EXPERT_MASK_BITS != 0 {
+                    return Err(err("mask uses bits beyond the expert range"));
+                }
+                self.expert_mask = m;
+            }
+            "src" | "source" => self.source = Some(v.to_owned()).filter(|s| !s.is_empty()),
             _ => return Err(err("unknown gene")),
         }
         Ok(())
@@ -617,6 +653,17 @@ impl DecoderGenome {
 
     /// Short human-readable summary (`forecast h=5 lb=32 ...`).
     pub fn summary(&self) -> String {
+        let mut s = self.summary_genes();
+        if self.expert_mask != 0 {
+            s.push_str(&format!(" mask={:#x}", self.expert_mask));
+        }
+        if let Some(src) = &self.source {
+            s.push_str(&format!(" src={src}"));
+        }
+        s
+    }
+
+    fn summary_genes(&self) -> String {
         match self.family {
             BaselineFamily::Forecast => format!(
                 "forecast ts={} h={} lb={} kernel={:.1} scale={:.2} shrink={:.2}",
@@ -653,9 +700,11 @@ impl DecoderGenome {
 
 impl fmt::Display for DecoderGenome {
     /// Canonical kv form: `<family>:ts=..;h=..;lb=..;levels=a/b/c;kernel=..;scale=..;shrink=..;
-    /// k=..;tau=..;gap=..;metric=..;lat=..[;inst=..]`. Every gene is printed (also the other
-    /// family's, so a child keeps them when its family gene flips) and floats print in Rust's
-    /// shortest round-trip form, so `parse(to_string())` is lossless.
+    /// k=..;tau=..;gap=..;metric=..;lat=..[;<neural genes>][;ninst=1][;mask=..][;inst=..][;src=..]`.
+    /// Every numeric gene is printed (also the other family's, so a child keeps them when its
+    /// family gene flips) and floats print in Rust's shortest round-trip form, so
+    /// `parse(to_string())` is lossless. `ninst`, `mask`, `inst` and `src` print only when set, so
+    /// genome strings written before those genes existed keep their canonical form.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let levels: Vec<String> = self.levels.iter().map(|l| l.to_string()).collect();
         write!(
@@ -701,8 +750,17 @@ impl fmt::Display for DecoderGenome {
                 n.seed
             )?;
         }
+        if self.family.is_neural() && self.nn.news_inst {
+            write!(f, ";ninst=1")?;
+        }
+        if self.expert_mask != 0 {
+            write!(f, ";mask={}", self.expert_mask)?;
+        }
         if let Some(inst) = &self.instrument {
             write!(f, ";inst={inst}")?;
+        }
+        if let Some(src) = &self.source {
+            write!(f, ";src={src}")?;
         }
         Ok(())
     }
@@ -791,6 +849,8 @@ mod tests {
             "forecast:h=3;lb=20;levels=0.1/0.5/0.9;kernel=8.25;scale=1.7;shrink=0.33",
             "retrieval:k=7;tau=10.5;gap=1;h=4;metric=euclid;lat=0.2;ts=1m",
             "retrieval:k=7;inst=01900000-0000-7000-8000-000000000001",
+            "nn_news:tdim=64;ninst=1;mask=5",
+            "nn_forecast:h=3;inst=01900000-0000-7000-8000-000000000001;src=01900000-0000-7000-8000-000000000002;mask=0x3",
             "g1",
             "g2",
             "forecast",
@@ -832,13 +892,15 @@ mod tests {
 
     #[test]
     fn neural_genomes_parse_round_trip_and_clamp() {
-        let g = DecoderGenome::parse("nn_forecast:h=4;lb=16;width=24;depth=3;gru=gru;steps=120;lr=0.002;bs=32").unwrap();
+        let g =
+            DecoderGenome::parse("nn_forecast:h=4;lb=16;width=24;depth=3;gru=gru;steps=120;lr=0.002;bs=32").unwrap();
         assert_eq!(g.family, BaselineFamily::NnForecast);
         assert!(g.family.is_neural() && g.family.forecasts() && !g.family.reconstructs());
         assert_eq!(g.family.output_family(), Family::RnnPrior);
         assert_eq!((g.nn.width, g.nn.depth, g.nn.gru, g.nn.steps, g.nn.batch), (24, 3, true, 120, 32));
         for fam in BaselineFamily::NEURAL {
-            let g = DecoderGenome::parse(&format!("{}:h=3;lb=8;res=10;tdim=64;tw=30;emb=6;seed=5", fam.as_str())).unwrap();
+            let g =
+                DecoderGenome::parse(&format!("{}:h=3;lb=8;res=10;tdim=64;tw=30;emb=6;seed=5", fam.as_str())).unwrap();
             let s = g.to_string();
             assert!(!s.contains(','), "{s}");
             let back = DecoderGenome::parse(&s).unwrap();
@@ -848,8 +910,7 @@ mod tests {
             assert_eq!(p.len(), NUMERIC_GENES.len() + NEURAL_GENES.len());
             assert!(same_genes(&g, &g.with_params(&p).unwrap()));
         }
-        let fams: std::collections::HashSet<_> =
-            BaselineFamily::ALL.iter().map(|f| f.output_family()).collect();
+        let fams: std::collections::HashSet<_> = BaselineFamily::ALL.iter().map(|f| f.output_family()).collect();
         assert_eq!(fams.len(), 6, "rnn_prior, retrieval, visual.chart/future, text.news/narrative");
         let mut m = g.params();
         m.insert("width".into(), 1000.0);
@@ -859,6 +920,17 @@ mod tests {
         let c = g.with_params(&m).unwrap();
         assert_eq!((c.nn.width, c.nn.lr, c.nn.gru, c.nn.train_frac), (256, 0.1, false, 0.2));
         assert!(matches!(DecoderGenome::parse("nn_chart:res=64"), Err(GenomeError::Gene { .. })));
+        assert!(matches!(DecoderGenome::parse("nn_chart:mask=0x10000"), Err(GenomeError::Gene { .. })));
+        let x = DecoderGenome::parse("nn_narrative:ninst=inst;mask=0x6;src=abc").unwrap();
+        assert_eq!((x.nn.news_inst, x.expert_mask, x.source.as_deref()), (true, 6, Some("abc")));
+        assert!(x.to_string().ends_with(";ninst=1;mask=6;src=abc"), "{x}");
+        let mut m = x.params();
+        m.insert("ninst".into(), 0.1);
+        let y = x.with_params(&m).unwrap();
+        assert!(
+            !y.nn.news_inst && y.expert_mask == 6 && y.source.as_deref() == Some("abc"),
+            "mask / src survive variation"
+        );
         assert!(matches!(DecoderGenome::parse("nn_news:tdim=4"), Err(GenomeError::Gene { .. })));
         let j = DecoderGenome::parse(r#"{"family":"nn_retrieval","params":{"emb":12,"temp":0.3,"gru":1}}"#).unwrap();
         assert_eq!((j.nn.emb, j.nn.temp, j.nn.gru), (12, 0.3, true));

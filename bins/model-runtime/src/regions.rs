@@ -22,7 +22,9 @@ use fa_mcmc::{
     calibration::{Arena, ArenaCfg, SamplerStanding},
     cross_asset::{CrossAssetCfg, CrossAssetPriors as CrossTracker},
     inference::Posterior,
-    kernel::{ConjugateExact, KernelSampler, SmcParticle},
+    kernel::{ConjugateExact, KernelCtx, KernelSampler, SmcParticle},
+    refit::RefitOutcome,
+    rich::{HierAsset, LogitCov, SecondOrder, SemiMarkov},
 };
 use fa_patterns::{
     DescentKind, DriftReport, ExpertRegionMap, HierarchyCfg, HierarchyTracker, RegionLifecycle, RegionStat,
@@ -50,6 +52,15 @@ pub struct KernelCfg {
     pub drift_warmup: u64,
     /// Geometric structural prior (spec 33 §6.1).
     pub geo_prior: bool,
+    /// The richer kernels of spec 33 §6.2 (`second_order`, `semi_markov`, `hier_asset`,
+    /// `logit_cov`) join the arena.
+    pub rich_kernels: bool,
+    /// `batch_refit_interval` in event time (0 disables `jobs.mcmc.refit`).
+    pub refit_every_ms: i64,
+    /// Transitions in a window before its first refit (and a quarter of it fresh for later ones).
+    pub refit_min_obs: usize,
+    /// Observation window per expert space.
+    pub refit_window: usize,
 }
 
 impl Default for KernelCfg {
@@ -62,25 +73,51 @@ impl Default for KernelCfg {
             drift_refit_kl: 0.1,
             drift_warmup: 2_000,
             geo_prior: true,
+            rich_kernels: true,
+            refit_every_ms: 3_600_000,
+            refit_min_obs: 500,
+            refit_window: 20_000,
         }
     }
 }
 
-/// Dirichlet rows with forgetting and the geometric prior; `conjugate` and `smc` compete in a
-/// calibration arena and the serving one publishes (spec 33 §6.4).
+/// Dirichlet rows with forgetting and the geometric prior; `conjugate`, `smc` and the richer
+/// kernels (`second_order`, `semi_markov`, `hier_asset` with Gibbs refits, `logit_cov` with NUTS
+/// refits) compete in a calibration arena and the serving one publishes (spec 33 §6.2, §6.4).
 pub struct ArenaTransitions {
     arena: Arena,
     ci_level: f64,
 }
 
+/// Key of the sampler states inside the persisted kernel JSON (ignored by `MarkovGraph` readers).
+const ARENA_STATES: &str = "arena_states";
+
 impl ArenaTransitions {
     pub fn from_graph(graph: MarkovGraph, ci_level: f64, draws: usize, kcfg: &KernelCfg, seed: u64) -> Self {
         let mut samplers: Vec<Box<dyn KernelSampler>> = vec![Box::new(ConjugateExact::new(graph.clone(), draws, seed))];
         if kcfg.smc_particles > 0 {
-            samplers.push(Box::new(SmcParticle::new(graph, kcfg.smc_particles, seed ^ 0x5EED)));
+            samplers.push(Box::new(SmcParticle::new(graph.clone(), kcfg.smc_particles, seed ^ 0x5EED)));
+        }
+        if kcfg.rich_kernels {
+            let d = draws.min(64);
+            samplers.push(Box::new(SecondOrder::new(graph.clone(), 4.0, d, seed ^ 0x20D)));
+            samplers.push(Box::new(SemiMarkov::new(graph.clone(), 2.0, d, seed ^ 0x5E31)));
+            samplers.push(Box::new(HierAsset::new(graph.clone(), 10.0, d, seed ^ 0x41E2)));
+            samplers.push(Box::new(LogitCov::new(graph, 32)));
         }
         Self { arena: Arena::new(samplers, kcfg.arena, seed ^ 0xA7E4A), ci_level }
     }
+}
+
+fn probs(v: Vec<(String, ProbSummary)>) -> Vec<fa_proto::v1::TransitionProb> {
+    v.into_iter()
+        .map(|(region_id, ProbSummary { mean, lower, upper })| fa_proto::v1::TransitionProb {
+            region_id,
+            mean,
+            lower,
+            upper,
+        })
+        .collect()
 }
 
 impl TransitionModel for ArenaTransitions {
@@ -98,17 +135,38 @@ impl TransitionModel for ArenaTransitions {
     }
     fn summarize(&mut self, from: &str) -> Vec<fa_proto::v1::TransitionProb> {
         let level = self.ci_level;
-        self.arena
-            .serving_mut()
-            .summarize(from, level)
-            .into_iter()
-            .map(|(region_id, ProbSummary { mean, lower, upper })| fa_proto::v1::TransitionProb {
-                region_id,
-                mean,
-                lower,
-                upper,
-            })
-            .collect()
+        probs(self.arena.serving_mut().summarize(from, level))
+    }
+    fn observe_ctx(&mut self, from: &str, to: &str, ctx: &KernelCtx) {
+        self.arena.observe_ctx(from, to, ctx);
+    }
+    fn summarize_ctx(&mut self, from: &str, ctx: &KernelCtx) -> Vec<fa_proto::v1::TransitionProb> {
+        let level = self.ci_level;
+        probs(self.arena.serving_mut().summarize_ctx(from, level, ctx))
+    }
+    fn kernel_state(&self) -> Option<String> {
+        let mut v = serde_json::to_value(self.arena.serving().graph()).ok()?;
+        let states = self.arena.export_states();
+        if let Some(obj) = v.as_object_mut()
+            && !states.is_empty()
+        {
+            obj.insert(ARENA_STATES.into(), serde_json::to_value(states).ok()?);
+        }
+        serde_json::to_string(&v).ok()
+    }
+    fn restore_kernel(&mut self, state: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(state) else { return };
+        let Ok(g) = serde_json::from_value::<MarkovGraph>(v.clone()) else { return };
+        self.arena.replace_graph(&g);
+        if let Some(states) = v.get(ARENA_STATES).and_then(|s| serde_json::from_value(s.clone()).ok()) {
+            self.arena.import_states(&states);
+        }
+    }
+    fn apply_refit(&mut self, o: &RefitOutcome) -> Vec<String> {
+        self.arena.apply_refit(o)
+    }
+    fn refit_refs(&self) -> Vec<String> {
+        self.arena.refit_refs()
     }
     fn n_rows(&self) -> usize {
         self.arena.serving().graph().regions().count()
@@ -359,7 +417,14 @@ pub struct CrossScale {
     last_close: HashMap<(Timescale, String), f64>,
     cross: BTreeMap<Timescale, CrossTracker>,
     ccfg: CrossAssetCfg,
+    /// Region-conditional mean next-bar return per (timescale, expert, region): (mean, n).
+    region_ret: HashMap<(Timescale, u32, String), (f64, f64)>,
+    /// Regions and router weights per (timescale, instrument) at the last closed bar.
+    prev_view: HashMap<(Timescale, String), (Vec<String>, Vec<f32>)>,
 }
+
+/// Running-mean horizon of the region-conditional returns (then an EWMA).
+const REGION_RET_HORIZON: f64 = 200.0;
 
 impl CrossScale {
     pub fn new(mut ladder: Vec<Timescale>, hcfg: HierarchyCfg, ccfg: CrossAssetCfg) -> Self {
@@ -373,7 +438,86 @@ impl CrossScale {
             last_close: HashMap::new(),
             cross: BTreeMap::new(),
             ccfg,
+            region_ret: HashMap::new(),
+            prev_view: HashMap::new(),
         }
+    }
+
+    /// Expert residual of a closed-bar return (spec 33 §6.5): `r − Σ_k w_k · μ_k(region_k)` with
+    /// the regions and router weights of the previous close; then the region means learn `r`.
+    fn expert_residual(&mut self, ts: Timescale, inst: &str, ret: f64, regions: &[String], weights: &[f32]) -> f64 {
+        let key = (ts, inst.to_owned());
+        let resid = match self.prev_view.get(&key) {
+            Some((prev, w)) => {
+                let wsum: f64 = w.iter().map(|x| f64::from(*x)).sum::<f64>().max(1e-12);
+                let pred: f64 = prev
+                    .iter()
+                    .zip(w)
+                    .enumerate()
+                    .map(|(k, (r, wk))| {
+                        let (m, n) = self.region_ret.get(&(ts, k as u32, r.clone())).copied().unwrap_or((0.0, 0.0));
+                        // shrink thin regions toward 0 (no view)
+                        f64::from(*wk) / wsum * m * n / (n + 5.0)
+                    })
+                    .sum();
+                for (k, r) in prev.iter().enumerate() {
+                    let e = self.region_ret.entry((ts, k as u32, r.clone())).or_insert((0.0, 0.0));
+                    e.1 = (e.1 + 1.0).min(REGION_RET_HORIZON);
+                    e.0 += (ret - e.0) / e.1;
+                }
+                ret - pred
+            }
+            None => ret,
+        };
+        self.prev_view.insert(key, (regions.to_vec(), weights.to_vec()));
+        resid
+    }
+
+    /// Persistable state of the cross-asset trackers (spec 33 §6.5; restored on start).
+    pub fn export_cross(&self) -> serde_json::Value {
+        let cross: BTreeMap<String, &CrossTracker> = self.cross.iter().map(|(t, c)| (t.to_string(), c)).collect();
+        let closes: Vec<(String, &String, f64)> =
+            self.last_close.iter().map(|((t, i), p)| (t.to_string(), i, *p)).collect();
+        let means: Vec<(String, u32, &String, f64, f64)> =
+            self.region_ret.iter().map(|((t, k, r), (m, n))| (t.to_string(), *k, r, *m, *n)).collect();
+        serde_json::json!({ "version": 1, "cross": cross, "last_close": closes, "region_ret": means })
+    }
+
+    /// Restores [`CrossScale::export_cross`]; returns the instruments restored per timescale.
+    pub fn restore_cross(&mut self, v: &serde_json::Value) -> usize {
+        let Some(cross) =
+            v.get("cross").and_then(|c| serde_json::from_value::<BTreeMap<String, CrossTracker>>(c.clone()).ok())
+        else {
+            return 0;
+        };
+        let mut n = 0;
+        for (t, mut c) in cross {
+            if let Ok(ts) = t.parse::<Timescale>() {
+                c.set_cfg(self.ccfg);
+                n += c.instruments();
+                self.cross.insert(ts, c);
+            }
+        }
+        if let Some(closes) =
+            v.get("last_close").and_then(|c| serde_json::from_value::<Vec<(String, String, f64)>>(c.clone()).ok())
+        {
+            for (t, i, p) in closes {
+                if let Ok(ts) = t.parse::<Timescale>() {
+                    self.last_close.insert((ts, i), p);
+                }
+            }
+        }
+        if let Some(means) = v
+            .get("region_ret")
+            .and_then(|c| serde_json::from_value::<Vec<(String, u32, String, f64, f64)>>(c.clone()).ok())
+        {
+            for (t, k, r, m, cnt) in means {
+                if let Ok(ts) = t.parse::<Timescale>() {
+                    self.region_ret.insert((ts, k, r), (m, cnt));
+                }
+            }
+        }
+        n
     }
 
     fn coarser(&self, ts: Timescale) -> Option<Timescale> {
@@ -406,7 +550,12 @@ impl CrossScale {
             && let Some(prev) = self.last_close.insert((ts, inst.clone()), p)
         {
             let ccfg = self.ccfg;
-            self.cross.entry(ts).or_insert_with(|| CrossTracker::new(ccfg)).push(&inst, as_of_ms, (p / prev).ln());
+            let ret = (p / prev).ln();
+            let resid = self.expert_residual(ts, &inst, ret, &regions, &state.router_weights);
+            self.cross
+                .entry(ts)
+                .or_insert_with(|| CrossTracker::new(ccfg))
+                .push_with_residual(&inst, as_of_ms, ret, resid);
         }
     }
 
@@ -600,7 +749,7 @@ mod tests {
         }
         let k = kernel_update(&space("s"), 1000, &t, 2, Some(DriftReport { kl: 0.2, refit_due: true }), 16, &mut rng)
             .unwrap();
-        assert_eq!(k.samplers.len(), 2);
+        assert_eq!(k.samplers.len(), 6);
         assert_eq!(k.samplers.iter().filter(|s| s.serving).count(), 1);
         assert_eq!(k.serving_sampler_id, t.sampler_id());
         assert_eq!(k.stationary.len(), 2);

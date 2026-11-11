@@ -14,14 +14,21 @@ func TestSubjectsMatchTaxonomy(t *testing.T) {
 		t.Fatalf("token = %s", got)
 	}
 	cases := map[string]string{
-		MdTrade("sim", inst):          "md.trade.sim." + tok,
-		MdBar("1h", "lemon", inst):    "md.bar.1h.lemon." + tok,
-		Heartbeat("ingestor"):         "svc.heartbeat.ingestor",
-		JobResult("evo.eval.decoder"): "jobs.result.evo.eval.decoder",
-		OrderEvent("paper"):           "order.event.paper",
-		Ctl("gpu", "acquire"):         "ctl.gpu.acquire",
-		LatentState("1m", "snap1"):    "latent.state.1m.snap1",
-		MacroObs("fred", "CPIAUCSL"):  "macro.obs.fred.CPIAUCSL",
+		MdTrade("sim", inst):                      "md.trade.sim." + tok,
+		MdBar("1h", "lemon", inst):                "md.bar.1h.lemon." + tok,
+		Heartbeat("ingestor"):                     "svc.heartbeat.ingestor",
+		JobResult("evo.eval.decoder"):             "jobs.result.evo.eval.decoder",
+		OrderEvent("paper"):                       "order.event.paper",
+		Ctl("gpu", "acquire"):                     "ctl.gpu.acquire",
+		LatentState("1m", "snap1"):                "latent.state.1m.snap1",
+		MacroObs("fred", "CPIAUCSL"):              "macro.obs.fred.CPIAUCSL",
+		LatentMembership("1m", tok):               "latent.membership.1m." + tok,
+		LatentLifecycle("1h"):                     "latent.lifecycle.1h",
+		LatentMcmc("1m", 2):                       "latent.mcmc.1m.2",
+		LatentHier("1m", "1h"):                    "latent.hier.1m.1h",
+		LatentCrossPrior("1d"):                    "latent.crossprior.1d",
+		DeadLetter("LATENT", "latent.state.1m.x"): "dlq.LATENT.latent.state.1m.x",
+		OpsAlert: "ops.alert",
 	}
 	for got, want := range cases {
 		if got != want {

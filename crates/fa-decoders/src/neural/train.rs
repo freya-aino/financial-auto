@@ -33,11 +33,14 @@ pub struct TrainOptions {
     pub should_stop: Option<Box<dyn Fn() -> bool + Send + Sync>>,
     /// Parent bundle: variables with the same name and shape start from its weights (§6.2.3).
     pub warm_start: Option<Vec<u8>>,
+    /// SGD steps instead of the genome's `steps` (successive-halving rungs train a fraction of
+    /// the full budget, spec 34 §6.2 step 4).
+    pub steps: Option<usize>,
 }
 
 impl Default for TrainOptions {
     fn default() -> Self {
-        Self { cutoff_ms: None, max_samples: 20_000, should_stop: None, warm_start: None }
+        Self { cutoff_ms: None, max_samples: 20_000, should_stop: None, warm_start: None, steps: None }
     }
 }
 
@@ -89,7 +92,15 @@ pub fn train(
     if !g.family.is_neural() {
         return Err(NeuralError::NotNeural(g.to_string()));
     }
-    let latent = if g.latent_weight > 0.0 { data::latent_dim(series, &ctx) } else { 0 };
+    // expert mask (spec 34 §4.2): the decoder only ever sees the selected experts
+    let latent_layout: Vec<(u32, u32)> = series
+        .iter()
+        .map(|s| ctx.layout(data::latent_instrument(g, s)))
+        .find(|l| !l.is_empty())
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
+    let ctx = if g.expert_mask != 0 { Arc::new(ctx.masked(g.expert_mask)) } else { ctx };
+    let latent = if g.latent_weight > 0.0 { data::latent_dim(series, &ctx, g.source.as_deref()) } else { 0 };
     let lay = Layout::of(g, latent);
     let (t0, t1) = series
         .iter()
@@ -109,7 +120,10 @@ pub fn train(
             if s.ts_ms[t] > cutoff {
                 break;
             }
-            let lat = ctx.latent_as_of(&s.instrument_id, s.ts_ms[t]).map(|l| l.vec.clone()).filter(|v| v.len() == latent);
+            let lat = ctx
+                .latent_as_of(data::latent_instrument(g, s), s.ts_ms[t])
+                .map(|l| l.vec.clone())
+                .filter(|v| v.len() == latent);
             if lay.seq == 0 && lay.extra == 0 && lat.is_none() {
                 continue; // latent-only input (conditioned nn_chart) without a latent: nothing to learn from
             }
@@ -130,11 +144,13 @@ pub fn train(
     }
     if raw.len() < 32 {
         return Err(NeuralError::InsufficientData(format!(
-            "{} rows with a known target before the cutoff {cutoff} (need ≥ 32; family {}, {} series over [{t0}, {t1}], text items {} over {:?})",
+            "{} rows with a known target before the cutoff {cutoff} (need ≥ 32; family {}, {} series over [{t0}, {t1}], text items {} ({} matched to an instrument; scope {}) over {:?})",
             raw.len(),
             g.family.as_str(),
             series.len(),
             text.len(),
+            text.matched(),
+            if g.nn.news_inst { "instrument" } else { "market" },
             text.span()
         )));
     }
@@ -184,10 +200,8 @@ pub fn train(
         Some(bytes) => warm_start(&varmap, bytes, &dev)?,
         None => 0,
     };
-    let mut opt = AdamW::new(
-        varmap.all_vars(),
-        ParamsAdamW { lr: g.nn.lr, weight_decay: g.nn.wd, ..Default::default() },
-    )?;
+    let mut opt =
+        AdamW::new(varmap.all_vars(), ParamsAdamW { lr: g.nn.lr, weight_decay: g.nn.wd, ..Default::default() })?;
 
     let step_ms = series.iter().map(|s| s.step_ms).find(|s| *s > 0).unwrap_or(1000);
     let gap_ms = (g.min_gap.max(g.horizon) as i64) * step_ms;
@@ -202,9 +216,10 @@ pub fn train(
     let mut interrupted = false;
     // Early stopping on the held-out tail: the weights with the best validation loss win.
     let val_idx: Vec<usize> = (n_train..rows.len()).collect();
-    let check_every = (g.nn.steps / 10).clamp(10, 200);
+    let total_steps = opts.steps.unwrap_or(g.nn.steps).max(1);
+    let check_every = (total_steps / 10).clamp(10, 200);
     let mut best = (ctx_loss.mean_loss(&network, &val_idx)?, 0usize, snapshot(&varmap)?);
-    for step in 0..g.nn.steps {
+    for step in 0..total_steps {
         if step % 8 == 0 && opts.should_stop.as_ref().is_some_and(|f| f()) {
             interrupted = true;
             break;
@@ -213,7 +228,7 @@ pub fn train(
         let Some(loss) = ctx_loss.batch_loss(&network, &batch, Some((&mut rng, n_train)))? else { continue };
         opt.backward_step(&loss)?;
         steps += 1;
-        if steps.is_multiple_of(check_every) || step + 1 == g.nn.steps {
+        if steps.is_multiple_of(check_every) || step + 1 == total_steps {
             let v = ctx_loss.mean_loss(&network, &val_idx)?;
             if v < best.0 || !best.0.is_finite() {
                 best = (v, steps, snapshot(&varmap)?);
@@ -253,6 +268,8 @@ pub fn train(
         output_family: g.family.output_family().as_str().into(),
         layout: lay,
         norm,
+        norm_version: super::NORM_VERSION,
+        latent_layout: if latent > 0 { latent_layout } else { Vec::new() },
         target_mean,
         sentiment,
         step_ms,
@@ -377,7 +394,8 @@ impl LossCtx<'_> {
                 if keep.is_empty() {
                     return Ok(None);
                 }
-                let keep_t = Tensor::from_vec(keep.iter().map(|k| *k as u32).collect::<Vec<_>>(), keep.len(), self.dev)?;
+                let keep_t =
+                    Tensor::from_vec(keep.iter().map(|k| *k as u32).collect::<Vec<_>>(), keep.len(), self.dev)?;
                 let q = net::l2_normalize(&out.index_select(&keep_t, 0)?)?;
                 let c = net::l2_normalize(&network.forward(&self.xs(&cand)?)?)?;
                 let yq = self.ys(&keep.iter().map(|k| idx[*k]).collect::<Vec<_>>())?;

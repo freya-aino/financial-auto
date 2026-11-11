@@ -153,6 +153,12 @@ enum Cmd {
         /// Override the snapshot's `params.adapter_guard.max_drift`.
         #[arg(long)]
         max_drift: Option<f64>,
+        /// Neural snapshots: input-normalisation adapter only (no LoRA).
+        #[arg(long, default_value_t = false)]
+        no_lora: bool,
+        /// Neural snapshots: LoRA SGD steps.
+        #[arg(long)]
+        lora_steps: Option<usize>,
     },
     /// List the `AdapterState` versions of a snapshot (Helix), newest first.
     Adapters {
@@ -160,6 +166,18 @@ enum Cmd {
         snapshot: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Train a list of neural genomes on the same history and print their expert-space health
+    /// and checklist verdict, one JSON line each (no snapshot is written).
+    Sweep {
+        #[command(flatten)]
+        fit: FitArgs,
+        /// JSON array of genome overrides (or `@file.json`).
+        #[arg(long)]
+        grid: String,
+        /// Cache the loaded bars here (read if it exists, so every sweep sees the same data).
+        #[arg(long)]
+        bars_cache: Option<PathBuf>,
     },
     /// Print the planner schedule and the jobs its next tick would enqueue.
     Plan(PlanArgs),
@@ -254,13 +272,15 @@ async fn main() -> anyhow::Result<()> {
     let outcome = match args.cmd {
         Cmd::Pretrain(f) => run::run_fit(Kind::Pretrain, f.spec()?, &svc, &Control::local("")).await,
         Cmd::Generation(f) => run::run_fit(Kind::Generation, f.spec()?, &svc, &Control::local("")).await,
-        Cmd::Adapter { snapshot, timescale, window_hours, instrument, max_drift } => {
+        Cmd::Adapter { snapshot, timescale, window_hours, instrument, max_drift, no_lora, lora_steps } => {
             let spec = AdapterSpec {
                 snapshot_id: snapshot,
                 timescale,
                 window_hours,
                 instrument,
                 max_drift,
+                no_lora,
+                lora: lora_steps.map(|steps| fa_encoders::neural::adapter::LoraConfig { steps, ..Default::default() }),
                 ..Default::default()
             };
             run::run_adapter(spec, &svc, &Control::local("")).await
@@ -272,6 +292,41 @@ async fn main() -> anyhow::Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({ "snapshot_id": snapshot, "adapters": rows }))?
             );
+            return Ok(());
+        }
+        Cmd::Sweep { fit, grid, bars_cache } => {
+            let spec = fit.spec()?;
+            let family = neural_fit::family_of(&spec)?
+                .ok_or_else(|| anyhow::anyhow!("sweep needs a neural --family (fsq_hybrid | jepa_vae | ...)"))?;
+            let grid_text = match grid.strip_prefix('@') {
+                Some(path) => std::fs::read_to_string(path)?,
+                None => grid,
+            };
+            let grid: Vec<serde_json::Value> = serde_json::from_str(&grid_text)?;
+            let history: Vec<data::BarHistory> = match bars_cache.as_ref().filter(|p| p.exists()) {
+                Some(p) => serde_json::from_slice(&std::fs::read(p)?)?,
+                None => {
+                    let (start_ms, end_ms) = data::window(spec.timescale, spec.window_hours, data::now_ms());
+                    let h = data::load_set(
+                        &tsdb,
+                        spec.timescale,
+                        spec.instruments.as_ref(),
+                        spec.instrument.as_deref(),
+                        start_ms,
+                        end_ms,
+                        None,
+                    )
+                    .await?;
+                    if let Some(p) = &bars_cache {
+                        std::fs::write(p, serde_json::to_vec(&h)?)?;
+                    }
+                    h
+                }
+            };
+            let (dev, _) = fa_expert_space::nn::device_from_str(spec.device.as_deref().unwrap_or("cpu"));
+            neural_fit::sweep(family, spec.timescale, &history, &grid, spec.seed, &dev, |row| {
+                println!("{row}");
+            })?;
             return Ok(());
         }
         Cmd::Plan(p) => {

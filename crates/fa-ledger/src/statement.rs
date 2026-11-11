@@ -324,6 +324,7 @@ mod tests {
             fee_eur: 1.0,
             filled_at: Utc.timestamp_opt(1_800_000_000 + at, 0).unwrap(),
             attribution: vec![],
+            settle_native: false,
         }
     }
 

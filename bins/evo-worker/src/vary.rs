@@ -13,6 +13,9 @@
 //! (same-family uniform crossover + Gaussian mutation on the numeric genes of
 //! `DecoderGenome::params`, clamped back by `with_params`) and are returned as canonical kv
 //! strings (`DecoderGenome::to_string`), de-duplicated against the parents and each other.
+//! The expert mask (`mask` gene) travels as the evolution genome's `expert_mask` bits
+//! ([`MASK_GENES`] bits, `0` = every bit set) and is bred by bit flips and uniform crossover;
+//! `inst` / `src` (an MCMC-proposed cross-asset pair) are kept from the first parent.
 //!
 //! Result: `{"protocol": "evo.vary.decoder/v0", "children": [..], "n_parents", "n_children",
 //! "plan": {..}?, "lineage": [{"child", "parents"}], "helix": {..}}`.
@@ -37,6 +40,23 @@ pub const KIND: &str = "evo.vary.decoder";
 pub const PROTOCOL: &str = "evo.vary.decoder/v0";
 /// Hard cap on children per job.
 pub const MAX_CHILDREN: usize = 10_000;
+/// Expert-mask bits bred by evolution (expert indices `0..MASK_GENES`; higher experts are read
+/// only by unmasked genomes).
+pub const MASK_GENES: u32 = 8;
+
+/// `mask` gene → evolution bits (`0` = all experts = every bit set).
+pub fn mask_bits(mask: u32) -> Vec<bool> {
+    (0..MASK_GENES).map(|i| mask == 0 || mask & (1 << i) != 0).collect()
+}
+
+/// Evolution bits → `mask` gene (every bit set = `0`, all experts; no bit set = `None`, invalid).
+pub fn mask_of(bits: &[bool]) -> Option<u32> {
+    if bits.is_empty() || bits.iter().all(|b| *b) {
+        return Some(0);
+    }
+    let m = bits.iter().enumerate().filter(|(_, b)| **b).fold(0u32, |m, (i, _)| m | (1 << i));
+    (m != 0).then_some(m)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -101,8 +121,13 @@ pub struct VaryRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct Lineage {
     pub child: String,
+    /// Parents in canonical kv form (Helix genome ids).
     pub parents: Vec<String>,
     pub op: &'static str,
+    /// The same parents exactly as the request named them (the orchestrator's genome ids, so it
+    /// can hand a child its parent's weights); omitted for strategy / allocator lineage.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub parents_as_sent: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,7 +145,7 @@ pub fn to_evo(g: &DecoderGenome, generation: u32) -> Genome {
         kind: GenomeKind::Decoder,
         family: g.family.as_str().to_owned(),
         timescale: g.timescale,
-        expert_mask: Vec::new(),
+        expert_mask: mask_bits(g.expert_mask),
         assets: Vec::new(),
         params: g.params(),
         parents: Vec::new(),
@@ -160,6 +185,8 @@ pub fn produce(req: &VaryRequest) -> Result<VaryOutcome, String> {
     let evo_parents: Vec<Genome> = parents.iter().map(|g| to_evo(g, req.generation.saturating_sub(1))).collect();
     let by_id: BTreeMap<&str, &DecoderGenome> =
         evo_parents.iter().zip(&parents).map(|(e, g)| (e.id.as_str(), g)).collect();
+    let as_sent: BTreeMap<&str, &str> =
+        evo_parents.iter().zip(&req.parents).map(|(e, p)| (e.id.as_str(), p.genome())).collect();
 
     let mut seen: BTreeSet<String> = evo_parents.iter().map(|p| p.id.clone()).collect();
     let mut children = Vec::with_capacity(n_children);
@@ -173,13 +200,21 @@ pub fn produce(req: &VaryRequest) -> Result<VaryOutcome, String> {
                 break;
             }
             let Some(base) = c.parents.first().and_then(|p| by_id.get(p.as_str())) else { continue };
-            let Ok(child) = base.with_params(&c.params) else { continue };
+            let Ok(mut child) = base.with_params(&c.params) else { continue };
+            // an empty mask (every expert flipped off) keeps the parent's
+            child.expert_mask = mask_of(&c.expert_mask).unwrap_or(base.expert_mask);
+            child.id = child.to_string();
             let key = child.to_string();
             if !seen.insert(key.clone()) {
                 continue;
             }
             lineage.push(Lineage {
                 child: key,
+                parents_as_sent: c
+                    .parents
+                    .iter()
+                    .map(|p| as_sent.get(p.as_str()).map_or(p.clone(), |s| (*s).to_owned()))
+                    .collect(),
                 parents: c.parents.clone(),
                 op: if c.parents.len() == 2 { "crossover+mutation" } else { "mutation" },
             });
@@ -295,10 +330,37 @@ mod tests {
             assert_eq!(l.child, s);
         }
         assert!(a.lineage.iter().any(|l| l.op == "crossover+mutation"), "forecast pair never crossed");
+        let sent = ["forecast:h=3;lb=16;kernel=8", "forecast:h=4;lb=20", "retrieval:h=3;lb=8;k=10"];
+        for l in &a.lineage {
+            assert_eq!(l.parents_as_sent.len(), l.parents.len());
+            assert!(l.parents_as_sent.iter().all(|p| sent.contains(&p.as_str())), "{:?}", l.parents_as_sent);
+        }
         assert_ne!(
             produce(&req(r#"{"parents":["forecast:h=3;lb=16"],"n_children":2,"seed":1}"#)).unwrap().children,
             produce(&req(r#"{"parents":["forecast:h=3;lb=16"],"n_children":2,"seed":2}"#)).unwrap().children
         );
+    }
+
+    #[test]
+    fn expert_masks_and_pairs_are_bred() {
+        assert_eq!(mask_of(&mask_bits(0)), Some(0));
+        assert_eq!(mask_of(&mask_bits(0b101)), Some(0b101));
+        assert_eq!(mask_of(&[false; 8]), None);
+        let r = req(
+            r#"{"parents":["nn_forecast:h=3;lb=16;mask=3;inst=t1;src=s1","nn_forecast:h=4;lb=16;mask=5;inst=t1;src=s1"],
+                "n_children":40,"seed":3,"sigma":0.1}"#,
+        );
+        let mut r = r;
+        r.crossover_prob = Some(1.0);
+        let out = produce(&r).unwrap();
+        assert_eq!(out.children.len(), 40);
+        let masks: BTreeSet<u32> = out.children.iter().map(|c| c.expert_mask).collect();
+        assert!(masks.len() > 2, "masks are bred: {masks:?}");
+        for c in &out.children {
+            assert_eq!((c.instrument.as_deref(), c.source.as_deref()), (Some("t1"), Some("s1")), "the pair is kept");
+            assert!(c.to_string().contains("src=s1"));
+            assert_eq!(DecoderGenome::parse(&c.to_string()).unwrap().expert_mask, c.expert_mask);
+        }
     }
 
     #[test]

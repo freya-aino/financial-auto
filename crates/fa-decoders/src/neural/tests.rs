@@ -26,7 +26,11 @@ fn regime_data(n: usize, seed: u64) -> (Series, DecodeCtx, TextTimeline) {
         let lat = vec![(r + 0.1 * rng.normal()) as f32, (0.1 * rng.normal()) as f32, 0.5];
         ctx.push("inst-syn", LatentPoint { as_of_ms: i as i64 * 1000, vec: lat });
         if i % 10 == 0 {
-            let words = if r > 0.0 { "stocks rally strong gains record surge" } else { "shares plunge weak losses slump crash" };
+            let words = if r > 0.0 {
+                "stocks rally strong gains record surge"
+            } else {
+                "shares plunge weak losses slump crash"
+            };
             text.push(i as i64 * 1000, words, "");
         }
     }
@@ -220,14 +224,25 @@ fn feedback_gradients_reach_the_latents_only() {
         let key = feedback::bundle_key("gen-test", &d.meta, &format!("job{i}"));
         assert!(key.starts_with("decoders/gen-test/") && key.ends_with(".safetensors"), "{key}");
         assert!(feedback::card_key(&key).ends_with(".card.json"));
-        cards.push(feedback::EliteCard { meta: d.meta.clone(), bucket: feedback::BUCKET.into(), key, created_ms: i as i64 });
+        cards.push(feedback::EliteCard {
+            meta: d.meta.clone(),
+            bucket: feedback::BUCKET.into(),
+            key,
+            created_ms: i as i64,
+        });
         bundles.push((d.to_bundle().unwrap(), 1.0));
     }
     // an unconditioned decoder is not a feedback elite
     let (s, ctx, text) = regime_data(900, 11);
     let blind_g = DecoderGenome::parse("nn_forecast:lb=12;width=8;steps=5;lat=0").unwrap();
-    let blind = train(&blind_g, std::slice::from_ref(&s), Arc::new(ctx.clone()), Arc::new(text.clone()), &TrainOptions::default())
-        .unwrap();
+    let blind = train(
+        &blind_g,
+        std::slice::from_ref(&s),
+        Arc::new(ctx.clone()),
+        Arc::new(text.clone()),
+        &TrainOptions::default(),
+    )
+    .unwrap();
     bundles.push((blind.to_bundle().unwrap(), 1.0));
 
     let top = feedback::select_top_k(&cards, 1, Some(3));
@@ -242,10 +257,8 @@ fn feedback_gradients_reach_the_latents_only() {
     let steps: Vec<(&Series, usize)> = (100..164).map(|t| (&s, t * 5)).collect();
     let batch = set.prepare(&steps, &text).unwrap();
     assert!(batch.rows_per_elite().iter().all(|n| *n > 0), "{:?}", batch.rows_per_elite());
-    let lat: Vec<f32> = steps
-        .iter()
-        .flat_map(|(s, t)| ctx.latent_as_of("inst-syn", s.ts_ms[*t]).unwrap().vec.clone())
-        .collect();
+    let lat: Vec<f32> =
+        steps.iter().flat_map(|(s, t)| ctx.latent_as_of("inst-syn", s.ts_ms[*t]).unwrap().vec.clone()).collect();
     let latents = Var::from_tensor(&Tensor::from_vec(lat, (steps.len(), 3), &Device::Cpu).unwrap()).unwrap();
     let out = set.aux_loss(latents.as_tensor(), &batch).unwrap();
     assert_eq!(out.parts.len(), 4, "{:?}", out.parts.iter().map(|p| &p.1).collect::<Vec<_>>());
@@ -277,4 +290,83 @@ fn latent_only_chart_falls_back_when_latents_start_after_the_cutoff() {
     assert_eq!(d.meta.layout.latent, 0, "unconditioned fallback");
     assert_eq!(d.meta.layout.seq, 12);
     assert_eq!(d.genome().latent_weight, 0.0);
+}
+
+/// First-generation bundles (latent normaliser v1, written before `norm_version` existed) are
+/// refused for serving / feedback and listed for re-training (D-068 open item).
+#[test]
+fn stale_normaliser_bundles_are_refused_and_listed() {
+    let (mut d, _) = fit("nn_forecast:h=3;lb=12;width=8;depth=1;steps=20", 900);
+    assert_eq!(d.meta.norm_version, NORM_VERSION);
+    // a card JSON from before the field existed deserialises as v1
+    let mut json = serde_json::to_value(&d.meta).unwrap();
+    json.as_object_mut().unwrap().remove("norm_version");
+    let old: BundleMeta = serde_json::from_value(json).unwrap();
+    assert_eq!(old.norm_version, 1);
+    assert!(!old.is_current());
+    d.meta.score = 0.2;
+    let fresh = feedback::EliteCard { meta: d.meta.clone(), bucket: "b".into(), key: "new".into(), created_ms: 2 };
+    let stale = feedback::EliteCard {
+        meta: BundleMeta { score: 0.3, ..old },
+        bucket: "b".into(),
+        key: "old".into(),
+        created_ms: 1,
+    };
+    let top = feedback::select_top_k(&[stale.clone(), fresh.clone()], 3, None);
+    assert_eq!(top.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec!["new"], "stale cards never serve");
+    assert_eq!(
+        feedback::stale_cards(&[stale.clone(), fresh]).iter().map(|c| c.key.as_str()).collect::<Vec<_>>(),
+        vec!["old"]
+    );
+    // the bundle itself is refused by from_bundle, still readable for inspection / warm starts
+    d.meta.norm_version = 1;
+    let bytes = d.to_bundle().unwrap();
+    assert!(matches!(NeuralDecoder::from_bundle(&bytes, &Device::Cpu), Err(NeuralError::StaleNormaliser(1))));
+    assert!(NeuralDecoder::from_bundle_any(&bytes, &Device::Cpu).is_ok());
+    let set = feedback::FeedbackSet::load(&[(bytes, 1.0)], 3, &Device::Cpu).unwrap();
+    assert!(set.is_empty() && set.skipped[0].1.contains("stale"), "{:?}", set.skipped);
+}
+
+/// An expert-masked elite reads only its experts' columns of the encoder latent.
+#[test]
+fn masked_feedback_selects_expert_columns() {
+    let (s, mut ctx, text) = regime_data(900, 11);
+    ctx.set_layout("inst-syn", vec![(0, 2), (1, 1)]);
+    let g = DecoderGenome::parse("nn_forecast:h=3;lb=12;width=8;steps=40;mask=1").unwrap();
+    let d =
+        train(&g, std::slice::from_ref(&s), Arc::new(ctx.clone()), Arc::new(text.clone()), &TrainOptions::default())
+            .unwrap();
+    assert_eq!((d.meta.layout.latent, d.meta.full_latent_dim()), (2, 3));
+    let mut card = feedback::EliteCard { meta: d.meta.clone(), bucket: "b".into(), key: "k".into(), created_ms: 0 };
+    card.meta.score = 0.1;
+    assert_eq!(feedback::select_top_k(std::slice::from_ref(&card), 1, Some(3)).len(), 1, "full dimension matches");
+    assert!(feedback::select_top_k(&[card], 1, Some(2)).is_empty());
+    let set = feedback::FeedbackSet::load(&[(d.to_bundle().unwrap(), 1.0)], 3, &Device::Cpu).unwrap();
+    assert_eq!(set.elites.len(), 1, "{:?}", set.skipped);
+    let steps: Vec<(&Series, usize)> = (100..140).map(|t| (&s, t * 5)).collect();
+    let batch = set.prepare(&steps, &text).unwrap();
+    let lat: Vec<f32> =
+        steps.iter().flat_map(|(s, t)| ctx.latent_as_of("inst-syn", s.ts_ms[*t]).unwrap().vec.clone()).collect();
+    let latents = Var::from_tensor(&Tensor::from_vec(lat, (steps.len(), 3), &Device::Cpu).unwrap()).unwrap();
+    let out = set.aux_loss(latents.as_tensor(), &batch).unwrap();
+    let grads = out.total.backward().unwrap();
+    let gm = grads.get(latents.as_tensor()).unwrap().sqr().unwrap().sum_keepdim(0).unwrap().to_vec2::<f32>().unwrap();
+    assert!(gm[0][0] > 0.0 || gm[0][1] > 0.0, "{gm:?}");
+    assert_eq!(gm[0][2], 0.0, "the unmasked expert gets no gradient: {gm:?}");
+    // serving picks the same experts from a latent state
+    let e0 = [1.0f32, 0.5];
+    let e1 = [9.0f32];
+    assert_eq!(d.select_latent([(1, &e1[..]), (0, &e0[..])]), Some(vec![1.0, 0.5]));
+    assert_eq!(d.select_latent([(1, &e1[..])]), None);
+}
+
+/// Successive-halving rungs train a fraction of the genome's steps.
+#[test]
+fn steps_override_limits_training() {
+    let (s, ctx, text) = regime_data(900, 11);
+    let g = DecoderGenome::parse("nn_forecast:h=3;lb=12;width=8;steps=400").unwrap();
+    let opts = TrainOptions { steps: Some(25), ..Default::default() };
+    let d = train(&g, std::slice::from_ref(&s), Arc::new(ctx), Arc::new(text), &opts).unwrap();
+    assert_eq!(d.meta.train.steps, 25);
+    assert!(d.meta.genome.contains("steps=400"), "the genome keeps its full-fidelity steps");
 }

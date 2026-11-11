@@ -18,7 +18,9 @@
 
 mod bars;
 mod decoders;
+mod expert_view;
 mod hub_sink;
+mod mcmc_jobs;
 mod neural_serving;
 mod pipeline;
 mod regions;
@@ -102,6 +104,10 @@ struct Args {
     /// Particles per source row of the SMC sampler competing with the conjugate one (0 = off).
     #[arg(long, default_value_t = 64)]
     smc_particles: usize,
+    /// `batch_refit_interval` of the richer kernels (spec 33 §6.3, `jobs.mcmc.refit`; 0 = off).
+    /// The first refit of an expert space runs once its window holds 500 transitions.
+    #[arg(long, default_value_t = 3600)]
+    mcmc_refit_secs: u64,
     /// Event-time cadence of `KernelUpdate`s (`latent.mcmc.<ts>.<expert>`) per expert space.
     #[arg(long, default_value_t = 60)]
     kernel_every_secs: u64,
@@ -204,6 +210,10 @@ struct Runtime {
     xscale: regions::CrossScale,
     /// Sustained occupancy drift → `train.adapter` request (spec 30 §6.6).
     drift_refit: regions::DriftTrigger,
+    /// Batch refits of the richer kernels and cross-asset persistence ([`mcmc_jobs`]).
+    mcmc: mcmc_jobs::McmcJobs,
+    /// `latent.expert.*` views and live expert health (spec 32 §4.3).
+    experts: expert_view::ExpertPublisher,
 }
 
 impl Runtime {
@@ -289,13 +299,27 @@ impl Runtime {
         };
         st.last_preview.insert(inst.to_owned(), now);
         let input = StepInput { instrument_id: inst, as_of_ms, bars: &bars, bar_closed: closed };
-        let out = match st.pipeline.step(&input) {
+        let mut out = match st.pipeline.step(&input) {
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!(%ts, instrument = inst, error = %e, "encode failed");
                 return;
             }
         };
+        // spec 60 §6.5: inference latency per timescale (encode + MCMC step of this bar update)
+        {
+            let ms = now.elapsed().as_secs_f64() * 1000.0;
+            let mut c = self.counters.lock().await;
+            let ewma = c.get(&format!("inference.{ts}.ms_ewma")).copied().map_or(ms, |e| 0.9 * e + 0.1 * ms);
+            let max = c.get(&format!("inference.{ts}.ms_max")).copied().unwrap_or(0.0).max(ms);
+            c.insert(format!("inference.{ts}.ms_last"), ms);
+            c.insert(format!("inference.{ts}.ms_ewma"), ewma);
+            c.insert(format!("inference.{ts}.ms_max"), max);
+            *c.entry(format!("inference.{ts}.count")).or_default() += 1.0;
+        }
+        for r in std::mem::take(&mut out.refits) {
+            self.mcmc.enqueue(r);
+        }
         let token = inst.replace('-', "");
         let shadow_state = st.shadow.as_mut().and_then(|sh| sh.step(&input, out.state.as_ref()));
         let shadow_gauges = st.shadow.as_ref().map(|sh| sh.gauges(ts));
@@ -331,6 +355,20 @@ impl Runtime {
                     Err(e) => tracing::warn!(error = %e, "drift refit request failed"),
                 }
             }
+        }
+        if let Some(state) = &out.state {
+            // spec 32 §4.2–§4.3: ExpertView per step, live expert health on closed bars
+            let (view, health) = self.experts.step(
+                ts,
+                &token,
+                out.family,
+                closed,
+                state,
+                out.membership.as_ref(),
+                out.extras.as_ref(),
+                as_of_ms,
+            );
+            expert_view::publish(&self.bus, &self.counters, ts, &token, view, health).await;
         }
         publish_step(&self.bus, &self.counters, ts, inst, closed, out, &self.states[i].pipeline).await;
         if let Some(s) = shadow_state
@@ -384,7 +422,7 @@ impl Runtime {
             *self.counters.lock().await.entry("news.duplicates".into()).or_default() += 1.0;
             return;
         };
-        self.neural.on_news(doc.ts_ms, &doc.title, &doc.body);
+        self.neural.on_news(doc.ts_ms, &doc.title, &doc.body, &matched);
         {
             let mut c = self.counters.lock().await;
             *c.entry("news.items".into()).or_default() += 1.0;
@@ -467,8 +505,29 @@ impl Runtime {
         }
     }
 
+    /// A batch refit's posterior samples (`jobs.mcmc.refit`) enter the arena of their space.
+    async fn on_refit(&mut self, o: fa_mcmc::refit::RefitOutcome) {
+        self.mcmc.done(&o.kernel_id);
+        let summary = o.summary();
+        let taken = self.states.iter_mut().find_map(|st| st.pipeline.apply_refit(&o));
+        let ts = o.timescale.clone();
+        let mut c = self.counters.lock().await;
+        match taken {
+            Some(samplers) => {
+                tracing::info!(kernel = %o.kernel_id, ?samplers, %summary, "refit applied to the sampler arena");
+                *c.entry(format!("mcmc_refits_applied.{ts}")).or_default() += 1.0;
+                c.insert(format!("mcmc.{ts}.e{}.refit_samplers", o.expert_index), samplers.len() as f64);
+            }
+            None => {
+                tracing::info!(kernel = %o.kernel_id, "refit for a snapshot no longer served; ignored");
+                *c.entry("mcmc_refits_stale".into()).or_default() += 1.0;
+            }
+        }
+    }
+
     /// Region sets, kernels, statistics and centroids to Helix (spec 30 §8).
     fn persist_tick(&self) {
+        self.mcmc.save_cross(self.xscale.export_cross());
         if let Some(sink) = &self.sink {
             for st in &self.states {
                 sink.send(hub_sink::HubEvent::Persist(st.pipeline.persist_rows()));
@@ -655,6 +714,7 @@ async fn main() -> anyhow::Result<()> {
         kernel: regions::KernelCfg {
             smc_particles: args.smc_particles,
             kernel_every_ms: (args.kernel_every_secs * 1000) as i64,
+            refit_every_ms: (args.mcmc_refit_secs * 1000) as i64,
             ..regions::KernelCfg::default()
         },
         ..PipelineConfig::default()
@@ -770,7 +830,18 @@ async fn main() -> anyhow::Result<()> {
             fa_mcmc::cross_asset::CrossAssetCfg::default(),
         ),
         drift_refit: regions::DriftTrigger::new(3, (args.drift_refit_cooldown_secs * 1000) as i64),
+        mcmc: mcmc_jobs::McmcJobs::spawn(
+            &bus,
+            fa_core::Secrets::load().ok().and_then(|s| fa_blob::S3BlobStore::from_config(&cfg, &s).ok()),
+        ),
+        experts: expert_view::ExpertPublisher::default(),
     };
+    // Cross-asset tracker and the refitted kernels of the restored spaces survive restarts.
+    if let Some(v) = rt.mcmc.load_cross().await {
+        let n = rt.xscale.restore_cross(&v);
+        tracing::info!(instruments = n, "cross-asset tracker restored from Garage");
+    }
+    rt.mcmc.reload(rt.states.iter().flat_map(|s| s.pipeline.refit_refs()).collect());
 
     let mut trades = bus.subscribe::<Envelope>(subjects::ALL_MD_TRADES.into()).await?;
     let mut bars_sub = bus.subscribe::<Envelope>("md.bar.>".into()).await?;
@@ -796,6 +867,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             Some((_, r)) = jobs.next() => rt.on_job_result(&r).await,
+            Some(o) = rt.mcmc.results.recv() => rt.on_refit(o).await,
             Some(cmd) = ctl_rx.recv() => rt.on_ctl(cmd).await,
             _ = text_tick.tick() => if !rt.text.timescales().is_empty() { rt.text_tick().await },
             _ = gauge_tick.tick() => rt.gauge_tick().await,
@@ -947,6 +1019,7 @@ async fn publish_step(
     }
     c.insert(format!("regions_live.{ts}"), pl.live_regions() as f64);
     c.insert(format!("transition_rows.{ts}"), pl.transition_rows() as f64);
+    c.insert(format!("mcmc_refit_window.{ts}"), pl.refit_window_len() as f64);
     c.extend(gauges);
 }
 
@@ -996,6 +1069,19 @@ async fn restore_regions(hub_url: &str, states: &mut [TimescaleState], counters:
 fn spawn_heartbeat(bus: Bus, counters: Counters, instance_id: String, every_secs: u64) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(every_secs));
+        // spec 60 §6.5 GPU utilisation per class: this service is the live-inference class. A CPU
+        // build or `FA_ML_DEVICE=cpu` reports device cpu and 0 % GPU, never an estimate.
+        let (device, _) = fa_encoders::neural::device_from_env();
+        let cuda = f64::from(u8::from(device.is_cuda()));
+        {
+            let mut c = counters.lock().await;
+            c.insert("ml.device.cuda".into(), cuda);
+            if cuda == 0.0 {
+                // no GPU in use: 0 is measured, not assumed (a CUDA device has no NVML probe yet)
+                c.insert("gpu.live_inference.utilisation".into(), 0.0);
+                c.insert("gpu.live_inference.mem_mb".into(), 0.0);
+            }
+        }
         loop {
             tick.tick().await;
             let hb = Heartbeat {

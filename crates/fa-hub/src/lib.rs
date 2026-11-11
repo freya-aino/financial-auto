@@ -28,6 +28,7 @@ pub mod asof;
 pub mod ast;
 pub mod buffer;
 pub mod catalog;
+pub mod experts;
 pub mod meta;
 pub mod queries;
 pub mod regions;
@@ -45,6 +46,7 @@ use serde_json::Value as Json;
 pub use asof::*;
 pub use ast::{Batch, Cond, EdgeRef, IndexSpec, Input, Metric, NodeRef, Op, ParamType, Pred, Val, param};
 pub use buffer::{BufferStats, FlushReport, WriteBuffer};
+pub use experts::{AlignmentRow, ExpertRow, NewAlignment, NewExpert, expert_uid};
 pub use meta::{SCHEMA_VERSION, SchemaMarker};
 pub use queries::*;
 pub use regions::{

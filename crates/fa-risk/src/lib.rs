@@ -13,6 +13,7 @@
 //! rules (suggestions, tighten-only).
 
 pub mod calibrate;
+pub mod exec;
 pub mod health;
 pub mod pipeline;
 pub mod pretrade;
@@ -58,6 +59,12 @@ pub struct RiskConfig {
     pub max_order_frac: f64,
     /// Pre-trade: a limit price must lie within this fraction of the mark.
     pub limit_price_band: f64,
+    /// Initial margin a short position ties up, per asset class, as a fraction of its notional
+    /// (spec 40 §10 Q5, paper answer). A class absent here cannot be shorted at all (no borrow);
+    /// an instrument whose `ref.contract_spec.shortable` is false cannot be shorted either.
+    pub short_margin: BTreeMap<AssetClass, f64>,
+    /// Margin budget for shorts: Σ |short_i| × short_margin(class_i) ≤ this × deployable.
+    pub short_margin_budget_frac: f64,
 }
 
 impl Default for RiskConfig {
@@ -81,8 +88,25 @@ impl Default for RiskConfig {
             provisional_position_frac: None,
             max_order_frac: 0.10,
             limit_price_band: 0.10,
+            short_margin: default_short_margin(),
+            short_margin_budget_frac: 0.5,
         }
     }
+}
+
+/// Paper short-margin schedule: Reg-T style 50 % for equities/ETFs, fully collateralised crypto
+/// (100 %), 5 % FX (20:1), 10 % index and 20 % commodity/derivative delta-1 notionals; rates and
+/// prediction markets are not shortable.
+pub fn default_short_margin() -> BTreeMap<AssetClass, f64> {
+    BTreeMap::from([
+        (AssetClass::Equity, 0.5),
+        (AssetClass::Etf, 0.5),
+        (AssetClass::Crypto, 1.0),
+        (AssetClass::Fx, 0.05),
+        (AssetClass::Index, 0.1),
+        (AssetClass::Commodity, 0.2),
+        (AssetClass::Derivative, 0.2),
+    ])
 }
 
 impl RiskConfig {
@@ -115,9 +139,19 @@ impl RiskConfig {
         le("liquidity_k", self.liquidity_k, new.liquidity_k);
         le("max_order_frac", self.max_order_frac, new.max_order_frac);
         le("limit_price_band", self.limit_price_band, new.limit_price_band);
+        le("short_margin_budget_frac", self.short_margin_budget_frac, new.short_margin_budget_frac);
         for (class, cap) in &new.leverage_cap {
             let old = self.leverage_cap.get(class).copied().unwrap_or(0.0);
             le(&format!("leverage_cap.{class:?}").to_lowercase(), old, *cap);
+        }
+        // a margin requirement may only rise; a class may only become non-shortable (removed)
+        for (class, m) in &new.short_margin {
+            let name = format!("short_margin.{class:?}").to_lowercase();
+            match self.short_margin.get(class) {
+                None => bad.push(format!("{name}: not shortable → {m} would loosen")),
+                Some(old) if !m.is_finite() || *m < *old => bad.push(format!("{name}: {old} → {m} would loosen")),
+                Some(_) => {}
+            }
         }
         if !new.daily_payout_quota_eur.is_finite() || new.daily_payout_quota_eur < self.daily_payout_quota_eur {
             bad.push(format!(
@@ -140,11 +174,21 @@ pub struct MarketInfo {
     /// Reference data still `provisional` (D-050): the stricter
     /// [`RiskConfig::provisional_position_frac`] applies.
     pub provisional: bool,
+    /// `ref.contract_spec.shortable` (borrow available); `None` = unknown → the class rule.
+    pub shortable: Option<bool>,
 }
 
 impl MarketInfo {
     pub fn new(asset_class: AssetClass, venue: &str, horizon_volume_eur: f64) -> Self {
-        Self { asset_class, venue: venue.into(), horizon_volume_eur, provisional: false }
+        Self { asset_class, venue: venue.into(), horizon_volume_eur, provisional: false, shortable: None }
+    }
+
+    /// Short margin fraction for this instrument, `None` when it cannot be shorted.
+    pub fn short_margin(&self, cfg: &RiskConfig) -> Option<f64> {
+        if self.shortable == Some(false) {
+            return None;
+        }
+        cfg.short_margin.get(&self.asset_class).copied().filter(|m| m.is_finite() && *m >= 0.0)
     }
 }
 
@@ -355,9 +399,26 @@ impl RiskEngine {
                 }; // unknown market → no position
                 let liq_cap = self.cfg.liquidity_k * m.horizon_volume_eur;
                 let cap = if m.provisional { prov_cap } else { pos_cap }.min(liq_cap);
-                (*i, t.clamp(-cap, cap))
+                // no borrow → no short (spec 40 §10 Q5)
+                let floor = if m.short_margin(&self.cfg).is_some() { -cap } else { 0.0 };
+                (*i, t.clamp(floor, cap))
             })
             .collect();
+        // short margin budget: Σ |short| × margin ≤ budget × deployable, shorts scaled down together
+        let margin_used: f64 = clipped
+            .iter()
+            .filter(|(_, v)| **v < 0.0)
+            .filter_map(|(i, v)| Some(v.abs() * market.get(i)?.short_margin(&self.cfg)?))
+            .sum();
+        let margin_cap = self.cfg.short_margin_budget_frac * deployable;
+        if margin_used > margin_cap {
+            let scale = if margin_used > 0.0 { margin_cap / margin_used } else { 0.0 };
+            for v in clipped.values_mut() {
+                if *v < 0.0 {
+                    *v *= scale;
+                }
+            }
+        }
         // per-asset-class gross leverage caps: scale the class down proportionally
         let mut gross: BTreeMap<AssetClass, f64> = BTreeMap::new();
         for (i, v) in &clipped {
@@ -550,6 +611,40 @@ mod tests {
         let r = e.cap_targets(&t, &m, 11_000.0);
         let gross: f64 = r.values().map(|v| v.abs()).sum();
         assert!((gross - 3_000.0).abs() < 1e-6, "portfolio cap binds: {r:?}");
+    }
+
+    #[test]
+    fn shorts_need_a_shortable_class_and_fit_the_margin_budget() {
+        let mut e = engine(); // 10 000 deployable
+        e.cfg.max_position_frac = 1.0;
+        e.cfg.max_class_frac = 10.0;
+        e.cfg.max_venue_frac = 10.0;
+        e.cfg.leverage_cap = BTreeMap::from([(AssetClass::Equity, 10.0), (AssetClass::Rates, 10.0)]);
+        let (a, b, c, d) = (InstrumentId::new(), InstrumentId::new(), InstrumentId::new(), InstrumentId::new());
+        let m = BTreeMap::from([
+            (a, MarketInfo::new(AssetClass::Equity, "v", 1e12)),
+            (b, MarketInfo { shortable: Some(false), ..MarketInfo::new(AssetClass::Equity, "v", 1e12) }),
+            (c, MarketInfo::new(AssetClass::Rates, "v", 1e12)),
+            (d, MarketInfo::new(AssetClass::Equity, "v", 1e12)),
+        ]);
+        let t = BTreeMap::from([(a, -4_000.0), (b, -3_000.0), (c, -2_000.0), (d, 3_000.0)]);
+        let r = e.cap_targets(&t, &m, 11_000.0);
+        assert_eq!((r[&a], r[&b], r[&c], r[&d]), (-4_000.0, 0.0, 0.0, 3_000.0), "no borrow → no short");
+        // 50 % margin on 4 000 = 2 000 > budget 0.1 × 10 000 → the short is scaled to 2 000
+        e.cfg.short_margin_budget_frac = 0.1;
+        let r = e.cap_targets(&t, &m, 11_000.0);
+        assert!((r[&a] + 2_000.0).abs() < 1e-9 && r[&d] == 3_000.0, "{r:?}");
+        // tighten-only: a lower margin or a newly shortable class loosens, removal tightens
+        let old = RiskConfig::default();
+        let mut looser = old.clone();
+        looser.short_margin.insert(AssetClass::Equity, 0.25);
+        looser.short_margin.insert(AssetClass::Rates, 0.5);
+        looser.short_margin_budget_frac = 0.9;
+        assert_eq!(old.check_tightens(&looser).len(), 3, "{:?}", old.check_tightens(&looser));
+        let mut tighter = old.clone();
+        tighter.short_margin.remove(&AssetClass::Crypto);
+        tighter.short_margin.insert(AssetClass::Equity, 0.75);
+        assert!(old.check_tightens(&tighter).is_empty());
     }
 
     #[test]

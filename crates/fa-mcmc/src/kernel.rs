@@ -20,7 +20,8 @@ use std::{collections::HashMap, time::Instant};
 
 use fa_core::rng::Rng;
 
-use crate::{MarkovGraph, ProbSummary, RegionKey, UNKNOWN};
+pub use crate::rich::KernelCtx;
+use crate::{MarkovGraph, ProbSummary, RegionKey, UNKNOWN, refit::RefitOutcome};
 
 pub trait KernelSampler: Send + Sync {
     /// Stable id (`conjugate`, `smc`), the `sampler_id` of published rows.
@@ -43,6 +44,29 @@ pub trait KernelSampler: Send + Sync {
     fn predict(&mut self, from: &str) -> Vec<(RegionKey, f64)>;
     /// Posterior mean and central interval of mass `level` per successor.
     fn summarize(&mut self, from: &str, level: f64) -> Vec<(RegionKey, ProbSummary)>;
+
+    /// Observation with its context (asset, previous region, dwell, covariates; spec 33 §4.1
+    /// `KernelCtx`). Context-free kernels ignore it.
+    fn observe_ctx(&mut self, from: &str, to: &str, _ctx: &KernelCtx) {
+        self.observe(from, to);
+    }
+    /// Posterior predictive given the context (the richer kernels of spec 33 §6.2 condition on it).
+    fn predict_ctx(&mut self, from: &str, _ctx: &KernelCtx) -> Vec<(RegionKey, f64)> {
+        self.predict(from)
+    }
+    fn summarize_ctx(&mut self, from: &str, level: f64, _ctx: &KernelCtx) -> Vec<(RegionKey, ProbSummary)> {
+        self.summarize(from, level)
+    }
+    /// Takes the part of a batch refit (`jobs.mcmc.refit`) meant for this kernel. Returns
+    /// whether anything changed.
+    fn apply_refit(&mut self, _o: &RefitOutcome) -> bool {
+        false
+    }
+    /// Sampler-specific state beyond the shared Dirichlet evidence (persisted with the kernel).
+    fn export_state(&self) -> Option<serde_json::Value> {
+        None
+    }
+    fn import_state(&mut self, _v: &serde_json::Value) {}
 }
 
 /// Closed-form Dirichlet–multinomial sampler (spec 33 `ConjugateExact`).

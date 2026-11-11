@@ -135,6 +135,8 @@ Constraints: max depth, max nodes, evaluation-time budget per step (cost objecti
 | Entity | Store | Fields |
 |---|---|---|
 | `StrategyGenome` | Helix node | representation, program tree (GP) or topology (neural), spec, generation, status (candidate / holdout-passed / shadow / paper / live / retired), objectives |
+
+**Implemented (Helix status mirror):** evolved strategies are Helix `Genome{kind: strategy, family: gp}` nodes (written by the evo-worker); the risk-engine pipeline mirrors each one's lifecycle status from `ledger.strategy_state` onto it at the end of every round (`fa_hub::set_genome_status`: properties `status` = `candidate|holdout_passed|shadow|active|paused|flattening|retired`, `strategy_id`, `status_reason`, `status_since_ms`, `status_updated_at`; a genome the worker never wrote is created with the genome text as `params`). Postgres stays the source of truth: the mirror is best-effort, reconciles every evolved row against the last successful write each round (operator actions and drawdown pauses included, within one `interval_secs`), stops trying for the round once Helix is unreachable and is reported in `ctl.risk.pipeline` status (`helix_mirror`) and the heartbeat (`helix.mirror_written|failed`, `helix.mirrored`). Hand-written baselines are not genomes (D-040) and get no node. Paper/live map onto `shadow`/`active` (D-029).
 | `CHILD_OF`, `READS` (Expert), `USES` (DecoderGenome), `TRADES` (Asset) | Helix edges | |
 | Weights (neural) | Garage | |
 | Exposure intents | NATS stream `signal.exposure.*`; archived to Garage for replay | |
@@ -199,6 +201,8 @@ Strategies are tied to the encoder snapshot they were evolved on. On a snapshot 
 - both re-enter shadow before trading on the new snapshot.
 Live strategies keep running on their snapshot until the replacement passes shadow (runtime serves multiple snapshots, spec 36).
 
+**Implemented (region literals and remapping):** the DSL has a region literal `(region expert ordinal)` (type `Region`, `RegionRef::Lit`), meaning region `<prefix>-e<expert>-r<nnn>` of the snapshot the strategy is bound to — `snapshot` in the `strategies.toml` entry / genome text (part of the phenotype id when set; unbound genomes keep their ids). A literal resolves only while its timescale serves the bound snapshot (else it answers the fallback, counted); `(dwell (region e k))` is the dwell when `k` is the current region, else 0. strategy-runtime collects the swap lineage model-runtime publishes on `latent.lifecycle.<ts>` (D-069: new regions with `carry|split|merge|partial` ancestors and their probe overlap, `reason = snapshot`; unmatched parents die) live and from the last 7 days of the `LATENT` stream at start (`fa_strategies::remap::LineageBook`). When a bound strategy's timescale starts serving another snapshot, `fa_strategies::remap::remap_def` rewrites every literal: a `carry` successor, else the successor with the largest overlap (split / merge / partial, recorded with kind and overlap); no descendant (`died`, `no_descendant`) or no observed lineage (`no_lineage`) is unmappable. A fully mapped strategy has its programs replaced in place (books kept; `ctl.strategy.status` `snapshot{bound, live, remap, remapped_ms}`, heartbeat `snapshot.remapped`); an unmappable one is suspended (pause code 4: flat, not evaluated; `snapshot.suspended`) until a later lineage maps it. The risk-engine pipeline sends an **active** strategy that was remapped after its promotion, or suspended, back to `shadow` (`strategy.snapshot_shadow`, audited) so it re-enters the gate on the new snapshot; a suspended shadow strategy is not retired for it (code 4 is not a runtime auto-pause). Limits: the runtime does not serve the old snapshot in parallel (model-runtime swaps), random generation does not emit literals, and the evo-worker does not yet stamp `snapshot` on genomes it evaluates, so today only hand-bound strategies carry literals; strategies without a binding are not touched on a swap.
+
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
 |---|---|---|
@@ -230,7 +234,7 @@ Live strategies keep running on their snapshot until the replacement passes shad
 3. Backtest of a strategy is deterministic and reproduces identical P&L given snapshot, window and seed.
 4. Fitness computation includes costs, and the deflated Sharpe implementation matches reference values on known test vectors.
 5. PBO computation runs per generation and blocks promotion when above `pbo_max`. **Met:** a generation with PBO > `pbo_max` (or unknown) yields no candidate, and PBO is a blocking gate item.
-6. The lifecycle states and transitions are persisted in Helix and visible in the evolution lab and trading desk UI. **Partly met:** persisted and audited in Postgres (`ledger.strategy_state`, `audit.log`) and served by `GET /api/trading/strategies`; Helix `Genome` nodes carry no status yet (fa-hub schema change pending) and the UI does not render the pipeline fields.
+6. The lifecycle states and transitions are persisted in Helix and visible in the evolution lab and trading desk UI. **Partly met:** persisted and audited in Postgres (`ledger.strategy_state`, `audit.log`), served by `GET /api/trading/strategies` and mirrored onto the Helix `Genome` nodes of evolved strategies every pipeline round (§5); the UI does not render the pipeline fields.
 
 ## 10. Open questions
 1. GP program semantics: should programs be stateful (memory registers across steps) or purely functional on the current observation?
@@ -238,7 +242,7 @@ Live strategies keep running on their snapshot until the replacement passes shad
 3. How does one fitness compare GP and neural fairly when their compute costs differ by orders of magnitude (normalisation of the cost objective)?
 4. Should strategies consume decoder outputs from **specific** elite decoders (genome references) or from an aggregated "best decoder per family" feed?
 5. Strategy capital unit: are exposures relative to a notional sleeve the allocator later scales (default) or absolute?
-6. Region literals in GP programs depend on spec 30 open question 1 (region identity).
+6. Region literals in GP programs depend on spec 30 open question 1 (region identity). *(Answered by D-069 lineage: literals are bound to a snapshot and remapped through it, §6.5.)*
 
 ## 11. Deferred
 - Market-making / order-book-level strategies (sub-second horizons).

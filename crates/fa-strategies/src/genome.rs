@@ -33,6 +33,9 @@ pub struct StrategyGenome {
     pub parents: Vec<String>,
     #[serde(default)]
     pub generation: u32,
+    /// Encoder snapshot the region literals refer to (spec 35 §6.5); part of the phenotype.
+    #[serde(default)]
+    pub snapshot: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +76,11 @@ impl StrategyGenome {
             self.signal,
             self.uncertainty
         );
+        // a snapshot binding changes what literals mean; unbound genomes keep their old ids
+        let key = match &self.snapshot {
+            Some(s) => format!("{key}|{s}"),
+            None => key,
+        };
         format!("{GP_ID_PREFIX}{:016x}", stable_hash(&key))
     }
 
@@ -97,6 +105,7 @@ impl StrategyGenome {
             step_secs: self.step_secs,
             signal: self.signal.to_string(),
             uncertainty: self.uncertainty.to_string(),
+            snapshot: self.snapshot.clone(),
         }
     }
 
@@ -124,6 +133,7 @@ impl StrategyGenome {
             uncertainty: s.uncertainty,
             parents,
             generation: 0,
+            snapshot: def.snapshot.clone(),
         })
     }
 
@@ -164,6 +174,9 @@ impl StrategyGenome {
             s.push_str(&format!("step_secs = {sec}\n"));
         }
         s.push_str(&format!("signal = {}\nuncertainty = {}\n", toml_str(&d.signal), toml_str(&d.uncertainty)));
+        if let Some(snap) = &d.snapshot {
+            s.push_str(&format!("snapshot = {}\n", toml_str(snap)));
+        }
         s
     }
 
@@ -205,7 +218,11 @@ impl fmt::Display for StrategyGenome {
         if let Some(sec) = d.step_secs {
             write!(f, ", step_secs = {sec}")?;
         }
-        write!(f, ", signal = {}, uncertainty = {} }}", toml_str(&d.signal), toml_str(&d.uncertainty))
+        write!(f, ", signal = {}, uncertainty = {}", toml_str(&d.signal), toml_str(&d.uncertainty))?;
+        if let Some(snap) = &d.snapshot {
+            write!(f, ", snapshot = {}", toml_str(snap))?;
+        }
+        f.write_str(" }")
     }
 }
 
@@ -224,6 +241,7 @@ mod tests {
             uncertainty: sexpr::parse("(sub 1 stay_prob)").unwrap(),
             parents: vec!["p1".into()],
             generation: 2,
+            snapshot: None,
         }
     }
 
@@ -253,6 +271,16 @@ mod tests {
         assert_eq!(parsed.strategy.len(), 2);
         assert_ne!(other.id(), g.id());
         assert!(file.starts_with("# promoted\ninstruments = []\n"));
+        // a snapshot binding (spec 35 §6.5) round-trips and is part of the phenotype id
+        let mut bound = sample();
+        bound.snapshot = Some("neural-v1-1m".into());
+        let text = bound.to_string();
+        assert!(text.ends_with(", snapshot = \"neural-v1-1m\" }"), "{text}");
+        let back = StrategyGenome::parse(&text).unwrap();
+        assert_eq!(back.snapshot.as_deref(), Some("neural-v1-1m"));
+        assert_eq!(back.id(), bound.id());
+        assert_ne!(bound.id(), g.id());
+        assert_eq!(StrategyGenome::parse(&bound.to_toml_entry()).unwrap().snapshot, bound.snapshot);
     }
 
     #[test]

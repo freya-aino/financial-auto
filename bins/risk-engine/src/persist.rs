@@ -1,25 +1,24 @@
 //! Postgres persistence for the paper book (spec 42): intents, fills (with currency, FX source,
 //! arrival price and slippage), cash movements, position snapshots, reconciliation runs,
 //! strategy lifecycle rows with their sub-books (`ledger.strategy_state`, D-051, D-061), the
-//! payout quota and the audit log; plus the reference-data, FX and ECB reads/writes (D-061). Everything here is best effort and idempotent: a failed write is logged and
-//! the in-memory engine carries on (the next reconciliation pass will surface the gap as a
-//! `diff`, which halts scope `broker`).
+//! payout quota and the audit log; plus the reference-data, FX and ECB reads/writes (D-061).
+//! Everything here is best effort and idempotent: a failed write is logged and the in-memory
+//! engine carries on. Fill persistence, orphan handling and reconciliation live in
+//! [`crate::recon`] (unconfirmed fill writes are retried; one that never lands surfaces as a
+//! reconciliation `diff`, which halts scope `broker`).
 use chrono::{DateTime, TimeZone, Utc};
 use fa_ledger::{
-    BookDiff, Ledger,
-    pg::{IntentRecord, PAPER_VENUE, PgLedger},
+    Ledger,
+    pg::{IntentRecord, PgLedger},
 };
 use fa_proto::v1::{OrderIntent, Side};
 use fa_risk::strategy::{Checklist, StrategyState, StrategyStatus};
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use crate::engine::{BookedFill, Evidence, RiskRecord, SubBookRecord};
+use crate::engine::{Evidence, RiskRecord, SubBookRecord};
 
 pub const ACTOR: &str = "system:risk-engine";
-/// Cash differences below this are not reported by the reconciliation pass.
-const CASH_TOL_EUR: f64 = 0.01;
-const QTY_TOL: f64 = 1e-9;
 
 pub struct Persist {
     pg: PgLedger,
@@ -72,12 +71,9 @@ impl Persist {
         }
     }
 
-    pub async fn fills(&self, fills: Vec<BookedFill>) {
-        for b in fills {
-            if let Err(e) = self.pg.record_fill_with(&b.fill, at(b.at_ms), &b.strategy_ids, &b.details).await {
-                tracing::warn!(fill = %b.fill.fill_id, error = %e, "fill not persisted");
-            }
-        }
+    /// The ledger (fill events, orphans, reconciliation: [`crate::recon`]).
+    pub fn pg(&self) -> &PgLedger {
+        &self.pg
     }
 
     pub async fn snapshot(&self, ledger: &Ledger, reason: &str) {
@@ -185,6 +181,25 @@ impl Persist {
                 Some((st, book))
             })
             .collect()
+    }
+
+    /// Borrow availability per instrument from the current `ref.contract_spec` rows (spec 40
+    /// §10 Q5): false when any current venue row says not shortable, true when all known rows
+    /// allow it; instruments without a row are absent (the class rule applies).
+    pub async fn load_shortable(&self) -> Option<std::collections::BTreeMap<fa_core::InstrumentId, bool>> {
+        let rows: Result<Vec<(uuid::Uuid, Option<bool>)>, _> = sqlx::query_as(
+            "select instrument_id, bool_and(shortable) from ref.contract_spec \
+             where shortable is not null and now() >= valid_from and now() < valid_to group by instrument_id",
+        )
+        .fetch_all(self.pg.pool())
+        .await;
+        match rows {
+            Ok(r) => Some(r.into_iter().filter_map(|(i, b)| Some((fa_core::InstrumentId(i), b?))).collect()),
+            Err(e) => {
+                tracing::warn!(error = %e, "contract specs (shortable) not loaded");
+                None
+            }
+        }
     }
 
     /// Instrument reference table (`fa_warehouse::venues`).
@@ -474,39 +489,6 @@ impl Persist {
             .ok()
             .flatten()?;
         serde_json::from_value(v).map_err(|e| tracing::warn!(error = %e, "risk state unreadable; starting fresh")).ok()
-    }
-
-    /// Compares the in-memory book with the one derived from Postgres and records a
-    /// `reconciliation_run` (`ok` | `diff`). Returns the diff when there is one; the caller
-    /// halts scope `broker` on it (spec 42 §6, D-051).
-    pub async fn reconcile(&self, ours: &Ledger) -> Option<BookDiff> {
-        let theirs = match self.pg.load_book(&self.book).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!(error = %e, "reconciliation skipped: cannot load book");
-                return None;
-            }
-        };
-        let diff = fa_ledger::diff_books(ours, &theirs, CASH_TOL_EUR, QTY_TOL);
-        let (status, diffs) = if diff.is_empty() {
-            ("ok", None)
-        } else {
-            (
-                "diff",
-                Some(json!({"book": self.book, "cash": {"memory": diff.cash_ours, "postgres": diff.cash_theirs},
-                "positions": diff.positions.iter().map(|d| json!({"instrument_id": d.instrument, "memory": d.ours, "postgres": d.broker})).collect::<Vec<_>>()})),
-            )
-        };
-        if let Err(e) = self.pg.record_reconciliation(PAPER_VENUE, status, diffs.as_ref()).await {
-            tracing::warn!(error = %e, "reconciliation run not recorded");
-        }
-        if diff.is_empty() {
-            tracing::debug!("reconciliation ok");
-            None
-        } else {
-            tracing::error!(?diff, "paper book differs from Postgres-derived book: halting scope broker");
-            Some(diff)
-        }
     }
 }
 

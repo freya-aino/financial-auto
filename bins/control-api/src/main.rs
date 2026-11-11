@@ -4,6 +4,7 @@
 mod alerts_routes;
 mod bus_tap;
 mod config_routes;
+mod console_routes;
 mod docker;
 mod evolution_routes;
 mod graph_routes;
@@ -87,7 +88,8 @@ async fn main() -> anyhow::Result<()> {
         .merge(config_routes::router().with_state(state.clone()))
         .merge(ws_routes::router().with_state(state.clone()))
         .merge(validation_routes::router().with_state(state.clone())) // holdout, trial reports, populations (D-052)
-        .merge(alerts_routes::router(state.clone())); // vmalert receiver → ops.alert + audit (spec 60 §6.5)
+        .merge(alerts_routes::router(state.clone())) // vmalert receiver → ops.alert + audit (spec 60 §6.5)
+        .merge(console_routes::router().with_state(state.clone())); // decoders, pipeline, halts/re-arm, risk events, refdata reads
     let app = ledger_routes::install(state.clone(), app).await; // Postgres pool + paper-book seed + ledger routes (D-047)
     let app = services_routes::install(state.clone(), app); // start/stop/restart via the Docker socket (D-060)
     let app = trading_routes::install(state, app); // strategy lifecycle + limits via ctl.risk.* (D-051)

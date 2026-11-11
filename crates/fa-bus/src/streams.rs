@@ -26,6 +26,9 @@ pub struct StreamSpec {
     pub name: String,
     pub subjects: Vec<String>,
     pub max_age_hours: u64,
+    /// Disk cap in MiB (spec 21 §10.1); `None` = unlimited. Old messages are discarded first.
+    #[serde(default)]
+    pub max_mib: Option<u64>,
     #[serde(default)]
     pub storage: Storage,
     #[serde(default)]
@@ -70,10 +73,16 @@ impl StreamSpec {
             subjects: self.subjects.clone(),
             retention: RetentionPolicy::Limits,
             max_age: Duration::from_secs(self.max_age_hours * 3600),
+            max_bytes: self.max_bytes(),
             storage: self.storage.into(),
             description: self.description.clone(),
             ..Default::default()
         }
+    }
+
+    /// `max_mib` in bytes, `-1` (JetStream's "unlimited") when absent.
+    pub fn max_bytes(&self) -> i64 {
+        self.max_mib.map_or(-1, |m| (m * 1024 * 1024) as i64)
     }
 }
 
@@ -120,7 +129,10 @@ pub enum StreamsError {
 }
 
 /// Creates every spec 21 §5 stream, updating the ones whose live config drifted
-/// (subjects, max age, storage, description). Idempotent; safe to call at every service start.
+/// (subjects, max age, max bytes, storage, description). Idempotent; safe to call at every
+/// service start. A `max_bytes` cap below a stream's current size is **not** applied (JetStream
+/// would discard the oldest messages at once): the stream keeps its previous cap and a warning
+/// names it, so purging is always an operator decision.
 /// Returns the names that were created or updated.
 pub async fn ensure_streams(js: &jetstream::Context) -> Result<Vec<String>, StreamsError> {
     let mut changed = Vec::new();
@@ -145,7 +157,13 @@ async fn ensure_stream(js: &jetstream::Context, want: &stream::Config) -> Result
             return Ok(true);
         }
     };
-    let have = &existing.info().await.map_err(|source| StreamsError::Info { name: name.clone(), source })?.config;
+    let info = existing.info().await.map_err(|source| StreamsError::Info { name: name.clone(), source })?;
+    let (have, used) = (&info.config, info.state.bytes);
+    let max_bytes = safe_max_bytes(have.max_bytes, want.max_bytes, used);
+    if max_bytes != want.max_bytes {
+        tracing::warn!(stream = %name, used, cap = want.max_bytes, "stream holds more than its max_bytes cap; cap not applied (would purge)");
+    }
+    let want = &stream::Config { max_bytes, ..want.clone() };
     if config_matches(have, want) {
         return Ok(false);
     }
@@ -153,12 +171,19 @@ async fn ensure_stream(js: &jetstream::Context, want: &stream::Config) -> Result
     let mut cfg = have.clone();
     cfg.subjects = want.subjects.clone();
     cfg.max_age = want.max_age;
+    cfg.max_bytes = want.max_bytes;
     cfg.description = want.description.clone();
     cfg.retention = want.retention;
     cfg.storage = want.storage;
     js.update_stream(cfg).await.map_err(|source| StreamsError::Update { name: name.clone(), source })?;
     tracing::info!(stream = %name, subjects = ?want.subjects, "updated JetStream stream");
     Ok(true)
+}
+
+/// The cap to apply: `want`, unless it would cut below the bytes the stream already holds
+/// (then the current cap stays).
+fn safe_max_bytes(have: i64, want: i64, used: u64) -> i64 {
+    if want > 0 && used > want as u64 { have } else { want }
 }
 
 fn config_matches(have: &stream::Config, want: &stream::Config) -> bool {
@@ -168,6 +193,7 @@ fn config_matches(have: &stream::Config, want: &stream::Config) -> bool {
     b.sort();
     a == b
         && have.max_age == want.max_age
+        && have.max_bytes == want.max_bytes
         && have.retention == want.retention
         && have.storage == want.storage
         && have.description.as_deref().unwrap_or("") == want.description.as_deref().unwrap_or("")
@@ -268,6 +294,8 @@ pub struct StreamStatus {
     pub retention: String,
     pub storage: String,
     pub max_age_secs: u64,
+    /// Disk cap (`-1` = unlimited).
+    pub max_bytes: i64,
     pub messages: u64,
     pub bytes: u64,
     pub first_seq: u64,
@@ -304,6 +332,7 @@ pub async fn list_streams(js: &jetstream::Context) -> Result<Vec<StreamStatus>, 
             retention: format!("{:?}", info.config.retention).to_ascii_lowercase(),
             storage: format!("{:?}", info.config.storage).to_ascii_lowercase(),
             max_age_secs: info.config.max_age.as_secs(),
+            max_bytes: info.config.max_bytes,
             messages: info.state.messages,
             bytes: info.state.bytes,
             first_seq: info.state.first_sequence,
@@ -351,11 +380,24 @@ pub fn subjects_overlap(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn by_name<'a>(t: &'a StreamTable, n: &str) -> &'a StreamSpec {
+        t.streams.iter().find(|s| s.name == n).unwrap()
+    }
+
+    #[test]
+    fn caps_never_purge() {
+        assert_eq!(safe_max_bytes(-1, 100, 50), 100);
+        assert_eq!(safe_max_bytes(-1, 100, 150), -1, "cap below usage is not applied");
+        assert_eq!(safe_max_bytes(200, -1, 150), -1, "removing a cap is fine");
+    }
+
     #[test]
     fn table_matches_spec_21() {
         let t = table();
         let names: Vec<&str> = t.streams.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["MD", "TEXT", "MEDIA", "MACRO", "LATENT", "SIGNAL", "ORDERS", "JOB_RESULTS"]);
+        assert_eq!(names, ["MD", "TEXT", "MEDIA", "MACRO", "LATENT", "SIGNAL", "ORDERS", "JOB_RESULTS", "DLQ"]);
+        assert!(t.streams.iter().all(|s| s.max_mib.is_some_and(|m| m >= 1024)), "every stream is capped");
+        assert_eq!(by_name(&t, "LATENT").config().max_bytes, 24 * 1024 * 1024 * 1024);
         let by = |n: &str| t.streams.iter().find(|s| s.name == n).unwrap();
         assert_eq!(by("MD").max_age_hours, 24);
         assert_eq!(by("TEXT").subjects, ["news.>", "filing.>"]);
@@ -397,6 +439,9 @@ mod tests {
             t.streams.iter().flat_map(|s| s.subjects.iter().map(move |f| (s.name.clone(), f.clone()))).collect();
         // Work queues owned elsewhere today (bins/evo-worker, go/services/evo-orchestrator).
         filters.push((work_queue_name("evo"), work_queue_subject("evo")));
+        filters.push((work_queue_name("mcmc"), work_queue_subject("mcmc")));
+        filters.push((work_queue_name("ingest"), work_queue_subject("ingest")));
+        filters.push((work_queue_name("train"), work_queue_subject("train")));
         for (i, (sa, fa)) in filters.iter().enumerate() {
             for (sb, fb) in &filters[i + 1..] {
                 if sa == sb {
@@ -420,6 +465,9 @@ mod tests {
             ("risk.halt.portfolio", Some("ORDERS")),
             ("jobs.result.evo.eval.decoder", Some("JOB_RESULTS")),
             ("jobs.evo.eval.decoder", Some("JOBS_EVO")),
+            ("jobs.mcmc.refit", Some("JOBS_MCMC")),
+            ("dlq.LATENT.latent.state.1m.x", Some("DLQ")),
+            ("ops.alert", None),
             ("jobs.progress.01J", None),
             ("ctl.ingest.start", None),
             ("svc.heartbeat.ingestor", None),
@@ -456,10 +504,11 @@ mod tests {
         assert!(second.is_empty(), "second ensure must be a no-op, changed {second:?}");
         eprintln!("ensure_streams: first run changed {first:?}, second run changed nothing");
 
-        // Drift repair: shrink MD's max_age, then ensure must restore it.
+        // Drift repair: change MD's description, then ensure must restore it. (Never drift a
+        // limit downwards here: shrinking max_age/max_bytes on the live server purges messages.)
         let md = table().streams.into_iter().find(|s| s.name == "MD").unwrap();
         let mut drifted = md.config();
-        drifted.max_age = Duration::from_secs(60);
+        drifted.description = Some("drifted by fa-bus live test".into());
         js.update_stream(drifted).await.expect("drift");
         let fixed = ensure_streams(&js).await.expect("repair");
         assert_eq!(fixed, ["MD"]);

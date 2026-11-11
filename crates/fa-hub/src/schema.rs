@@ -108,6 +108,8 @@ pub fn static_indexes() -> Vec<IndexSpec> {
         I::node_equality(crate::regions::labels::KERNEL_MODEL, "snapshot_id", false),
         I::node_equality(crate::regions::labels::CROSS_PRIOR, "pair_id", true),
         I::node_equality(crate::regions::labels::CROSS_PRIOR, "timescale", false),
+        I::node_equality(crate::experts::labels::EXPERT, "expert_uid", true),
+        I::node_equality(crate::experts::labels::EXPERT, "snapshot_id", false),
         I::edge_equality(edge::TRANSITION, "sampler_id"),
     ]
 }

@@ -34,6 +34,11 @@ pub struct StrategyDef {
     /// GP program for the exposure uncertainty (S-expression).
     #[serde(default = "default_uncertainty")]
     pub uncertainty: String,
+    /// Encoder snapshot the programs' region literals `(region e k)` refer to (spec 35 §6.5).
+    /// Bound strategies are remapped through the region lineage when the live snapshot of their
+    /// timescale changes; unbound literals resolve against whatever snapshot is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
 }
 
 fn default_genome() -> String {

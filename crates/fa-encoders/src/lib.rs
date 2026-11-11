@@ -182,6 +182,34 @@ pub trait EncoderFamily: Send + Sync {
     /// Encodes one window into per-expert latents. `router_weights` and region fields are
     /// left for the router and region stages (spec 32 §6.6).
     fn encode(&self, input: &EncoderInput) -> Result<fa_expert_space::ExpertView, EncoderError>;
+
+    /// [`Self::encode`] plus what only learned encoders know (spec 32 §4.2 `ExpertView`): each
+    /// expert's own next-step prediction, FSQ codes, the prior novelty score, and the realised
+    /// (normalised) next-step targets of the previous window for live health. Default: none.
+    fn encode_with_extras(
+        &self,
+        input: &EncoderInput,
+    ) -> Result<(fa_expert_space::ExpertView, Option<ExpertExtras>), EncoderError> {
+        Ok((self.encode(input)?, None))
+    }
+}
+
+/// Per-window extras of a learned encoder ([`EncoderFamily::encode_with_extras`]).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ExpertExtras {
+    /// Names of the next-step targets (`next_ret`, `next_abs_ret`, `next_range`).
+    pub targets: Vec<String>,
+    /// `[expert][target]` next-step prediction on the normalised targets.
+    pub next_step: Vec<Vec<f32>>,
+    /// FSQ code per expert (`fsq_hybrid`).
+    pub codes: Option<Vec<u32>>,
+    /// Novelty under the family prior (families 2 and 4).
+    pub prior_score: Option<f64>,
+    /// Normalised targets realised by the window's last bar: the outcome of the previous
+    /// window's `next_step` (live residuals, spec 32 §8).
+    pub realised_prev: Option<Vec<f32>>,
+    /// Full router probabilities (before top-k).
+    pub probs: Vec<f32>,
 }
 
 #[cfg(test)]

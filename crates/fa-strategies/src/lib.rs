@@ -18,6 +18,7 @@ pub mod graph;
 pub mod ops;
 pub mod population;
 pub mod random;
+pub mod remap;
 pub mod sexpr;
 
 use fa_core::{Horizon, InstrumentId};
@@ -68,6 +69,19 @@ impl ExposureDistribution {
 pub enum RegionRef {
     /// `(cur_region expert)`: the asset's current region in the given expert space.
     Cur(u32),
+    /// `(region expert ordinal)`: a fixed region literal — region `<prefix>-e<expert>-r<nnn>` of
+    /// the encoder snapshot the strategy is bound to (spec 35 §6.5). It resolves only while that
+    /// snapshot is live; on a snapshot change [`remap`] rewrites it through the region lineage.
+    Lit(u32, u32),
+}
+
+impl RegionRef {
+    /// Expert space the reference lives in.
+    pub fn expert(self) -> u32 {
+        match self {
+            Self::Cur(e) | Self::Lit(e, _) => e,
+        }
+    }
 }
 
 /// A region-set-typed sub-expression (`RegionSet`).

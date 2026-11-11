@@ -324,8 +324,12 @@ services:
     profiles: ["app"]
     image: financial-auto/rust:dev
     command: ["evo-worker"]
-    environment: *rust-env
-    volumes: *secrets-volume
+    environment:
+      <<: *rust-env
+      FA_COSTS: /app/config/costs.yaml # venue cost model of the paper venue (spec 35/41 §6.3): decoder trade value, strategy replays
+    volumes:
+      - ./config/secrets.toml:/app/config/secrets.toml:ro
+      - ./go/services/broker-gateway/costs.yaml:/app/config/costs.yaml:ro
     ports:
       - "127.0.0.1:9110-9119:9100" # metrics; a range so up to 10 replicas can publish (scrape uses DNS inside compose)
     depends_on: *core-deps
@@ -382,10 +386,14 @@ services:
     image: financial-auto/go:dev
     entrypoint: ["broker-gateway"]
     command: ["-nats", "nats://nats:4222"]
-    volumes: *secrets-volume
+    volumes:
+      - ./config/secrets.toml:/app/config/secrets.toml:ro
+      - broker-gateway-state:/var/lib/fa # calibrated costs (spec 41 §6.3), written by the gateway
     environment:
       FA_SECRETS: /app/config/secrets.toml
       FA_METRICS_BIND: 0.0.0.0:9100
+      FA_COSTS: /app/config/costs.yaml # go/services/broker-gateway/costs.yaml, baked into the image
+      FA_STATE_DIR: /var/lib/fa # → costs.calibrated.yaml (+ .report.json)
     ports:
       - "127.0.0.1:9106:9100" # metrics
     depends_on:
@@ -451,3 +459,4 @@ volumes:
   vm-data:
   garage-meta:
   garage-data:
+  broker-gateway-state: # broker-gateway calibrated cost model

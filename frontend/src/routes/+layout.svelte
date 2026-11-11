@@ -3,6 +3,7 @@
 	import '../app.css';
 	import { page } from '$app/state';
 	import { onMount } from 'svelte';
+	import AlertBanner from '../lib/AlertBanner.svelte';
 	import KillSwitch from '../lib/KillSwitch.svelte';
 	import { api, eur, live, poll, type Health, type RiskView } from '../lib/api';
 	import { runtime } from '../lib/runtime.svelte';
@@ -10,12 +11,15 @@
 
 	let { children } = $props();
 
-	const nav = [
-		{ href: '/', label: 'Ops' },
-		{ href: '/latent/', label: 'Latent & Graph' },
-		{ href: '/evolution/', label: 'Evolution Lab' },
-		{ href: '/trading/', label: 'Trading Desk' }
+	// Sections with their sub-pages (spec 51 §4; panels that outgrew a view got their own route).
+	const nav: { href: string; label: string; sub?: { href: string; label: string }[] }[] = [
+		{ href: '/', label: 'Ops', sub: [{ href: '/', label: 'Overview' }, { href: '/alerts/', label: 'Alerts' }, { href: '/refdata/', label: 'Reference data' }] },
+		{ href: '/latent/', label: 'Latent & Graph', sub: [{ href: '/latent/', label: 'Explorer' }, { href: '/latent/mcmc/', label: 'MCMC' }, { href: '/latent/snapshots/', label: 'Encoder snapshots' }] },
+		{ href: '/evolution/', label: 'Evolution Lab', sub: [{ href: '/evolution/', label: 'Lab' }, { href: '/evolution/decoders/', label: 'Neural decoders' }] },
+		{ href: '/trading/', label: 'Trading Desk', sub: [{ href: '/trading/', label: 'Desk' }, { href: '/trading/pipeline/', label: 'Strategy pipeline' }, { href: '/trading/risk/', label: 'Risk & halts' }, { href: '/trading/ledger/', label: 'Ledger' }] }
 	];
+	const path = $derived(page.url.pathname);
+	const section = $derived(nav.find((n) => n.sub?.some((s) => s.href === path)) ?? nav.find((n) => n.href !== '/' && path.startsWith(n.href)) ?? nav[0]);
 
 	let health = $state<Health | null>(null);
 	let healthError = $state(false);
@@ -93,7 +97,7 @@
 		</div>
 		<nav>
 			{#each nav as item}
-				<a href={item.href} class:active={page.url.pathname === item.href}>{item.label}</a>
+				<a href={item.href} class:active={section === item}>{item.label}</a>
 			{/each}
 		</nav>
 		<div class="figures" class:stale={riskError}>
@@ -121,6 +125,14 @@
 			<KillSwitch {risk} compact onchanged={pollRisk} />
 		</div>
 	</header>
+	{#if section.sub}
+		<nav class="subnav" aria-label="{section.label} pages">
+			{#each section.sub as item}
+				<a href={item.href} class:active={path === item.href}>{item.label}</a>
+			{/each}
+		</nav>
+	{/if}
+	<AlertBanner />
 	{#if anyStale || healthError || riskError}
 		<div class="stale-banner" role="status">
 			{#if healthError || riskError}
@@ -200,6 +212,20 @@
 		color: var(--text);
 		background: var(--bg-inset);
 		box-shadow: inset 0 -2px 0 var(--accent);
+	}
+
+	.subnav {
+		display: flex;
+		gap: 2px;
+		padding: 2px 16px;
+		border-bottom: 1px solid var(--border);
+		background: var(--bg-inset);
+		font-size: 12px;
+		flex-wrap: wrap;
+	}
+
+	.subnav a {
+		padding: 3px 10px;
 	}
 
 	.figures {

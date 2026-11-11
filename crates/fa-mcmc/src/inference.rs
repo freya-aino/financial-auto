@@ -297,7 +297,52 @@ impl Posterior {
         (states, m)
     }
 
+    /// Stationary distribution: a direct solve of `π(P − I) = 0, Σπ = 1` (Gaussian elimination
+    /// with partial pivoting, O(n³)); reducible chains (singular system) fall back to the lazy
+    /// power iteration from the uniform start.
     fn stationary_of(m: &[Vec<f64>]) -> Vec<f64> {
+        Self::stationary_solve(m).unwrap_or_else(|| Self::stationary_power(m))
+    }
+
+    fn stationary_solve(m: &[Vec<f64>]) -> Option<Vec<f64>> {
+        let n = m.len();
+        if n == 0 {
+            return None;
+        }
+        // rows = equations: (Pᵀ − I) π = 0 for j < n−1, last equation Σ π = 1
+        let mut a: Vec<Vec<f64>> = (0..n)
+            .map(|j| {
+                if j == n - 1 {
+                    vec![1.0; n + 1]
+                } else {
+                    let mut row: Vec<f64> = (0..n).map(|i| m[i][j] - if i == j { 1.0 } else { 0.0 }).collect();
+                    row.push(0.0);
+                    row
+                }
+            })
+            .collect();
+        for c in 0..n {
+            let p = (c..n).max_by(|&x, &y| a[x][c].abs().total_cmp(&a[y][c].abs()))?;
+            if a[p][c].abs() < 1e-10 {
+                return None;
+            }
+            a.swap(c, p);
+            let pivot = a[c].clone();
+            for (r, row) in a.iter_mut().enumerate() {
+                if r != c && row[c] != 0.0 {
+                    let f = row[c] / pivot[c];
+                    for (x, p) in row[c..].iter_mut().zip(&pivot[c..]) {
+                        *x -= f * p;
+                    }
+                }
+            }
+        }
+        let pi: Vec<f64> = (0..n).map(|i| (a[i][n] / a[i][i]).max(0.0)).collect();
+        let s: f64 = pi.iter().sum();
+        (s > 0.0 && pi.iter().all(|x| x.is_finite())).then(|| pi.into_iter().map(|x| x / s).collect())
+    }
+
+    fn stationary_power(m: &[Vec<f64>]) -> Vec<f64> {
         let n = m.len();
         let mut pi = vec![1.0 / n as f64; n];
         for _ in 0..2000 {
@@ -360,8 +405,18 @@ fn second_eigen_modulus(m: &[Vec<f64>], pi: &[f64]) -> f64 {
     let n = m.len();
     // deterministic, not orthogonal to any eigenvector in practice
     let mut v: Vec<f64> = (0..n).map(|i| ((i * 7919 + 13) % 101) as f64 / 101.0 - 0.5).collect();
-    let mut log_ratio = Vec::new();
+    let mut log_ratio: Vec<f64> = Vec::new();
     for it in 0..300 {
+        // converged: the mean log ratio of the last 20 iterations equals that of the 20 before
+        if it >= 100 && it % 10 == 0 && log_ratio.len() >= 40 {
+            let k = log_ratio.len();
+            let a = log_ratio[k - 20..].iter().sum::<f64>() / 20.0;
+            let b = log_ratio[k - 40..k - 20].iter().sum::<f64>() / 20.0;
+            if (a - b).abs() < 1e-5 {
+                log_ratio.drain(..k - 20);
+                break;
+            }
+        }
         let s: f64 = v.iter().sum();
         let mut next = Posterior::step(&v, m);
         for (x, p) in next.iter_mut().zip(pi) {
@@ -372,12 +427,13 @@ fn second_eigen_modulus(m: &[Vec<f64>], pi: &[f64]) -> f64 {
         if a < 1e-300 || b < 1e-300 {
             return 0.0;
         }
-        if it >= 240 {
+        if it >= 60 {
             log_ratio.push((b / a).ln());
         }
         v = next.into_iter().map(|x| x / b).collect();
     }
-    let mean = log_ratio.iter().sum::<f64>() / log_ratio.len().max(1) as f64;
+    let tail = &log_ratio[log_ratio.len().saturating_sub(60)..];
+    let mean = tail.iter().sum::<f64>() / tail.len().max(1) as f64;
     mean.exp().clamp(0.0, 1.0)
 }
 
@@ -397,6 +453,20 @@ mod tests {
             }
         }
         g
+    }
+
+    #[test]
+    fn direct_stationary_solve_matches_the_power_iteration() {
+        let m = vec![vec![0.9, 0.1, 0.0], vec![0.05, 0.9, 0.05], vec![0.0, 0.2, 0.8]];
+        let a = Posterior::stationary_solve(&m).unwrap();
+        let b = Posterior::stationary_power(&m);
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-9, "{a:?} {b:?}");
+        }
+        // two closed classes: singular → power-iteration fallback
+        let red = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        assert!(Posterior::stationary_solve(&red).is_none());
+        assert_eq!(Posterior::stationary_of(&red), vec![0.5, 0.5]);
     }
 
     #[test]

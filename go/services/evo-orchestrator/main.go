@@ -7,7 +7,10 @@
 //	ctl.gpu.release  args: lease_id
 //	ctl.evo.start    args: kind, snapshot_id, genomes (newline list, D-044), eta, min_budget_ms,
 //	                 max_budget_ms, max_generations (default -max-generations / 1),
-//	                 total_budget_ms (0 = fixed population), data_window_hours (0 = worker default)
+//	                 total_budget_ms (0 = fixed population; also the per-loop budget whose overrun
+//	                 truncates rungs), data_window_hours (0 = worker default), mcmc_pairs (cross-asset
+//	                 nn_forecast src→target genomes seeded per loop from latent.crossprior.*; default
+//	                 -mcmc-pairs, decoder kinds only)
 //	ctl.evo.cancel   args: job_id — drops the job from its generation (scored as failed), releases
 //	                 the GPU lease named after the job id and publishes JobResult{CANCELLED, error
 //	                 "cancelled by operator"} on jobs.result.<kind> so views update.
@@ -26,6 +29,10 @@
 //
 // Error replies carry a prefix control-api maps to HTTP: `not_found:` (404), `conflict:` (409).
 //
+// Neural decoders (spec 34 §6.2): eval envelopes carry `warm_start` ("<bucket>/<key>" of the
+// genome's previous-rung bundle, or of its parent's for a child) and `train_steps_fraction`
+// (η^-(R−1−r): rung r of R trains that share of the genome's SGD steps).
+//
 // Ranking: NSGA-II (non-dominated sort + crowding distance) over JobResult.objectives /
 // directions (proto maps, else the result JSON), falling back to the scalar `score`. After
 // every rung a `generation.summary` JSON (Pareto front, front sizes, survivors) is published as
@@ -34,7 +41,8 @@
 // Heartbeat counters: gpu.used_mb, gpu.active, gpu.queued, gpu.capacity_mb (from -gpu-mem-mb /
 // FA_GPU_MEM_MB, default 24000; D-031), generations.started|done|active, generations.loops,
 // jobs.cancelled, vary.jobs, vary.failed, pareto.front_size, pareto.fronts, pareto.candidates,
-// pareto.unranked, pareto.generation, pareto.rung.
+// pareto.unranked, pareto.generation, pareto.rung, budget.used_ms, budget.loop_used_ms,
+// budget.truncations, warm_start.jobs, crossprior.messages, crossprior.proposals, pairs.seeded.
 //
 // Notifications (CtlRequest, no reply): ctl.gpu.preempt / ctl.gpu.granted with arg lease_id.
 package main
@@ -74,6 +82,7 @@ func main() {
 	maxGens := flag.Int("max-generations", envInt("FA_EVO_MAX_GENERATIONS", 1), "default max_generations for ctl.evo.start (halving + variation loops)")
 	garageURL := flag.String("garage", envOr("FA_GARAGE_URL", "http://127.0.0.1:3900"), "Garage S3 endpoint for promoted strategy populations (empty disables)")
 	secretsPath := flag.String("secrets", envOr("FA_SECRETS", "config/secrets.toml"), "secrets file with [garage] access_key_id / secret_access_key (D-020)")
+	mcmcPairs := flag.Int("mcmc-pairs", envInt("FA_EVO_MCMC_PAIRS", 4), "default cross-asset pair genomes per decoder loop from latent.crossprior.* (0 disables)")
 	metricsBind := flag.String("metrics", bus.MetricsBindDefault(service), "Prometheus GET /metrics bind (FA_METRICS_BIND; off disables)")
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("svc", service)
@@ -113,6 +122,22 @@ func main() {
 	}
 	publishJob := func(subject, msgID string, job *fav1.Job) error { return pub.PublishWithID(subject, msgID, job) }
 
+	// MCMC cross-asset pair proposals (D-069) for the RNN-prior seed (spec 34 §6.2 step 1).
+	pairBook := NewPairBook()
+	if _, err := pub.NC.Subscribe("latent.crossprior.>", func(m *nats.Msg) {
+		var x fav1.CrossAssetPriors
+		if err := proto.Unmarshal(m.Data, &x); err != nil {
+			counters.Add("errors.decode", 1)
+			return
+		}
+		pairBook.Update(&x)
+		seen, held := pairBook.Stats()
+		counters.Set("crossprior.messages", float64(seen))
+		counters.Set("crossprior.proposals", float64(held))
+	}); err != nil {
+		log.Warn("subscribe latent.crossprior", "err", err)
+	}
+
 	var gensMu sync.Mutex
 	gens := map[string]*Generation{}
 
@@ -138,6 +163,13 @@ func main() {
 		counters.Set("pareto.unranked", float64(s.Unranked))
 		counters.Set("pareto.generation", float64(s.Generation))
 		counters.Set("pareto.rung", float64(s.Rung))
+		if s.Budget != nil {
+			counters.Set("budget.used_ms", float64(s.Budget.UsedMs))
+			counters.Set("budget.loop_used_ms", float64(s.Budget.LoopUsedMs))
+			counters.Set("budget.truncations", float64(s.Budget.Truncations))
+		}
+		counters.Add("warm_start.jobs", float64(s.WarmStarted))
+		counters.Add("pairs.seeded", float64(s.PairsSeeded))
 		if s.VaryJobID != "" {
 			counters.Add("vary.jobs", 1)
 			counters.Add("generations.loops", 1)
@@ -243,10 +275,14 @@ func main() {
 		}
 		totalB, _ := strconv.ParseUint(r.Args["total_budget_ms"], 10, 64)
 		window, _ := strconv.Atoi(r.Args["data_window_hours"])
+		pairs := *mcmcPairs
+		if v, err := strconv.Atoi(r.Args["mcmc_pairs"]); err == nil && v >= 0 {
+			pairs = v
+		}
 		g, err := NewGenerationWith(GenerationConfig{
 			Kind: r.Args["kind"], SnapshotID: r.Args["snapshot_id"], Genomes: genomes, Eta: eta, MinBudgetMs: minB, MaxBudgetMs: maxB,
 			Seed: uint64(time.Now().UnixNano()), MaxGenerations: mg, TotalBudgetMs: totalB, DataWindowHours: window, OnSummary: onSummary,
-			Promote: promote,
+			Promote: promote, PairProposals: pairBook.Top, MaxPairs: pairs,
 		})
 		if err != nil {
 			return "", err
@@ -256,7 +292,7 @@ func main() {
 		counters.Set("generations.active", float64(len(gens)))
 		gensMu.Unlock()
 		counters.Add("generations.started", 1)
-		log.Info("generation start", "id", g.ID, "kind", g.Kind, "genomes", len(genomes), "eta", g.eta, "max_generations", mg, "min_budget_ms", minB)
+		log.Info("generation start", "id", g.ID, "kind", g.Kind, "genomes", len(genomes), "pairs", g.pairsSeeded, "eta", g.eta, "max_generations", mg, "min_budget_ms", minB)
 		return g.ID, g.Start(publishJob)
 	})
 

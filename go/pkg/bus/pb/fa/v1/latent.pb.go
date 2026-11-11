@@ -1674,6 +1674,468 @@ func (x *CrossAssetPriors) GetPairsEvaluated() uint32 {
 	return 0
 }
 
+// One expert's own next-step prediction (spec 32 §4.2 PredictiveDist) on the normalised
+// next-step targets of the timescale (spec 31 §6.5).
+type PredictiveDist struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Targets       []string               `protobuf:"bytes,1,rep,name=targets,proto3" json:"targets,omitempty"` // next_ret | next_abs_ret | next_range
+	Mean          []float32              `protobuf:"fixed32,2,rep,packed,name=mean,proto3" json:"mean,omitempty"`
+	LogVar        []float32              `protobuf:"fixed32,3,rep,packed,name=log_var,json=logVar,proto3" json:"log_var,omitempty"` // empty: point prediction only
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PredictiveDist) Reset() {
+	*x = PredictiveDist{}
+	mi := &file_fa_v1_latent_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PredictiveDist) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PredictiveDist) ProtoMessage() {}
+
+func (x *PredictiveDist) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PredictiveDist.ProtoReflect.Descriptor instead.
+func (*PredictiveDist) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *PredictiveDist) GetTargets() []string {
+	if x != nil {
+		return x.Targets
+	}
+	return nil
+}
+
+func (x *PredictiveDist) GetMean() []float32 {
+	if x != nil {
+		return x.Mean
+	}
+	return nil
+}
+
+func (x *PredictiveDist) GetLogVar() []float32 {
+	if x != nil {
+		return x.LogVar
+	}
+	return nil
+}
+
+// One expert of an ExpertView (spec 32 §4.2 ExpertLatent; named apart from LatentState's).
+type ExpertViewLatent struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ExpertId      uint32                 `protobuf:"varint,1,opt,name=expert_id,json=expertId,proto3" json:"expert_id,omitempty"` // stable across generations where aligned (§6.5)
+	Mu            []float32              `protobuf:"fixed32,2,rep,packed,name=mu,proto3" json:"mu,omitempty"`                     // expert_dim
+	Logvar        []float32              `protobuf:"fixed32,3,rep,packed,name=logvar,proto3" json:"logvar,omitempty"`
+	Gate          float32                `protobuf:"fixed32,4,opt,name=gate,proto3" json:"gate,omitempty"`   // router weight of this window (top-k renormalised)
+	Region        *ExpertMembership      `protobuf:"bytes,5,opt,name=region,proto3" json:"region,omitempty"` // soft membership (spec 30)
+	NextStep      *PredictiveDist        `protobuf:"bytes,6,opt,name=next_step,json=nextStep,proto3" json:"next_step,omitempty"`
+	Codes         []uint32               `protobuf:"varint,7,rep,packed,name=codes,proto3" json:"codes,omitempty"` // FSQ code index (fsq_hybrid)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExpertViewLatent) Reset() {
+	*x = ExpertViewLatent{}
+	mi := &file_fa_v1_latent_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExpertViewLatent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExpertViewLatent) ProtoMessage() {}
+
+func (x *ExpertViewLatent) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExpertViewLatent.ProtoReflect.Descriptor instead.
+func (*ExpertViewLatent) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *ExpertViewLatent) GetExpertId() uint32 {
+	if x != nil {
+		return x.ExpertId
+	}
+	return 0
+}
+
+func (x *ExpertViewLatent) GetMu() []float32 {
+	if x != nil {
+		return x.Mu
+	}
+	return nil
+}
+
+func (x *ExpertViewLatent) GetLogvar() []float32 {
+	if x != nil {
+		return x.Logvar
+	}
+	return nil
+}
+
+func (x *ExpertViewLatent) GetGate() float32 {
+	if x != nil {
+		return x.Gate
+	}
+	return 0
+}
+
+func (x *ExpertViewLatent) GetRegion() *ExpertMembership {
+	if x != nil {
+		return x.Region
+	}
+	return nil
+}
+
+func (x *ExpertViewLatent) GetNextStep() *PredictiveDist {
+	if x != nil {
+		return x.NextStep
+	}
+	return nil
+}
+
+func (x *ExpertViewLatent) GetCodes() []uint32 {
+	if x != nil {
+		return x.Codes
+	}
+	return nil
+}
+
+// Current region per expert + where the kernel posterior is published (spec 33).
+type McmcStateRef struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RegionIds     []string               `protobuf:"bytes,1,rep,name=region_ids,json=regionIds,proto3" json:"region_ids,omitempty"`             // by expert position
+	KernelSubject string                 `protobuf:"bytes,2,opt,name=kernel_subject,json=kernelSubject,proto3" json:"kernel_subject,omitempty"` // latent.mcmc.<timescale>.<expert> prefix
+	SamplerId     string                 `protobuf:"bytes,3,opt,name=sampler_id,json=samplerId,proto3" json:"sampler_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *McmcStateRef) Reset() {
+	*x = McmcStateRef{}
+	mi := &file_fa_v1_latent_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *McmcStateRef) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*McmcStateRef) ProtoMessage() {}
+
+func (x *McmcStateRef) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use McmcStateRef.ProtoReflect.Descriptor instead.
+func (*McmcStateRef) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *McmcStateRef) GetRegionIds() []string {
+	if x != nil {
+		return x.RegionIds
+	}
+	return nil
+}
+
+func (x *McmcStateRef) GetKernelSubject() string {
+	if x != nil {
+		return x.KernelSubject
+	}
+	return ""
+}
+
+func (x *McmcStateRef) GetSamplerId() string {
+	if x != nil {
+		return x.SamplerId
+	}
+	return ""
+}
+
+// latent.expert.<timescale>.<asset_set>: the one structure decoders, MCMC and strategies
+// consume (spec 32 §4.2). `experts` holds only the experts the mask selects.
+type ExpertView struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SnapshotId    string                 `protobuf:"bytes,1,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	Timescale     string                 `protobuf:"bytes,2,opt,name=timescale,proto3" json:"timescale,omitempty"`
+	T             *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=t,proto3" json:"t,omitempty"`                                              // window end (point in time)
+	InstrumentSet string                 `protobuf:"bytes,4,opt,name=instrument_set,json=instrumentSet,proto3" json:"instrument_set,omitempty"` // instrument or asset-set id
+	Experts       []*ExpertViewLatent    `protobuf:"bytes,5,rep,name=experts,proto3" json:"experts,omitempty"`
+	ExpertMask    []bool                 `protobuf:"varint,6,rep,packed,name=expert_mask,json=expertMask,proto3" json:"expert_mask,omitempty"`
+	McmcState     *McmcStateRef          `protobuf:"bytes,7,opt,name=mcmc_state,json=mcmcState,proto3" json:"mcmc_state,omitempty"`
+	EncoderFamily string                 `protobuf:"bytes,8,opt,name=encoder_family,json=encoderFamily,proto3" json:"encoder_family,omitempty"`
+	// Novelty under the family's learned prior (hier_vae_flow: −log p(z_top); latent_diffusion:
+	// denoising score); has_prior_score = false for families without one.
+	PriorScore    float64 `protobuf:"fixed64,9,opt,name=prior_score,json=priorScore,proto3" json:"prior_score,omitempty"`
+	HasPriorScore bool    `protobuf:"varint,10,opt,name=has_prior_score,json=hasPriorScore,proto3" json:"has_prior_score,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExpertView) Reset() {
+	*x = ExpertView{}
+	mi := &file_fa_v1_latent_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExpertView) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExpertView) ProtoMessage() {}
+
+func (x *ExpertView) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExpertView.ProtoReflect.Descriptor instead.
+func (*ExpertView) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *ExpertView) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+func (x *ExpertView) GetTimescale() string {
+	if x != nil {
+		return x.Timescale
+	}
+	return ""
+}
+
+func (x *ExpertView) GetT() *timestamppb.Timestamp {
+	if x != nil {
+		return x.T
+	}
+	return nil
+}
+
+func (x *ExpertView) GetInstrumentSet() string {
+	if x != nil {
+		return x.InstrumentSet
+	}
+	return ""
+}
+
+func (x *ExpertView) GetExperts() []*ExpertViewLatent {
+	if x != nil {
+		return x.Experts
+	}
+	return nil
+}
+
+func (x *ExpertView) GetExpertMask() []bool {
+	if x != nil {
+		return x.ExpertMask
+	}
+	return nil
+}
+
+func (x *ExpertView) GetMcmcState() *McmcStateRef {
+	if x != nil {
+		return x.McmcState
+	}
+	return nil
+}
+
+func (x *ExpertView) GetEncoderFamily() string {
+	if x != nil {
+		return x.EncoderFamily
+	}
+	return ""
+}
+
+func (x *ExpertView) GetPriorScore() float64 {
+	if x != nil {
+		return x.PriorScore
+	}
+	return 0
+}
+
+func (x *ExpertView) GetHasPriorScore() bool {
+	if x != nil {
+		return x.HasPriorScore
+	}
+	return false
+}
+
+// latent.expert.health (spec 32 §4.3, §6.4): per-expert usage, skill and the residual
+// correlation matrix of an expert space.
+type ExpertHealth struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SnapshotId    string                 `protobuf:"bytes,1,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	Timescale     string                 `protobuf:"bytes,2,opt,name=timescale,proto3" json:"timescale,omitempty"`
+	AsOf          *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=as_of,json=asOf,proto3" json:"as_of,omitempty"`
+	Source        string                 `protobuf:"bytes,4,opt,name=source,proto3" json:"source,omitempty"` // validation (fit) | live (served windows)
+	ExpertIds     []uint32               `protobuf:"varint,5,rep,packed,name=expert_ids,json=expertIds,proto3" json:"expert_ids,omitempty"`
+	Usage         []float64              `protobuf:"fixed64,6,rep,packed,name=usage,proto3" json:"usage,omitempty"`
+	Skill         []float64              `protobuf:"fixed64,7,rep,packed,name=skill,proto3" json:"skill,omitempty"`
+	ResidCorr     []float64              `protobuf:"fixed64,8,rep,packed,name=resid_corr,json=residCorr,proto3" json:"resid_corr,omitempty"` // row-major K × K
+	KEff          float64                `protobuf:"fixed64,9,opt,name=k_eff,json=kEff,proto3" json:"k_eff,omitempty"`
+	ResidCorrMax  float64                `protobuf:"fixed64,10,opt,name=resid_corr_max,json=residCorrMax,proto3" json:"resid_corr_max,omitempty"`
+	NWindows      uint64                 `protobuf:"varint,11,opt,name=n_windows,json=nWindows,proto3" json:"n_windows,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExpertHealth) Reset() {
+	*x = ExpertHealth{}
+	mi := &file_fa_v1_latent_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExpertHealth) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExpertHealth) ProtoMessage() {}
+
+func (x *ExpertHealth) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_latent_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExpertHealth.ProtoReflect.Descriptor instead.
+func (*ExpertHealth) Descriptor() ([]byte, []int) {
+	return file_fa_v1_latent_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *ExpertHealth) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+func (x *ExpertHealth) GetTimescale() string {
+	if x != nil {
+		return x.Timescale
+	}
+	return ""
+}
+
+func (x *ExpertHealth) GetAsOf() *timestamppb.Timestamp {
+	if x != nil {
+		return x.AsOf
+	}
+	return nil
+}
+
+func (x *ExpertHealth) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
+}
+
+func (x *ExpertHealth) GetExpertIds() []uint32 {
+	if x != nil {
+		return x.ExpertIds
+	}
+	return nil
+}
+
+func (x *ExpertHealth) GetUsage() []float64 {
+	if x != nil {
+		return x.Usage
+	}
+	return nil
+}
+
+func (x *ExpertHealth) GetSkill() []float64 {
+	if x != nil {
+		return x.Skill
+	}
+	return nil
+}
+
+func (x *ExpertHealth) GetResidCorr() []float64 {
+	if x != nil {
+		return x.ResidCorr
+	}
+	return nil
+}
+
+func (x *ExpertHealth) GetKEff() float64 {
+	if x != nil {
+		return x.KEff
+	}
+	return 0
+}
+
+func (x *ExpertHealth) GetResidCorrMax() float64 {
+	if x != nil {
+		return x.ResidCorrMax
+	}
+	return 0
+}
+
+func (x *ExpertHealth) GetNWindows() uint64 {
+	if x != nil {
+		return x.NWindows
+	}
+	return 0
+}
+
 var File_fa_v1_latent_proto protoreflect.FileDescriptor
 
 const file_fa_v1_latent_proto_rawDesc = "" +
@@ -1835,7 +2297,58 @@ const file_fa_v1_latent_proto_rawDesc = "" +
 	"\x05as_of\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x04asOf\x123\n" +
 	"\tproposals\x18\x03 \x03(\v2\x15.fa.v1.CrossAssetPairR\tproposals\x12 \n" +
 	"\vinstruments\x18\x04 \x01(\rR\vinstruments\x12'\n" +
-	"\x0fpairs_evaluated\x18\x05 \x01(\rR\x0epairsEvaluatedB\x85\x01\n" +
+	"\x0fpairs_evaluated\x18\x05 \x01(\rR\x0epairsEvaluated\"W\n" +
+	"\x0ePredictiveDist\x12\x18\n" +
+	"\atargets\x18\x01 \x03(\tR\atargets\x12\x12\n" +
+	"\x04mean\x18\x02 \x03(\x02R\x04mean\x12\x17\n" +
+	"\alog_var\x18\x03 \x03(\x02R\x06logVar\"\xe6\x01\n" +
+	"\x10ExpertViewLatent\x12\x1b\n" +
+	"\texpert_id\x18\x01 \x01(\rR\bexpertId\x12\x0e\n" +
+	"\x02mu\x18\x02 \x03(\x02R\x02mu\x12\x16\n" +
+	"\x06logvar\x18\x03 \x03(\x02R\x06logvar\x12\x12\n" +
+	"\x04gate\x18\x04 \x01(\x02R\x04gate\x12/\n" +
+	"\x06region\x18\x05 \x01(\v2\x17.fa.v1.ExpertMembershipR\x06region\x122\n" +
+	"\tnext_step\x18\x06 \x01(\v2\x15.fa.v1.PredictiveDistR\bnextStep\x12\x14\n" +
+	"\x05codes\x18\a \x03(\rR\x05codes\"s\n" +
+	"\fMcmcStateRef\x12\x1d\n" +
+	"\n" +
+	"region_ids\x18\x01 \x03(\tR\tregionIds\x12%\n" +
+	"\x0ekernel_subject\x18\x02 \x01(\tR\rkernelSubject\x12\x1d\n" +
+	"\n" +
+	"sampler_id\x18\x03 \x01(\tR\tsamplerId\"\x94\x03\n" +
+	"\n" +
+	"ExpertView\x12\x1f\n" +
+	"\vsnapshot_id\x18\x01 \x01(\tR\n" +
+	"snapshotId\x12\x1c\n" +
+	"\ttimescale\x18\x02 \x01(\tR\ttimescale\x12(\n" +
+	"\x01t\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x01t\x12%\n" +
+	"\x0einstrument_set\x18\x04 \x01(\tR\rinstrumentSet\x121\n" +
+	"\aexperts\x18\x05 \x03(\v2\x17.fa.v1.ExpertViewLatentR\aexperts\x12\x1f\n" +
+	"\vexpert_mask\x18\x06 \x03(\bR\n" +
+	"expertMask\x122\n" +
+	"\n" +
+	"mcmc_state\x18\a \x01(\v2\x13.fa.v1.McmcStateRefR\tmcmcState\x12%\n" +
+	"\x0eencoder_family\x18\b \x01(\tR\rencoderFamily\x12\x1f\n" +
+	"\vprior_score\x18\t \x01(\x01R\n" +
+	"priorScore\x12&\n" +
+	"\x0fhas_prior_score\x18\n" +
+	" \x01(\bR\rhasPriorScore\"\xd8\x02\n" +
+	"\fExpertHealth\x12\x1f\n" +
+	"\vsnapshot_id\x18\x01 \x01(\tR\n" +
+	"snapshotId\x12\x1c\n" +
+	"\ttimescale\x18\x02 \x01(\tR\ttimescale\x12/\n" +
+	"\x05as_of\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x04asOf\x12\x16\n" +
+	"\x06source\x18\x04 \x01(\tR\x06source\x12\x1d\n" +
+	"\n" +
+	"expert_ids\x18\x05 \x03(\rR\texpertIds\x12\x14\n" +
+	"\x05usage\x18\x06 \x03(\x01R\x05usage\x12\x14\n" +
+	"\x05skill\x18\a \x03(\x01R\x05skill\x12\x1d\n" +
+	"\n" +
+	"resid_corr\x18\b \x03(\x01R\tresidCorr\x12\x13\n" +
+	"\x05k_eff\x18\t \x01(\x01R\x04kEff\x12$\n" +
+	"\x0eresid_corr_max\x18\n" +
+	" \x01(\x01R\fresidCorrMax\x12\x1b\n" +
+	"\tn_windows\x18\v \x01(\x04R\bnWindowsB\x85\x01\n" +
 	"\tcom.fa.v1B\vLatentProtoP\x01Z6github.com/fey/financial-auto/go/pkg/bus/pb/fa/v1;fav1\xa2\x02\x03FXX\xaa\x02\x05Fa.V1\xca\x02\x05Fa\\V1\xe2\x02\x11Fa\\V1\\GPBMetadata\xea\x02\x06Fa::V1b\x06proto3"
 
 var (
@@ -1851,7 +2364,7 @@ func file_fa_v1_latent_proto_rawDescGZIP() []byte {
 }
 
 var file_fa_v1_latent_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_fa_v1_latent_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_fa_v1_latent_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_fa_v1_latent_proto_goTypes = []any{
 	(RegionEvent_Kind)(0),          // 0: fa.v1.RegionEvent.Kind
 	(RegionLifecycleEvent_Kind)(0), // 1: fa.v1.RegionLifecycleEvent.Kind
@@ -1873,38 +2386,49 @@ var file_fa_v1_latent_proto_goTypes = []any{
 	(*RegionHierarchy)(nil),        // 17: fa.v1.RegionHierarchy
 	(*CrossAssetPair)(nil),         // 18: fa.v1.CrossAssetPair
 	(*CrossAssetPriors)(nil),       // 19: fa.v1.CrossAssetPriors
-	(*timestamppb.Timestamp)(nil),  // 20: google.protobuf.Timestamp
+	(*PredictiveDist)(nil),         // 20: fa.v1.PredictiveDist
+	(*ExpertViewLatent)(nil),       // 21: fa.v1.ExpertViewLatent
+	(*McmcStateRef)(nil),           // 22: fa.v1.McmcStateRef
+	(*ExpertView)(nil),             // 23: fa.v1.ExpertView
+	(*ExpertHealth)(nil),           // 24: fa.v1.ExpertHealth
+	(*timestamppb.Timestamp)(nil),  // 25: google.protobuf.Timestamp
 }
 var file_fa_v1_latent_proto_depIdxs = []int32{
-	20, // 0: fa.v1.LatentState.as_of:type_name -> google.protobuf.Timestamp
+	25, // 0: fa.v1.LatentState.as_of:type_name -> google.protobuf.Timestamp
 	4,  // 1: fa.v1.LatentState.experts:type_name -> fa.v1.ExpertLatent
 	0,  // 2: fa.v1.RegionEvent.kind:type_name -> fa.v1.RegionEvent.Kind
 	2,  // 3: fa.v1.RegionEvent.space:type_name -> fa.v1.ExpertSpaceRef
 	2,  // 4: fa.v1.TransitionUpdate.space:type_name -> fa.v1.ExpertSpaceRef
 	7,  // 5: fa.v1.TransitionUpdate.to:type_name -> fa.v1.TransitionProb
-	20, // 6: fa.v1.TransitionUpdate.as_of:type_name -> google.protobuf.Timestamp
+	25, // 6: fa.v1.TransitionUpdate.as_of:type_name -> google.protobuf.Timestamp
 	8,  // 7: fa.v1.ExpertMembership.weights:type_name -> fa.v1.RegionWeight
-	20, // 8: fa.v1.RegionMembership.as_of:type_name -> google.protobuf.Timestamp
+	25, // 8: fa.v1.RegionMembership.as_of:type_name -> google.protobuf.Timestamp
 	9,  // 9: fa.v1.RegionMembership.experts:type_name -> fa.v1.ExpertMembership
 	1,  // 10: fa.v1.RegionLifecycleEvent.kind:type_name -> fa.v1.RegionLifecycleEvent.Kind
 	2,  // 11: fa.v1.RegionLifecycleEvent.space:type_name -> fa.v1.ExpertSpaceRef
-	20, // 12: fa.v1.RegionLifecycleEvent.as_of:type_name -> google.protobuf.Timestamp
+	25, // 12: fa.v1.RegionLifecycleEvent.as_of:type_name -> google.protobuf.Timestamp
 	11, // 13: fa.v1.RegionLifecycleEvent.ancestors:type_name -> fa.v1.RegionAncestor
 	2,  // 14: fa.v1.KernelUpdate.space:type_name -> fa.v1.ExpertSpaceRef
-	20, // 15: fa.v1.KernelUpdate.as_of:type_name -> google.protobuf.Timestamp
+	25, // 15: fa.v1.KernelUpdate.as_of:type_name -> google.protobuf.Timestamp
 	14, // 16: fa.v1.KernelUpdate.samplers:type_name -> fa.v1.SamplerScore
 	13, // 17: fa.v1.KernelUpdate.stationary:type_name -> fa.v1.RegionDist
 	2,  // 18: fa.v1.RegionHierarchy.fine:type_name -> fa.v1.ExpertSpaceRef
 	2,  // 19: fa.v1.RegionHierarchy.coarse:type_name -> fa.v1.ExpertSpaceRef
-	20, // 20: fa.v1.RegionHierarchy.as_of:type_name -> google.protobuf.Timestamp
+	25, // 20: fa.v1.RegionHierarchy.as_of:type_name -> google.protobuf.Timestamp
 	16, // 21: fa.v1.RegionHierarchy.edges:type_name -> fa.v1.HierEdge
-	20, // 22: fa.v1.CrossAssetPriors.as_of:type_name -> google.protobuf.Timestamp
+	25, // 22: fa.v1.CrossAssetPriors.as_of:type_name -> google.protobuf.Timestamp
 	18, // 23: fa.v1.CrossAssetPriors.proposals:type_name -> fa.v1.CrossAssetPair
-	24, // [24:24] is the sub-list for method output_type
-	24, // [24:24] is the sub-list for method input_type
-	24, // [24:24] is the sub-list for extension type_name
-	24, // [24:24] is the sub-list for extension extendee
-	0,  // [0:24] is the sub-list for field type_name
+	9,  // 24: fa.v1.ExpertViewLatent.region:type_name -> fa.v1.ExpertMembership
+	20, // 25: fa.v1.ExpertViewLatent.next_step:type_name -> fa.v1.PredictiveDist
+	25, // 26: fa.v1.ExpertView.t:type_name -> google.protobuf.Timestamp
+	21, // 27: fa.v1.ExpertView.experts:type_name -> fa.v1.ExpertViewLatent
+	22, // 28: fa.v1.ExpertView.mcmc_state:type_name -> fa.v1.McmcStateRef
+	25, // 29: fa.v1.ExpertHealth.as_of:type_name -> google.protobuf.Timestamp
+	30, // [30:30] is the sub-list for method output_type
+	30, // [30:30] is the sub-list for method input_type
+	30, // [30:30] is the sub-list for extension type_name
+	30, // [30:30] is the sub-list for extension extendee
+	0,  // [0:30] is the sub-list for field type_name
 }
 
 func init() { file_fa_v1_latent_proto_init() }
@@ -1918,7 +2442,7 @@ func file_fa_v1_latent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_fa_v1_latent_proto_rawDesc), len(file_fa_v1_latent_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   18,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

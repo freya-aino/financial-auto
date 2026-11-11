@@ -368,7 +368,12 @@ pub fn produce(req: &VaryRequest) -> Result<VaryOutcome, String> {
             if !seen.insert(c.genome.id()) {
                 continue;
             }
-            lineage.push(Lineage { child: c.genome.to_string(), parents: c.parents.clone(), op: op_name(&c.op) });
+            lineage.push(Lineage {
+                child: c.genome.to_string(),
+                parents: c.parents.clone(),
+                op: op_name(&c.op),
+                parents_as_sent: Vec::new(),
+            });
             children.push(c.genome);
         }
         round += 1;
@@ -381,7 +386,12 @@ pub fn produce(req: &VaryRequest) -> Result<VaryOutcome, String> {
         if !seen.insert(g.id()) {
             continue;
         }
-        lineage.push(Lineage { child: g.to_string(), parents: Vec::new(), op: "immigrant" });
+        lineage.push(Lineage {
+            child: g.to_string(),
+            parents: Vec::new(),
+            op: "immigrant",
+            parents_as_sent: Vec::new(),
+        });
         children.push(g);
         immigrants += 1;
     }

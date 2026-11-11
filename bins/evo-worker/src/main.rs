@@ -22,6 +22,7 @@ mod job;
 mod latent;
 mod market;
 mod neural;
+mod news;
 mod recorded;
 mod run;
 mod strategy;
@@ -187,6 +188,9 @@ async fn main() -> anyhow::Result<()> {
 
     let counters = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<String, f64>::new()));
     let recorded = recorded::RecordedStore::from_env();
+    // News → instrument matching for `ninst=1` text genomes (reference snapshot from Postgres).
+    let news_refs = news::NewsRefs::default();
+    news_refs.spawn_refresh(cfg.postgres.url.clone());
     {
         let bus = bus.clone();
         let worker_id = worker_id.clone();
@@ -238,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
         trials,
         cost,
         recorded,
+        news_refs,
     };
     tracing::info!(%worker_id, gpu_lease_mb = args.gpu_lease_mb, "pulling jobs from {STREAM}");
     // One message at a time so idle workers do not hoard jobs other replicas could take.

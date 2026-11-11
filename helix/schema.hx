@@ -106,6 +106,38 @@ E::HasSpace {
     Properties: {}
 }
 
+// One surviving expert of a learned (neural) snapshot (spec 32 §5, §6.5); written by the
+// trainer after CKA matching. `expert_id` is the stable expert index, so `AlignedTo` chains are
+// an expert's identity across generations.
+N::Expert {
+    UNIQUE INDEX expert_uid: String, // `<snapshot_id>/e<expert_id>`
+    INDEX snapshot_id: String,
+    timescale: String,
+    expert_id: U32,
+    dim: U32,
+    usage: F64,          // validation router usage
+    skill: F64,          // validation skill vs naive (spec 32 §6.4)
+    specialisation: String, // JSON: gate mass per instrument
+    born_gen: U32,
+    died_gen: U32,       // set when no child expert continues it
+    updated_at: Date DEFAULT NOW,
+}
+
+E::ExpertOf {
+    From: Expert,
+    To: Snapshot,
+    Properties: {}
+}
+
+E::AlignedTo {
+    From: Expert, // child (new generation)
+    To: Expert,   // parent-generation expert it continues
+    Properties: {
+        cka: F64,
+        kind: String, // carry
+    }
+}
+
 E::SnapshotParent {
     From: Snapshot, // parent
     To: Snapshot,   // child (spec 36 lineage; written by the trainer)
@@ -292,6 +324,13 @@ N::Genome {
     family: String,
     params: String, // JSON
     created_at: Date DEFAULT NOW,
+    // Strategies only (spec 35 §5): lifecycle status mirrored from ledger.strategy_state by the
+    // risk-engine pipeline (setGenomeStatus); absent on genomes that never reached the lifecycle.
+    status: String, // candidate | holdout_passed | shadow | active | paused | flattening | retired
+    strategy_id: String,
+    status_reason: String,
+    status_since_ms: I64,
+    status_updated_at: Date,
 }
 
 N::FitnessRecord {

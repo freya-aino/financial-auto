@@ -9,7 +9,10 @@
 //! - order size: notional ≤ `max_order_frac` × deployable (fat-finger quantities);
 //! - post-trade position ≤ the position cap (stricter for provisional instruments) and the
 //!   liquidity cap `k × horizon volume`;
-//! - post-trade gross per asset class, per venue and for the portfolio ≤ their caps.
+//! - post-trade gross per asset class, per venue and for the portfolio ≤ their caps;
+//! - shorts (spec 40 §10 Q5): opening or adding to a short needs a shortable instrument
+//!   (class in `short_margin`, `ref.contract_spec.shortable` not false) and margin room:
+//!   Σ |short| × margin after the order ≤ `short_margin_budget_frac` × deployable.
 //!
 //! An order that only reduces an existing position (same sign, smaller magnitude) always
 //! passes the size and cap checks — closing risk is never blocked by a cap.
@@ -34,6 +37,8 @@ pub struct OrderCheck<'a> {
     pub class_gross_eur: f64,
     pub venue_gross_eur: f64,
     pub portfolio_gross_eur: f64,
+    /// Margin currently tied up by shorts (Σ |short| × margin, EUR).
+    pub short_margin_used_eur: f64,
 }
 
 /// `Ok(())` or the rejection reason.
@@ -91,6 +96,17 @@ pub fn check_order(cfg: &RiskConfig, o: &OrderCheck<'_>) -> Result<(), String> {
             m.horizon_volume_eur
         ));
     }
+    let added_short = (-post).max(0.0) - (-o.position_eur).max(0.0);
+    if added_short > 0.0 {
+        let Some(margin) = m.short_margin(cfg) else {
+            return Err(format!("pre-trade: {:?} instrument is not shortable (no borrow)", m.asset_class));
+        };
+        let budget = cfg.short_margin_budget_frac * deployable;
+        let used = o.short_margin_used_eur + added_short * margin;
+        if used > budget + 1e-9 {
+            return Err(format!("pre-trade: short margin {used:.0} EUR > short margin budget {budget:.0}"));
+        }
+    }
     let added = post.abs() - o.position_eur.abs();
     let class_cap = cfg.leverage_cap.get(&m.asset_class).copied().unwrap_or(0.0).min(cfg.max_class_frac) * deployable;
     if o.class_gross_eur + added > class_cap {
@@ -136,6 +152,7 @@ mod tests {
             class_gross_eur: 0.0,
             venue_gross_eur: 0.0,
             portfolio_gross_eur: 0.0,
+            short_margin_used_eur: 0.0,
         }
     }
 
@@ -190,5 +207,23 @@ mod tests {
         assert!(check_order(&c, &o).unwrap_err().contains("venue cap"));
         let o = OrderCheck { portfolio_gross_eur: 199_000.0, ..order(20.0, &m) };
         assert!(check_order(&c, &o).unwrap_err().contains("gross cap"));
+    }
+
+    #[test]
+    fn shorts_need_borrow_and_margin_room() {
+        let c = cfg();
+        let eq = MarketInfo::new(AssetClass::Equity, "xetr", 10_000_000.0);
+        assert_eq!(check_order(&c, &order(-40.0, &eq)), Ok(()), "4 000 short ties up 2 000 margin");
+        let no_borrow = MarketInfo { shortable: Some(false), ..eq.clone() };
+        assert!(check_order(&c, &order(-40.0, &no_borrow)).unwrap_err().contains("not shortable"));
+        assert_eq!(check_order(&c, &order(40.0, &no_borrow)), Ok(()), "longs are unaffected");
+        let rates = MarketInfo::new(AssetClass::Rates, "x", 10_000_000.0);
+        assert!(check_order(&c, &order(-10.0, &rates)).unwrap_err().contains("not shortable"));
+        // 49 000 margin used of the 50 000 budget: another 4 000 short at 50 % does not fit
+        let o = OrderCheck { short_margin_used_eur: 49_000.0, ..order(-40.0, &eq) };
+        assert!(check_order(&c, &o).unwrap_err().contains("short margin"));
+        // covering a short always passes, even on a non-shortable instrument
+        let o = OrderCheck { position_eur: -4_000.0, short_margin_used_eur: 60_000.0, ..order(20.0, &no_borrow) };
+        assert_eq!(check_order(&c, &o), Ok(()));
     }
 }

@@ -147,6 +147,34 @@ pub struct Genome {
     pub params: String,
     #[serde(default)]
     pub created_at: Option<String>,
+    /// Lifecycle status mirrored from `ledger.strategy_state` (spec 35 §5; strategies only):
+    /// `candidate | holdout_passed | shadow | active | paused | flattening | retired`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Live strategy id the status belongs to (evolved: the genome id itself).
+    #[serde(default)]
+    pub strategy_id: Option<String>,
+    #[serde(default)]
+    pub status_reason: Option<String>,
+    /// When the status was entered (ms since the epoch, from `ledger.strategy_state.since`).
+    #[serde(default)]
+    pub status_since_ms: Option<i64>,
+    #[serde(default)]
+    pub status_updated_at: Option<String>,
+}
+
+/// A lifecycle status to mirror onto a `Genome` node (`setGenomeStatus`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenomeStatus {
+    pub genome_id: String,
+    /// Used only when the genome node does not exist yet (created like `upsertGenome`).
+    pub kind: String,
+    pub family: String,
+    pub params: String,
+    pub strategy_id: String,
+    pub status: String,
+    pub reason: String,
+    pub since_ms: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -1029,6 +1057,41 @@ impl HubClient {
         let batch =
             get_or_create(Batch::write().named("upsert_genome"), node::GENOME, "genome_id", &g.genome_id, props);
         take_existing_or_created(self.batch(&batch).await?)
+    }
+
+    /// `setGenomeStatus`: mirrors a strategy's lifecycle status onto its `Genome` (spec 35 §5),
+    /// creating the genome like `upsertGenome` when the evo-worker never wrote it. Idempotent.
+    pub async fn set_genome_status(&self, g: &GenomeStatus) -> Result<Genome> {
+        let status_props = |op: Op| {
+            op.set_property("status", g.status.as_str())
+                .set_property("strategy_id", g.strategy_id.as_str())
+                .set_property("status_reason", g.reason.as_str())
+                .set_property("status_since_ms", g.since_ms)
+                .set_property("status_updated_at", Input::Now)
+                .value_map(None)
+        };
+        let created = Op::add_n(
+            node::GENOME,
+            vec![
+                ("genome_id", s(&g.genome_id)),
+                ("kind", s(&g.kind)),
+                ("family", s(&g.family)),
+                ("params", s(&g.params)),
+                ("created_at", Input::Now),
+            ],
+        );
+        let batch = Batch::write()
+            .named("set_genome_status")
+            .var("existing", by_key_nodes(node::GENOME, "genome_id", &g.genome_id))
+            .var_if("updated", Cond::VarNotEmpty("existing".into()), status_props(Op::nodes(NodeRef::var("existing"))))
+            .var_if("created", Cond::VarEmpty("existing".into()), created)
+            .var_if("created_row", Cond::VarNotEmpty("created".into()), status_props(Op::nodes(NodeRef::var("created"))))
+            .returning(["updated", "created_row"]);
+        let mut resp = self.batch(&batch).await?;
+        if let Some(row) = resp.take_opt::<Genome>("updated")? {
+            return Ok(row);
+        }
+        resp.take_one("created_row")
     }
 
     /// `linkParent`: `ParentOf{op}` by business ids; returns the edge id, `NotFound` when a

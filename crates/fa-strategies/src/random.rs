@@ -225,6 +225,7 @@ pub fn random_genome(rng: &mut Rng, timescale: Timescale, spec: &RandomSpec) -> 
         uncertainty: random_expr(rng, spec.max_depth_uncertainty, spec),
         parents: Vec::new(),
         generation: 0,
+        snapshot: None,
     }
 }
 

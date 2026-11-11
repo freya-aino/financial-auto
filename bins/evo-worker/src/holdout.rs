@@ -287,6 +287,7 @@ pub(crate) mod tests {
             trials: None,
             cost: std::sync::Arc::new(fa_backtest::cost::CostModel::default()),
             recorded: crate::recorded::RecordedStore::disabled(),
+            news_refs: crate::news::NewsRefs::default(),
         }
     }
 

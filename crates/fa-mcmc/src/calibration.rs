@@ -22,17 +22,20 @@
 //! qualifies), switched only after `min_evals` evaluations and when it beats the current one by
 //! `margin` nats (hysteresis).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use fa_core::rng::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     RegionKey, UNKNOWN,
-    kernel::{KernelSampler, timed},
+    kernel::{KernelCtx, KernelSampler, timed},
+    refit::RefitOutcome,
 };
 
 const BINS: usize = 10;
+/// Evaluations between serving re-selections.
+const RESELECT_EVERY: u64 = 16;
 const PIT_WINDOW: usize = 512;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,14 +131,23 @@ impl Calibration {
         self.bins.iter().filter(|b| b.2 > 0.0).map(|b| (b.0 / b.2, b.1 / b.2, b.2)).collect()
     }
 
+    /// [`Calibration::scores`] without the PIT KS distance (no sort; selection does not use it).
+    pub fn selection_scores(&self) -> CalibrationScores {
+        CalibrationScores { pit_ks: 0.0, ..self.scores_with(false) }
+    }
+
     pub fn scores(&self) -> CalibrationScores {
+        self.scores_with(true)
+    }
+
+    fn scores_with(&self, pit: bool) -> CalibrationScores {
         let total: f64 = self.bins.iter().map(|b| b.2).sum();
         let ece = if total > 0.0 {
             self.bins.iter().filter(|b| b.2 > 0.0).map(|b| (b.2 / total) * ((b.0 - b.1) / b.2).abs()).sum()
         } else {
             0.0
         };
-        let mut u: Vec<f64> = self.pit.iter().copied().collect();
+        let mut u: Vec<f64> = if pit { self.pit.iter().copied().collect() } else { Vec::new() };
         u.sort_by(f64::total_cmp);
         let n = u.len() as f64;
         let pit_ks = u
@@ -240,10 +252,16 @@ impl Arena {
 
     /// Prequential step: every sampler predicts, is scored on `to`, then observes it.
     pub fn observe(&mut self, from: &str, to: &str) {
+        self.observe_ctx(from, to, &KernelCtx::default());
+    }
+
+    /// Prequential step with the step's context (asset, previous region, dwell, covariates):
+    /// the richer kernels of spec 33 §6.2 condition on it, the Dirichlet baselines ignore it.
+    pub fn observe_ctx(&mut self, from: &str, to: &str, ctx: &KernelCtx) {
         for (s, c) in self.samplers.iter_mut().zip(&mut self.cal) {
             let ((), ns) = timed(|| {
-                let pred = s.predict(from);
-                s.observe(from, to);
+                let pred = s.predict_ctx(from, ctx);
+                s.observe_ctx(from, to, ctx);
                 c.record(&pred, to, -1.0, &mut self.rng);
             });
             // cost is attributed after the fact (the closure cannot time itself)
@@ -252,23 +270,61 @@ impl Arena {
         self.reselect();
     }
 
+    /// Hands a batch refit (`jobs.mcmc.refit`) to every sampler; returns the ones that took it.
+    pub fn apply_refit(&mut self, o: &RefitOutcome) -> Vec<String> {
+        self.samplers.iter_mut().filter_map(|s| s.apply_refit(o).then(|| s.name().to_owned())).collect()
+    }
+
+    /// Sampler-specific state by sampler name (persisted next to the kernel).
+    pub fn export_states(&self) -> BTreeMap<String, serde_json::Value> {
+        self.samplers.iter().filter_map(|s| Some((s.name().to_owned(), s.export_state()?))).collect()
+    }
+
+    pub fn import_states(&mut self, states: &BTreeMap<String, serde_json::Value>) {
+        for s in &mut self.samplers {
+            if let Some(v) = states.get(s.name()) {
+                s.import_state(v);
+            }
+        }
+    }
+
+    /// Garage keys of the refits the samplers currently serve (reloaded after a restart).
+    pub fn refit_refs(&self) -> Vec<String> {
+        let mut refs: Vec<String> = self
+            .export_states()
+            .values()
+            .filter_map(|v| v.get("refit_ref").and_then(|r| r.as_str()).map(str::to_owned))
+            .collect();
+        refs.sort();
+        refs.dedup();
+        refs
+    }
+
     fn dominates(a: &CalibrationScores, b: &CalibrationScores) -> bool {
         let ge = a.log_score >= b.log_score && a.ece <= b.ece && a.cost_us <= b.cost_us;
         let gt = a.log_score > b.log_score || a.ece < b.ece || a.cost_us < b.cost_us;
         ge && gt
     }
 
-    fn front(&self) -> Vec<bool> {
-        let s: Vec<CalibrationScores> = self.cal.iter().map(Calibration::scores).collect();
+    fn front_of(s: &[CalibrationScores]) -> Vec<bool> {
         (0..s.len()).map(|i| !(0..s.len()).any(|j| j != i && Self::dominates(&s[j], &s[i]))).collect()
     }
 
+    fn front(&self) -> Vec<bool> {
+        Self::front_of(&self.cal.iter().map(Calibration::scores).collect::<Vec<_>>())
+    }
+
+    /// Re-evaluates the serving sampler every [`RESELECT_EVERY`] evaluations (selection uses log
+    /// score, ECE and cost only, so the PIT window is not sorted on the hot path).
     fn reselect(&mut self) {
         if self.cal.iter().any(|c| c.evals < self.cfg.min_evals) {
             return;
         }
-        let front = self.front();
-        let s: Vec<CalibrationScores> = self.cal.iter().map(Calibration::scores).collect();
+        if !self.cal[0].evals.is_multiple_of(RESELECT_EVERY) {
+            return;
+        }
+        let s: Vec<CalibrationScores> = self.cal.iter().map(Calibration::selection_scores).collect();
+        let front = Self::front_of(&s);
         let pick = |strict: bool| {
             (0..s.len())
                 .filter(|&i| front[i] && (!strict || s[i].ece <= self.cfg.max_ece))
@@ -360,5 +416,101 @@ mod tests {
             assert!(s.scores.cost_us > 0.0);
         }
         assert!(arena.serving().graph().row_mass("a") > 0.0);
+    }
+}
+
+/// Latency benchmark of spec 33 §9.4 (online update per step per kernel ≤ 1 ms for the
+/// conjugate kernel). Run: `cargo test -p fa-mcmc --release -- --ignored --nocapture bench_`.
+#[cfg(test)]
+mod bench {
+    use std::time::Instant;
+
+    use fa_core::rng::Rng;
+
+    use super::*;
+    use crate::{
+        MarkovGraph,
+        kernel::{ConjugateExact, SmcParticle},
+        rich::{HierAsset, LogitCov, SecondOrder, SemiMarkov},
+    };
+
+    /// 64 live regions with 8-d centroids (geometric prior on), a sticky chain over 6 assets.
+    fn graph() -> MarkovGraph {
+        let mut g = MarkovGraph::new(1.0, 0.9995);
+        let mut rng = Rng::seed(1);
+        for r in 0..64 {
+            let id = format!("r{r}");
+            g.register_region(&id);
+            g.set_centroid(&id, &(0..8).map(|_| rng.normal() as f32).collect::<Vec<_>>());
+        }
+        g
+    }
+
+    fn stream(n: usize) -> Vec<(String, String, KernelCtx)> {
+        let mut rng = Rng::seed(2);
+        let mut cur = [0usize; 6];
+        let mut dwell = [1u32; 6];
+        let mut prev: Vec<Option<String>> = vec![None; 6];
+        (0..n)
+            .map(|t| {
+                let a = t % 6;
+                let from = cur[a];
+                let to = if rng.uniform() < 0.8 { from } else { (from + 1 + rng.below(5)) % 64 };
+                let ctx = KernelCtx {
+                    instrument: format!("inst{a}"),
+                    prev: prev[a].clone(),
+                    dwell: dwell[a],
+                    x: [f64::from(dwell[a]).ln(), rng.normal(), rng.uniform(), 0.3],
+                };
+                if to == from {
+                    dwell[a] += 1;
+                } else {
+                    prev[a] = Some(format!("r{from}"));
+                    dwell[a] = 1;
+                }
+                cur[a] = to;
+                (format!("r{from}"), format!("r{to}"), ctx)
+            })
+            .collect()
+    }
+
+    fn time_arena(name: &str, samplers: Vec<Box<dyn KernelSampler>>) -> f64 {
+        let mut arena = Arena::new(samplers, ArenaCfg::default(), 3);
+        let s = stream(22_000);
+        for (f, t, c) in &s[..2_000] {
+            arena.observe_ctx(f, t, c);
+        }
+        let t0 = Instant::now();
+        for (f, t, c) in &s[2_000..] {
+            arena.observe_ctx(f, t, c);
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / 20_000.0;
+        eprintln!("{name:>34}: {us:8.2} µs per update (predict + score + observe)");
+        us
+    }
+
+    #[test]
+    #[ignore = "benchmark: run with --release --ignored"]
+    fn bench_kernel_update_latency() {
+        let g = graph();
+        let conj = time_arena("conjugate", vec![Box::new(ConjugateExact::new(g.clone(), 256, 1))]);
+        time_arena("smc (64 particles)", vec![Box::new(SmcParticle::new(g.clone(), 64, 1))]);
+        time_arena("second_order", vec![Box::new(SecondOrder::new(g.clone(), 4.0, 64, 1))]);
+        time_arena("semi_markov", vec![Box::new(SemiMarkov::new(g.clone(), 2.0, 64, 1))]);
+        time_arena("hier_asset", vec![Box::new(HierAsset::new(g.clone(), 10.0, 64, 1))]);
+        time_arena("logit_cov (no fit: fallback)", vec![Box::new(LogitCov::new(g.clone(), 32))]);
+        let all = time_arena(
+            "full arena (6 kernels)",
+            vec![
+                Box::new(ConjugateExact::new(g.clone(), 256, 1)),
+                Box::new(SmcParticle::new(g.clone(), 64, 2)),
+                Box::new(SecondOrder::new(g.clone(), 4.0, 64, 3)),
+                Box::new(SemiMarkov::new(g.clone(), 2.0, 64, 4)),
+                Box::new(HierAsset::new(g.clone(), 10.0, 64, 5)),
+                Box::new(LogitCov::new(g, 32)),
+            ],
+        );
+        assert!(conj < 1000.0, "spec 33 §9.4: conjugate update {conj} µs > 1 ms");
+        assert!(all < 6000.0, "six kernels at ≤ 1 ms each: {all} µs");
     }
 }

@@ -22,9 +22,10 @@ Live service: meta-allocation across strategy signals, non-evolvable hard risk l
    - per-instrument position cap, stricter for `provisional` instruments;
    - liquidity cap (`k ×` rolling traded volume, extrapolated while the window fills);
    - per-asset-class leverage **and** concentration cap, and the per-venue cap, both from reference data;
-   - portfolio gross cap.
+   - portfolio gross cap;
+   - shorts: no short without borrow (class absent from `limits.short_margin`, or `ref.contract_spec.shortable = false`), all shorts scaled down when Σ |short| × class margin exceeds `short_margin_budget_frac` × deployable.
 6. `gate`: kill switch and model/broker halts flatten everything; daily-loss and `fx` halts are reduce-only. A `source:<id>` halt flattens only the instruments that source feeds when every instrument in play has exactly one known listing source; otherwise it flattens everything. The bare `source` scope always flattens everything. Foreign intents follow the same per-instrument rule.
-7. Diff against book + pending intents, no-trade band (`max(min_order_eur, band × |target|)`) → market `OrderIntent`s in `TradingMode::Paper`, account `paper`, contributors in `strategy_ids`. Each is published on `order.intent.paper` and immediately on `order.approved.paper` (the broker-gateway paper engine fills it). `flattening` strategies become `paused` once their closing intents are out (`strategy.flattened` audit).
+7. Diff against book + pending intents, no-trade band (`max(min_order_eur, band × |target|)`) → `OrderIntent`s whose `exec_algo` comes from `fa_risk::exec` (`[exec]`: urgent or horizon < 60 s → `market`; else `pov` / `twap` / `vwap` / `smart_limit` by participation in the horizon volume, spec 40 §6.4); a working order stays pending for its working time and partial fills shrink the pending remainder; in `TradingMode::Paper`, account `paper`, contributors in `strategy_ids`. Each is published on `order.intent.paper` and immediately on `order.approved.paper` (the broker-gateway paper engine fills it). `flattening` strategies become `paused` once their closing intents are out (`strategy.flattened` audit).
 
 Foreign intents seen on `order.intent.<account>` (control-api's manual orders since D-051) are gated the same way: non-paper mode or an active halt → `OrderEvent{REJECTED}` on `order.event.<account>`; otherwise republished on `order.approved.<account>`.
 
@@ -56,11 +57,12 @@ Errors use the control-api prefix convention (`not_found:` / `conflict:` / `inva
 | `source` (bare) | `risk.halt.source` without an id | flatten everything | bare `risk.resume.source` |
 | `fx` | accounting FX older than `fx.max_age_hours` with `fx.halt_on_stale = true` (spec 42 §8) | reduce-only | a fresh rate (engine publishes `risk.resume.fx`), or `risk.resume.fx` |
 | `broker` | reconciliation diff (spec 42), or `risk.halt.broker` / `venue:*` from other services | flatten, no orders | `risk.resume.broker` |
-| `model` | other services | flatten, no orders | `risk.resume.model` |
+| `model` (bare) | other services | flatten, no orders | `risk.resume.model` (also clears every snapshot halt) |
+| `model:<snapshot>` | `risk.halt.model:<snapshot>`, or the engine's drift alarm on `latent.mcmc.*` (`drift_kl ≥ [model_drift] halt_kl` for `sustain` updates) | strategies of that snapshot's timescale leave allocation (their sleeves net away); others trade on | `risk.resume.model:<snapshot>`; a halt the alarm raised also clears itself after `clear_sustain` updates ≤ `clear_kl` |
 | per strategy | attributed drawdown ≥ `strategy_max_drawdown` of the sleeve | that strategy paused + flattened | `ctl.risk.strategy resume` |
 
 ## Settings
-[`risk.toml`](risk.toml) (`--risk`, `FA_RISK`); the built-in copy is used when the file is missing. `mode` must be `paper`; anything else fails startup. Limits follow the spec 40 §7 placeholders; at runtime they can only be tightened (`ctl.risk.limits`), loosening needs an edit + restart. `new_strategy_status`, `shadow_sleeve_eur` and `[promotion]` configure the lifecycle; `refdata_refresh_secs` and `[fx]` (`ecb_refresh_secs`, `max_age_hours`, `halt_on_stale`, `source`, `history_days`) configure reference data and FX.
+[`risk.toml`](risk.toml) (`--risk`, `FA_RISK`); the built-in copy is used when the file is missing. `mode` must be `paper`; anything else fails startup. Limits follow the spec 40 §7 placeholders; at runtime they can only be tightened (`ctl.risk.limits`), loosening needs an edit + restart. `new_strategy_status`, `shadow_sleeve_eur` and `[promotion]` configure the lifecycle; `refdata_refresh_secs` and `[fx]` (`ecb_refresh_secs`, `max_age_hours`, `halt_on_stale`, `source`, `history_days`) configure reference data and FX; `[exec]` the algorithm choice, `[model_drift]` the drift alarm, `[limits.short_margin]` / `short_margin_budget_frac` the paper short rules. Heartbeat gauges `headroom.*` give the distance to every limit (spec 60 §6.5).
 
 ## Run
 ```sh

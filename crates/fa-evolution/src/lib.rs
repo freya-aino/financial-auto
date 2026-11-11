@@ -2,7 +2,8 @@
 //!
 //! The NSGA-II functions ([`non_dominated_sort`], [`crowding_distance`], [`nsga2_select`]) are
 //! the reference implementation; `go/services/evo-orchestrator/nsga.go` is a line-by-line port
-//! and both test suites read `testdata/nsga_fixture.json` so they cannot drift.
+//! and both test suites read `go/services/evo-orchestrator/testdata/nsga_fixture.json` (under
+//! `go/` so the Docker Go toolchain, which mounts only `go/`, sees it) so they cannot drift.
 
 pub mod objectives;
 pub mod vary;
@@ -321,7 +322,8 @@ mod tests {
         fn close(a: f64, b: f64) -> bool {
             (a.is_infinite() && b.is_infinite() && a.signum() == b.signum()) || (a - b).abs() < 1e-9
         }
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/nsga_fixture.json");
+        let path =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../go/services/evo-orchestrator/testdata/nsga_fixture.json");
         let fx: Fixture = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert!(fx.cases.len() >= 5);
         for c in &fx.cases {

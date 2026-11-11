@@ -5,9 +5,13 @@
 //! movement `(venue_id, kind, ref)`), so replaying the same event stream yields the same book.
 //! [`PgLedger::load_book`] rebuilds a [`Ledger`] from cash movements plus fills in time order.
 //!
-//! Money is `NUMERIC(38,18)` in Postgres and `f64` here (the paper book is f64 end to end);
-//! values are cast at the SQL boundary. Paper fills have no venue, so the fixed
-//! [`PAPER_VENUE`] id stands in for `venue_id` (it must be non-null for the uniqueness
+//! Money is `NUMERIC(38,18)` in Postgres and exact [`Decimal`] at the boundary: wire `f64`s
+//! are converted once with [`money::dec`] and bound as `NUMERIC` (no `float8` cast), and the
+//! book is rebuilt from the stored decimals, so [`PgLedger::load_book`] and the in-memory
+//! [`Ledger`] agree digit for digit ([`PgLedger::reconcile_cut`]). Rows written before the
+//! decimal change hold Postgres' `float8 → numeric` rendering and are read as stored. The
+//! reporting reads ([`FillRow`], snapshots, the derived accounting) stay `f64`. Paper fills
+//! have no venue, so the fixed [`PAPER_VENUE`] id stands in for `venue_id` (it must be non-null for the uniqueness
 //! constraints to bite).
 use std::collections::BTreeMap;
 
@@ -18,7 +22,13 @@ use serde_json::Value;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use uuid::Uuid;
 
-use crate::{Fill, Ledger, accounting::LotMethod};
+use crate::{
+    BookDiff, ExactFill, Fill, Ledger, Totals,
+    accounting::LotMethod,
+    cash_key,
+    money::{self, Decimal, dec},
+    settlement::{Settlement, SettlementPolicy},
+};
 
 /// Venue id used for paper books (no real venue exists yet).
 pub const PAPER_VENUE: Uuid = Uuid::from_u128(0x7061_7065_7200_0000_0000_0000_0000_0001);
@@ -156,11 +166,38 @@ pub struct PayoutQuota {
     pub paid_eur: f64,
 }
 
+/// A cash movement with its exact EUR amount ([`PgLedger::cash_rows`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CashRow {
+    /// [`cash_key`] of the row.
+    pub key: String,
+    pub kind: String,
+    pub amount_eur: Decimal,
+    pub occurred_at: DateTime<Utc>,
+}
+
+/// Result of [`PgLedger::reconcile_cut`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Reconciliation {
+    /// Differences at the common cut; empty = the books agree.
+    pub diff: BookDiff,
+    /// Fills compared (booked on both sides).
+    pub compared_fills: usize,
+    /// In-memory fills excluded because their write is still in flight.
+    pub in_flight: usize,
+    /// Fills in Postgres that the in-memory book has not booked (not a diff: apply them).
+    pub fills_only_theirs: Vec<(ExactFill, DateTime<Utc>)>,
+    /// Cash movements in Postgres that the in-memory book has not applied (apply them).
+    pub cash_only_theirs: Vec<CashRow>,
+}
+
 #[derive(Clone)]
 pub struct PgLedger {
     pool: PgPool,
     /// `ledger.lot_method` (spec 42 §7) used by the derived reads in `pg_accounting`.
     lot_method: LotMethod,
+    /// Settlement per venue (spec 42 §10 Q5) for the derived reads; default EUR everywhere.
+    settlement: SettlementPolicy,
 }
 
 impl PgLedger {
@@ -174,7 +211,7 @@ impl PgLedger {
     }
 
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool, lot_method: LotMethod::default() }
+        Self { pool, lot_method: LotMethod::default(), settlement: SettlementPolicy::default() }
     }
 
     /// Same ledger with another lot method for lots, positions and P&L (default FIFO).
@@ -185,6 +222,38 @@ impl PgLedger {
 
     pub fn lot_method(&self) -> LotMethod {
         self.lot_method
+    }
+
+    /// Same ledger with another settlement policy for the derived reads.
+    pub fn with_settlement(mut self, policy: SettlementPolicy) -> Self {
+        self.settlement = policy;
+        self
+    }
+
+    pub fn settlement(&self) -> &SettlementPolicy {
+        &self.settlement
+    }
+
+    /// Reads `ledger.venue_settlement` (migration `20261112000010`) into a policy (default EUR;
+    /// an unreadable or missing table yields the default).
+    pub async fn load_settlement(&self) -> SettlementPolicy {
+        let rows: Vec<(Uuid, String)> = sqlx::query_as("SELECT venue_id, settlement FROM ledger.venue_settlement")
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default();
+        let mut p = SettlementPolicy::default();
+        for (v, s) in rows {
+            if let Some(s) = Settlement::parse(&s) {
+                p.venues.insert(v, s);
+            }
+        }
+        p
+    }
+
+    /// [`Self::with_settlement`] with the stored policy.
+    pub async fn with_stored_settlement(self) -> Self {
+        let p = self.load_settlement().await;
+        self.with_settlement(p)
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -201,14 +270,14 @@ impl PgLedger {
         let inserted = sqlx::query(
             "INSERT INTO ledger.order_intent \
              (id, book, instrument_id, side, qty, exec_algo, params, idempotency_key, created_at) \
-             VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              ON CONFLICT DO NOTHING",
         )
         .bind(uuid_of(&i.intent_id))
         .bind(&i.book)
         .bind(i.instrument.0)
         .bind(&i.side)
-        .bind(i.qty)
+        .bind(dec(i.qty))
         .bind(&i.exec_algo)
         .bind(&params)
         .bind(&i.intent_id)
@@ -219,15 +288,15 @@ impl PgLedger {
         sqlx::query(
             "INSERT INTO ledger.venue_order \
              (client_order_id, intent_id, venue_id, venue_order_id, status, qty, limit_price, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, 'approved', $5::float8::numeric, $6::float8::numeric, $7, $7) \
+             VALUES ($1, $2, $3, $4, 'approved', $5, $6, $7, $7) \
              ON CONFLICT DO NOTHING",
         )
         .bind(&i.intent_id)
         .bind(uuid_of(&i.intent_id))
         .bind(PAPER_VENUE)
         .bind(format!("paper-{}", i.intent_id))
-        .bind(i.qty)
-        .bind(i.limit_price)
+        .bind(dec(i.qty))
+        .bind(i.limit_price.filter(|v| v.is_finite()).map(dec))
         .bind(i.created_at)
         .execute(&mut *tx)
         .await?;
@@ -266,40 +335,40 @@ impl PgLedger {
             return Err(PgError::UnknownIntent { fill_id: f.fill_id.clone(), intent_id: f.intent_id.clone() });
         }
         let fill_uuid = uuid_of(&f.fill_id);
+        let x = ExactFill::of(f);
         let inserted = sqlx::query(
             "INSERT INTO ledger.fill \
              (id, client_order_id, venue_fill_id, qty, price, ccy, fee, fee_ccy, fx_rate_eur, fx_source, filled_at, \
               arrival_price, slippage_bps) \
-             VALUES ($1, $2, $3, $4::float8::numeric, $5::float8::numeric, $9, $6::float8::numeric, 'EUR', \
-                     $7::float8::numeric, $10, $8, $11::float8::numeric, $12::float8::numeric) \
+             VALUES ($1, $2, $3, $4, $5, $9, $6, 'EUR', $7, $10, $8, $11, $12) \
              ON CONFLICT DO NOTHING",
         )
         .bind(fill_uuid)
         .bind(&f.intent_id)
         .bind(&f.fill_id)
-        .bind(f.quantity.abs())
-        .bind(f.price)
-        .bind(f.fee_eur)
-        .bind(f.fx_to_eur)
+        .bind(x.qty.abs())
+        .bind(x.price)
+        .bind(x.fee_eur)
+        .bind(x.fx_to_eur)
         .bind(filled_at)
         .bind(if d.ccy.is_empty() { fa_core::BASE_CURRENCY } else { d.ccy.as_str() })
         .bind(if d.fx_source.is_empty() { "fixed" } else { d.fx_source.as_str() })
-        .bind(d.arrival_price.filter(|v| v.is_finite()))
-        .bind(d.slippage_bps.filter(|v| v.is_finite()))
+        .bind(d.arrival_price.filter(|v| v.is_finite()).map(dec))
+        .bind(d.slippage_bps.filter(|v| v.is_finite()).map(dec))
         .execute(&mut *tx)
         .await?
         .rows_affected();
         if inserted > 0 && !strategy_ids.is_empty() {
-            let n = strategy_ids.len() as f64;
+            let n = Decimal::from(strategy_ids.len());
             for s in strategy_ids {
                 sqlx::query(
                     "INSERT INTO ledger.fill_attribution (fill_id, strategy_id, qty, fee_share) \
-                     VALUES ($1, $2, $3::float8::numeric, $4::float8::numeric) ON CONFLICT DO NOTHING",
+                     VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
                 )
                 .bind(fill_uuid)
                 .bind(uuid_of(s))
-                .bind(f.quantity.abs() / n)
-                .bind(f.fee_eur / n)
+                .bind(money::div(x.qty.abs(), n))
+                .bind(money::div(x.fee_eur, n))
                 .execute(&mut *tx)
                 .await?;
             }
@@ -314,16 +383,16 @@ impl PgLedger {
         let n = sqlx::query(
             "INSERT INTO ledger.cash_movement \
              (id, book, venue_id, kind, amount, ccy, fx_rate_eur, ref, occurred_at) \
-             VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7::float8::numeric, $8, $9) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              ON CONFLICT DO NOTHING",
         )
         .bind(id)
         .bind(&m.book)
         .bind(PAPER_VENUE)
         .bind(&m.kind)
-        .bind(m.amount)
+        .bind(dec(m.amount))
         .bind(&m.ccy)
-        .bind(m.fx_rate_eur)
+        .bind(dec(m.fx_rate_eur))
         .bind(&m.reference)
         .bind(m.occurred_at)
         .execute(&self.pool)
@@ -365,15 +434,15 @@ impl PgLedger {
     ) -> Result<usize, PgError> {
         let mut tx = self.pool.begin().await?;
         let mut n = 0;
-        for (inst, p) in &ledger.positions {
+        for (inst, p) in &ledger.exact().positions {
             n += sqlx::query(
                 "INSERT INTO ledger.position_snapshot (book, venue_id, instrument_id, qty, avg_price, as_of) \
-                 VALUES ($1, $2, $3, $4::float8::numeric, $5::float8::numeric, $6) ON CONFLICT DO NOTHING",
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
             )
             .bind(book)
             .bind(PAPER_VENUE)
             .bind(inst.0)
-            .bind(p.quantity)
+            .bind(p.qty)
             .bind(p.avg_cost_eur)
             .bind(as_of)
             .execute(&mut *tx)
@@ -497,30 +566,160 @@ impl PgLedger {
         Ok(cash.unwrap_or(0.0))
     }
 
-    /// Rebuilds the book: cash from cash movements, intents registered, fills replayed in
-    /// `filled_at` order. Payouts (`kind = 'payout'`) are counted in `paid_out_eur`.
-    pub async fn load_book(&self, book: &str) -> Result<Ledger, PgError> {
-        let cash = self.cash_eur(book).await?;
-        let (payouts,): (Option<f64>,) = sqlx::query_as(
-            "SELECT -sum(amount * fx_rate_eur)::float8 FROM ledger.cash_movement \
-             WHERE book = $1 AND kind = 'payout'",
+    /// Every cash movement of a book with its exact EUR amount (`amount × fx_rate_eur` at the
+    /// ledger scale), oldest first.
+    pub async fn cash_rows(&self, book: &str) -> Result<Vec<CashRow>, PgError> {
+        let rows = sqlx::query(
+            "SELECT venue_id, kind, ref, amount, fx_rate_eur, occurred_at FROM ledger.cash_movement \
+             WHERE book = $1 ORDER BY occurred_at, kind, ref",
         )
         .bind(book)
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let venue: Uuid = r.get("venue_id");
+                let kind: String = r.get("kind");
+                let reference: String = r.get("ref");
+                let amount: Decimal = r.get("amount");
+                let fx: Decimal = r.get("fx_rate_eur");
+                CashRow {
+                    key: cash_key(&venue, &kind, &reference),
+                    kind,
+                    amount_eur: money::mul(money::round(amount), money::round(fx)),
+                    occurred_at: r.get("occurred_at"),
+                }
+            })
+            .collect())
+    }
+
+    /// Every fill of a book in exact decimals, in `(filled_at, id)` order.
+    pub async fn exact_fills(&self, book: &str) -> Result<Vec<(ExactFill, DateTime<Utc>)>, PgError> {
+        let rows = sqlx::query(
+            "SELECT f.venue_fill_id, oi.instrument_id, oi.side, f.qty, f.price, f.fee, f.fx_rate_eur, f.filled_at \
+             FROM ledger.fill f \
+             JOIN ledger.venue_order vo ON vo.client_order_id = f.client_order_id \
+             JOIN ledger.order_intent oi ON oi.id = vo.intent_id \
+             WHERE oi.book = $1 ORDER BY f.filled_at, f.id",
+        )
+        .bind(book)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let qty = money::round(r.get::<Decimal, _>("qty"));
+                let side: String = r.get("side");
+                (
+                    ExactFill {
+                        fill_id: r.get("venue_fill_id"),
+                        instrument: InstrumentId(r.get::<Uuid, _>("instrument_id")),
+                        qty: if side == "sell" { -qty } else { qty },
+                        price: money::round(r.get("price")),
+                        fx_to_eur: money::round(r.get("fx_rate_eur")),
+                        fee_eur: money::round(r.get("fee")),
+                    },
+                    r.get("filled_at"),
+                )
+            })
+            .collect())
+    }
+
+    /// Rebuilds the book exactly: every cash movement applied once, intents registered, fills
+    /// replayed in `filled_at` order. Payouts (`kind = 'payout'`) are counted in `paid_out_eur`.
+    pub async fn load_book(&self, book: &str) -> Result<Ledger, PgError> {
+        let cash = self.cash_rows(book).await?;
         let intents: Vec<(String,)> = sqlx::query_as("SELECT idempotency_key FROM ledger.order_intent WHERE book = $1")
             .bind(book)
             .fetch_all(&self.pool)
             .await?;
-        let mut ledger = Ledger::with_cash(cash);
-        ledger.paid_out_eur = payouts.unwrap_or(0.0);
+        let mut ledger = Ledger::with_cash_exact(Decimal::ZERO);
+        for c in &cash {
+            ledger.apply_cash(&c.key, &c.kind, c.amount_eur);
+        }
         for (id,) in intents {
             let _ = ledger.register_intent(&id);
         }
-        for row in self.fills(book, None, None, None).await? {
-            ledger.apply_fill(&row.to_fill());
+        for (f, _) in self.exact_fills(book).await? {
+            ledger.apply_exact(&f);
         }
         Ok(ledger)
+    }
+
+    /// Reconciles an in-memory book against Postgres at the same cut (spec 42 §6).
+    ///
+    /// The comparison is on additive totals (cash, fees, quantity per instrument), which do not
+    /// depend on fill order, in exact decimals:
+    /// - ours = `Totals::of(ours)` minus `in_flight` (fills booked in memory whose write to
+    ///   Postgres has not been confirmed yet — they are not expected there);
+    /// - theirs = the cash movements ours has applied plus the fills ours has booked (minus
+    ///   `in_flight`), as stored in Postgres.
+    ///
+    /// So rows written to Postgres after the in-memory snapshot was taken cannot show as a diff
+    /// (the 2026-11-10/11 false halts: the snapshot was taken, a fill arrived and was persisted,
+    /// then Postgres was read). What remains is real: fills ours booked that Postgres lacks
+    /// (`fills_only_ours`), stored values that differ, and — returned separately for the
+    /// caller to apply — rows Postgres has that ours has not seen (fills booked by another
+    /// writer, e.g. an operator-booked orphan, and cash movements such as payouts).
+    pub async fn reconcile_cut(
+        &self,
+        book: &str,
+        ours: &Ledger,
+        in_flight: &[ExactFill],
+        cash_tol: f64,
+        qty_tol: f64,
+    ) -> Result<Reconciliation, PgError> {
+        let cash = self.cash_rows(book).await?;
+        let fills = self.exact_fills(book).await?;
+        let pending: std::collections::HashSet<&str> =
+            in_flight.iter().filter(|f| ours.has_fill(&f.fill_id)).map(|f| f.fill_id.as_str()).collect();
+        let mut mine = Totals::of(ours);
+        for f in in_flight.iter().filter(|f| pending.contains(f.fill_id.as_str())) {
+            mine.remove_fill(f);
+        }
+        let mut theirs = Totals::default();
+        let mut cash_only_theirs = Vec::new();
+        for c in cash {
+            if ours.cash_refs().contains(&c.key) {
+                theirs.add_cash(c.amount_eur);
+            } else {
+                cash_only_theirs.push(c);
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut fills_only_theirs = Vec::new();
+        let mut compared = 0usize;
+        for (f, at) in fills {
+            seen.insert(f.fill_id.clone());
+            if pending.contains(f.fill_id.as_str()) {
+                continue;
+            }
+            if ours.has_fill(&f.fill_id) {
+                theirs.add_fill(&f);
+                compared += 1;
+            } else {
+                fills_only_theirs.push((f, at));
+            }
+        }
+        // Postgres has no cash movement for a book that was opened in memory only (with_cash);
+        // that is a cash diff like any other.
+        let mut diff: BookDiff = crate::diff_totals(&mine, &theirs, cash_tol, qty_tol);
+        let mut only_ours: Vec<String> = ours
+            .fill_ids()
+            .iter()
+            .filter(|id| !seen.contains(*id) && !pending.contains(id.as_str()))
+            .cloned()
+            .collect();
+        only_ours.sort();
+        diff.fills_only_ours = only_ours;
+        Ok(Reconciliation {
+            diff,
+            compared_fills: compared,
+            in_flight: pending.len(),
+            fills_only_theirs,
+            cash_only_theirs,
+        })
     }
 
     pub async fn record_reconciliation(
@@ -583,14 +782,14 @@ impl PgLedger {
     pub async fn upsert_payout_quota(&self, q: &PayoutQuota) -> Result<(), PgError> {
         sqlx::query(
             "INSERT INTO ledger.payout_quota (day, quota_eur, reserved_eur, paid_eur) \
-             VALUES ($1, $2::float8::numeric, $3::float8::numeric, $4::float8::numeric) \
+             VALUES ($1, $2, $3, $4) \
              ON CONFLICT (day) DO UPDATE SET quota_eur = excluded.quota_eur, \
              reserved_eur = excluded.reserved_eur, paid_eur = excluded.paid_eur",
         )
         .bind(q.day)
-        .bind(q.quota_eur)
-        .bind(q.reserved_eur)
-        .bind(q.paid_eur)
+        .bind(dec(q.quota_eur))
+        .bind(dec(q.reserved_eur))
+        .bind(dec(q.paid_eur))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -755,6 +954,78 @@ mod tests {
         pg.delete_book(&book).await.unwrap();
         assert!(!pg.book_exists(&book).await.unwrap());
         assert!(pg.fills(&book, None, None, None).await.unwrap().is_empty());
+    }
+
+    /// Regression for the recurring `broker` halts of 2026-11-10/11: the in-memory book was
+    /// cloned, a fill arrived and was persisted, then Postgres was read — a diff of exactly
+    /// that fill. `reconcile_cut` compares at the memory's cut, excludes writes in flight, and
+    /// still reports a fill that never reached Postgres; the decimals agree digit for digit.
+    #[tokio::test]
+    async fn reconcile_cut_has_no_snapshot_race_and_finds_real_gaps() {
+        let Some(pg) = ledger().await else { return };
+        let book = format!("test-{}", Uuid::now_v7());
+        let inst = InstrumentId::new();
+        pg.ensure_initial_deposit(&book, 100_000.0).await.unwrap();
+        let mut mem = pg.load_book(&book).await.unwrap();
+        let raw: [(f64, f64); 3] = [
+            (2.85021203500556, 101.80316189408),
+            (-1.15531427142454, 101.804900229592),
+            (1.11897472440106, 100.77850057833),
+        ];
+        let mut fills = Vec::new();
+        for (n, (q, px)) in raw.iter().enumerate() {
+            let id = format!("{book}-i{n}");
+            pg.record_intent(&intent(&book, &id, inst, if *q < 0.0 { "sell" } else { "buy" }, q.abs())).await.unwrap();
+            let mut f = fill(&format!("{id}:f"), &id, inst, *q, *px);
+            f.fee_eur = 0.0123 * q.abs();
+            fills.push(f);
+        }
+        let t0 = Utc::now();
+        for f in &fills[..2] {
+            mem.apply_fill(f);
+            pg.record_fill(f, t0, &[]).await.unwrap();
+        }
+        // the reconciliation snapshot is taken here; the third fill lands in both afterwards
+        let snap = mem.clone();
+        mem.apply_fill(&fills[2]);
+        pg.record_fill(&fills[2], t0, &[]).await.unwrap();
+        let old_way = crate::diff_books(&snap, &pg.load_book(&book).await.unwrap(), 0.01, 1e-6);
+        assert!(!old_way.is_empty(), "the pre-fix comparison reports the race as a diff");
+        let r = pg.reconcile_cut(&book, &snap, &[], 0.0, 0.0).await.unwrap();
+        assert!(r.diff.is_empty(), "{:?}", r.diff);
+        assert_eq!((r.compared_fills, r.fills_only_theirs.len()), (2, 1));
+        assert_eq!(r.fills_only_theirs[0].0, ExactFill::of(&fills[2]));
+        // exact agreement of the full book, decimals included
+        let full = pg.load_book(&book).await.unwrap();
+        assert_eq!(Totals::of(&full), Totals::of(&mem));
+        assert!(pg.reconcile_cut(&book, &mem, &[], 0.0, 0.0).await.unwrap().diff.is_empty());
+
+        // a fill booked in memory whose write is still in flight is not a diff ...
+        let id = format!("{book}-i9");
+        pg.record_intent(&intent(&book, &id, inst, "buy", 3.0)).await.unwrap();
+        let late = fill(&format!("{id}:f"), &id, inst, 3.0, 99.5);
+        mem.apply_fill(&late);
+        let r = pg.reconcile_cut(&book, &mem, &[ExactFill::of(&late)], 0.0, 0.0).await.unwrap();
+        assert!(r.diff.is_empty() && r.in_flight == 1, "{r:?}");
+        // ... but a fill that never reached Postgres is
+        let r = pg.reconcile_cut(&book, &mem, &[], 0.0, 0.0).await.unwrap();
+        assert_eq!(r.diff.fills_only_ours, vec![late.fill_id.clone()]);
+        assert_eq!(r.diff.positions.len(), 1);
+        assert!(r.diff.cash_ours != r.diff.cash_theirs);
+
+        // cash written by another writer (a payout from control-api) is returned to apply
+        crate::pg::PgLedger::record_payout(&pg, &book, chrono::NaiveDate::from_ymd_opt(2099, 1, 2).unwrap(), 12.5)
+            .await
+            .unwrap();
+        pg.record_fill(&late, t0, &[]).await.unwrap();
+        let r = pg.reconcile_cut(&book, &mem, &[], 0.0, 0.0).await.unwrap();
+        assert!(r.diff.is_empty(), "{:?}", r.diff);
+        assert_eq!(r.cash_only_theirs.len(), 1);
+        let c = &r.cash_only_theirs[0];
+        assert!(mem.apply_cash(&c.key, &c.kind, c.amount_eur));
+        assert_eq!(Totals::of(&pg.load_book(&book).await.unwrap()), Totals::of(&mem));
+        sqlx::query("DELETE FROM ledger.payout_quota WHERE day = '2099-01-02'").execute(pg.pool()).await.unwrap();
+        pg.delete_book(&book).await.unwrap();
     }
 
     #[tokio::test]

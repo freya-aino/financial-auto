@@ -20,6 +20,9 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+ulid.workspace = true
 
 [lints]
 workspace = true

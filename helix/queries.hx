@@ -251,6 +251,14 @@ QUERY upsertGenome(genome_id: String, kind: String, family: String, params: Stri
     created <- AddN<Genome>({genome_id: genome_id, kind: kind, family: family, params: params}) // when existing is empty
     RETURN existing, created
 
+// Lifecycle mirror (spec 35 §5): update the status properties, creating the genome like
+// upsertGenome when it is missing.
+QUERY setGenomeStatus(genome_id: String, kind: String, family: String, params: String, strategy_id: String, status: String, reason: String, since_ms: I64) =>
+    existing <- N<Genome>({genome_id: genome_id})
+    updated <- existing::UPDATE({status: status, strategy_id: strategy_id, status_reason: reason, status_since_ms: since_ms, status_updated_at: NOW}) // when existing is not empty
+    created <- AddN<Genome>({genome_id: genome_id, kind: kind, family: family, params: params, status: status, strategy_id: strategy_id, status_reason: reason, status_since_ms: since_ms}) // when existing is empty
+    RETURN updated, created
+
 QUERY linkParent(parent_id: String, child_id: String, op: String) =>
     parent <- N<Genome>({genome_id: parent_id})
     child <- N<Genome>({genome_id: child_id})
@@ -294,3 +302,27 @@ QUERY resolveNode(business_id: String) =>
 // params): getInstrument, listSnapshots, snapshotSpaces, snapshotGraph, spaceRegions, getRegion,
 // regionTransitions, regionNeighbors, searchLatent, genomeParents, genomeFitness, genomeAncestry,
 // resolveNode, neighborhood.
+
+// ── Expert identity (spec 32 §5, §6.5; fa-hub `experts.rs`) ──
+
+QUERY upsertExpert(expert_uid: String, snapshot_id: String, timescale: String, expert_id: U32, dim: U32, usage: F64, skill: F64, born_gen: U32, specialisation: String) =>
+    existing <- N<Expert>({expert_uid: expert_uid})
+    updated <- existing::UPDATE({usage: usage, skill: skill, dim: dim, specialisation: specialisation, updated_at: NOW}) // when existing is not empty
+    created <- AddN<Expert>({expert_uid: expert_uid, snapshot_id: snapshot_id, timescale: timescale, expert_id: expert_id, dim: dim, usage: usage, skill: skill, born_gen: born_gen, specialisation: specialisation}) // when existing is empty
+    snap <- N<Snapshot>({snapshot_id: snapshot_id})
+    edge <- AddE<ExpertOf>::From(created)::To(snap) // when created
+    RETURN updated, created
+
+QUERY alignExpert(child_uid: String, parent_uid: String, cka: F64, kind: String) =>
+    child <- N<Expert>({expert_uid: child_uid})
+    parent <- N<Expert>({expert_uid: parent_uid})
+    edge <- AddE<AlignedTo>({cka: cka, kind: kind})::From(child)::To(parent)
+    RETURN edge
+
+QUERY snapshotExperts(snapshot_id: String) =>
+    experts <- N<Expert>({snapshot_id: snapshot_id})
+    RETURN experts
+
+QUERY expertParents(expert_uid: String) =>
+    parents <- N<Expert>({expert_uid: expert_uid})::Out<AlignedTo>
+    RETURN parents
