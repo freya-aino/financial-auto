@@ -117,13 +117,30 @@ pub struct StartGeneration {
     pub max_generations: Option<u32>,
     pub total_budget_ms: Option<u64>,
     pub data_window_hours: Option<u32>,
+    /// Cross-asset `src→target` genomes seeded per decoder loop from `latent.crossprior.*`
+    /// (D-074; orchestrator default `-mcmc-pairs` 4, 0 disables).
+    #[serde(default)]
+    pub mcmc_pairs: Option<u32>,
 }
 
 /// Starts a successive-halving generation via the orchestrator's `ctl.evo.start`.
 pub async fn start_generation(State(s): State<AppState>, Json(body): Json<StartGeneration>) -> Response {
+    let Some(args) = start_args(body) else {
+        return err(StatusCode::BAD_REQUEST, "kind and at least one genome are required");
+    };
+    let req = CtlRequest { verb: "start".into(), args: args.into_iter().map(|(k, v)| (k.to_owned(), v)).collect() };
+    match ctl_request(&s, subjects::ctl("evo", "start"), &req).await {
+        Ok(r) if r.ok => Json(json!({ "ok": true, "generation_id": r.message })).into_response(),
+        Ok(r) => err(StatusCode::UNPROCESSABLE_ENTITY, r.message),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `ctl.evo.start` arguments of a start body (`None` without a kind or a genome).
+pub fn start_args(body: StartGeneration) -> Option<Vec<(&'static str, String)>> {
     let genomes: Vec<&str> = body.genomes.iter().map(|g| g.trim()).filter(|g| !g.is_empty()).collect();
     if body.kind.trim().is_empty() || genomes.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "kind and at least one genome are required");
+        return None;
     }
     let mut args =
         // newline-separated so kv (`;`) and JSON (`,`) genomes survive transport (D-044)
@@ -146,12 +163,10 @@ pub async fn start_generation(State(s): State<AppState>, Json(body): Json<StartG
     if let Some(v) = body.data_window_hours {
         args.push(("data_window_hours", v.to_string()));
     }
-    let req = CtlRequest { verb: "start".into(), args: args.into_iter().map(|(k, v)| (k.to_owned(), v)).collect() };
-    match ctl_request(&s, subjects::ctl("evo", "start"), &req).await {
-        Ok(r) if r.ok => Json(json!({ "ok": true, "generation_id": r.message })).into_response(),
-        Ok(r) => err(StatusCode::UNPROCESSABLE_ENTITY, r.message),
-        Err(e) => e.into_response(),
+    if let Some(v) = body.mcmc_pairs {
+        args.push(("mcmc_pairs", v.to_string()));
     }
+    Some(args)
 }
 
 async fn ctl_request(s: &AppState, subject: String, req: &CtlRequest) -> Result<CtlReply, ApiError> {
@@ -344,6 +359,24 @@ pub async fn paper_order(State(s): State<AppState>, Json(body): Json<PaperOrder>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_forwards_mcmc_pairs() {
+        let body: StartGeneration = serde_json::from_value(json!({
+            "kind": "evo.eval.decoder", "genomes": ["nn_forecast:h=5", " "], "eta": 3, "mcmc_pairs": 0
+        }))
+        .unwrap();
+        let args = start_args(body).unwrap();
+        let get = |k: &str| args.iter().find(|(a, _)| *a == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("mcmc_pairs"), Some("0"), "0 disables pair seeding and must reach the orchestrator");
+        assert_eq!(get("genomes"), Some("nn_forecast:h=5"));
+        assert_eq!(get("eta"), Some("3"));
+        let none: StartGeneration =
+            serde_json::from_value(json!({ "kind": "evo.eval.decoder", "genomes": ["g"] })).unwrap();
+        assert!(start_args(none).unwrap().iter().all(|(k, _)| *k != "mcmc_pairs"), "absent = orchestrator default");
+        let bad: StartGeneration = serde_json::from_value(json!({ "kind": " ", "genomes": ["g"] })).unwrap();
+        assert!(start_args(bad).is_none());
+    }
 
     fn order(mode: Option<&str>) -> PaperOrder {
         PaperOrder {

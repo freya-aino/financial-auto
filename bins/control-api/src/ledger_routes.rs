@@ -139,12 +139,14 @@ pub async fn pnl(State(s): State<AppState>, Query(q): Query<PnlQuery>) -> Respon
         Err(e) => return db_err(e),
     };
     let mut replay = Ledger::with_cash(0.0);
-    let mut turnover = 0.0;
+    let mut turnover = fa_ledger::Decimal::ZERO;
     for f in &fills {
-        turnover += f.qty * f.price * f.fx_rate_eur;
+        turnover += fa_ledger::money::mul(f.qty, fa_ledger::money::mul(f.price, f.fx_rate_eur));
         replay.apply_fill(&f.to_fill());
     }
-    let realised: f64 = replay.positions.values().map(|p| p.realised_eur).sum();
+    let turnover = fa_ledger::money::f(turnover);
+    let realised: f64 =
+        fa_ledger::money::f(fa_ledger::money::sum(replay.exact().positions.values().map(|p| p.realised_eur)));
     let by_instrument: Vec<_> = replay
         .positions
         .iter()
@@ -163,7 +165,7 @@ pub async fn pnl(State(s): State<AppState>, Query(q): Query<PnlQuery>) -> Respon
         "turnover_eur": turnover,
         "realised_eur": realised,
         "fees_eur": replay.fees_eur,
-        "net_eur": realised - replay.fees_eur,
+        "net_eur": fa_ledger::money::f(fa_ledger::money::sum(replay.exact().positions.values().map(|p| p.realised_eur)) - replay.exact().fees_eur),
         "by_instrument": by_instrument,
         "snapshot": snapshot,
         "note": "realised P&L over fills in range with average-cost lots; unrealised needs marks (not persisted yet)",

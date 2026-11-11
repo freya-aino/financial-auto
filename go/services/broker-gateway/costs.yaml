@@ -17,6 +17,12 @@ default_class: equity   # the gateway has no reference data; map known instrumen
 # instrument UUID -> asset class (equity | etf | fx | crypto | commodity | rates | index | derivative | prediction_market)
 instruments:
   01900000-0000-7000-8000-000000000001: equity   # synthetic heartbeat instrument
+  # crypto (ref.instrument / ref.listing, 2026-11-11): priced by the crypto schedules below, not
+  # the equity 1 EUR minimum they fell back to before (the gateway has no reference data)
+  850b1098-d844-59e3-a7eb-1fb84638c1bf: crypto   # XBTEUR (kraken)
+  88649f5f-667f-5a21-aee9-7bc843b60fc1: crypto   # ETHEUR (kraken)
+  6d155600-908f-5f21-b5b6-771cbdd91050: crypto   # SOLEUR (kraken)
+  9daa8cea-67a6-5f6b-8347-f9e5a30f7463: crypto   # BTC-USD (yahoo)
 
 # Lookup: venues.<venue>.classes.<class>, venues.<venue>.default, default.classes.<class>, default.default.
 default:
@@ -32,6 +38,12 @@ default:
 venues:
   sim:      # synthetic heartbeat feed: costless venue so the baseline paper P&L is readable
     default: { commission_bps: 0, commission_min_eur: 0, spread_bps: 0, impact_k: 0 }
+  kraken:   # Kraken Pro spot, lowest volume tier (< 10 k USD / 30 d): taker 0.40 %, maker 0.25 %, no
+            # minimum; BTC/ETH-EUR books are ~1 bp wide (2 bp modelled until md.quote.kraken.* is
+            # seen). `default` covers Kraken pairs missing from `instruments` (all crypto).
+    default:  { commission_bps: 40, commission_min_eur: 0, spread_bps: 2, funding_bps_day: 0, impact_k: 0.2 }
+    classes:
+      crypto: { commission_bps: 40, commission_min_eur: 0, spread_bps: 2, funding_bps_day: 0, impact_k: 0.2 }
   yahoo:    # delayed bars/quotes; treat as a retail broker
     classes:
       equity: { commission_bps: 5, commission_min_eur: 1, spread_bps: 5 }

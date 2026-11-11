@@ -262,8 +262,17 @@ type OrderEvent struct {
 	// Execution quality (spec 40 §6.4, 41 §6.3): the arrival price is the last trade seen when
 	// the intent was accepted; slippage is the signed cost against the taker in basis points of
 	// the arrival price (fill vs arrival, positive = paid). Both are 0 for non-fill events.
-	ArrivalPrice  float64 `protobuf:"fixed64,10,opt,name=arrival_price,json=arrivalPrice,proto3" json:"arrival_price,omitempty"`
-	SlippageBps   float64 `protobuf:"fixed64,11,opt,name=slippage_bps,json=slippageBps,proto3" json:"slippage_bps,omitempty"`
+	ArrivalPrice float64 `protobuf:"fixed64,10,opt,name=arrival_price,json=arrivalPrice,proto3" json:"arrival_price,omitempty"`
+	SlippageBps  float64 `protobuf:"fixed64,11,opt,name=slippage_bps,json=slippageBps,proto3" json:"slippage_bps,omitempty"`
+	// Venue-assigned id of this fill, unique per venue (spec 42 §5 `venue_fill_id`): two partial
+	// fills of one order in the same millisecond stay distinct. Empty from older producers;
+	// consumers then fall back to `intent:venue_order:event-ms`.
+	VenueFillId string `protobuf:"bytes,12,opt,name=venue_fill_id,json=venueFillId,proto3" json:"venue_fill_id,omitempty"`
+	// What was traded (spec 42 §8), so a consumer that does not know the intent (an orphan fill)
+	// can identify the instrument instead of assuming: the internal instrument id when the venue
+	// adapter knows it, and the venue's own symbol.
+	InstrumentId  string `protobuf:"bytes,13,opt,name=instrument_id,json=instrumentId,proto3" json:"instrument_id,omitempty"`
+	VenueSymbol   string `protobuf:"bytes,14,opt,name=venue_symbol,json=venueSymbol,proto3" json:"venue_symbol,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -375,6 +384,27 @@ func (x *OrderEvent) GetSlippageBps() float64 {
 	return 0
 }
 
+func (x *OrderEvent) GetVenueFillId() string {
+	if x != nil {
+		return x.VenueFillId
+	}
+	return ""
+}
+
+func (x *OrderEvent) GetInstrumentId() string {
+	if x != nil {
+		return x.InstrumentId
+	}
+	return ""
+}
+
+func (x *OrderEvent) GetVenueSymbol() string {
+	if x != nil {
+		return x.VenueSymbol
+	}
+	return ""
+}
+
 // `order.cancel.<account>`: cancels a working order (resting limit or the unfilled remainder of
 // an algo order) by its intent id (spec 40 §6.4). Field 1 is wire-compatible with
 // `OrderIntent.intent_id`, so senders still publishing an `OrderIntent` keep working.
@@ -474,7 +504,7 @@ const file_fa_v1_order_proto_rawDesc = "" +
 	"\n" +
 	"created_at\x18\n" +
 	" \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAtB\x0e\n" +
-	"\f_limit_price\"\x87\x04\n" +
+	"\f_limit_price\"\xf3\x04\n" +
 	"\n" +
 	"OrderEvent\x12\x1b\n" +
 	"\tintent_id\x18\x01 \x01(\tR\bintentId\x12$\n" +
@@ -490,7 +520,10 @@ const file_fa_v1_order_proto_rawDesc = "" +
 	"\x06reason\x18\t \x01(\tR\x06reason\x12#\n" +
 	"\rarrival_price\x18\n" +
 	" \x01(\x01R\farrivalPrice\x12!\n" +
-	"\fslippage_bps\x18\v \x01(\x01R\vslippageBps\"v\n" +
+	"\fslippage_bps\x18\v \x01(\x01R\vslippageBps\x12\"\n" +
+	"\rvenue_fill_id\x18\f \x01(\tR\vvenueFillId\x12#\n" +
+	"\rinstrument_id\x18\r \x01(\tR\finstrumentId\x12!\n" +
+	"\fvenue_symbol\x18\x0e \x01(\tR\vvenueSymbol\"v\n" +
 	"\x04Kind\x12\x14\n" +
 	"\x10KIND_UNSPECIFIED\x10\x00\x12\f\n" +
 	"\bKIND_ACK\x10\x01\x12\x15\n" +

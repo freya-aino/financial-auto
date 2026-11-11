@@ -11,6 +11,7 @@ pub mod money;
 pub mod payout;
 pub mod pg;
 pub mod pg_accounting;
+pub mod restate;
 pub mod settlement;
 pub mod statement;
 

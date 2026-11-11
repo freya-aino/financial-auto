@@ -5,7 +5,7 @@
 //! |---|---|---|---|
 //! | [`DensityClusters`] | `density` | hierarchical VAE + flow prior, JEPA + VAE head, latent diffusion | HDBSCAN: core distances (k-NN), mutual-reachability MST (Prim), single-linkage dendrogram, condensed tree with `min_cluster_size`, excess-of-mass selection |
 //! | [`MapperCover`] | `mapper` | JEPA embedding | Mapper: filter = first principal component, overlapping interval cover, single-linkage clusters per interval, nerve graph; regions = connected components of the nerve |
-//! | [`CodebookRegions`] | `codebook` | FSQ/VQ hybrid | a VQ codebook (deterministic k-means++ / Lloyd) over the latents; used codes are candidate regions, codes with overlapping spread merge (union-find), a code whose members are clearly bimodal splits |
+//! | [`CodebookRegions`] | `codebook` | FSQ/VQ hybrid | a VQ codebook (deterministic k-means++ / Lloyd) over the latents; used codes are candidate regions; with next-step residuals ([`RegionDiscovery::discover_with_residuals`]) neighbouring codes (Gabriel graph) merge agglomeratively while their residual distributions are indistinguishable (two-sample KS, p ≥ `merge_alpha`), without residuals codes with overlapping spread merge (union-find); a code whose members are clearly bimodal splits |
 //!
 //! All three are deterministic and independent of the input order (points are sorted
 //! canonically first; centroids are emitted sorted), as spec 30 §9.3 requires, and pass the
@@ -20,6 +20,40 @@ use crate::{DiscoveryMethod, RegionDiscovery, nearest};
 
 fn d2(a: &[f32], b: &[f32]) -> f64 {
     a.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum()
+}
+
+/// Two-sample Kolmogorov–Smirnov p-value (asymptotic, Stephens' small-sample correction) of
+/// two **sorted** samples.
+pub fn ks_pvalue(a: &[f64], b: &[f64]) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 1.0;
+    }
+    let (n, m) = (a.len() as f64, b.len() as f64);
+    let (mut i, mut j, mut d) = (0usize, 0usize, 0.0f64);
+    while i < a.len() && j < b.len() {
+        let x = a[i].min(b[j]);
+        while i < a.len() && a[i] <= x {
+            i += 1;
+        }
+        while j < b.len() && b[j] <= x {
+            j += 1;
+        }
+        d = d.max((i as f64 / n - j as f64 / m).abs());
+    }
+    let ne = (n * m / (n + m)).sqrt();
+    let lambda = (ne + 0.12 + 0.11 / ne) * d;
+    if lambda < 1e-3 {
+        return 1.0;
+    }
+    let mut p = 0.0;
+    for k in 1..=100 {
+        let t = 2.0 * (-1.0f64).powi(k - 1) * (-2.0 * f64::from(k * k) * lambda * lambda).exp();
+        p += t;
+        if t.abs() < 1e-10 {
+            break;
+        }
+    }
+    p.clamp(0.0, 1.0)
 }
 
 fn canonical(points: &[Vec<f32>]) -> Vec<Vec<f32>> {
@@ -461,8 +495,14 @@ pub struct CodebookRegions {
     pub codebook_size: usize,
     /// A code is "used" when it holds at least this share of the points.
     pub min_usage: f64,
-    /// Codes merge when their centroid distance ≤ `merge_factor · (rms spread a + rms spread b)`.
+    /// Without residuals: codes merge when their centroid distance ≤
+    /// `merge_factor · (rms spread a + rms spread b)`.
     pub merge_factor: f64,
+    /// With residuals (spec 30 §6.2): neighbouring regions merge while the two-sample KS test
+    /// of their next-step residuals gives p ≥ `merge_alpha` (most similar pair first).
+    pub merge_alpha: f64,
+    /// A code with fewer finite residuals than this is merged by the spread rule instead.
+    pub min_residuals: usize,
     /// A code splits when its 2-means halves are ≥ `split_gap` pooled sds apart.
     pub split_gap: f64,
     pub max_regions: usize,
@@ -476,6 +516,8 @@ impl CodebookRegions {
             codebook_size: 32,
             min_usage: 0.005,
             merge_factor: 1.0,
+            merge_alpha: 0.05,
+            min_residuals: 20,
             split_gap: 4.0,
             max_regions,
             lloyd_iters: 30,
@@ -542,8 +584,91 @@ impl CodebookRegions {
         (points.iter().map(|p| d2(p, c)).sum::<f64>() / points.len().max(1) as f64).sqrt()
     }
 
-    /// Region label per point.
+    /// Agglomerative merge of used codes on residual statistics: regions start as single codes;
+    /// two regions are neighbours when any of their codes are Gabriel neighbours (no other used
+    /// code inside the sphere on their centroid segment); the neighbouring pair whose pooled
+    /// residuals are most alike (largest KS p-value) merges while p ≥ `merge_alpha`. A region
+    /// with too few residuals scores 1.0 against a neighbour whose spread overlaps it (and is
+    /// never merged otherwise). Returns the region label per code.
+    fn residual_merge(
+        &self,
+        cents: &[Vec<f32>],
+        used: &[bool],
+        code_res: &[Vec<f64>],
+        overlap: &dyn Fn(usize, usize) -> bool,
+    ) -> Vec<usize> {
+        let k = cents.len();
+        let codes: Vec<usize> = (0..k).filter(|c| used[*c]).collect();
+        let mut gabriel = vec![vec![false; k]; k];
+        for (i, &a) in codes.iter().enumerate() {
+            for &b in &codes[i + 1..] {
+                let dab = d2(&cents[a], &cents[b]);
+                let blocked = codes
+                    .iter()
+                    .any(|&c| c != a && c != b && d2(&cents[a], &cents[c]) + d2(&cents[b], &cents[c]) < dab);
+                gabriel[a][b] = !blocked;
+                gabriel[b][a] = !blocked;
+            }
+        }
+        // region → member codes, pooled sorted residuals
+        let mut members: Vec<Vec<usize>> = codes.iter().map(|c| vec![*c]).collect();
+        let mut pooled: Vec<Vec<f64>> = codes
+            .iter()
+            .map(|c| {
+                let mut r = code_res[*c].clone();
+                r.sort_by(f64::total_cmp);
+                r
+            })
+            .collect();
+        loop {
+            let mut best: Option<(f64, usize, usize)> = None;
+            for i in 0..members.len() {
+                for j in i + 1..members.len() {
+                    if !members[i].iter().any(|a| members[j].iter().any(|b| gabriel[*a][*b])) {
+                        continue;
+                    }
+                    let p = if pooled[i].len() < self.min_residuals || pooled[j].len() < self.min_residuals {
+                        if members[i].iter().any(|a| members[j].iter().any(|b| gabriel[*a][*b] && overlap(*a, *b))) {
+                            1.0
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        ks_pvalue(&pooled[i], &pooled[j])
+                    };
+                    if p >= self.merge_alpha && best.is_none_or(|(bp, _, _)| p > bp) {
+                        best = Some((p, i, j));
+                    }
+                }
+            }
+            let Some((_, i, j)) = best else { break };
+            let mj = members.remove(j);
+            let rj = pooled.remove(j);
+            members[i].extend(mj);
+            pooled[i].extend(rj);
+            pooled[i].sort_by(f64::total_cmp);
+        }
+        let mut label = vec![usize::MAX; k];
+        for (r, m) in members.iter().enumerate() {
+            for c in m {
+                label[*c] = r;
+            }
+        }
+        // unused codes get their own (ignored) labels
+        for (next, l) in (members.len()..).zip(label.iter_mut().filter(|l| **l == usize::MAX)) {
+            *l = next;
+        }
+        label
+    }
+
+    /// Region label per point (geometric merge rule).
     pub fn labels(&self, points: &[Vec<f32>]) -> Vec<Option<usize>> {
+        self.labels_with_residuals(points, None)
+    }
+
+    /// Region label per point; with `residuals` (one per point, NaN = unknown) codes merge on
+    /// residual statistics (spec 30 §6.2), otherwise on overlapping spread.
+    pub fn labels_with_residuals(&self, points: &[Vec<f32>], residuals: Option<&[f64]>) -> Vec<Option<usize>> {
         let n = points.len();
         if n == 0 {
             return Vec::new();
@@ -555,17 +680,31 @@ impl CodebookRegions {
         let min = (self.min_usage * n as f64).ceil() as usize;
         let used: Vec<bool> = members.iter().map(|m| m.len() >= min.max(1)).collect();
         let spread: Vec<f64> = (0..k).map(|c| Self::rms(&members[c], &cents[c])).collect();
-        // merge codes with overlapping spread
-        let mut uf = UnionFind::new(k);
-        for a in 0..k {
-            for b in a + 1..k {
-                if used[a] && used[b] && d2(&cents[a], &cents[b]).sqrt() <= self.merge_factor * (spread[a] + spread[b])
-                {
-                    uf.union(a, b);
+        let overlap =
+            |a: usize, b: usize| d2(&cents[a], &cents[b]).sqrt() <= self.merge_factor * (spread[a] + spread[b]);
+        let code_region = match residuals.filter(|r| r.len() == n) {
+            Some(res) => {
+                let mut code_res: Vec<Vec<f64>> = vec![Vec::new(); k];
+                for (a, r) in assign.iter().zip(res) {
+                    if r.is_finite() {
+                        code_res[*a].push(*r);
+                    }
                 }
+                self.residual_merge(&cents, &used, &code_res, &overlap)
             }
-        }
-        let code_region = uf.labels();
+            None => {
+                // merge codes with overlapping spread
+                let mut uf = UnionFind::new(k);
+                for a in 0..k {
+                    for b in a + 1..k {
+                        if used[a] && used[b] && overlap(a, b) {
+                            uf.union(a, b);
+                        }
+                    }
+                }
+                uf.labels()
+            }
+        };
         // split a code whose members are clearly bimodal (2-means gap)
         let mut extra = code_region.iter().max().map_or(0, |m| m + 1);
         let mut point_region: Vec<Option<usize>> = assign.iter().map(|a| used[*a].then_some(code_region[*a])).collect();
@@ -613,6 +752,18 @@ impl RegionDiscovery for CodebookRegions {
     fn discover(&self, points: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let pts = canonical(points);
         let labels = self.labels(&pts);
+        centroids(&pts, &labels, self.max_regions)
+    }
+    fn discover_with_residuals(&self, points: &[Vec<f32>], residuals: &[f64]) -> Vec<Vec<f32>> {
+        if residuals.len() != points.len() {
+            return self.discover(points);
+        }
+        // canonical order of (point, residual) pairs → order-free
+        let mut pairs: Vec<(&Vec<f32>, f64)> = points.iter().zip(residuals.iter().copied()).collect();
+        pairs.sort_by(|a, b| a.0.partial_cmp(b.0).unwrap_or(Ordering::Equal).then(a.1.total_cmp(&b.1)));
+        let pts: Vec<Vec<f32>> = pairs.iter().map(|p| p.0.clone()).collect();
+        let res: Vec<f64> = pairs.iter().map(|p| p.1).collect();
+        let labels = self.labels_with_residuals(&pts, Some(&res));
         centroids(&pts, &labels, self.max_regions)
     }
     fn assign(&self, centroids: &[Vec<f32>], point: &[f32]) -> Option<usize> {
@@ -677,6 +828,38 @@ mod tests {
             let r = check(&*d, &p, &l);
             assert!(r.passes(), "{:?}: {r:?}", d.method());
         }
+    }
+
+    #[test]
+    fn ks_pvalue_separates_distributions() {
+        let a: Vec<f64> = (0..200).map(|i| f64::from(i) / 200.0).collect();
+        let b: Vec<f64> = (0..300).map(|i| f64::from(i) / 300.0).collect();
+        let c: Vec<f64> = (0..200).map(|i| 0.5 + f64::from(i) / 200.0).collect();
+        assert!(ks_pvalue(&a, &b) > 0.9);
+        assert!(ks_pvalue(&a, &c) < 1e-6);
+    }
+
+    /// Spec 30 §6.2: codebook codes merge on residual statistics, not geometry. Three latent
+    /// blobs (origin, +e1, +e2); blobs 0 and 1 share one residual law and blob 2 has another,
+    /// so the residual rule gives two regions where the spread rule gives three.
+    #[test]
+    fn codebook_merges_on_residual_statistics() {
+        let (p, l) = gaussian_mixture(3, 8, 200, 6.0, 0.3, 21);
+        let mut rng = Rng::seed(5);
+        let res: Vec<f64> = l.iter().map(|c| rng.normal() + if *c < 2 { 0.0 } else { 3.0 }).collect();
+        let cb = CodebookRegions::new(64);
+        let geo = cb.discover(&p);
+        let by_res = cb.discover_with_residuals(&p, &res);
+        assert_eq!(geo.len(), 3, "spread rule keeps the three blobs");
+        assert_eq!(by_res.len(), 2, "residual rule merges blobs with one residual law: {by_res:?}");
+        // order-free
+        let mut idx: Vec<usize> = (0..p.len()).collect();
+        idx.reverse();
+        let p2: Vec<Vec<f32>> = idx.iter().map(|i| p[*i].clone()).collect();
+        let r2: Vec<f64> = idx.iter().map(|i| res[*i]).collect();
+        assert_eq!(cb.discover_with_residuals(&p2, &r2), by_res);
+        // wrong-length residuals fall back to the geometric rule
+        assert_eq!(cb.discover_with_residuals(&p, &res[..3]), geo);
     }
 
     #[test]

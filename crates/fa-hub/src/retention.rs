@@ -7,7 +7,8 @@
 //! with [`crate::KnnFilter`] `kind = "aggregate"`), mean `uncertainty` and `ts` = newest folded
 //! observation. The folded rows are dropped in the same write batch as the aggregate update, so a
 //! page is either fully folded or untouched. Regions, transitions, centroids and windows are never
-//! touched.
+//! touched; version rows of transitions and region status ([`crate::versions`]) older than the
+//! same cut-off are thinned to the newest one per edge / region.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -54,6 +55,8 @@ pub struct PruneReport {
     pub aggregates_created: u64,
     /// Aggregate rows updated.
     pub aggregates_updated: u64,
+    /// `TransitionVersion` / `RegionStatusVersion` rows dropped ([`crate::versions`]).
+    pub versions_pruned: u64,
 }
 
 impl PruneReport {
@@ -61,6 +64,7 @@ impl PruneReport {
         self.pruned += o.pruned;
         self.aggregates_created += o.aggregates_created;
         self.aggregates_updated += o.aggregates_updated;
+        self.versions_pruned += o.versions_pruned;
     }
 }
 
@@ -263,7 +267,9 @@ impl HubClient {
     }
 
     /// Apply `policy` to every expert space of one snapshot (cut-off from `Snapshot.timescale`
-    /// at `now_ms`). A timescale without a horizon is left alone.
+    /// at `now_ms`): observations are folded, and transition / status versions older than the
+    /// cut-off are thinned to the one in force at the cut-off ([`HubClient::prune_space_versions`]).
+    /// A timescale without a horizon is left alone.
     pub async fn prune_snapshot_observations(
         &self,
         snapshot_id: &str,
@@ -275,6 +281,7 @@ impl HubClient {
         let Some(cutoff) = policy.cutoff_ms(&snap.timescale, now_ms) else { return Ok(total) };
         for space in self.snapshot_spaces(snap.id).await? {
             total.add(&self.prune_space_observations(&space.expert_space_id, cutoff).await?);
+            total.versions_pruned += self.prune_space_versions(space.id, cutoff).await?;
         }
         Ok(total)
     }

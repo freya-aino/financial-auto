@@ -49,6 +49,7 @@ type Envelope struct {
 	//	*Envelope_Macro
 	//	*Envelope_Onchain
 	//	*Envelope_Filing
+	//	*Envelope_Fundamental
 	Payload       isEnvelope_Payload `protobuf_oneof:"payload"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -256,6 +257,15 @@ func (x *Envelope) GetFiling() *FilingEvent {
 	return nil
 }
 
+func (x *Envelope) GetFundamental() *FundamentalFact {
+	if x != nil {
+		if x, ok := x.Payload.(*Envelope_Fundamental); ok {
+			return x.Fundamental
+		}
+	}
+	return nil
+}
+
 type isEnvelope_Payload interface {
 	isEnvelope_Payload()
 }
@@ -296,6 +306,10 @@ type Envelope_Filing struct {
 	Filing *FilingEvent `protobuf:"bytes,28,opt,name=filing,proto3,oneof"`
 }
 
+type Envelope_Fundamental struct {
+	Fundamental *FundamentalFact `protobuf:"bytes,29,opt,name=fundamental,proto3,oneof"`
+}
+
 func (*Envelope_Trade) isEnvelope_Payload() {}
 
 func (*Envelope_Quote) isEnvelope_Payload() {}
@@ -313,6 +327,8 @@ func (*Envelope_Macro) isEnvelope_Payload() {}
 func (*Envelope_Onchain) isEnvelope_Payload() {}
 
 func (*Envelope_Filing) isEnvelope_Payload() {}
+
+func (*Envelope_Fundamental) isEnvelope_Payload() {}
 
 // RawRef points at the archived raw payload in Garage.
 type RawRef struct {
@@ -379,7 +395,7 @@ var File_fa_v1_envelope_proto protoreflect.FileDescriptor
 
 const file_fa_v1_envelope_proto_rawDesc = "" +
 	"\n" +
-	"\x14fa/v1/envelope.proto\x12\x05fa.v1\x1a\x11fa/v1/macro.proto\x1a\x12fa/v1/market.proto\x1a\x11fa/v1/media.proto\x1a\x10fa/v1/text.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x83\a\n" +
+	"\x14fa/v1/envelope.proto\x12\x05fa.v1\x1a\x11fa/v1/macro.proto\x1a\x12fa/v1/market.proto\x1a\x11fa/v1/media.proto\x1a\x10fa/v1/text.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xbf\a\n" +
 	"\bEnvelope\x12\x19\n" +
 	"\bevent_id\x18\x01 \x01(\tR\aeventId\x12\x1b\n" +
 	"\tsource_id\x18\x02 \x01(\tR\bsourceId\x12#\n" +
@@ -407,7 +423,8 @@ const file_fa_v1_envelope_proto_rawDesc = "" +
 	"\x05media\x18\x19 \x01(\v2\x11.fa.v1.MediaChunkH\x00R\x05media\x12/\n" +
 	"\x05macro\x18\x1a \x01(\v2\x17.fa.v1.MacroObservationH\x00R\x05macro\x12/\n" +
 	"\aonchain\x18\x1b \x01(\v2\x13.fa.v1.OnchainEventH\x00R\aonchain\x12,\n" +
-	"\x06filing\x18\x1c \x01(\v2\x12.fa.v1.FilingEventH\x00R\x06filingB\t\n" +
+	"\x06filing\x18\x1c \x01(\v2\x12.fa.v1.FilingEventH\x00R\x06filing\x12:\n" +
+	"\vfundamental\x18\x1d \x01(\v2\x16.fa.v1.FundamentalFactH\x00R\vfundamentalB\t\n" +
 	"\apayload\"J\n" +
 	"\x06RawRef\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x16\n" +
@@ -441,6 +458,7 @@ var file_fa_v1_envelope_proto_goTypes = []any{
 	(*MacroObservation)(nil),      // 9: fa.v1.MacroObservation
 	(*OnchainEvent)(nil),          // 10: fa.v1.OnchainEvent
 	(*FilingEvent)(nil),           // 11: fa.v1.FilingEvent
+	(*FundamentalFact)(nil),       // 12: fa.v1.FundamentalFact
 }
 var file_fa_v1_envelope_proto_depIdxs = []int32{
 	2,  // 0: fa.v1.Envelope.event_time:type_name -> google.protobuf.Timestamp
@@ -456,11 +474,12 @@ var file_fa_v1_envelope_proto_depIdxs = []int32{
 	9,  // 10: fa.v1.Envelope.macro:type_name -> fa.v1.MacroObservation
 	10, // 11: fa.v1.Envelope.onchain:type_name -> fa.v1.OnchainEvent
 	11, // 12: fa.v1.Envelope.filing:type_name -> fa.v1.FilingEvent
-	13, // [13:13] is the sub-list for method output_type
-	13, // [13:13] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	12, // 13: fa.v1.Envelope.fundamental:type_name -> fa.v1.FundamentalFact
+	14, // [14:14] is the sub-list for method output_type
+	14, // [14:14] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_fa_v1_envelope_proto_init() }
@@ -482,6 +501,7 @@ func file_fa_v1_envelope_proto_init() {
 		(*Envelope_Macro)(nil),
 		(*Envelope_Onchain)(nil),
 		(*Envelope_Filing)(nil),
+		(*Envelope_Fundamental)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

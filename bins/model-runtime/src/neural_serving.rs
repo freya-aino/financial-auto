@@ -130,6 +130,29 @@ pub struct Loaded {
     pub errors: Vec<String>,
     /// Qualifying cards with a stale latent normaliser (re-train candidates), best first.
     pub stale: Vec<EliteCard>,
+    /// Evolution evidence of src→target pairs from every evaluated card (spec 33 §6.5).
+    pub pair_evidence: PairEvidenceMap,
+}
+
+/// Per timescale: `(source, target)` → wins / losses of evaluated src→target decoders.
+pub type PairEvidenceMap = BTreeMap<Timescale, BTreeMap<(String, String), fa_mcmc::cross_asset::PairEvidence>>;
+
+/// Evidence of the cross-asset pairs from decoder cards (spec 33 §6.5 "fitness results flow back
+/// as evidence"): every evaluated decoder whose genome reads another instrument's latents
+/// (`src`) for a target series (`inst`) is a trial of `(src, inst)` at its timescale, a win
+/// when its family score (`crps_skill` for forecasters) is positive.
+pub fn pair_evidence(cards: &[EliteCard]) -> PairEvidenceMap {
+    let mut out = PairEvidenceMap::new();
+    for c in cards {
+        let Ok(g) = DecoderGenome::parse(&c.meta.genome) else { continue };
+        let (Some(src), Some(tgt)) = (g.source.as_ref(), g.instrument.as_ref()) else { continue };
+        if src == tgt || c.meta.objectives.is_empty() {
+            continue; // not evaluated yet
+        }
+        let skill = c.meta.objectives.get("crps_skill").copied().unwrap_or(c.meta.score);
+        out.entry(g.timescale).or_default().entry((src.clone(), tgt.clone())).or_default().record(skill);
+    }
+    out
 }
 
 type SlotKey = (String, Timescale);
@@ -506,9 +529,13 @@ impl NeuralServing {
                                        "score": c.map(|c| c.card.meta.score), "online_n": o.n, "online_loss": o.mean()})
                             })
                         };
+                        // shadow age against the promotion minimum (FA_NEURAL_PROMOTE_MINUTES)
+                        let age_s = s.shadow.as_ref().map(|_| ((now - s.shadow_since_ms) / 1000).max(0));
                         json!({"family": f, "timescale": ts.to_string(), "serving": stat(&s.serving),
                                "shadow": stat(&s.shadow), "disabled": st.disabled.contains(&(f.clone(), *ts)),
-                               "pinned": st.pins.get(&(f.clone(), *ts))})
+                               "pinned": st.pins.get(&(f.clone(), *ts)),
+                               "shadow_since_ms": s.shadow.as_ref().map(|_| s.shadow_since_ms),
+                               "shadow_age_s": age_s, "promote_min_s": st.cfg.promote_min_ms / 1000})
                     })
                     .collect();
                 let stale: Vec<_> = st
@@ -769,13 +796,19 @@ async fn run_loader(blob: S3BlobStore, every: Duration, mut kick: mpsc::Receiver
             errors = errors.len(),
             "decoder cards scanned"
         );
-        if tx.send(Arc::new(Loaded { candidates, cards: cards.len(), errors, stale })).is_err() {
+        let pair_evidence = pair_evidence(&all);
+        if tx.send(Arc::new(Loaded { candidates, cards: cards.len(), errors, stale, pair_evidence })).is_err() {
             return;
         }
     }
 }
 
 impl NeuralServing {
+    /// Evolution evidence of the cross-asset pairs (latest card scan).
+    pub fn pair_evidence(&self) -> PairEvidenceMap {
+        self.lock().loaded.pair_evidence.clone()
+    }
+
     /// Genomes of the stale (first-generation normaliser) cards, best first, de-duplicated.
     pub fn stale_genomes(&self) -> Vec<String> {
         let st = self.lock();
@@ -881,8 +914,45 @@ mod tests {
         let (tx, rx) = watch::channel(Arc::new(Loaded::default()));
         let (kick, _krx) = mpsc::channel(1);
         let s = NeuralServing::with_receiver(cfg, rx, kick);
-        tx.send(Arc::new(Loaded { cards: cands.len(), candidates: cands, errors: vec![], stale: vec![] })).unwrap();
+        tx.send(Arc::new(Loaded {
+            cards: cands.len(),
+            candidates: cands,
+            errors: vec![],
+            stale: vec![],
+            ..Default::default()
+        }))
+        .unwrap();
         (s, tx)
+    }
+
+    /// Spec 33 §6.5: evaluated src→target decoder cards become pair evidence.
+    #[test]
+    fn decoder_cards_become_pair_evidence() {
+        let mk = |genome: &str, skill: Option<f64>| {
+            let mut meta: fa_decoders::neural::BundleMeta = serde_json::from_value(serde_json::json!({
+                "format": "x", "genome": genome, "family": "nn_forecast", "output_family": "forecast",
+                "layout": {"seq": 0, "extra": 0, "latent": 0, "out": 1, "target": 1},
+                "norm": fa_decoders::neural::data::Norm::default(), "target_mean": [],
+                "step_ms": 60000, "cutoff_ms": 0, "train": fa_decoders::neural::TrainReport::default(),
+            }))
+            .unwrap();
+            if let Some(s) = skill {
+                meta.objectives.insert("crps_skill".into(), s);
+            }
+            EliteCard { meta, bucket: "fa-models".into(), key: genome.into(), created_ms: 0 }
+        };
+        let cards = vec![
+            mk("nn_forecast:h=5;inst=t;src=s;ts=1m", Some(0.02)),
+            mk("nn_forecast:h=3;inst=t;src=s;ts=1m", Some(-0.01)),
+            mk("nn_forecast:h=3;inst=t;src=s;ts=1m;lb=8", Some(0.03)),
+            mk("nn_forecast:h=5;inst=t;src=s;ts=1h", Some(-0.5)),
+            mk("nn_forecast:h=5;inst=t;ts=1m", Some(0.5)), // no src: not a pair
+            mk("nn_forecast:h=5;inst=t;src=s;ts=1m;lb=9", None), // not evaluated yet
+        ];
+        let ev = pair_evidence(&cards);
+        let m = &ev[&Timescale::Minute][&("s".to_owned(), "t".to_owned())];
+        assert_eq!((m.wins, m.losses), (2.0, 1.0));
+        assert_eq!(ev[&Timescale::Hour][&("s".to_owned(), "t".to_owned())].losses, 1.0);
     }
 
     #[test]
@@ -926,6 +996,9 @@ mod tests {
         let expect = if promotions as u64 % 2 == 1 { "decoders/g/b" } else { "decoders/g/a" };
         assert_eq!(v["slots"][0]["serving"]["key"], expect);
         assert_eq!(v["slots"][0]["pinned"], expect);
+        // the shadow's age is reported next to the promotion minimum
+        assert!(v["slots"][0]["shadow_age_s"].as_i64().unwrap() >= 0, "{v}");
+        assert_eq!(v["slots"][0]["promote_min_s"], 0);
         let args = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
         assert!(s.ctl("promote", &args(&[("family", "rnn_prior"), ("timescale", "1m")])).ok);
         assert!(s.ctl("off", &args(&[("family", "rnn_prior"), ("timescale", "1m")])).ok);

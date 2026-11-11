@@ -20,6 +20,7 @@
 
 pub mod adapter;
 pub mod data;
+pub mod heads;
 pub mod model;
 pub mod prior;
 pub mod regions;

@@ -111,6 +111,8 @@ pub fn static_indexes() -> Vec<IndexSpec> {
         I::node_equality(crate::experts::labels::EXPERT, "expert_uid", true),
         I::node_equality(crate::experts::labels::EXPERT, "snapshot_id", false),
         I::edge_equality(edge::TRANSITION, "sampler_id"),
+        I::node_equality(crate::versions::labels::TRANSITION_VERSION, "edge_key", false),
+        I::node_equality(crate::versions::labels::REGION_STATUS_VERSION, "region_id", false),
     ]
 }
 

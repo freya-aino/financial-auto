@@ -19,6 +19,7 @@
 mod bars;
 mod decoders;
 mod expert_view;
+mod hub_retention;
 mod hub_sink;
 mod mcmc_jobs;
 mod neural_serving;
@@ -80,6 +81,16 @@ struct Args {
     /// Do not persist anything to HelixDB.
     #[arg(long)]
     no_hub: bool,
+    /// Helix retention (spec 20 §6.5): `timescale=duration` horizons of observation latents and
+    /// transition/status versions (`default=…` for unlisted timescales, else kept forever).
+    #[arg(long, env = "FA_HUB_RETENTION", default_value = "1s=2d,1m=14d,1h=180d")]
+    hub_retention: String,
+    /// Run the Helix retention this often (0 disables).
+    #[arg(long, env = "FA_HUB_PRUNE_SECS", default_value_t = 6 * 3600)]
+    hub_prune_secs: u64,
+    /// Delay before the first retention run after start.
+    #[arg(long, env = "FA_HUB_PRUNE_DELAY_SECS", default_value_t = 600)]
+    hub_prune_delay_secs: u64,
     /// Timescales whose bar closes publish `visual.chart` / `visual.future` (empty disables).
     #[arg(long, default_value = "1m,1h,1d,1w", value_delimiter = ',')]
     visual_timescales: Vec<String>,
@@ -298,6 +309,10 @@ impl Runtime {
             BarUpdate::Ignored => return,
         };
         st.last_preview.insert(inst.to_owned(), now);
+        if closed {
+            // spec 33 §10 q3: the coarse-timescale regime age is a kernel covariate
+            st.pipeline.set_coarse_context(inst, self.xscale.coarse_context(ts, inst));
+        }
         let input = StepInput { instrument_id: inst, as_of_ms, bars: &bars, bar_closed: closed };
         let mut out = match st.pipeline.step(&input) {
             Ok(o) => o,
@@ -473,8 +488,13 @@ impl Runtime {
     }
 
     /// Publishes the region hierarchy and the cross-asset priors (and persists them).
-    async fn graph_tick(&self) {
+    async fn graph_tick(&mut self) {
         let now = now_ms();
+        // spec 33 §6.5: evolved src→target decoders feed back into the cross-asset ranking
+        let evidence = self.neural.pair_evidence();
+        let pairs: usize = evidence.values().map(|m| m.len()).sum();
+        self.xscale.set_pair_evidence(evidence);
+        self.counters.lock().await.insert("crossprior.evidence_pairs".into(), pairs as f64);
         let hier = self.xscale.hierarchy(now);
         let cross = self.xscale.cross_priors(now);
         let mut c = self.counters.lock().await;
@@ -769,6 +789,18 @@ async fn main() -> anyhow::Result<()> {
         );
         for d in &descs {
             sink.announce_snapshot(d.clone());
+        }
+        match hub_retention::parse_policy(&args.hub_retention) {
+            Ok(policy) => hub_retention::spawn(
+                hub_retention::RetentionConfig {
+                    url: hub_url.clone(),
+                    every: Duration::from_secs(args.hub_prune_secs),
+                    initial_delay: Duration::from_secs(args.hub_prune_delay_secs),
+                    policy,
+                },
+                counters.clone(),
+            ),
+            Err(e) => tracing::error!(error = %e, "--hub-retention invalid; helix retention disabled"),
         }
         sink
     });

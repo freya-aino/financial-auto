@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { alertBanner, applyAlertEvent, severityRank, since, sortAlerts } from './alerts';
 import type { ActiveAlert, AlertEvent, AlertsView, DecoderSlot, SnapshotDetail } from './console';
-import { cardSummary, checklistRows, cumulative, expertHealth, genomeParams, missingNeuralChecks, parseList, slotVerdict, topMemberships } from './models';
+import { cardSummary, checklistRows, cumulative, expertHealth, genomeParams, isNeuralFamily, liveExpertHealth, missingNeuralChecks, parseList, shadowAge, slotVerdict, topMemberships } from './models';
 import { busRiskEvent, eventKinds, evidence, haltFamily, isRearmable, rankAllocators, rearmConfirmText, stageCounts, verdict } from './riskdesk';
 
 const ev = (p: Partial<AlertEvent>): AlertEvent => ({
@@ -153,6 +153,30 @@ describe('models', () => {
 		expect(slotVerdict(slot(1, 0.5, 100))).toMatchObject({ ready: false, progress: 0.5, text: '100/200 scored' });
 		expect(slotVerdict({ ...slot(1, 1), shadow: null }).text).toBe('no shadow');
 		expect(slotVerdict({ ...slot(1, 1), disabled: true }).text).toBe('slot off');
+	});
+
+	it('shows the shadow age against the promotion minimum', () => {
+		const base: DecoderSlot = {
+			family: 'rnn_prior', timescale: '1m', disabled: false, pinned: null,
+			serving: { key: 'a', genome: null, score: 0.2, online_n: 0, online_loss: null },
+			shadow: { key: 'b', genome: null, score: 0.1, online_n: 0, online_loss: null }
+		};
+		expect(shadowAge(base)).toBeNull();
+		expect(shadowAge({ ...base, shadow_age_s: 720, promote_min_s: 1800 })).toEqual({ text: '12 min / 30 min', ripe: false });
+		expect(shadowAge({ ...base, shadow_age_s: 9000, promote_min_s: 1800 })?.ripe).toBe(true);
+		expect(shadowAge({ ...base, shadow: null, shadow_age_s: 5 })).toBeNull();
+	});
+
+	it('reads live expert health from latent.expert.health', () => {
+		expect(liveExpertHealth(null)).toBeNull();
+		const h = liveExpertHealth({
+			snapshot_id: 's', timescale: '1m', as_of: '2026-11-11T10:00:00Z', source: 'live', expert_ids: [0, 3],
+			usage: [0.7, 0.3], skill: [0.05, -0.1], resid_corr: [[1, 0.4], [0.4, 1]], k_eff: 1.7, resid_corr_max: 0.4, n_windows: 300
+		});
+		expect(h?.labels).toEqual(['E0', 'E3']);
+		expect(h?.resid_corr?.[0][1]).toBe(0.4);
+		expect(h?.k_eff).toBe(1.7);
+		expect(isNeuralFamily('hier_vae_flow') && isNeuralFamily('latent_diffusion')).toBe(true);
 	});
 
 	it('summarises decoder cards and genomes', () => {

@@ -189,6 +189,31 @@ E::Transition {
     }
 }
 
+// Event-time history of values updated in place (spec 20 §6.3, fa-hub `versions`): one row per
+// Transition write (same batch as the edge upsert) and per region lifecycle mark. As-of reads use
+// the latest version with ts <= t; retention keeps everything newer than the observation horizon
+// plus the newest older row per edge / region.
+N::TransitionVersion {
+    INDEX edge_key: String, // from_region_id|to_region_id|sampler_id
+    from_region_id: String,
+    to_region_id: String,
+    sampler_id: String,
+    count: I64,
+    mean: F64,
+    lower: F64,
+    upper: F64,
+    kernel_params: String, // JSON
+    ts: Date DEFAULT NOW, // record time of the write
+}
+
+N::RegionStatusVersion {
+    INDEX region_id: String,
+    status: String, // live | merged | retired
+    related_region_id: String,
+    reason: String, // created | revived | merged | support | unmatched | ""
+    ts: Date DEFAULT NOW,
+}
+
 E::Hier {
     From: LatentRegion, // fine timescale (spec 30 §6.5 REFINES)
     To: LatentRegion,   // coarse timescale, same expert index

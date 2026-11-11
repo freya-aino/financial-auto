@@ -1,6 +1,7 @@
 // Package warehouse is the ingestor's Postgres write path for slow canonical
 // records (spec 20 §6.1 (b)). It writes FilingEvent envelopes into wh.filing
-// (idempotent on source_id + accession) and MacroObservation envelopes into
+// (idempotent on source_id + accession), FundamentalFact envelopes into
+// wh.fundamental (idempotent on CIK, field, unit, period, vintage, source) and MacroObservation envelopes into
 // wh.macro_observation, one row per (source_id, series_id, period, vintage),
 // idempotently: a replayed or re-polled vintage is a no-op (`on conflict do
 // nothing`), so live polls, backfill jobs and raw-archive replays may all
@@ -96,6 +97,59 @@ const InsertFilingSQL = `insert into wh.filing (source_id, accession, issuer_cik
 values ($1, $2, nullif($3, ''), nullif($4, ''), $5, $6, $7, $8, $9)
 on conflict (source_id, accession) do nothing`
 
+// FundamentalRow is one wh.fundamental row (migration 20261113000012).
+type FundamentalRow struct {
+	SourceID, IssuerCIK, Field, Unit, Period  string
+	PeriodStart                               *time.Time
+	PeriodEnd                                 *time.Time
+	Vintage                                   time.Time
+	Value                                     float64
+	Form, Accession, FiscalYear, FiscalPeriod string
+}
+
+// FundamentalRows extracts the rows of the fundamental envelopes in envs;
+// facts missing the CIK, field, period or vintage, or with a non-finite value,
+// are counted in invalid.
+func FundamentalRows(envs []*fav1.Envelope) (rows []FundamentalRow, invalid int) {
+	for _, e := range envs {
+		f := e.GetFundamental()
+		if f == nil {
+			continue
+		}
+		if e.GetSourceId() == "" || f.GetIssuerCik() == "" || f.GetField() == "" || f.GetPeriod() == "" ||
+			f.GetVintage() == nil || math.IsNaN(f.GetValue()) || math.IsInf(f.GetValue(), 0) {
+			invalid++
+			continue
+		}
+		r := FundamentalRow{SourceID: e.GetSourceId(), IssuerCIK: f.GetIssuerCik(), Field: f.GetField(), Unit: f.GetUnit(),
+			Period: f.GetPeriod(), Vintage: f.GetVintage().AsTime().UTC(), Value: f.GetValue(), Form: f.GetForm(),
+			Accession: f.GetAccession(), FiscalYear: f.GetFiscalYear(), FiscalPeriod: f.GetFiscalPeriod()}
+		if t := f.GetPeriodStart(); t != nil {
+			v := t.AsTime().UTC()
+			r.PeriodStart = &v
+		}
+		if t := f.GetPeriodEnd(); t != nil {
+			v := t.AsTime().UTC()
+			r.PeriodEnd = &v
+		}
+		rows = append(rows, r)
+	}
+	return rows, invalid
+}
+
+// InsertFundamentalSQL is idempotent on the natural key (CIK, field, unit,
+// period, vintage, source). instrument_id is filled only when exactly one
+// instrument carries the CIK (ref.identifier scheme 'cik', padded or not)
+// valid at the vintage; share classes sharing a CIK stay on the CIK alone.
+const InsertFundamentalSQL = `insert into wh.fundamental (instrument_id, issuer_cik, field, unit, period, period_start, period_end,
+  vintage, value, form, accession, fiscal_year, fiscal_period, source_id)
+values ((select case when count(distinct i.instrument_id) = 1 then (array_agg(i.instrument_id))[1] end
+         from ref.identifier i where i.scheme = 'cik' and i.value in ($1, ltrim($1, '0'))
+           and i.valid_from <= $7 and i.valid_to > $7),
+        $1, $2, nullif($3, ''), $4, $5::timestamptz::date, $6::timestamptz::date, $7, $8, nullif($9, ''), nullif($10, ''),
+        nullif($11, ''), nullif($12, ''), $13)
+on conflict do nothing`
+
 // DB is the subset of *pgxpool.Pool the writer uses.
 type DB interface {
 	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
@@ -129,8 +183,9 @@ func (w *Writer) Write(ctx context.Context, envs []*fav1.Envelope) (int, error) 
 	}
 	rows, invalid := MacroRows(envs)
 	filings, finvalid := FilingRows(envs)
-	w.invalid.Add(uint64(invalid + finvalid))
-	if len(rows) == 0 && len(filings) == 0 {
+	facts, fuinvalid := FundamentalRows(envs)
+	w.invalid.Add(uint64(invalid + finvalid + fuinvalid))
+	if len(rows) == 0 && len(filings) == 0 && len(facts) == 0 {
 		return 0, nil
 	}
 	timeout := w.Timeout
@@ -140,7 +195,7 @@ func (w *Writer) Write(ctx context.Context, envs []*fav1.Envelope) (int, error) 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	b := &pgx.Batch{}
-	labels := make([]string, 0, len(rows)+len(filings))
+	labels := make([]string, 0, len(rows)+len(filings)+len(facts))
 	for _, r := range rows {
 		b.Queue(InsertMacroSQL, r.SourceID, r.SeriesID, r.Period, r.Vintage, r.Value, r.Revision)
 		labels = append(labels, "macro "+r.SourceID+"/"+r.SeriesID+"/"+r.Period)
@@ -148,6 +203,11 @@ func (w *Writer) Write(ctx context.Context, envs []*fav1.Envelope) (int, error) 
 	for _, f := range filings {
 		b.Queue(InsertFilingSQL, f.SourceID, f.Accession, f.IssuerCIK, f.IssuerLEI, f.FormType, f.FilingTime, f.PublishTime, f.DocumentRefs, f.EventID)
 		labels = append(labels, "filing "+f.SourceID+"/"+f.Accession)
+	}
+	for _, f := range facts {
+		b.Queue(InsertFundamentalSQL, f.IssuerCIK, f.Field, f.Unit, f.Period, f.PeriodStart, f.PeriodEnd, f.Vintage, f.Value,
+			f.Form, f.Accession, f.FiscalYear, f.FiscalPeriod, f.SourceID)
+		labels = append(labels, "fundamental "+f.SourceID+"/"+f.IssuerCIK+"/"+f.Field+"/"+f.Period)
 	}
 	br := w.DB.SendBatch(ctx, b)
 	n := 0

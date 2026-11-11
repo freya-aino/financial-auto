@@ -20,7 +20,7 @@ use fa_core::{Timescale, rng::Rng};
 use fa_mcmc::{
     MarkovGraph, ProbSummary,
     calibration::{Arena, ArenaCfg, SamplerStanding},
-    cross_asset::{CrossAssetCfg, CrossAssetPriors as CrossTracker},
+    cross_asset::{CrossAssetCfg, CrossAssetPriors as CrossTracker, PairEvidence},
     inference::Posterior,
     kernel::{ConjugateExact, KernelCtx, KernelSampler, SmcParticle},
     refit::RefitOutcome,
@@ -91,6 +91,8 @@ pub struct ArenaTransitions {
 
 /// Key of the sampler states inside the persisted kernel JSON (ignored by `MarkovGraph` readers).
 const ARENA_STATES: &str = "arena_states";
+/// Key of the arena's calibration scores and serving choice (spec 33 §6.4) in the same JSON.
+const ARENA_CALIBRATION: &str = "arena_calibration";
 
 impl ArenaTransitions {
     pub fn from_graph(graph: MarkovGraph, ci_level: f64, draws: usize, kcfg: &KernelCfg, seed: u64) -> Self {
@@ -147,10 +149,11 @@ impl TransitionModel for ArenaTransitions {
     fn kernel_state(&self) -> Option<String> {
         let mut v = serde_json::to_value(self.arena.serving().graph()).ok()?;
         let states = self.arena.export_states();
-        if let Some(obj) = v.as_object_mut()
-            && !states.is_empty()
-        {
-            obj.insert(ARENA_STATES.into(), serde_json::to_value(states).ok()?);
+        if let Some(obj) = v.as_object_mut() {
+            if !states.is_empty() {
+                obj.insert(ARENA_STATES.into(), serde_json::to_value(states).ok()?);
+            }
+            obj.insert(ARENA_CALIBRATION.into(), serde_json::to_value(self.arena.export_calibration()).ok()?);
         }
         serde_json::to_string(&v).ok()
     }
@@ -160,6 +163,9 @@ impl TransitionModel for ArenaTransitions {
         self.arena.replace_graph(&g);
         if let Some(states) = v.get(ARENA_STATES).and_then(|s| serde_json::from_value(s.clone()).ok()) {
             self.arena.import_states(&states);
+        }
+        if let Some(cal) = v.get(ARENA_CALIBRATION).and_then(|s| serde_json::from_value(s.clone()).ok()) {
+            self.arena.import_calibration(&cal);
         }
     }
     fn apply_refit(&mut self, o: &RefitOutcome) -> Vec<String> {
@@ -421,6 +427,10 @@ pub struct CrossScale {
     region_ret: HashMap<(Timescale, u32, String), (f64, f64)>,
     /// Regions and router weights per (timescale, instrument) at the last closed bar.
     prev_view: HashMap<(Timescale, String), (Vec<String>, Vec<f32>)>,
+    /// Closed bars spent in the current region per expert of (timescale, instrument).
+    dwell: HashMap<(Timescale, String), Vec<(String, u32)>>,
+    /// Evolution evidence of src→target pairs per timescale (spec 33 §6.5 feedback).
+    evidence: BTreeMap<Timescale, BTreeMap<(String, String), PairEvidence>>,
 }
 
 /// Running-mean horizon of the region-conditional returns (then an EWMA).
@@ -440,7 +450,25 @@ impl CrossScale {
             ccfg,
             region_ret: HashMap::new(),
             prev_view: HashMap::new(),
+            dwell: HashMap::new(),
+            evidence: BTreeMap::new(),
         }
+    }
+
+    /// `coarse_ln_dwell` covariate per expert for a step of `ts` (spec 33 §10 q3):
+    /// ln(1 + closed bars) the instrument has spent in its current region of the same expert on
+    /// the next coarser served timescale; empty when there is none or it has not closed yet.
+    pub fn coarse_context(&self, ts: Timescale, inst: &str) -> Vec<f64> {
+        self.coarser(ts)
+            .and_then(|c| self.dwell.get(&(c, inst.to_owned())))
+            .map(|v| v.iter().map(|(_, d)| f64::from(*d).ln_1p()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Replaces the evolution evidence of src→target decoder pairs (spec 33 §6.5: "fitness
+    /// results flow back as evidence"); cross-prior proposals are re-ranked by it.
+    pub fn set_pair_evidence(&mut self, ev: BTreeMap<Timescale, BTreeMap<(String, String), PairEvidence>>) {
+        self.evidence = ev;
     }
 
     /// Expert residual of a closed-bar return (spec 33 §6.5): `r − Σ_k w_k · μ_k(region_k)` with
@@ -533,6 +561,16 @@ impl CrossScale {
         if !closed {
             return;
         }
+        let d = self.dwell.entry((ts, inst.clone())).or_default();
+        let next: Vec<(String, u32)> = regions
+            .iter()
+            .enumerate()
+            .map(|(k, r)| match d.get(k) {
+                Some((p, n)) if p == r => (r.clone(), n + 1),
+                _ => (r.clone(), 1),
+            })
+            .collect();
+        *d = next;
         if let Some(coarse) = self.coarser(ts)
             && let Some((coarse_snap, coarse_regions)) = self.current.get(&(coarse, inst.clone()))
         {
@@ -609,8 +647,9 @@ impl CrossScale {
             .map(|(ts, c)| {
                 let all = c.all_pairs();
                 let evaluated = all.len();
+                let empty = BTreeMap::new();
                 let proposals = c
-                    .proposals()
+                    .proposals_with_evidence(self.evidence.get(ts).unwrap_or(&empty))
                     .into_iter()
                     .map(|p| CrossAssetPair {
                         source_instrument_id: p.source,
@@ -804,6 +843,50 @@ mod tests {
         assert_eq!(c[0].instruments, 2);
         let top = &c[0].proposals[0];
         assert_eq!((top.source_instrument_id.as_str(), top.target_instrument_id.as_str(), top.lead_lag), ("x", "y", 1));
+        // spec 33 §6.5 feedback: losing src→target decoders lower the pair's score
+        let mut ev = PairEvidence::default();
+        for _ in 0..4 {
+            ev.record(-0.1);
+        }
+        let raw = top.score;
+        cs.set_pair_evidence(BTreeMap::from([(
+            Timescale::Minute,
+            BTreeMap::from([(("x".to_owned(), "y".to_owned()), ev)]),
+        )]));
+        let c2 = cs.cross_priors(0);
+        let p =
+            c2[0].proposals.iter().find(|p| p.source_instrument_id == "x" && p.target_instrument_id == "y").unwrap();
+        assert!((p.score - raw * ev.weight()).abs() < 1e-9, "{} vs {raw}", p.score);
+    }
+
+    /// Spec 33 §10 q3: the coarse-timescale regime age per expert, ln(1 + closed coarse bars).
+    #[test]
+    fn coarse_context_is_the_coarse_regime_age() {
+        let mut cs = CrossScale::new(
+            vec![Timescale::Minute, Timescale::Hour],
+            HierarchyCfg::default(),
+            CrossAssetCfg::default(),
+        );
+        let st = |ts: &str, r0: &str, r1: &str| LatentState {
+            snapshot_id: "s".into(),
+            timescale: ts.into(),
+            instrument_id: "x".into(),
+            experts: vec![
+                ExpertLatent { expert_index: 0, region_id: r0.into(), ..Default::default() },
+                ExpertLatent { expert_index: 1, region_id: r1.into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        assert!(cs.coarse_context(Timescale::Minute, "x").is_empty());
+        for (t, r0) in ["A", "A", "A", "B"].iter().enumerate() {
+            cs.observe(Timescale::Hour, &st("1h", r0, "C"), true, None, t as i64);
+        }
+        cs.observe(Timescale::Hour, &st("1h", "A", "D"), false, None, 9); // previews do not count
+        let c = cs.coarse_context(Timescale::Minute, "x");
+        assert_eq!(c.len(), 2);
+        assert!((c[0] - 1f64.ln_1p()).abs() < 1e-12, "B entered at the last close");
+        assert!((c[1] - 4f64.ln_1p()).abs() < 1e-12, "C held for four closes");
+        assert!(cs.coarse_context(Timescale::Hour, "x").is_empty(), "no coarser timescale");
     }
 
     #[test]

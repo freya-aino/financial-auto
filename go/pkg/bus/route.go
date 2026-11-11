@@ -28,6 +28,8 @@ func SubjectFor(env *fav1.Envelope, venue string) (string, error) {
 		return OnchainEvent(p.Onchain.GetChain()), nil
 	case *fav1.Envelope_Filing:
 		return FilingEvent(env.SourceId), nil
+	case *fav1.Envelope_Fundamental:
+		return FundamentalFact(env.SourceId), nil
 	default:
 		return "", fmt.Errorf("bus: envelope %s has no payload", env.GetEventId())
 	}

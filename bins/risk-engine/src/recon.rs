@@ -59,6 +59,8 @@ fn event(p: &Persist, b: &BookedFill) -> FillEvent {
         details: b.details.clone(),
         book: Some(p.book().to_owned()),
         venue: Some(PAPER_VENUE),
+        venue_symbol: None,
+        fee_native: None,
     }
 }
 
@@ -163,29 +165,36 @@ pub async fn resolve_unknown(p: &Persist, engine: &Shared, events: Vec<OrderEven
             outs.extend(persist_fills(p, engine, booked).await);
             continue;
         }
-        // no intent anywhere: an orphan (spec 42 §8)
+        // no intent anywhere: an orphan (spec 42 §8). Nothing is assumed: the instrument comes
+        // from the event (id, else the venue symbol resolved by the ledger), the fill currency is
+        // left to the instrument's quote currency, the fee stays in the venue's currency.
         let now = now_ms();
         let fill = Fill {
             fill_id: fill_id_of(&ev, now),
             intent_id: ev.intent_id.clone(),
-            instrument: fa_core::InstrumentId(Uuid::nil()),
+            instrument: fa_core::InstrumentId(Uuid::parse_str(ev.instrument_id.trim()).unwrap_or(Uuid::nil())),
             quantity: ev.fill_quantity,
             price: ev.fill_price,
             fx_to_eur: 1.0,
-            fee_eur: ev.fee,
+            fee_eur: 0.0,
         };
         let fe = FillEvent {
             filled_at: at(ev.event_time.as_ref().map_or(now, |t| t.seconds * 1000 + i64::from(t.nanos) / 1_000_000)),
             fill,
             strategy_ids: Vec::new(),
             details: FillDetails {
-                ccy: if ev.fee_currency.is_empty() { fa_core::BASE_CURRENCY.into() } else { ev.fee_currency.clone() },
+                ccy: String::new(),
                 fx_source: "unknown".into(),
                 arrival_price: (ev.arrival_price > 0.0).then_some(ev.arrival_price),
                 slippage_bps: (ev.arrival_price > 0.0).then_some(ev.slippage_bps),
             },
             book: Some(p.book().to_owned()),
             venue: Some(PAPER_VENUE),
+            venue_symbol: Some(ev.venue_symbol.trim().to_owned()).filter(|s| !s.is_empty()),
+            fee_native: Some(fa_ledger::pg_accounting::NativeFee {
+                amount: ev.fee,
+                ccy: ev.fee_currency.trim().to_owned(),
+            }),
         };
         match p.pg().record_fill_event(&fe).await {
             Ok(r) => {

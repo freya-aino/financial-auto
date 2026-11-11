@@ -36,7 +36,7 @@
 	{#if error}<p class="badge danger">{error}</p>{/if}
 	{#if streams.length}
 		<table>
-			<thead><tr><th>stream</th><th>subjects</th><th>retention</th><th>messages</th><th>bytes</th><th>seq</th><th>consumers</th></tr></thead>
+			<thead><tr><th>stream</th><th>subjects</th><th>retention</th><th>messages</th><th>bytes / cap</th><th>seq</th><th>consumers</th></tr></thead>
 			<tbody>
 				{#each streams as s (s.name)}
 					<tr class:open={open === s.name} onclick={() => (open = open === s.name ? null : s.name)}>
@@ -45,8 +45,17 @@
 						<td class="dim">{s.retention} · {s.storage} · {age(s.max_age_secs)}</td>
 						<td class="mono">{s.messages.toLocaleString()}</td>
 						<td>
-							<div class="bar"><div style="width: {(100 * s.bytes) / maxBytes}%"></div></div>
-							<span class="mono">{bytes(s.bytes)}</span>
+							{#if s.max_bytes > 0}
+								<!-- usage of the JetStream cap (spec 21 §5 max_mib) -->
+								<div class="bar" title="{(100 * (s.used_ratio ?? s.bytes / s.max_bytes)).toFixed(1)}% of the cap"><div class:warn-fill={(s.used_ratio ?? 0) > 0.8} style="width: {Math.min(100, 100 * (s.used_ratio ?? s.bytes / s.max_bytes))}%"></div></div>
+								<span class="mono">{bytes(s.bytes)} / {bytes(s.max_bytes)}</span>
+							{:else}
+								<div class="bar"><div style="width: {(100 * s.bytes) / maxBytes}%"></div></div>
+								<span class="mono">{bytes(s.bytes)} <span class="dim">/ no cap</span></span>
+							{/if}
+							{#if s.cap_applied === false}
+								<span class="badge warn" title="the stream held more than the planned cap, so ensure_streams kept {bytes(s.max_bytes)} instead of purging">planned {s.planned_max_bytes ? bytes(s.planned_max_bytes) : '—'} not applied</span>
+							{/if}
 						</td>
 						<td class="mono dim">{s.first_seq}–{s.last_seq}</td>
 						<td class="mono">
@@ -116,6 +125,9 @@
 		height: 100%;
 		background: var(--accent);
 		border-radius: 3px;
+	}
+	.bar > div.warn-fill {
+		background: var(--warn);
 	}
 	.warn {
 		color: var(--warn);

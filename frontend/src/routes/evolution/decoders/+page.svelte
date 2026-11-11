@@ -9,7 +9,7 @@
 	import { num, poll } from '../../../lib/api';
 	import { since } from '../../../lib/alerts';
 	import { consoleApi, errText, type DecoderCardRow, type DecoderServing, type DecoderSlot, type DecoderVerb } from '../../../lib/console';
-	import { cardSummary, genomeParams, slotVerdict } from '../../../lib/models';
+	import { cardSummary, genomeParams, shadowAge, slotVerdict } from '../../../lib/models';
 	import { runtime } from '../../../lib/runtime.svelte';
 	import { bus } from '../../../lib/ws.svelte';
 
@@ -137,6 +137,8 @@
 								{#if s.shadow}
 									<div class="mono key" title={s.shadow.key}>{genomeParams(s.shadow.genome ?? '')[0] || s.shadow.key.split('/').pop()}</div>
 									<div class="dim small">score {num(s.shadow.score, 3)} · n {s.shadow.online_n} · loss {num(s.shadow.online_loss, 5)}</div>
+									{@const age = shadowAge(s)}
+									{#if age}<div class="small" title="shadow age vs the minimum before an automatic promotion"><span class="dim">shadow for</span> <span class="mono" class:pos={age.ripe}>{age.text}</span></div>{/if}
 								{:else}<span class="dim">—</span>{/if}
 							</td>
 							<td>

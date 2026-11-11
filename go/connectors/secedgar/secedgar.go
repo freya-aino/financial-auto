@@ -15,7 +15,8 @@
 // acceptance time, event_time = filingDate 00:00 ET and publish_time =
 // filingDate 22:00 ET (EDGAR's last acceptance on that filing date, so the
 // estimate is never earlier than the real availability); ET is taken as UTC−5.
-// Filings carry no instrument_id (spec 10 §5.1).
+// Filings carry no instrument_id (spec 10 §5.1). XBRL company facts
+// (wh.fundamental) are polled from the same host, see facts.go.
 //
 // CIKs come from `config.extra.ciks` (comma list) — not `config.symbols`,
 // which the backfill job would try to resolve as instruments. SEC fair access
@@ -83,6 +84,10 @@ type Connector struct {
 	Fetch      *connector.Fetcher
 	UserAgent  string
 	Lookback   time.Duration
+	// FactsInterval is the companyfacts cadence (facts.go); < 0 disables.
+	FactsInterval time.Duration
+	// Concepts is the "<taxonomy>:<concept>" whitelist of emitted facts.
+	Concepts map[string]bool
 
 	cfg  connector.SourceConfig
 	deps connector.Deps
@@ -92,12 +97,14 @@ type Connector struct {
 	mu sync.Mutex
 	// floor per CIK is the cursor loaded at Init; cursor is the newest acceptance published.
 	floor, cursor map[int64]time.Time
+	// factsDue is when each CIK's companyfacts is next fetched; factsFloor the newest vintage published.
+	factsDue, factsFloor map[int64]time.Time
 }
 
 func (c *Connector) ID() string { return ID }
 
 func (c *Connector) Capabilities() connector.Capabilities {
-	return connector.Capabilities{Poll: true, Backfill: true, Events: []connector.EventKind{connector.KindFiling}}
+	return connector.Capabilities{Poll: true, Backfill: true, Events: []connector.EventKind{connector.KindFiling, connector.KindFundamental}}
 }
 
 // ParseCIK accepts "320193", "0000320193" or "CIK0000320193".
@@ -182,7 +189,7 @@ func (c *Connector) Init(ctx context.Context, cfg connector.SourceConfig, deps c
 			}
 		}
 	}
-	return nil
+	return c.initFacts(ctx, p.Extra)
 }
 
 func (c *Connector) Schedule() connector.PollSchedule {
@@ -220,6 +227,11 @@ func (c *Connector) Poll(ctx context.Context, _ connector.PollRequest) ([]connec
 			continue
 		}
 		out = append(out, c.raw("submissions", u, n, b))
+	}
+	facts, err := c.pollFacts(ctx)
+	out = append(out, facts...)
+	if err != nil && firstErr == nil {
+		firstErr = err
 	}
 	if len(out) == 0 && firstErr != nil {
 		return nil, firstErr
@@ -342,6 +354,10 @@ func (c *Connector) Normalize(raw connector.RawMessage) ([]*fav1.Envelope, []con
 		cik int64
 		err error
 	)
+	if raw.TransportMeta[connector.MetaEndpoint] == endpointFacts {
+		envs, err := c.normalizeFacts(raw)
+		return envs, nil, err
+	}
 	if raw.TransportMeta[connector.MetaEndpoint] == "page" {
 		if err := json.Unmarshal(raw.Bytes, &r); err != nil {
 			return nil, nil, fmt.Errorf("secedgar: decode page: %w", err)

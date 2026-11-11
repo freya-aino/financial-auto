@@ -523,16 +523,20 @@ pub async fn run(
         });
     }
     let child_final = NeuralEncoder::new(tr.model.clone(), ts, meta.snapshot_id.clone());
-    let latents = encode_probes(&child_final, &history, &ends, &probes)?;
+    let (latents, residuals) = encode_probes_with_residuals(&child_final, &history, &ends, &probes)?;
     let probe_keys: Vec<ProbeKey> =
         probes.iter().map(|&(i, p)| (history[i].instrument.clone(), history[i].ends_ms[ends[i][p] - 1])).collect();
     let parent_assign = artifact::parent_assignment(hub, parent_graph.as_ref(), &history, &probe_keys).await;
-    // the region discovery the family declares (density modes for families 2 and 4)
+    // the region discovery the family declares (spec 30 §6.2: codebook for fsq_hybrid with the
+    // residual merge criterion, mapper for jepa_vae, density modes for families 2 and 4)
     let disc = fa_encoders::neural::regions::discovery_for(family, spec.region_radius, spec.max_regions);
     let mut experts = Vec::new();
     let mut regions = Vec::new();
     for (k, points) in latents.iter().enumerate() {
-        let centroids = disc.discover(points);
+        let centroids = match residuals.get(k) {
+            Some(r) => disc.discover_with_residuals(points, r),
+            None => disc.discover(points),
+        };
         let new_assign: Vec<Option<usize>> =
             points.iter().map(|p| disc.assign(&centroids, p).or_else(|| fa_patterns::nearest(&centroids, p))).collect();
         let empty = Vec::new();
@@ -861,22 +865,44 @@ fn encode_probes(
     ends: &[Vec<usize>],
     probes: &[(usize, usize)],
 ) -> anyhow::Result<Vec<Vec<Vec<f32>>>> {
+    Ok(encode_probes_with_residuals(enc, history, ends, probes)?.0)
+}
+
+/// Per expert the probe latents and the expert's next-step residual on `next_ret` (normalised
+/// target − expert prediction; NaN for a probe without a next bar), the residuals the codebook
+/// merge criterion of spec 30 §6.2 compares.
+#[allow(clippy::type_complexity)]
+fn encode_probes_with_residuals(
+    enc: &NeuralEncoder,
+    history: &[BarHistory],
+    ends: &[Vec<usize>],
+    probes: &[(usize, usize)],
+) -> anyhow::Result<(Vec<Vec<Vec<f32>>>, Vec<Vec<f64>>)> {
     let k = enc.sizing().max_experts as usize;
+    let norm = &enc.model().norm;
     let mut out: Vec<Vec<Vec<f32>>> = vec![Vec::with_capacity(probes.len()); k];
+    let mut res: Vec<Vec<f64>> = vec![Vec::with_capacity(probes.len()); k];
     let mut i = 0;
     while i < probes.len() {
         let inst = probes[i].0;
         let j = probes[i..].iter().position(|p| p.0 != inst).map_or(probes.len(), |d| i + d);
         let win_ends: Vec<usize> = probes[i..j].iter().map(|&(s, p)| ends[s][p]).collect();
         let enc_w = tokio::task::block_in_place(|| enc.encode_windows(&history[inst].bars, &win_ends))?;
-        for e in enc_w {
+        let feats = fa_encoders::neural::data::bar_features(&history[inst].bars);
+        for (e, end) in enc_w.into_iter().zip(&win_ends) {
+            let target = fa_encoders::neural::data::targets_at(&feats, *end).map(|t| norm.target(0, t[0]));
             for (k, mu) in e.mu.into_iter().enumerate() {
                 out[k].push(mu);
+                let r = match (target, e.pred.get(k).and_then(|p| p.first())) {
+                    (Some(t), Some(p)) => f64::from(t - p),
+                    _ => f64::NAN,
+                };
+                res[k].push(r);
             }
         }
         i = j;
     }
-    Ok(out)
+    Ok((out, res))
 }
 
 /// Output order after expert matching (spec 32 §6.5): a child expert matched to parent index

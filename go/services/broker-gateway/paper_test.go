@@ -225,3 +225,17 @@ func TestVenueAdapterInterface(t *testing.T) {
 		t.Fatal("cancel of unknown must error")
 	}
 }
+
+// spec 42 §5: fills priced in the same millisecond (here: a frozen clock) still get distinct
+// venue fill ids, and every fill names its instrument and venue symbol (orphan identification).
+func TestFillIdsAreUniqueWithinOneMillisecond(t *testing.T) {
+	p := free()
+	p.ObserveTrade(tradeSub, 100, 1, t0)
+	a, b := p.Execute(intent("x1")), p.Execute(intent("x2"))
+	if a.VenueFillId == "" || a.VenueFillId == b.VenueFillId {
+		t.Fatalf("fill ids not unique: %q %q", a.VenueFillId, b.VenueFillId)
+	}
+	if a.InstrumentId != inst || a.VenueSymbol == "" {
+		t.Fatalf("fill does not identify its instrument: %v", a)
+	}
+}

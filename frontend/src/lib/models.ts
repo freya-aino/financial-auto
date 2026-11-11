@@ -4,7 +4,7 @@ import type { CheckItem, DecoderCardRow, DecoderSlot, Dist, SnapshotDetail } fro
 
 // ------------------------------------------------------------------ encoder snapshots (D-070)
 
-export const NEURAL_FAMILIES = ['fsq_hybrid', 'jepa_vae'] as const;
+export const NEURAL_FAMILIES = ['fsq_hybrid', 'hier_vae_flow', 'jepa_vae', 'latent_diffusion'] as const;
 export const isNeuralFamily = (f: string) => (NEURAL_FAMILIES as readonly string[]).includes(f);
 
 export interface ExpertHealth {
@@ -52,6 +52,26 @@ export function expertHealth(manifest: Record<string, unknown> | null): ExpertHe
 	};
 }
 
+/** Expert health as model-runtime publishes it live on `latent.expert.health` (labels by expert id). */
+export function liveExpertHealth(h: import('./api').LiveExpertHealth | null | undefined): (ExpertHealth & { labels: string[]; as_of: string | null; source: string }) | null {
+	if (!h || !Array.isArray(h.skill)) return null;
+	return {
+		k_eff: num(h.k_eff),
+		pre_prune_k_eff: null,
+		resid_corr: Array.isArray(h.resid_corr) && h.resid_corr.length ? h.resid_corr : null,
+		resid_corr_max: num(h.resid_corr_max),
+		skill: nums(h.skill),
+		usage: nums(h.usage),
+		mix_skill: null,
+		pruned: null,
+		n_windows: num(h.n_windows),
+		cka: null,
+		labels: (h.expert_ids ?? h.skill.map((_, i) => i)).map((i) => `E${i}`),
+		as_of: h.as_of ?? null,
+		source: h.source ?? 'live'
+	};
+}
+
 /** Checklist rows plus the items not evaluated (spec 36 §6 checklist, D-070 additions). */
 export function checklistRows(d: SnapshotDetail | null): { rows: (CheckItem & { state: 'pass' | 'fail' | 'unknown' })[]; passed: boolean; notEvaluated: string[] } {
 	const rows = (d?.checklist?.checks ?? []).map((c) => ({ ...c, state: (c.ok ? 'pass' : c.value === null ? 'unknown' : 'fail') as 'pass' | 'fail' | 'unknown' }));
@@ -82,7 +102,15 @@ export interface SlotVerdict {
 	text: string;
 }
 
-/** Online promotion progress of a slot (serving vs shadow). The 30-min shadow age is not visible here. */
+/** Shadow age vs the promotion minimum: `"12 min / 30 min"`, `null` without a shadow or age. */
+export function shadowAge(slot: DecoderSlot): { text: string; ripe: boolean } | null {
+	if (!slot.shadow || slot.shadow_age_s === null || slot.shadow_age_s === undefined) return null;
+	const fmt = (s: number) => (s >= 7200 ? `${(s / 3600).toFixed(1)} h` : s >= 60 ? `${Math.floor(s / 60)} min` : `${s} s`);
+	const min = slot.promote_min_s ?? 1800;
+	return { text: `${fmt(slot.shadow_age_s)} / ${fmt(min)}`, ripe: slot.shadow_age_s >= min };
+}
+
+/** Online promotion progress of a slot (serving vs shadow); the shadow's age is in `shadowAge`. */
 export function slotVerdict(slot: DecoderSlot, minN = PROMOTE_MIN_OUTPUTS, margin = PROMOTE_MARGIN): SlotVerdict {
 	const s = slot.serving;
 	const h = slot.shadow;

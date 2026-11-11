@@ -31,6 +31,8 @@
 //! halts, drawdown peak) is persisted in `ledger.risk_state` and restored at start. Limit
 //! clips, pre-trade rejections, feed freezes / bad ticks and allocator fallbacks go out as
 //! `fa.v1.RiskEvent{LIMIT_BREACH}` on `risk.event.<account>` and into `audit.log`.
+#[cfg(test)]
+mod decision_replay;
 mod engine;
 mod persist;
 mod pipeline;
@@ -455,6 +457,20 @@ async fn main() -> anyhow::Result<()> {
     let fx_settings = settings.fx.clone();
     let refdata_refresh_secs = settings.refdata_refresh_secs;
     let engine: Shared = Arc::new(Mutex::new(Engine::new(settings.clone())));
+    // the paper venue's cost model behind the cost-aware rebalance (spec 40 §6.1 step 6)
+    match std::env::var("FA_COSTS").ok().filter(|p| !p.is_empty()) {
+        Some(path) => match std::fs::read_to_string(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|src| fa_backtest::cost::CostModel::from_yaml(&src).map_err(anyhow::Error::from))
+        {
+            Ok(m) => {
+                tracing::info!(%path, venues = m.venues.len(), instruments = m.instruments.len(), "cost model loaded");
+                engine.lock().await.set_costs(m);
+            }
+            Err(e) => tracing::warn!(%path, error = %e, "cost model not loaded; using the built-in default schedule"),
+        },
+        None => tracing::warn!("FA_COSTS not set; rebalance costs use the built-in default schedule"),
+    }
     let store: Store = if cfg.postgres.url.is_empty() {
         tracing::warn!("no [postgres] url configured: paper book is in memory only (resets on restart)");
         None
@@ -582,17 +598,37 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // live slippage recalibration of the paper venue (spec 41 §6.3): impact k per (venue, class)
+    {
+        let engine = engine.clone();
+        let mut sub = bus.subscribe_raw("exec.costs.calibrated".into()).await?;
+        tokio::spawn(async move {
+            while let Some(m) = sub.next().await {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&m.payload) {
+                    let n = engine.lock().await.apply_calibration(&v);
+                    tracing::info!(entries = n, "calibrated impact coefficients applied to the rebalance cost model");
+                }
+            }
+        });
+    }
+
     // trades: marks + volume (+ equity-driven halts)
     {
         let (bus, engine, store) = (bus.clone(), engine.clone(), store.clone());
         let mut sub = bus.subscribe::<Envelope>(subjects::ALL_MD_TRADES.into()).await?;
         tokio::spawn(async move {
-            while let Some((_, env)) = sub.next().await {
+            while let Some((subject, env)) = sub.next().await {
                 if let Some(Payload::Trade(t)) = &env.payload
                     && let Ok(uuid) = Uuid::parse_str(&env.instrument_id)
                 {
                     let at = ms(env.event_time.as_ref()).unwrap_or_else(now_ms);
-                    let outs = engine.lock().await.on_trade(InstrumentId(uuid), at, t.price, t.size);
+                    let mut e = engine.lock().await;
+                    // md.trade.<venue>.<token>: the venue the paper venue prices fees by
+                    if let Some(venue) = subject.strip_prefix("md.trade.").and_then(|r| r.split('.').next()) {
+                        e.note_md_venue(InstrumentId(uuid), venue);
+                    }
+                    let outs = e.on_trade(InstrumentId(uuid), at, t.price, t.size);
+                    drop(e);
                     publish_outs(&bus, &store, &engine, outs).await;
                 }
             }
@@ -988,12 +1024,18 @@ async fn main() -> anyhow::Result<()> {
 
     // decision loop; SIGTERM / SIGINT flush the book snapshot and every strategy row + sub-book
     // before exiting, so a clean stop (docker compose stop) loses no sub-book change (D-061)
-    let mut tick = tokio::time::interval(Duration::from_millis(args.tick_ms.max(100)));
+    // ticks sit on the wall-clock grid (multiples of tick_ms since the epoch), so a replay of the
+    // recorded inputs knows when every decision was taken (spec 41 §9 decision-level replay)
+    let period = args.tick_ms.max(100);
+    let phase = Duration::from_millis(period - (now_ms().rem_euclid(period as i64)) as u64);
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + phase, Duration::from_millis(period));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let outs = engine.lock().await.tick(now_ms());
+                let t = now_ms();
+                let outs = engine.lock().await.tick(t - t.rem_euclid(period as i64));
                 publish_outs(&bus, &store, &engine, outs).await;
             }
             _ = term.recv() => break,

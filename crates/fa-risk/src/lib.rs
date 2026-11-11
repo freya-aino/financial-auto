@@ -10,13 +10,15 @@
 //! [`pipeline`] the automatic evolved-strategy lifecycle (candidate → holdout → shadow →
 //! active → retired); [`pretrade`] the checks for foreign/manual orders; [`health`] the
 //! per-instrument stale-feed freeze and bad-tick filter; [`calibrate`] the limit calibration
-//! rules (suggestions, tighten-only).
+//! rules (suggestions, tighten-only); [`rebalance`] the cost-aware trade decision (benefit vs
+//! full expected cost, min order notional from the fee minimum, turnover budget, batching).
 
 pub mod calibrate;
 pub mod exec;
 pub mod health;
 pub mod pipeline;
 pub mod pretrade;
+pub mod rebalance;
 pub mod strategy;
 
 use std::collections::{BTreeMap, BTreeSet};

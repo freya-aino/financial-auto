@@ -38,8 +38,16 @@ async fn cleanup(c: &HubClient, p: &str) {
         (node::FITNESS_RECORD, "genome_id"),
         (node::NEWS_DOC, "doc_id"),
         (node::MEDIA_SEGMENT, "segment_id"),
+        (fa_hub::versions::labels::TRANSITION_VERSION, "edge_key"),
+        (fa_hub::versions::labels::REGION_STATUS_VERSION, "region_id"),
     ] {
-        c.drop_nodes(label, Pred::starts_with(key, p)).await.expect("cleanup drop");
+        // label-wide prefix scans of parallel tests conflict; back off beyond the client's retries
+        let mut attempt = 0;
+        while let Err(e) = c.drop_nodes(label, Pred::starts_with(key, p)).await {
+            attempt += 1;
+            assert!(attempt < 10 && matches!(&e, HubError::Server { status: 409, .. }), "cleanup drop: {e:?}");
+            tokio::time::sleep(Duration::from_millis(100 * attempt)).await;
+        }
         let left = c.query(Op::nodes_with_label_where(label, Pred::starts_with(key, p)).count()).await.expect("count");
         assert_eq!(left, 0, "{label} rows with prefix {p} remain");
     }
@@ -775,7 +783,8 @@ async fn as_of_reads_hide_later_rows() {
     let regions = c.space_regions_as_of(space.id, between).await.expect("regions as of");
     assert_eq!(regions.iter().map(|r| r.id).collect::<Vec<_>>(), vec![r1.id]);
     let g = c.snapshot_graph_as_of(&snap.snapshot_id, between).await.expect("graph").expect("snapshot visible");
-    assert_eq!((g.regions.len(), g.transitions.len()), (1, 1), "only r1 and its self loop");
+    // the transitions were first written after `between` (event-time versions, fa-hub `versions`)
+    assert_eq!((g.regions.len(), g.transitions.len()), (1, 0), "only r1, no edge yet");
     let g = c.snapshot_graph_as_of(&snap.snapshot_id, now_ms() + 60_000).await.expect("graph").expect("visible");
     assert_eq!((g.regions.len(), g.transitions.len()), (2, 2));
     assert!(c.snapshot_graph_as_of(&snap.snapshot_id, before_all).await.expect("graph").is_none());
@@ -827,7 +836,7 @@ async fn prune_folds_old_observations_into_region_aggregates() {
     .expect("latents");
 
     let r = c.prune_space_observations(&sid, 5_000).await.expect("prune");
-    assert_eq!(r, PruneReport { pruned: 3, aggregates_created: 2, aggregates_updated: 0 });
+    assert_eq!(r, PruneReport { pruned: 3, aggregates_created: 2, aggregates_updated: 0, versions_pruned: 0 });
     let rows = c.space_latents(&sid, None, None, 50).await.expect("rows");
     let kinds: Vec<(String, String)> =
         rows.iter().map(|r| (r.kind.clone(), r.ref_id.trim_start_matches(&p).to_owned())).collect();
@@ -850,7 +859,7 @@ async fn prune_folds_old_observations_into_region_aggregates() {
         default: None,
     };
     let r = c.prune_snapshot_observations(&snap.snapshot_id, 10_001, &policy).await.expect("policy prune");
-    assert_eq!(r, PruneReport { pruned: 1, aggregates_created: 0, aggregates_updated: 1 });
+    assert_eq!(r, PruneReport { pruned: 1, aggregates_created: 0, aggregates_updated: 1, versions_pruned: 0 });
     let aggs = c.space_latents(&sid, Some("aggregate"), None, 10).await.expect("aggs");
     let a = aggs.iter().find(|r| r.ref_id == format!("{p}ra")).expect("ra");
     assert_eq!(a.extra.get("obs_count").and_then(serde_json::Value::as_u64), Some(3));

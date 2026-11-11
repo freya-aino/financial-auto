@@ -99,6 +99,13 @@ export interface BusStream {
 	retention: string;
 	storage: string;
 	max_age_secs: number;
+	/** Applied JetStream cap in bytes (−1 = unlimited). */
+	max_bytes: number;
+	/** spec 21 §5 cap (`null` for streams outside the table). */
+	planned_max_bytes?: number | null;
+	/** false when a larger cap was kept because the stream already held more (no purge). */
+	cap_applied?: boolean;
+	used_ratio?: number | null;
 	messages: number;
 	bytes: number;
 	first_seq: number;
@@ -627,6 +634,23 @@ export interface ExpertsView {
 		feature: string;
 	} | null;
 	live: { messages: number; last_as_of: string | null };
+	/** Latest `latent.expert.health` of the snapshot (model-runtime, closed bars; spec 32 §4.3). */
+	health?: LiveExpertHealth;
+}
+
+export interface LiveExpertHealth {
+	snapshot_id: string;
+	timescale: string;
+	as_of: string | null;
+	/** `validation` (fit) | `live` (served windows). */
+	source: string;
+	expert_ids: number[];
+	usage: number[];
+	skill: number[];
+	resid_corr: number[][];
+	k_eff: number;
+	resid_corr_max: number;
+	n_windows: number;
 }
 
 export interface ProjectionPoint {

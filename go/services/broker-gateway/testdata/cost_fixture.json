@@ -5,7 +5,11 @@
     "default_adv_eur": 10000000,
     "default_class": "equity",
     "instruments": {
-      "01900000-0000-7000-8000-000000000001": "equity"
+      "01900000-0000-7000-8000-000000000001": "equity",
+      "6d155600-908f-5f21-b5b6-771cbdd91050": "crypto",
+      "850b1098-d844-59e3-a7eb-1fb84638c1bf": "crypto",
+      "88649f5f-667f-5a21-aee9-7bc843b60fc1": "crypto",
+      "9daa8cea-67a6-5f6b-8347-f9e5a30f7463": "crypto"
     },
     "default": {
       "default": {
@@ -62,6 +66,26 @@
       }
     },
     "venues": {
+      "kraken": {
+        "default": {
+          "commission_bps": 40,
+          "commission_min_eur": 0,
+          "spread_bps": 2,
+          "impact_k": 0.2,
+          "funding_bps_day": 0,
+          "borrow_bps_day": 0
+        },
+        "classes": {
+          "crypto": {
+            "commission_bps": 40,
+            "commission_min_eur": 0,
+            "spread_bps": 2,
+            "impact_k": 0.2,
+            "funding_bps_day": 0,
+            "borrow_bps_day": 0
+          }
+        }
+      },
       "sim": {
         "default": {
           "commission_bps": 0,

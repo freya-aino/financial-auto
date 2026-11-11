@@ -35,6 +35,7 @@ func fixture(t *testing.T, name string) []byte {
 func newTest(t *testing.T, cur connector.CursorStore, extra map[string]string, clock time.Time) (*Connector, *atomic.Int32, *atomic.Int32) {
 	t.Helper()
 	sub, page := fixture(t, "submissions_aapl.json"), fixture(t, "submissions_aapl_001.json")
+	facts := fixture(t, "companyfacts_aapl.json")
 	var subs, pages atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if ua := r.Header.Get("User-Agent"); ua != "financial-auto ingestor" && ua != extra["user_agent"] {
@@ -46,6 +47,8 @@ func newTest(t *testing.T, cur connector.CursorStore, extra map[string]string, c
 		case "/submissions/CIK0000320193.json":
 			subs.Add(1)
 			w.Write(sub)
+		case "/api/xbrl/companyfacts/CIK0000320193.json":
+			w.Write(facts)
 		case "/submissions/CIK0000320193-submissions-001.json":
 			pages.Add(1)
 			w.Write(page)
@@ -57,6 +60,9 @@ func newTest(t *testing.T, cur connector.CursorStore, extra map[string]string, c
 	t.Cleanup(srv.Close)
 	if extra == nil {
 		extra = map[string]string{}
+	}
+	if _, ok := extra["facts_interval"]; !ok {
+		extra["facts_interval"] = "off" // facts_test.go covers companyfacts
 	}
 	if _, ok := extra["ciks"]; !ok {
 		extra["ciks"] = "320193"

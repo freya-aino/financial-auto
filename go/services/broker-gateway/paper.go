@@ -75,6 +75,18 @@ type PaperEngine struct {
 	VolumeWindow time.Duration
 	// EWMA decay of the return variance.
 	SigmaDecay float64
+	// Fills priced since start: with the fill time it makes every venue fill id unique, even
+	// for several child fills of one order in the same millisecond (spec 42 §5).
+	fillSeq uint64
+	// Guard rejects risk-increasing intents while the risk-engine heartbeat is missing
+	// (spec 40 §8 fail-closed; nil = off).
+	Guard *RiskGuard
+	// Net filled quantity per account|instrument (fail-closed judgement, persisted).
+	positions map[string]float64
+	// Insertion order of `seen` (bounded idempotency memory, persisted).
+	seenOrder []string
+	// Bumped on every change of persisted state (state.go).
+	rev uint64
 }
 
 func NewPaperEngine(costs *CostModel) *PaperEngine {
@@ -83,7 +95,7 @@ func NewPaperEngine(costs *CostModel) *PaperEngine {
 	}
 	return &PaperEngine{
 		markets: map[string]*market{}, seen: map[string]bool{}, resting: map[string]*resting{},
-		working: map[string]*working{}, profiles: map[string][]float64{},
+		working: map[string]*working{}, profiles: map[string][]float64{}, positions: map[string]float64{},
 		now: time.Now, Costs: costs, VolumeWindow: time.Hour, SigmaDecay: 0.97,
 	}
 }
@@ -277,10 +289,15 @@ func (p *PaperEngine) fill(in *fav1.OrderIntent, m *market, px, arrival float64,
 		bps = dir * (res.FillPrice - arrival) / arrival * 10_000
 		p.observeSlippage(ci, res, arrival, bps, algo)
 	}
+	p.fillSeq++
+	p.positions[posKey(in.AccountId, in.InstrumentId)] += signedQty(in.Side, in.Quantity)
+	p.touch()
 	return &fav1.OrderEvent{
 		IntentId: in.IntentId, VenueOrderId: "paper-" + in.IntentId, Kind: fav1.OrderEvent_KIND_FILL,
 		FillPrice: res.FillPrice, FillQuantity: in.Quantity, Fee: res.Fee, FeeCurrency: res.FeeCurrency,
 		EventTime: timestamppb.New(now), ArrivalPrice: arrival, SlippageBps: bps,
+		VenueFillId:  fmt.Sprintf("pf-%d-%d", now.UnixNano(), p.fillSeq),
+		InstrumentId: in.InstrumentId, VenueSymbol: bus.SubjectToken(in.InstrumentId),
 	}
 }
 
@@ -291,7 +308,8 @@ func (p *PaperEngine) Execute(in *fav1.OrderIntent) *fav1.OrderEvent {
 	if p.seen[in.IntentId] {
 		return nil
 	}
-	p.seen[in.IntentId] = true
+	p.markSeen(in.IntentId)
+	p.touch()
 
 	ev := &fav1.OrderEvent{IntentId: in.IntentId, VenueOrderId: "paper-" + in.IntentId, EventTime: timestamppb.New(p.now())}
 	switch {
@@ -303,6 +321,14 @@ func (p *PaperEngine) Execute(in *fav1.OrderIntent) *fav1.OrderEvent {
 		return ev
 	case in.LimitPrice != nil && *in.LimitPrice <= 0:
 		ev.Kind, ev.Reason = fav1.OrderEvent_KIND_REJECTED, "non-positive limit price"
+		return ev
+	case !p.Guard.Alive(p.now()) && increasesRisk(p.projected(in.AccountId, in.InstrumentId), signedQty(in.Side, in.Quantity)):
+		ev.Kind = fav1.OrderEvent_KIND_REJECTED
+		ev.Reason = fmt.Sprintf("fail-closed: no risk-engine heartbeat for %.0f s (> %s); risk-increasing intents are rejected",
+			p.Guard.Age(p.now()), p.Guard.Timeout)
+		if p.Counters != nil {
+			p.Counters.Add("failclosed.rejected", 1)
+		}
 		return ev
 	}
 	token := bus.SubjectToken(in.InstrumentId)
@@ -335,6 +361,7 @@ func (p *PaperEngine) Execute(in *fav1.OrderIntent) *fav1.OrderEvent {
 	// market, or limit (with or without a price): an explicit limit_price always rests
 	if !marketable(in, m.last) {
 		p.resting[in.IntentId] = &resting{intent: in, arrival: m.last, token: token}
+		p.touch()
 		ev.Kind, ev.Reason, ev.ArrivalPrice = fav1.OrderEvent_KIND_ACK, "limit not marketable; resting", m.last
 		return ev
 	}
@@ -347,6 +374,7 @@ func (p *PaperEngine) CancelResting(intentID string) *Published {
 	defer p.mu.Unlock()
 	if w, ok := p.working[intentID]; ok {
 		delete(p.working, intentID)
+		p.touch()
 		p.algoCount(w.algo.Name, "working", -1)
 		p.algoCount(w.algo.Name, "cancelled", 1)
 		return &Published{Account: w.intent.AccountId, Event: &fav1.OrderEvent{
@@ -360,6 +388,7 @@ func (p *PaperEngine) CancelResting(intentID string) *Published {
 		return nil
 	}
 	delete(p.resting, intentID)
+	p.touch()
 	return &Published{Account: r.intent.AccountId, Event: &fav1.OrderEvent{
 		IntentId: intentID, VenueOrderId: "paper-" + intentID, Kind: fav1.OrderEvent_KIND_CANCELED,
 		EventTime: timestamppb.New(p.now()), Reason: "cancelled by request", ArrivalPrice: r.arrival,

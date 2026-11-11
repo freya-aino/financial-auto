@@ -36,6 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use fa_allocator::{Allocator, PerformanceTracker, tournament::Tournament};
+use fa_backtest::cost::CostModel;
 use fa_core::{Horizon, InstrumentId, Timescale};
 use fa_ledger::{Fill, Ledger, Position, pg::FillDetails};
 use fa_proto::{
@@ -52,6 +53,7 @@ use fa_risk::{
     health::{FeedGuard, FeedState, TradeVerdict},
     pipeline::{Decision, FrontMember},
     pretrade::{OrderCheck, check_order},
+    rebalance::{CostQuote, Rebalancer, TradeCandidate, Verdict, VolEstimator, effective_obs, strategy_edge},
     strategy::{Checklist, GateEvidence, StrategyAction, StrategyState, StrategyStatus},
 };
 use fa_strategies::ExposureDistribution;
@@ -344,6 +346,20 @@ pub struct Engine {
     equity_history: VecDeque<(i64, f64)>,
     hourly_marks: BTreeMap<InstrumentId, VecDeque<f64>>,
     risk_dirty: bool,
+    // cost-aware rebalancing (spec 40 §6.1 step 6, `fa_risk::rebalance`)
+    rebalancer: Rebalancer,
+    /// The paper venue's cost model (`costs.yaml`, `FA_COSTS`; impact `k` updated from
+    /// `exec.costs.calibrated`): what an order is expected to cost.
+    costs: CostModel,
+    /// σ_day per instrument from the trade tape (the venue's own estimate).
+    vol: VolEstimator,
+    /// Market-data venue token per instrument (`md.trade.<venue>.<token>`), the key the venue
+    /// prices fees by.
+    md_venue: BTreeMap<InstrumentId, String>,
+    /// Each strategy's last distribution while within its turnover budget (netted instead of
+    /// new signals once the budget is spent, until the UTC day rolls).
+    last_dists: BTreeMap<String, ExposureDistribution>,
+    last_tick_ms: Option<i64>,
     pub counters: BTreeMap<&'static str, f64>,
 }
 
@@ -378,6 +394,7 @@ impl Engine {
             fa_allocator::by_name(&settings.allocator, settings.max_strategy_weight, settings.kelly_fraction)
                 .expect("validated");
         let cash = settings.starting_cash_eur;
+        let settings_rebalance = settings.rebalance.clone();
         let (settings_feed, settings_cap, settings_kelly, settings_cost_bps) = (
             settings.feed.clone(),
             settings.max_strategy_weight,
@@ -434,7 +451,82 @@ impl Engine {
             equity_history: VecDeque::new(),
             hourly_marks: BTreeMap::new(),
             risk_dirty: false,
+            rebalancer: Rebalancer::new(settings_rebalance),
+            costs: CostModel::default(),
+            vol: VolEstimator::default(),
+            md_venue: BTreeMap::new(),
+            last_dists: BTreeMap::new(),
+            last_tick_ms: None,
             counters: BTreeMap::new(),
+        }
+    }
+
+    // ------------------------------------------------- execution costs (cost-aware rebalance)
+
+    /// Replaces the cost model (`costs.yaml` at start).
+    pub fn set_costs(&mut self, m: CostModel) {
+        self.costs = m;
+    }
+
+    /// Applies an `exec.costs.calibrated` report of the broker-gateway (spec 41 §6.3 live
+    /// recalibration): every `calibrated` (venue, class) entry overrides the impact `k`.
+    /// Returns the number of entries applied.
+    pub fn apply_calibration(&mut self, report: &Value) -> usize {
+        let mut n = 0;
+        for e in report.get("entries").and_then(Value::as_array).into_iter().flatten() {
+            let (Some(venue), Some(class), Some(k)) = (
+                e.get("venue").and_then(Value::as_str),
+                e.get("class").and_then(Value::as_str),
+                e.get("k_new").and_then(Value::as_f64),
+            ) else {
+                continue;
+            };
+            if e.get("status").and_then(Value::as_str) != Some("calibrated") || !(k.is_finite() && k >= 0.0) {
+                continue;
+            }
+            let mut sched = self.costs.schedule(venue, class);
+            sched.impact_k = Some(k);
+            self.costs.venues.entry(venue.to_owned()).or_default().classes.insert(class.to_owned(), sched);
+            n += 1;
+        }
+        if n > 0 {
+            self.bump("costs.calibrations");
+        }
+        n
+    }
+
+    /// Remembers the market-data venue of an instrument (`md.trade.<venue>.<token>`).
+    pub fn note_md_venue(&mut self, inst: InstrumentId, venue: &str) {
+        if self.md_venue.get(&inst).is_none_or(|v| v != venue) {
+            self.md_venue.insert(inst, venue.to_owned());
+        }
+    }
+
+    /// Current EUR mark of an instrument (decision replay).
+    #[cfg(test)]
+    pub fn mark(&self, inst: &InstrumentId) -> Option<f64> {
+        self.marks.get(inst).copied()
+    }
+
+    /// What an order on `inst` is expected to cost: the venue schedule for its (venue, class)
+    /// as the paper venue resolves it, σ_day from the tape, ADV from the volume window.
+    pub(crate) fn cost_quote(&self, inst: InstrumentId, now_ms: i64) -> CostQuote {
+        let venue = self
+            .md_venue
+            .get(&inst)
+            .cloned()
+            .or_else(|| self.refs.get(&inst).and_then(|r| r.venue.clone()))
+            .unwrap_or_default();
+        let class = self.costs.class_of(&inst.to_string());
+        let s = self.costs.schedule(&venue, &class);
+        let (vol_eur, secs) = self.window_volume(inst, now_ms);
+        CostQuote {
+            commission_bps: s.commission_bps,
+            commission_min_eur: s.commission_min_eur,
+            half_spread_bps: s.spread_bps / 2.0,
+            impact_k: s.impact_k.unwrap_or(self.costs.default_k),
+            sigma_day: self.vol.sigma_day(&inst).unwrap_or(self.costs.default_sigma),
+            adv_eur: if vol_eur > 0.0 && secs > 0.0 { vol_eur * 86_400.0 / secs } else { self.costs.default_adv_eur },
         }
     }
 
@@ -856,6 +948,7 @@ impl Engine {
             TradeVerdict::Accept => {}
         }
         self.marks.insert(inst, price_eur);
+        self.vol.observe(inst, at_ms, price_eur);
         self.first_seen_ms.entry(inst).or_insert(at_ms);
         let window = self.settings.volume_window_secs as i64 * 1000;
         let v = self.volume.entry(inst).or_default();
@@ -1771,6 +1864,23 @@ impl Engine {
             .filter(|(d, _)| !paused_ts.as_ref().is_some_and(|p| p.is_empty() || p.contains(&d.horizon.timescale)))
             .map(|(d, _)| d.clone())
             .collect();
+        // strategies over their daily turnover budget keep their last distribution (frozen
+        // sub-target) until the UTC day rolls (`fa_risk::rebalance`)
+        let frozen = self.rebalancer.over_budget(now_ms).clone();
+        let dists: Vec<ExposureDistribution> = dists
+            .into_iter()
+            .map(|d| {
+                if frozen.contains(&d.strategy_id) {
+                    self.last_dists.get(&d.strategy_id).cloned().unwrap_or(d)
+                } else {
+                    self.last_dists.insert(d.strategy_id.clone(), d.clone());
+                    d
+                }
+            })
+            .collect();
+        self.counters.insert("rebalance.frozen_strategies", frozen.len() as f64);
+        let step_secs = self.last_tick_ms.map_or(1.0, |t| ((now_ms - t) as f64 / 1000.0).clamp(0.1, 60.0));
+        self.last_tick_ms = Some(now_ms);
         let model_paused = self
             .signals
             .values()
@@ -1810,6 +1920,35 @@ impl Engine {
         }
         self.last_alloc = alloc.clone();
         let raw = fa_allocator::net_targets(&dists, &alloc, deployable);
+        // expected edge per strategy (fraction per holding period) and its signed EUR
+        // contribution per instrument, for the cost-aware rebalance decision
+        let rb_cfg = self.rebalancer.cfg.clone();
+        let mut edges: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
+        for (d, st) in dists.iter().zip(&stats) {
+            let mean_abs = if d.exposures.is_empty() {
+                0.0
+            } else {
+                d.exposures.iter().map(|e| e.mean.abs()).sum::<f64>() / d.exposures.len() as f64
+            };
+            let hold = d.horizon.duration().as_secs_f64() * rb_cfg.holding_horizons.max(0.0);
+            let n_eff = effective_obs(st.observations, self.settings.performance_decay);
+            let edge = strategy_edge(&rb_cfg, st.mean_return, mean_abs, n_eff, step_secs, hold);
+            edges.insert(d.strategy_id.as_str(), (edge, hold));
+        }
+        let mut contributions: BTreeMap<InstrumentId, Vec<(f64, f64, f64)>> = BTreeMap::new();
+        for d in &dists {
+            let w = alloc.get(&d.strategy_id).copied().unwrap_or(0.0);
+            let (edge, hold) = edges.get(d.strategy_id.as_str()).copied().unwrap_or((0.0, 0.0));
+            if w <= 0.0 || d.exposures.is_empty() {
+                continue;
+            }
+            let per_asset = w * deployable / d.exposures.len() as f64;
+            for e in &d.exposures {
+                let c = per_asset * e.mean.clamp(-1.0, 1.0) / (1.0 + e.stddev.max(0.0));
+                contributions.entry(e.instrument).or_default().push((c, edge, hold));
+            }
+        }
+        let sleeves: BTreeMap<String, f64> = self.strategies.iter().map(|(id, s)| (id.clone(), s.sleeve_eur)).collect();
 
         let mut market: BTreeMap<InstrumentId, MarketInfo> = BTreeMap::new();
         let known: Vec<InstrumentId> = raw.keys().filter(|i| self.marks.contains_key(i)).copied().collect();
@@ -1941,14 +2080,41 @@ impl Engine {
             let cur = current.get(&inst).copied().unwrap_or(0.0);
             let delta = target - cur;
             let band = self.settings.min_order_eur.max(self.settings.no_trade_band_frac * target.abs());
-            if delta.abs() < band {
-                continue;
-            }
-            let intent_id = ulid::Ulid::generate().to_string();
             // spec 40 §6.4: algorithm from urgency, horizon and size vs traded volume
             let urgent = halt_urgent
                 || flattening_insts.contains(&inst)
                 || self.feed.state(&inst, now_ms, bar_ms.get(&inst).copied()) == FeedState::Flatten;
+            // spec 40 §6.1 step 6: trade only when the expected benefit beats the full expected
+            // cost (fee minimum, half spread, impact); limits and halts are never traded off
+            let parts = contributions.get(&inst).map(Vec::as_slice).unwrap_or(&[]);
+            let weight: f64 = parts.iter().map(|(c, _, _)| c.abs()).sum();
+            let (edge, hold) = if weight > 0.0 {
+                let dir = if target != 0.0 { target.signum() } else { 0.0 };
+                (
+                    parts.iter().map(|(c, e, _)| c.signum() * dir * c.abs() * e).sum::<f64>() / weight,
+                    parts.iter().map(|(c, _, h)| c.abs() * h).sum::<f64>() / weight,
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            let raw_target = raw.get(&inst).copied().unwrap_or(0.0);
+            let candidate = TradeCandidate {
+                instrument: inst,
+                current_eur: cur,
+                target_eur: target,
+                edge,
+                holding_secs: hold,
+                urgent,
+                limit_bound: target.abs() + 1e-6 < raw_target.abs(),
+                contributors: contributors(inst),
+                cost: self.cost_quote(inst, now_ms),
+            };
+            if let Verdict::Skip { .. } =
+                self.rebalancer.decide(&candidate, band, self.settings.min_order_eur, &sleeves, now_ms)
+            {
+                continue;
+            }
+            let intent_id = ulid::Ulid::generate().to_string();
             let horizon_secs = dists
                 .iter()
                 .filter(|d| d.exposures.iter().any(|e| e.instrument == inst && e.mean != 0.0))
@@ -2002,6 +2168,23 @@ impl Engine {
             out.push(Out::Intent(intent.clone()));
             out.push(Out::Approved(intent));
         }
+        let rs = &self.rebalancer.stats;
+        let mut rc = vec![
+            ("rebalance.trades", rs.trades as f64),
+            ("rebalance.bypass", rs.bypass as f64),
+            ("rebalance.expected_cost_eur", rs.expected_cost_eur),
+            ("rebalance.avoided_cost_eur", rs.avoided_cost_eur),
+        ];
+        for (k, name) in [
+            ("band", "rebalance.skip.band"),
+            ("min_notional", "rebalance.skip.min_notional"),
+            ("cost", "rebalance.skip.cost"),
+            ("confirming", "rebalance.skip.confirming"),
+            ("budget", "rebalance.skip.budget"),
+        ] {
+            rc.push((name, rs.skipped.get(k).copied().unwrap_or(0) as f64));
+        }
+        self.counters.extend(rc);
         // flattening strategies have had their closing intents issued: they are paused now
         let flattening: Vec<String> = self
             .strategies
@@ -2387,10 +2570,16 @@ impl Engine {
     }
 }
 
-/// The ledger fill id of a fill event: `intent:venue_order:event ms` (idempotency key in both
-/// books, `ledger.fill.venue_fill_id`).
+/// The ledger fill id of a fill event (idempotency key in both books, `ledger.fill.venue_fill_id`):
+/// `intent:venue_order:vf:<venue fill id>` when the venue assigns one (unique even for two partial
+/// fills of one order in the same millisecond, spec 42 §5), else the legacy
+/// `intent:venue_order:event ms` — events from older producers, and every stored row, keep
+/// mapping to the same id, so redelivery stays idempotent.
 pub fn fill_id_of(m: &OrderEvent, now_ms: i64) -> String {
-    format!("{}:{}:{}", m.intent_id, m.venue_order_id, ms_of(m.event_time.as_ref()).unwrap_or(now_ms))
+    match m.venue_fill_id.trim() {
+        "" => format!("{}:{}:{}", m.intent_id, m.venue_order_id, ms_of(m.event_time.as_ref()).unwrap_or(now_ms)),
+        vf => format!("{}:{}:vf:{vf}", m.intent_id, m.venue_order_id),
+    }
 }
 
 /// Ledger ↔ engine interface (spec 42 §6, §8; I/O in `crate::recon`).
@@ -2500,10 +2689,14 @@ mod tests {
 
     /// `risk.toml` with the feed guard off: the scenario tests below jump the clock and the
     /// price on purpose (the guard has its own tests).
+    /// The tests below pin the limit chain, halts and lifecycle with the plain D-041 band
+    /// (every target move above it trades at once); the cost-aware rule has its own tests
+    /// (`cost_aware_*`) on the full `risk.toml`.
     fn settings() -> Settings {
         let mut s = Settings::parse(include_str!("../risk.toml")).unwrap();
         s.feed.stale_freeze_bars = 0.0;
         s.feed.jump_max = 0.0;
+        s.rebalance.enabled = false;
         s
     }
 
@@ -2543,6 +2736,101 @@ mod tests {
 
     fn approved(out: &[Out]) -> Vec<OrderIntent> {
         out.iter().filter_map(|o| if let Out::Approved(i) = o { Some(i.clone()) } else { None }).collect()
+    }
+
+    /// SYNTHETIC replay of the churn recorded 2026-11-10 19:00 – 11-11 02:00 (`ledger.fill`:
+    /// ~7 000 rebalances averaging ~300 EUR, each paying the 1 EUR fee minimum): two 1 s
+    /// strategies whose exposures jitter around a level every second, the level switching side
+    /// every 10 minutes. The plain band trades nearly every tick; the cost-aware rule trades
+    /// the level switches only, and a halt still flattens at once.
+    #[test]
+    fn cost_aware_rebalancing_suppresses_the_recorded_churn_pattern() {
+        let inst = InstrumentId::new();
+        let run = |enabled: bool| {
+            let mut s = settings();
+            s.rebalance.enabled = enabled;
+            let mut e = Engine::new(s);
+            for k in 0..3_600 {
+                e.on_trade(inst, T0 - 3_600_000 + k * 1000, PX, 10.0);
+            }
+            let mut rng = fa_core::rng::Rng::seed(3);
+            let (mut n, mut fees, mut notional) = (0usize, 0.0, 0.0);
+            for k in 1..=1_800i64 {
+                let now = T0 + k * 1000;
+                e.on_trade(inst, now, PX * (1.0 + 0.0002 * rng.normal()), 10.0);
+                let level = if (k / 600) % 2 == 0 { 0.04 } else { -0.03 };
+                e.on_signal(&signal("a", inst, level + 0.004 * rng.normal()), now);
+                e.on_signal(&signal("b", inst, level + 0.004 * rng.normal()), now);
+                for i in approved(&e.tick(now)) {
+                    let mark = e.marks[&inst];
+                    fees += (i.quantity * mark * 5e-4).max(1.0);
+                    notional += i.quantity * mark;
+                    n += 1;
+                    fill(&mut e, &i, mark, now + 100);
+                }
+            }
+            (n, fees, notional, e)
+        };
+        let (n_old, fee_old, not_old, _) = run(false);
+        let (n_new, fee_new, not_new, mut e) = run(true);
+        eprintln!(
+            "band: {n_old} orders, {fee_old:.0} EUR fees, avg {:.0} EUR; cost-aware: {n_new} orders, {fee_new:.1} EUR, avg {:.0} EUR",
+            not_old / n_old as f64,
+            not_new / n_new.max(1) as f64
+        );
+        assert!(n_old > 1_500, "the band trades nearly every tick: {n_old}");
+        assert!(fee_old / not_old > 25e-4, "mostly minimum fees: {} bp", fee_old / not_old * 1e4);
+        assert!((3..=12).contains(&n_new), "level switches only: {n_new}");
+        assert!(fee_new < fee_old / 50.0, "{fee_new} vs {fee_old}");
+        assert!(fee_new / not_new < 6e-4, "orders pay the proportional rate, not the minimum");
+        assert!(e.counters["rebalance.skip.min_notional"] > 1_000.0);
+        assert!(e.counters["rebalance.avoided_cost_eur"] > 0.0 || e.counters["rebalance.skip.cost"] == 0.0);
+        // a halt flattens the whole position on the next tick whatever it costs
+        let now = T0 + 1_801_000;
+        e.on_halt(
+            &Halt { scope: "portfolio".into(), reason: "test".into(), since: Some(ts_of(now)), manual: true },
+            now,
+        );
+        let flat = approved(&e.tick(now + 1000));
+        assert_eq!(flat.len(), 1);
+        let pos = e.ledger().positions[&inst].quantity;
+        assert!(
+            (flat[0].quantity - pos.abs()).abs() < 1e-9
+                && flat[0].side == if pos > 0.0 { Side::Sell } else { Side::Buy } as i32
+        );
+        assert!(e.counters["rebalance.bypass"] >= 1.0);
+    }
+
+    /// The expected cost comes from the venue's schedule as the paper venue resolves it
+    /// (md venue + `costs.yaml` class), σ from the tape, ADV from the volume window, and the
+    /// impact k from the gateway's `exec.costs.calibrated` report.
+    #[test]
+    fn cost_aware_quotes_follow_costs_yaml_and_the_calibration() {
+        let inst = InstrumentId(Uuid::parse_str("850b1098-d844-59e3-a7eb-1fb84638c1bf").unwrap());
+        let mut e = Engine::new(settings());
+        e.set_costs(CostModel::from_yaml(include_str!("../../../go/services/broker-gateway/costs.yaml")).unwrap());
+        e.note_md_venue(inst, "kraken");
+        for k in 0..600 {
+            e.on_trade(inst, T0 + k * 1000, 90_000.0 * (1.0 + if k % 2 == 0 { 1e-4 } else { -1e-4 }), 0.01);
+        }
+        let q = e.cost_quote(inst, T0 + 600_000);
+        assert_eq!(
+            (q.commission_bps, q.commission_min_eur, q.half_spread_bps),
+            (40.0, 0.0, 1.0),
+            "kraken crypto, no minimum"
+        );
+        assert!((q.sigma_day - 2e-4 * 86_400f64.sqrt()).abs() < 0.01, "σ from the tape: {}", q.sigma_day);
+        assert!((q.adv_eur - 900.0 * 86_400.0).abs() / (900.0 * 86_400.0) < 0.01, "ADV from the window: {}", q.adv_eur);
+        assert_eq!(q.impact_k, 0.2);
+        let report = json!({"entries": [
+            {"venue": "kraken", "class": "crypto", "k_new": 0.31, "status": "calibrated"},
+            {"venue": "yahoo", "class": "equity", "k_new": 0.5, "status": "insufficient"}]});
+        assert_eq!(e.apply_calibration(&report), 1);
+        let q = e.cost_quote(inst, T0 + 600_000);
+        assert_eq!((q.impact_k, q.commission_bps), (0.31, 40.0), "k replaced, fees kept");
+        // without a known venue an unmapped instrument is an equity at the 1 EUR minimum
+        let other = InstrumentId::new();
+        assert_eq!(e.cost_quote(other, T0).commission_min_eur, 1.0);
     }
 
     #[test]
@@ -3327,7 +3615,9 @@ mod tests {
     }
 
     fn production() -> Settings {
-        Settings::parse(include_str!("../risk.toml")).unwrap()
+        let mut s = Settings::parse(include_str!("../risk.toml")).unwrap();
+        s.rebalance.enabled = false;
+        s
     }
 
     fn events<'a>(out: &'a [Out], kind: &str) -> Vec<&'a Value> {
@@ -3697,6 +3987,33 @@ mod tests {
         assert_eq!(hr["exec.algo.smart_limit"], 1.0);
         assert_eq!(hr["exec.algo.market"], 1.0);
         assert!(hr.contains_key("headroom.position_min_eur") && hr.contains_key("headroom.short_margin_eur"));
+    }
+
+    /// spec 42 §5: two partial fills of one order in the same millisecond are two fills when the
+    /// venue names them; events without a venue fill id keep the legacy (stored) id.
+    #[test]
+    fn same_millisecond_partials_are_distinct_fills() {
+        let inst = InstrumentId::new();
+        let mut e = warm(inst);
+        let i = OrderIntent { intent_id: "i-partials".into(), quantity: 4.0, ..Default::default() };
+        e.recover_intent(&i.intent_id, inst, i.quantity, vec!["s".into()]);
+        let part = |vf: &str| OrderEvent {
+            intent_id: i.intent_id.clone(),
+            venue_order_id: format!("paper-{}", i.intent_id),
+            kind: order_event::Kind::PartialFill as i32,
+            fill_price: PX,
+            fill_quantity: i.quantity / 4.0,
+            event_time: Some(ts_of(T0 + 20_000)),
+            venue_fill_id: vf.into(),
+            ..Default::default()
+        };
+        let (a, b) = (part("pf-1"), part("pf-2"));
+        assert_ne!(fill_id_of(&a, 0), fill_id_of(&b, 0));
+        assert_eq!(fill_id_of(&part(""), 0), format!("{}:paper-{}:{}", i.intent_id, i.intent_id, T0 + 20_000));
+        e.on_order_event(&a, T0 + 20_000);
+        e.on_order_event(&b, T0 + 20_000);
+        e.on_order_event(&a, T0 + 20_001); // redelivery
+        assert!((e.ledger().positions[&inst].quantity - i.quantity / 2.0).abs() < 1e-9, "both partials booked once");
     }
 
     #[test]

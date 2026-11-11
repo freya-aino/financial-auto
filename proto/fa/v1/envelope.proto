@@ -34,6 +34,7 @@ message Envelope {
     MacroObservation macro = 26;
     OnchainEvent onchain = 27;
     FilingEvent filing = 28;
+    FundamentalFact fundamental = 29;
   }
 }
 

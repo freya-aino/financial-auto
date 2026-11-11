@@ -163,3 +163,70 @@ func TestFilingRows(t *testing.T) {
 		t.Fatalf("rows %+v invalid %d", rows, invalid)
 	}
 }
+
+func fact(field, unit, period string, v float64, filed time.Time) *fav1.Envelope {
+	end := time.Date(2026, 9, 26, 0, 0, 0, 0, time.UTC)
+	return &fav1.Envelope{SourceId: "sec_edgar", Payload: &fav1.Envelope_Fundamental{Fundamental: &fav1.FundamentalFact{
+		IssuerCik: "0000320193", Field: field, Unit: unit, Period: period, PeriodEnd: timestamppb.New(end),
+		Value: v, Vintage: timestamppb.New(filed), Form: "10-K", Accession: "0000320193-26-000026", FiscalYear: "2026", FiscalPeriod: "FY",
+	}}}
+}
+
+func TestFundamentalRows(t *testing.T) {
+	filed := time.Date(2026, 11, 4, 3, 0, 0, 0, time.UTC)
+	envs := []*fav1.Envelope{
+		fact("us-gaap:NetIncomeLoss", "USD", "2025-09-28..2026-09-26", 132175000000, filed),
+		fact("us-gaap:Assets", "USD", "", 1, filed),                                                                                               // no period
+		fact("us-gaap:Assets", "USD", "2026-09-26", math.Inf(1), filed),                                                                           // not finite
+		{SourceId: "sec_edgar", Payload: &fav1.Envelope_Fundamental{Fundamental: &fav1.FundamentalFact{IssuerCik: "1", Field: "f", Period: "p"}}}, // no vintage
+		macro("X", "2026", 1, false),
+	}
+	rows, invalid := FundamentalRows(envs)
+	if len(rows) != 1 || invalid != 3 {
+		t.Fatalf("rows %d invalid %d", len(rows), invalid)
+	}
+	r := rows[0]
+	if r.IssuerCIK != "0000320193" || r.Field != "us-gaap:NetIncomeLoss" || r.Unit != "USD" || !r.Vintage.Equal(filed) ||
+		r.PeriodEnd == nil || r.PeriodStart != nil || r.Form != "10-K" || r.FiscalPeriod != "FY" {
+		t.Fatalf("row %+v", r)
+	}
+}
+
+// TestPostgresFundamentals: like TestPostgres (FA_TEST_POSTGRES_URL, rolled back);
+// needs migration 20261113000012.
+func TestPostgresFundamentals(t *testing.T) {
+	url := os.Getenv("FA_TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("FA_TEST_POSTGRES_URL not set")
+	}
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	filed := time.Date(2099, 1, 2, 3, 0, 0, 0, time.UTC)
+	w := NewWriter(tx)
+	envs := []*fav1.Envelope{
+		fact("test:Concept", "USD", "2098-01-01..2098-12-31", 1, filed),
+		fact("test:Concept", "EUR", "2098-01-01..2098-12-31", 2, filed),                   // other unit: own row
+		fact("test:Concept", "USD", "2098-01-01..2098-12-31", 3, filed.Add(24*time.Hour)), // revision: new vintage
+	}
+	if n, err := w.Write(ctx, envs); err != nil || n != 3 {
+		t.Fatalf("insert %d %v", n, err)
+	}
+	if n, err := w.Write(ctx, envs); err != nil || n != 0 {
+		t.Fatalf("idempotent re-insert %d %v", n, err)
+	}
+	// as-of read: latest vintage <= t
+	var v float64
+	if err := tx.QueryRow(ctx, `select value from wh.fundamental where issuer_cik='0000320193' and field='test:Concept' and unit='USD'
+		and vintage <= $1 order by vintage desc limit 1`, filed.Add(time.Hour)).Scan(&v); err != nil || v != 1 {
+		t.Fatalf("as-of %v %v", v, err)
+	}
+}

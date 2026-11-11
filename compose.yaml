@@ -306,9 +306,11 @@ services:
     environment:
       <<: *rust-env
       FA_RISK: /app/risk.toml
+      FA_COSTS: /app/config/costs.yaml # paper venue cost model behind the cost-aware rebalance (spec 40 §6.1 step 6)
     volumes:
       - ./bins/risk-engine/risk.toml:/app/risk.toml:ro # limits editable without a rebuild (D-041)
       - ./config/secrets.toml:/app/config/secrets.toml:ro
+      - ./go/services/broker-gateway/costs.yaml:/app/config/costs.yaml:ro
     ports:
       - "127.0.0.1:9104:9100" # metrics
     depends_on: *core-deps

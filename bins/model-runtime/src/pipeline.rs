@@ -219,6 +219,9 @@ pub struct TimescalePipeline {
     last_closed: HashMap<String, ChainPos>,
     /// EWMA of |closed-bar log return| per instrument (volatility covariate).
     vol: HashMap<String, f64>,
+    /// `coarse_ln_dwell` per expert of each instrument on the next coarser timescale (set by the
+    /// runtime from [`crate::regions::CrossScale::coarse_context`] before each step).
+    coarse: HashMap<String, Vec<f64>>,
     /// Observation window per expert for the batch refits.
     windows: Vec<ObsWindow>,
     /// Event time of the last refit request per expert.
@@ -261,6 +264,7 @@ impl TimescalePipeline {
             transitions,
             last_closed: HashMap::new(),
             vol: HashMap::new(),
+            coarse: HashMap::new(),
             windows: (0..n_experts).map(|_| ObsWindow::new(cfg.kernel.refit_window)).collect(),
             last_refit_ms: vec![i64::MIN; n_experts],
             drift: Self::drift_monitors(cfg, n_experts, region_map),
@@ -269,6 +273,16 @@ impl TimescalePipeline {
             kcfg: cfg.kernel,
             rng: Rng::seed(cfg.seed ^ 0xD1A6),
             novelty_threshold: cfg.regions.novelty_threshold,
+        }
+    }
+
+    /// Sets the coarse-timescale context of an instrument (`coarse_ln_dwell` per expert index,
+    /// spec 33 §10 q3) used by its next closed-bar step.
+    pub fn set_coarse_context(&mut self, instrument: &str, ln_dwell: Vec<f64>) {
+        if ln_dwell.is_empty() {
+            self.coarse.remove(instrument);
+        } else {
+            self.coarse.insert(instrument.to_owned(), ln_dwell);
         }
     }
 
@@ -614,6 +628,7 @@ impl TimescalePipeline {
         }
 
         if input.bar_closed {
+            let coarse = self.coarse.get(input.instrument_id).cloned().unwrap_or_default();
             let close = input.bars.last().map_or(0.0, |b| b.close);
             let prev_pos = self.last_closed.remove(input.instrument_id);
             // volatility covariate: |log return| relative to its EWMA (spec 33 §6.2)
@@ -625,6 +640,14 @@ impl TimescalePipeline {
             let vol_ratio = ((ret + 1e-6) / (*ewma + 1e-6)).ln().clamp(-3.0, 3.0);
             *ewma = 0.95 * *ewma + 0.05 * ret;
             let mut pos = ChainPos { regions: current.clone(), close, ..ChainPos::default() };
+            // which experts' regions changed at this close (the `peer_switch` covariate)
+            let switched: Vec<bool> = current
+                .iter()
+                .enumerate()
+                .map(|(k, to)| prev_pos.as_ref().is_some_and(|p| p.regions.get(k).is_some_and(|r| r != to)))
+                .collect();
+            let n_switched = switched.iter().filter(|s| **s).count();
+            let peers = current.len().saturating_sub(1).max(1) as f64;
             for (k, to) in current.iter().enumerate() {
                 let (prev, dwell) = match &prev_pos {
                     Some(p) if p.regions.get(k) == Some(to) => (p.prev[k].clone(), p.dwell[k] + 1),
@@ -634,7 +657,15 @@ impl TimescalePipeline {
                 let w = view.router_weights.get(k).copied().map_or(0.0, f64::from);
                 pos.prev.push(prev);
                 pos.dwell.push(dwell);
-                pos.x.push([f64::from(dwell).ln(), vol_ratio, novelty.get(k).copied().unwrap_or(0.0).min(10.0), w]);
+                let peer_switch = (n_switched - usize::from(switched[k])) as f64 / peers;
+                pos.x.push([
+                    f64::from(dwell).ln(),
+                    vol_ratio,
+                    novelty.get(k).copied().unwrap_or(0.0).min(10.0),
+                    w,
+                    peer_switch,
+                    coarse.get(k).copied().unwrap_or(0.0),
+                ]);
             }
             if let Some(prev) = prev_pos {
                 for (k, (from, to)) in prev.regions.iter().zip(&current).enumerate() {
@@ -1060,6 +1091,8 @@ mod tests {
         let a = bars(90, 11);
         let b = bars(90, 12);
         let mut requests = Vec::new();
+        // i1 sees a coarse regime age of 3 bars on every expert (spec 33 §10 q3)
+        pl.set_coarse_context("i1", vec![3f64.ln_1p(); 3]);
         for end in 2..=a.len() {
             for (inst, series) in [("i1", &a), ("i2", &b)] {
                 let out = pl
@@ -1080,6 +1113,13 @@ mod tests {
         assert_eq!(req.dump.kernel_id, crate::hub_sink::expert_space_id(pl.snapshot_id(), 0));
         assert!(req.dump.records.iter().all(|r| r.dwell >= 1 && r.x[0] >= 0.0));
         assert!(req.dump.records.iter().any(|r| r.instrument == "i2"));
+        // cross-space covariates: peer_switch is a share, coarse_ln_dwell follows the context
+        assert!(req.dump.records.iter().all(|r| (0.0..=1.0).contains(&r.x[4])));
+        assert!(req.dump.records.iter().any(|r| r.x[4] > 0.0), "other experts do switch");
+        for r in &req.dump.records {
+            let want = if r.instrument == "i1" { 3f32.ln_1p() } else { 0.0 };
+            assert!((r.x[5] - want).abs() < 1e-6, "{r:?}");
+        }
         assert!(pl.refit_window_len() >= 3 * 60);
         // the worker's computation (fast settings) and the arena hand-off
         let rcfg = fa_mcmc::refit::RefitCfg {
@@ -1200,6 +1240,17 @@ mod tests {
         let again: serde_json::Value = serde_json::from_str(&fresh.transitions[0].kernel_state().unwrap()).unwrap();
         assert_eq!(again["arena_states"]["second_order"], v["arena_states"]["second_order"]);
         assert_eq!(again["arena_states"]["semi_markov"], v["arena_states"]["semi_markov"]);
+        // the sampler competition (scores, serving choice) survives the restart (spec 33 §6.4)
+        let cal = &v["arena_calibration"];
+        assert!(cal["calibration"]["conjugate"]["evals"].as_u64().unwrap() > 0, "{cal}");
+        assert_eq!(again["arena_calibration"]["serving"], cal["serving"]);
+        assert_eq!(again["arena_calibration"]["calibration"]["smc"]["evals"], cal["calibration"]["smc"]["evals"]);
+        let (s0, s1) = (pl.transitions[0].standings(), fresh.transitions[0].standings());
+        for (a, b) in s0.iter().zip(&s1) {
+            assert_eq!(a.scores.evals, b.scores.evals);
+            assert!((a.scores.log_score - b.scores.log_score).abs() < 1e-12);
+            assert_eq!(a.serving, b.serving);
+        }
         // a state of another snapshot is refused
         let stats = StatisticalEncoder::fit(Timescale::Minute, &all, &fa_encoders::FitConfig::default()).unwrap();
         let mut other = TimescalePipeline::with_encoder(

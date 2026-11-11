@@ -171,6 +171,17 @@ pub struct NeuralConfig {
     /// hinge, but exact correlations instead of minibatch estimates). 0 = off.
     #[serde(default)]
     pub head_refit_steps: usize,
+    /// Head refit solver: `""` / `adam` (the penalised full-batch refit above) or `constrained`
+    /// ([`super::heads`]: gated least squares with the pairwise residual covariance as an
+    /// equality constraint, solved exactly per expert; runs even with `head_refit_steps` 0).
+    #[serde(default)]
+    pub head_solver: String,
+    /// `constrained` solver: target |residual correlation| per expert pair (0 = exact).
+    #[serde(default)]
+    pub head_solver_corr: f64,
+    /// `constrained` solver: block-coordinate sweeps (0 = the solver default).
+    #[serde(default)]
+    pub head_solver_sweeps: usize,
     pub lr: f64,
     pub weight_decay: f64,
     pub batch: usize,
@@ -241,6 +252,9 @@ impl NeuralConfig {
             skill_floor: default_skill_floor(),
             lambda_ncl: 0.0,
             head_refit_steps: 0,
+            head_solver: String::new(),
+            head_solver_corr: 0.0,
+            head_solver_sweeps: 0,
             lr: 3e-3,
             weight_decay: 1e-4,
             batch: 64,

@@ -25,6 +25,14 @@
 //! `a`'s view adds to `b`'s **expert** next-step model, not to a bare AR(1). Pairs without
 //! residuals fall back to returns (`basis = "return"`).
 //!
+//! **Evolution evidence** (spec 33 §6.5 "fitness results flow back as evidence"): every evaluated
+//! `src → target` decoder (spec 34 `nn_forecast` with a `src` gene) is a Bernoulli trial of the
+//! pair — a win when its CRPS skill over the naive forecast is positive. With a Beta(1, 1) prior
+//! the pair's evidence weight is `2·(1 + wins)/(2 + wins + losses)` (1 without evidence, → 2 for
+//! a pair that keeps winning, → 0 for one that keeps losing), and
+//! [`CrossAssetPriors::proposals_with_evidence`] ranks by `score = |t| · weight` (`raw_score`
+//! keeps `|t|`), so evolution's results raise or lower the pair's prior.
+//!
 //! The tracker is `serde` (model-runtime persists it to Garage and restores it on start).
 
 use std::collections::{BTreeMap, VecDeque};
@@ -73,6 +81,41 @@ pub struct CrossPrior {
     /// `residual` (lead-lag and gain on expert residuals) or `return`.
     #[serde(default)]
     pub basis: String,
+    /// `gain / uncertainty` before the evolution evidence (= `score` without evidence).
+    #[serde(default)]
+    pub raw_score: f64,
+    /// Evolution evidence of the pair (wins, losses of evaluated src→target decoders).
+    #[serde(default)]
+    pub evidence: PairEvidence,
+}
+
+/// Evolution evidence of one directed pair (spec 33 §6.5 feedback).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct PairEvidence {
+    /// Evaluated src→target decoders with positive CRPS skill.
+    pub wins: f64,
+    /// … with non-positive skill.
+    pub losses: f64,
+}
+
+impl PairEvidence {
+    /// Folds one evaluated decoder's skill in.
+    pub fn record(&mut self, skill: f64) {
+        if !skill.is_finite() {
+            return;
+        }
+        if skill > 0.0 {
+            self.wins += 1.0;
+        } else {
+            self.losses += 1.0;
+        }
+    }
+
+    /// `2·(1 + wins)/(2 + wins + losses)`: Beta(1, 1) posterior mean of a win, scaled so no
+    /// evidence is neutral (1).
+    pub fn weight(&self) -> f64 {
+        2.0 * (1.0 + self.wins) / (2.0 + self.wins + self.losses)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -301,6 +344,8 @@ impl CrossAssetPriors {
             score,
             residual_correlation,
             basis: basis.into(),
+            raw_score: score,
+            evidence: PairEvidence::default(),
         })
     }
 
@@ -320,7 +365,25 @@ impl CrossAssetPriors {
 
     /// Top-N proposals: positive predictive gain, ranked by `gain / uncertainty`.
     pub fn proposals(&self) -> Vec<CrossPrior> {
-        let mut v: Vec<CrossPrior> = self.all_pairs().into_iter().filter(|p| p.predictive_gain > 0.0).collect();
+        self.proposals_with_evidence(&BTreeMap::new())
+    }
+
+    /// Top-N proposals with the evolution evidence of `(source, target)` pairs folded in:
+    /// `score = raw_score · evidence.weight()`, ranked by it (spec 33 §6.5 feedback).
+    pub fn proposals_with_evidence(&self, evidence: &BTreeMap<(String, String), PairEvidence>) -> Vec<CrossPrior> {
+        let mut v: Vec<CrossPrior> = self
+            .all_pairs()
+            .into_iter()
+            .filter(|p| p.predictive_gain > 0.0)
+            .map(|mut p| {
+                if let Some(e) = evidence.get(&(p.source.clone(), p.target.clone())) {
+                    p.evidence = *e;
+                    p.score = p.raw_score * e.weight();
+                }
+                p
+            })
+            .collect();
+        v.sort_by(|p, q| q.score.total_cmp(&p.score).then_with(|| (&p.source, &p.target).cmp(&(&q.source, &q.target))));
         v.truncate(self.cfg.top_n);
         v
     }
@@ -383,6 +446,45 @@ mod tests {
         // serde round trip (persistence)
         let back: CrossAssetPriors = serde_json::from_str(&serde_json::to_string(&cp).unwrap()).unwrap();
         assert_eq!(back.pair("a", "b").unwrap().lead_lag, 1);
+    }
+
+    /// Spec 33 §6.5: evolution results re-rank the proposals. Two equally good leaders; the one
+    /// whose src→target decoders keep losing drops below the one that keeps winning.
+    #[test]
+    fn evolution_evidence_reranks_pairs() {
+        let mut rng = Rng::seed(3);
+        let mut cp = CrossAssetPriors::new(CrossAssetCfg::default());
+        let mut la = vec![0.0; 2];
+        let mut lb = vec![0.0; 2];
+        for t in 0..400i64 {
+            let (a, b) = (0.01 * rng.normal(), 0.01 * rng.normal());
+            la.push(a);
+            lb.push(b);
+            cp.push("a", t, a);
+            cp.push("b", t, b);
+            cp.push("ta", t, 0.8 * la[la.len() - 2] + 0.004 * rng.normal());
+            cp.push("tb", t, 0.8 * lb[lb.len() - 2] + 0.004 * rng.normal());
+        }
+        let base = cp.proposals();
+        let rank = |v: &[CrossPrior], s: &str, t: &str| v.iter().position(|p| p.source == s && p.target == t).unwrap();
+        let (ra, rb) = (rank(&base, "a", "ta"), rank(&base, "b", "tb"));
+        let (winner, loser) = if ra < rb { (("b", "tb"), ("a", "ta")) } else { (("a", "ta"), ("b", "tb")) };
+        let mut ev = BTreeMap::new();
+        let mut w = PairEvidence::default();
+        let mut l = PairEvidence::default();
+        for _ in 0..6 {
+            w.record(0.05);
+            l.record(-0.02);
+        }
+        assert!((PairEvidence::default().weight() - 1.0).abs() < 1e-12);
+        assert!(w.weight() > 1.7 && l.weight() < 0.3);
+        ev.insert((winner.0.to_owned(), winner.1.to_owned()), w);
+        ev.insert((loser.0.to_owned(), loser.1.to_owned()), l);
+        let re = cp.proposals_with_evidence(&ev);
+        assert!(rank(&re, winner.0, winner.1) < rank(&re, loser.0, loser.1), "{re:?}");
+        let top = &re[rank(&re, winner.0, winner.1)];
+        assert!((top.score - top.raw_score * w.weight()).abs() < 1e-9);
+        assert_eq!(top.evidence.wins, 6.0);
     }
 
     #[test]

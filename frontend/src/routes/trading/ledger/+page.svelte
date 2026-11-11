@@ -6,6 +6,7 @@
 	import ViewHeader from '../../../lib/ViewHeader.svelte';
 	import { eur, num, poll, short } from '../../../lib/api';
 	import { consoleApi, errText, type PnlBreakdown, type PnlParts } from '../../../lib/console';
+	import { canBook, orphanConfirmText, orphanResolveBody, orphanRow, payoutBody, payoutConfirmText } from '../../../lib/ledgerForms';
 	import { loadPref, savePref } from '../../../lib/prefs';
 	import { runtime } from '../../../lib/runtime.svelte';
 
@@ -32,6 +33,43 @@
 	const opening = $derived((statement?.opening ?? null) as Record<string, unknown> | null);
 	const fxFills = $derived(fills.filter((f) => f.ccy !== 'EUR').length);
 	const feeSum = $derived(fills.reduce((s, f) => s + (typeof f.fee_eur === 'number' ? f.fee_eur : 0), 0));
+
+	// operator forms: orphan resolution and payout booking (confirm first, show the API's answer)
+	const orphanRows = $derived(orphans.map(orphanRow));
+	let dismissReason = $state<Record<string, string>>({});
+	let actionMsg = $state('');
+	let actionOk = $state(true);
+	let busy = $state(false);
+	let payoutDay = $state(new Date().toISOString().slice(0, 10));
+	let payoutAmount = $state('');
+
+	async function act(question: string, call: () => Promise<unknown>, done: string) {
+		if (!confirm(question)) return;
+		busy = true;
+		try {
+			const r = await call();
+			actionMsg = `${done}: ${JSON.stringify(r)}`;
+			actionOk = true;
+			await refresh();
+		} catch (e) {
+			actionMsg = `${done} failed: ${errText(e)}`;
+			actionOk = false;
+		} finally {
+			busy = false;
+		}
+	}
+
+	function resolve(o: ReturnType<typeof orphanRow>, action: 'book' | 'dismiss') {
+		const b = orphanResolveBody(action, dismissReason[o.id] ?? '');
+		if ('error' in b) return ((actionMsg = b.error), (actionOk = false));
+		void act(orphanConfirmText(o, b.body), () => consoleApi.resolveOrphan(o.id, b.body), `orphan ${action}`);
+	}
+
+	function bookPayout() {
+		const p = payoutBody(book, payoutDay, payoutAmount);
+		if ('error' in p) return ((actionMsg = p.error), (actionOk = false));
+		void act(payoutConfirmText(p.body), () => consoleApi.bookPayout(p.body), 'payout');
+	}
 
 	async function refresh() {
 		const f = from || undefined;
@@ -173,23 +211,54 @@
 	<section class="panel">
 		<div class="panel-head"><h2>Orphan fills <span class="dim">({orphans.length} open)</span></h2></div>
 		{#if orphansError}<p class="badge danger">{orphansError}</p>{/if}
-		{#if orphans.length}
+		{#if actionMsg}<p class="badge" class:ok={actionOk} class:danger={!actionOk}>{actionMsg}</p>{/if}
+		{#if orphanRows.length}
 			<table>
-				<thead><tr><th>fill</th><th>instrument</th><th>qty</th><th>seen</th></tr></thead>
+				<thead><tr><th>fill</th><th>order</th><th>instrument</th><th>qty @ price</th><th>book</th><th>resolve</th></tr></thead>
 				<tbody>
-					{#each orphans as o, i (i)}
-						<tr><td class="mono">{short(String(o.fill_id ?? o.id ?? ''), 16)}</td><td class="mono">{short(String(o.instrument_id ?? ''), 12)}</td><td class="mono">{String(o.qty ?? o.quantity ?? '—')}</td><td class="mono dim">{String(o.seen_at ?? o.created_at ?? '')}</td></tr>
+					{#each orphanRows as o (o.id)}
+						<tr>
+							<td class="mono">{short(o.venue_fill_id || o.id, 16)}</td>
+							<td class="mono dim">{short(o.client_order_id, 14)}</td>
+							<td class="mono">{o.instrument ? short(o.instrument, 12) : `${o.venue_symbol ?? '?'} (${o.instrument_status})`}</td>
+							<td class="mono">{o.qty} @ {o.price} {o.ccy ?? ''}</td>
+							<td class="mono dim">{o.book ?? 'paper'}</td>
+							<td class="actions">
+								<button disabled={busy || !canBook(o)} title={canBook(o) ? 'book it as a normal fill' : 'instrument not resolved yet'} onclick={() => resolve(o, 'book')}>book</button>
+								<input placeholder="dismiss reason" bind:value={dismissReason[o.id]} />
+								<button class="danger" disabled={busy} onclick={() => resolve(o, 'dismiss')}>dismiss</button>
+							</td>
+						</tr>
 					{/each}
 				</tbody>
 			</table>
-			<p class="dim small">Resolve via <code>POST /api/trading/orphans/&#123;id&#125;/resolve</code> (spec 42 §8).</p>
+			<p class="dim small"><code>POST /api/trading/orphans/&#123;id&#125;/resolve</code> (spec 42 §8); every action asks first and is audited.</p>
 		{:else if !orphansError}
 			<p class="dim">No orphan fills.</p>
 		{/if}
 	</section>
+
+	<section class="panel">
+		<div class="panel-head"><h2>Book a payout <span class="dim">(book {book})</span></h2></div>
+		<div class="toolbar">
+			<label>day <input type="date" bind:value={payoutDay} /></label>
+			<label>amount EUR <input inputmode="decimal" placeholder="0.00" bind:value={payoutAmount} /></label>
+			<button disabled={busy || !payoutAmount} onclick={bookPayout}>book payout…</button>
+		</div>
+		<p class="dim small"><code>POST /api/trading/payouts</code> (spec 42 §6): a cash movement out of the book, after a confirmation; the risk-engine's daily quota (<code>[payout]</code>) is advisory, booking stays an operator action.</p>
+	</section>
 </div>
 
 <style>
+	.actions {
+		display: flex;
+		gap: 6px;
+		align-items: center;
+		flex-wrap: wrap;
+	}
+	.actions input {
+		width: 140px;
+	}
 	.toolbar {
 		display: flex;
 		gap: 12px;

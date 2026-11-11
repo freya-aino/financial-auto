@@ -206,6 +206,141 @@ func (x *FilingEvent) GetDocumentRefs() []string {
 	return nil
 }
 
+// One reported XBRL fact (`wh.fundamental`, spec 20 §5.1): a company's value of
+// one concept for one period as published in one filing. The envelope's
+// publish_time is the filing date (the vintage); event_time is the period end.
+type FundamentalFact struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	IssuerCik     string                 `protobuf:"bytes,1,opt,name=issuer_cik,json=issuerCik,proto3" json:"issuer_cik,omitempty"`       // 10 digits, zero padded
+	Field         string                 `protobuf:"bytes,2,opt,name=field,proto3" json:"field,omitempty"`                                // "<taxonomy>:<concept>", e.g. "us-gaap:Revenues"
+	Unit          string                 `protobuf:"bytes,3,opt,name=unit,proto3" json:"unit,omitempty"`                                  // XBRL unit, e.g. "USD", "USD/shares", "shares"
+	Period        string                 `protobuf:"bytes,4,opt,name=period,proto3" json:"period,omitempty"`                              // "FY2025", "2025Q3", or "<start>..<end>" / "<end>" when the filing has no fy/fp
+	PeriodStart   *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=period_start,json=periodStart,proto3" json:"period_start,omitempty"` // unset for instant facts
+	PeriodEnd     *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=period_end,json=periodEnd,proto3" json:"period_end,omitempty"`
+	Value         float64                `protobuf:"fixed64,7,opt,name=value,proto3" json:"value,omitempty"`
+	Vintage       *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=vintage,proto3" json:"vintage,omitempty"` // filing date: when the value became public
+	Form          string                 `protobuf:"bytes,9,opt,name=form,proto3" json:"form,omitempty"`       // 10-K, 10-Q, 8-K, ...
+	Accession     string                 `protobuf:"bytes,10,opt,name=accession,proto3" json:"accession,omitempty"`
+	FiscalYear    string                 `protobuf:"bytes,11,opt,name=fiscal_year,json=fiscalYear,proto3" json:"fiscal_year,omitempty"`       // fy as reported (the filing's fiscal year)
+	FiscalPeriod  string                 `protobuf:"bytes,12,opt,name=fiscal_period,json=fiscalPeriod,proto3" json:"fiscal_period,omitempty"` // fp as reported (FY, Q1..Q4)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FundamentalFact) Reset() {
+	*x = FundamentalFact{}
+	mi := &file_fa_v1_text_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FundamentalFact) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FundamentalFact) ProtoMessage() {}
+
+func (x *FundamentalFact) ProtoReflect() protoreflect.Message {
+	mi := &file_fa_v1_text_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FundamentalFact.ProtoReflect.Descriptor instead.
+func (*FundamentalFact) Descriptor() ([]byte, []int) {
+	return file_fa_v1_text_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *FundamentalFact) GetIssuerCik() string {
+	if x != nil {
+		return x.IssuerCik
+	}
+	return ""
+}
+
+func (x *FundamentalFact) GetField() string {
+	if x != nil {
+		return x.Field
+	}
+	return ""
+}
+
+func (x *FundamentalFact) GetUnit() string {
+	if x != nil {
+		return x.Unit
+	}
+	return ""
+}
+
+func (x *FundamentalFact) GetPeriod() string {
+	if x != nil {
+		return x.Period
+	}
+	return ""
+}
+
+func (x *FundamentalFact) GetPeriodStart() *timestamppb.Timestamp {
+	if x != nil {
+		return x.PeriodStart
+	}
+	return nil
+}
+
+func (x *FundamentalFact) GetPeriodEnd() *timestamppb.Timestamp {
+	if x != nil {
+		return x.PeriodEnd
+	}
+	return nil
+}
+
+func (x *FundamentalFact) GetValue() float64 {
+	if x != nil {
+		return x.Value
+	}
+	return 0
+}
+
+func (x *FundamentalFact) GetVintage() *timestamppb.Timestamp {
+	if x != nil {
+		return x.Vintage
+	}
+	return nil
+}
+
+func (x *FundamentalFact) GetForm() string {
+	if x != nil {
+		return x.Form
+	}
+	return ""
+}
+
+func (x *FundamentalFact) GetAccession() string {
+	if x != nil {
+		return x.Accession
+	}
+	return ""
+}
+
+func (x *FundamentalFact) GetFiscalYear() string {
+	if x != nil {
+		return x.FiscalYear
+	}
+	return ""
+}
+
+func (x *FundamentalFact) GetFiscalPeriod() string {
+	if x != nil {
+		return x.FiscalPeriod
+	}
+	return ""
+}
+
 var File_fa_v1_text_proto protoreflect.FileDescriptor
 
 const file_fa_v1_text_proto_rawDesc = "" +
@@ -229,7 +364,24 @@ const file_fa_v1_text_proto_rawDesc = "" +
 	"\vfiling_time\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"filingTime\x12\x1c\n" +
 	"\taccession\x18\x05 \x01(\tR\taccession\x12#\n" +
-	"\rdocument_refs\x18\x06 \x03(\tR\fdocumentRefsB\x83\x01\n" +
+	"\rdocument_refs\x18\x06 \x03(\tR\fdocumentRefs\"\xb0\x03\n" +
+	"\x0fFundamentalFact\x12\x1d\n" +
+	"\n" +
+	"issuer_cik\x18\x01 \x01(\tR\tissuerCik\x12\x14\n" +
+	"\x05field\x18\x02 \x01(\tR\x05field\x12\x12\n" +
+	"\x04unit\x18\x03 \x01(\tR\x04unit\x12\x16\n" +
+	"\x06period\x18\x04 \x01(\tR\x06period\x12=\n" +
+	"\fperiod_start\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\vperiodStart\x129\n" +
+	"\n" +
+	"period_end\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tperiodEnd\x12\x14\n" +
+	"\x05value\x18\a \x01(\x01R\x05value\x124\n" +
+	"\avintage\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\avintage\x12\x12\n" +
+	"\x04form\x18\t \x01(\tR\x04form\x12\x1c\n" +
+	"\taccession\x18\n" +
+	" \x01(\tR\taccession\x12\x1f\n" +
+	"\vfiscal_year\x18\v \x01(\tR\n" +
+	"fiscalYear\x12#\n" +
+	"\rfiscal_period\x18\f \x01(\tR\ffiscalPeriodB\x83\x01\n" +
 	"\tcom.fa.v1B\tTextProtoP\x01Z6github.com/fey/financial-auto/go/pkg/bus/pb/fa/v1;fav1\xa2\x02\x03FXX\xaa\x02\x05Fa.V1\xca\x02\x05Fa\\V1\xe2\x02\x11Fa\\V1\\GPBMetadata\xea\x02\x06Fa::V1b\x06proto3"
 
 var (
@@ -244,19 +396,23 @@ func file_fa_v1_text_proto_rawDescGZIP() []byte {
 	return file_fa_v1_text_proto_rawDescData
 }
 
-var file_fa_v1_text_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_fa_v1_text_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_fa_v1_text_proto_goTypes = []any{
 	(*NewsItem)(nil),              // 0: fa.v1.NewsItem
 	(*FilingEvent)(nil),           // 1: fa.v1.FilingEvent
-	(*timestamppb.Timestamp)(nil), // 2: google.protobuf.Timestamp
+	(*FundamentalFact)(nil),       // 2: fa.v1.FundamentalFact
+	(*timestamppb.Timestamp)(nil), // 3: google.protobuf.Timestamp
 }
 var file_fa_v1_text_proto_depIdxs = []int32{
-	2, // 0: fa.v1.FilingEvent.filing_time:type_name -> google.protobuf.Timestamp
-	1, // [1:1] is the sub-list for method output_type
-	1, // [1:1] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	3, // 0: fa.v1.FilingEvent.filing_time:type_name -> google.protobuf.Timestamp
+	3, // 1: fa.v1.FundamentalFact.period_start:type_name -> google.protobuf.Timestamp
+	3, // 2: fa.v1.FundamentalFact.period_end:type_name -> google.protobuf.Timestamp
+	3, // 3: fa.v1.FundamentalFact.vintage:type_name -> google.protobuf.Timestamp
+	4, // [4:4] is the sub-list for method output_type
+	4, // [4:4] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_fa_v1_text_proto_init() }
@@ -270,7 +426,7 @@ func file_fa_v1_text_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_fa_v1_text_proto_rawDesc), len(file_fa_v1_text_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

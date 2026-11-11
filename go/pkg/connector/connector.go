@@ -59,6 +59,8 @@ const (
 	KindMacro   EventKind = "macro"
 	KindOnchain EventKind = "onchain"
 	KindFiling  EventKind = "filing"
+	// KindFundamental is a reported XBRL fact (FundamentalFact).
+	KindFundamental EventKind = "fundamental"
 )
 
 // Capabilities declares what a connector supports.

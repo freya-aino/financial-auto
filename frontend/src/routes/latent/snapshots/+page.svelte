@@ -11,7 +11,7 @@
 	import { live, num, pct, poll, type Snapshot } from '../../../lib/api';
 	import { since } from '../../../lib/alerts';
 	import { consoleApi, errText, type SnapshotDetail } from '../../../lib/console';
-	import { checklistRows, expertHealth, isNeuralFamily, missingNeuralChecks } from '../../../lib/models';
+	import { checklistRows, expertHealth, isNeuralFamily, liveExpertHealth, missingNeuralChecks } from '../../../lib/models';
 	import { loadPref, savePref } from '../../../lib/prefs';
 	import { runtime } from '../../../lib/runtime.svelte';
 
@@ -31,6 +31,8 @@
 	const timescales = $derived([...new Set(snapshots.map((s) => s.timescale))].sort());
 	const shown = $derived(snapshots.filter((s) => !tsFilter || s.timescale === tsFilter));
 	const health = $derived(expertHealth(detail?.manifest ?? null));
+	let liveHealthRaw = $state<import('../../../lib/api').LiveExpertHealth | null>(null);
+	const liveHealth = $derived(liveExpertHealth(liveHealthRaw));
 	const checks = $derived(checklistRows(detail));
 	const missing = $derived(missingNeuralChecks(detail));
 	const snap = $derived(detail?.snapshot ?? null);
@@ -56,6 +58,8 @@
 		try {
 			detail = await consoleApi.snapshot(selected);
 			detailError = '';
+			// spec 32 §4.3: live health on served windows (latent.expert.health via control-api)
+			liveHealthRaw = (await live.experts(selected).catch(() => null))?.health ?? null;
 		} catch (e) {
 			detailError = errText(e);
 			detail = null;
@@ -229,10 +233,42 @@
 						</table>
 						{#if health.resid_corr?.length}
 							<h3 class="sub">Residual correlation between experts</h3>
-							<Heatmap matrix={health.resid_corr} {labels} title="residual correlation" />
+							<Heatmap matrix={health.resid_corr} {labels} title="residual correlation" scale="sequential" />
 						{/if}
 					{:else}
 						<p class="dim">{isNeuralFamily(snap.encoder_family) ? 'The manifest carries no health block.' : 'Statistical snapshot: expert-space health is not part of its checklist (see Latent & Graph → experts for live routing statistics).'}</p>
+					{/if}
+				</section>
+
+				<section class="panel">
+					<div class="panel-head">
+						<h2>Live expert health</h2>
+						<span class="dim">latent.expert.health{liveHealth ? ` · ${liveHealth.source} · ${liveHealth.n_windows ?? 0} windows${liveHealth.as_of ? ` · ${since(liveHealth.as_of, now)}` : ''}` : ''}</span>
+					</div>
+					{#if liveHealth}
+						<div class="kpis">
+							<div><span class="dim">K_eff</span><b class="mono" class:neg={(liveHealth.k_eff ?? 0) < 2}>{num(liveHealth.k_eff, 2)}</b><span class="dim small">≥ 2</span></div>
+							<div><span class="dim">max |resid corr|</span><b class="mono" class:neg={(liveHealth.resid_corr_max ?? 0) > 0.1}>{num(liveHealth.resid_corr_max, 3)}</b><span class="dim small">≤ 0.1</span></div>
+							<div><span class="dim">min skill</span><b class="mono" class:neg={Math.min(...liveHealth.skill) < 0.02}>{liveHealth.skill.length ? num(Math.min(...liveHealth.skill), 3) : '—'}</b><span class="dim small">≥ 0.02</span></div>
+						</div>
+						<table>
+							<thead><tr><th>expert</th><th>usage</th><th>skill vs naive</th></tr></thead>
+							<tbody>
+								{#each liveHealth.skill as sk, i}
+									<tr>
+										<td class="mono">{liveHealth.labels[i]}</td>
+										<td><div class="bar"><div style="width: {100 * (liveHealth.usage[i] ?? 0)}%"></div></div> <span class="mono">{pct(liveHealth.usage[i] ?? null, 1)}</span></td>
+										<td class="mono" class:neg={sk < 0.02} class:pos={sk >= 0.02}>{num(sk, 3)}</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+						{#if liveHealth.resid_corr?.length}
+							<h3 class="sub">Live residual correlation</h3>
+							<Heatmap matrix={liveHealth.resid_corr} labels={liveHealth.labels} title="live residual correlation" scale="sequential" />
+						{/if}
+					{:else}
+						<p class="dim">No latent.expert.health for this snapshot yet (model-runtime publishes it for learned snapshots it serves, active or shadow, on closed bars).</p>
 					{/if}
 				</section>
 

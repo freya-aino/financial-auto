@@ -189,6 +189,9 @@ fn envelope_json(e: Envelope) -> Value {
         }
         Some(Payload::Onchain(o)) => json!({"kind": "onchain", "chain": o.chain, "event": o.kind}),
         Some(Payload::Filing(f)) => json!({"kind": "filing", "form_type": f.form_type}),
+        Some(Payload::Fundamental(f)) => {
+            json!({"kind": "fundamental", "field": f.field, "period": f.period, "value": f.value})
+        }
         None => Value::Null,
     };
     json!({

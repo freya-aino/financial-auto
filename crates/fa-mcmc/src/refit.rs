@@ -30,8 +30,17 @@ use crate::{
     nuts::{self, Chain, Diagnostics, LogDensity, NutsCfg},
 };
 
-/// Covariates of the logistic-normal kernel, in [`crate::rich::KernelCtx::x`] order.
-pub const COVARIATES: [&str; 4] = ["ln_dwell", "vol_ratio", "novelty", "router_weight"];
+/// Covariates of the logistic-normal kernel, in [`crate::rich::KernelCtx::x`] order (spec 33
+/// §6.2; §10 q3 decided): the chain's own `ln_dwell`, `vol_ratio` (ln |r| / EWMA), `novelty`
+/// and `router_weight`, plus two cross-space covariates — `peer_switch`, the share of the
+/// instrument's **other experts** whose region changed at this close, and `coarse_ln_dwell`,
+/// ln(1 + closed bars) the instrument has spent in its current region of the same expert on the
+/// **next coarser timescale** (0 when there is none). Categorical region ids of other spaces are
+/// not used directly: their supports differ per snapshot and would make the row design grow
+/// with every region; these two scalars carry the "is the rest of the system moving / is the
+/// coarse regime old" signal at a fixed width.
+pub const COVARIATES: [&str; 6] =
+    ["ln_dwell", "vol_ratio", "novelty", "router_weight", "peer_switch", "coarse_ln_dwell"];
 pub const COV_DIM: usize = COVARIATES.len();
 /// Pooled successor bucket of a fitted row (spread over the remaining successors at prediction).
 pub const OTHER: &str = "~other";
@@ -48,7 +57,19 @@ pub struct ObsRecord {
     pub from: RegionKey,
     pub to: RegionKey,
     pub dwell: u32,
+    /// Covariates; a record written with fewer (older windows) is padded with zeros.
+    #[serde(deserialize_with = "de_cov")]
     pub x: [f32; COV_DIM],
+}
+
+fn de_cov<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[f32; COV_DIM], D::Error> {
+    let v: Vec<f32> = Vec::deserialize(d)?;
+    if v.len() > COV_DIM {
+        return Err(serde::de::Error::custom(format!("{} covariates > {COV_DIM}", v.len())));
+    }
+    let mut out = [0.0; COV_DIM];
+    out[..v.len()].copy_from_slice(&v);
+    Ok(out)
 }
 
 /// What the worker reads from Garage.
@@ -712,6 +733,17 @@ pub fn row_counts(records: &[ObsRecord]) -> HashMap<&str, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn obs_records_with_fewer_covariates_are_padded() {
+        let old = r#"{"t_ms":1,"instrument":"i","from":"a","to":"b","dwell":2,"x":[1.0,2.0,3.0,4.0]}"#;
+        let r: ObsRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(r.x, [1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
+        let too_many = r#"{"t_ms":1,"instrument":"i","from":"a","to":"b","dwell":2,"x":[1,2,3,4,5,6,7]}"#;
+        assert!(serde_json::from_str::<ObsRecord>(too_many).is_err());
+        let back: ObsRecord = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+    }
     use crate::{
         kernel::KernelSampler,
         rich::{HierAsset, KernelCtx, LogitCov},
@@ -727,7 +759,7 @@ mod tests {
             let vol = rng.normal();
             let p_b = 1.0 / (1.0 + (-3.0 * vol).exp());
             let to = if rng.uniform() < p_b { "b" } else { "c" };
-            let x = [1.0, vol as f32, 0.5, 0.3];
+            let x = [1.0, vol as f32, 0.5, 0.3, 0.0, 0.0];
             g.observe("a", to);
             recs.push(ObsRecord {
                 t_ms: t as i64,
@@ -751,7 +783,7 @@ mod tests {
                 from: "d".into(),
                 to: to.into(),
                 dwell: 1,
-                x: [0.0; 4],
+                x: [0.0; COV_DIM],
             });
         }
         (g, recs)
@@ -817,8 +849,8 @@ mod tests {
         let mut o2 = back;
         o2.samples_ref = samples_key("s-e0", 1);
         assert!(lc.apply_refit(&o2));
-        let hi = KernelCtx { x: [1.0, 2.0, 0.5, 0.3], ..KernelCtx::default() };
-        let lo = KernelCtx { x: [1.0, -2.0, 0.5, 0.3], ..KernelCtx::default() };
+        let hi = KernelCtx { x: [1.0, 2.0, 0.5, 0.3, 0.0, 0.0], ..KernelCtx::default() };
+        let lo = KernelCtx { x: [1.0, -2.0, 0.5, 0.3, 0.0, 0.0], ..KernelCtx::default() };
         let pb = |v: Vec<(RegionKey, f64)>| v.iter().find(|x| x.0 == "b").map_or(0.0, |x| x.1);
         assert!(pb(lc.predict_ctx("a", &hi)) > 0.9 && pb(lc.predict_ctx("a", &lo)) < 0.1);
         assert!((lc.predict_ctx("a", &hi).iter().map(|x| x.1).sum::<f64>() - 1.0).abs() < 1e-9);
@@ -883,7 +915,7 @@ mod bench {
                 from,
                 to,
                 dwell: 1 + rng.below(5) as u32,
-                x: [rng.normal() as f32, rng.normal() as f32, rng.uniform() as f32, 0.3],
+                x: [rng.normal() as f32, rng.normal() as f32, rng.uniform() as f32, 0.3, rng.uniform() as f32, 0.5],
             });
         }
         let dump = ObsDump { kernel_id: "bench".into(), created_ms: 0, graph: g.clone(), records: recs };
@@ -907,7 +939,7 @@ mod bench {
         );
         let mut lc = LogitCov::new(g, 32);
         lc.apply_refit(&o);
-        let ctx = KernelCtx { x: [0.1, 0.2, 0.3, 0.3], ..KernelCtx::default() };
+        let ctx = KernelCtx { x: [0.1, 0.2, 0.3, 0.3, 0.0, 0.5], ..KernelCtx::default() };
         let t1 = Instant::now();
         for i in 0..20_000 {
             let from = format!("r{}", i % 24);

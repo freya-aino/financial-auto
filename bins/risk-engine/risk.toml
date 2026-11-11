@@ -149,6 +149,30 @@ sliced_min_horizon_secs = 600
 max_slice_dur_secs = 3600
 slice_secs = 30
 
+# Cost-aware rebalancing (spec 40 §6.1 step 6, fa_risk::rebalance). The no-trade band above sat
+# far below the paper venue's 1 EUR fee minimum: 2026-11-10 19:00 – 11-11 02:00 the 1 s baselines
+# paid ~7 000 EUR of fees on ~7 000 rebalances of ~300 EUR (30–50 bp each). A non-urgent order is
+# now sent only when its expected benefit — edge × |Δ| with the trade, risk_aversion × σ_hold ×
+# |Δ| for reductions — is ≥ min_benefit_cost_ratio × its full expected cost (commission incl. the
+# minimum, half spread, sqrt impact; costs.yaml via FA_COSTS, impact k from exec.costs.calibrated),
+# it is ≥ the min order notional commission_min × 1e4 / max_fee_bps (1 000 EUR at a 1 EUR
+# minimum), and it stayed worthwhile for confirm_secs (swings between strategies net out first).
+# Halts, flattens and limit-bound reductions bypass the cost test. Each strategy may cause at most
+# turnover_budget_per_day × its sleeve of traded notional per UTC day; over budget its last
+# distribution is netted (frozen) until the day rolls. enabled = false restores the plain band.
+[rebalance]
+enabled = true
+min_benefit_cost_ratio = 1.0  # benefit must cover the full expected cost
+prior_edge_bps = 20.0         # edge per holding period of a strategy without track record …
+prior_obs = 600.0             # … shrunk with the tracker's observations (ticks) against this weight
+max_edge_bps = 200.0
+holding_horizons = 1.0        # holding period = this × the contributors' horizon …
+min_holding_secs = 60.0       # … at least this (orphans: a day)
+risk_aversion = 1.0           # benefit per EUR of shedding one σ_hold of unwanted risk
+max_fee_bps = 10.0            # min order notional: the fee minimum costs at most this
+turnover_budget_per_day = 20.0 # × sleeve per strategy per UTC day
+confirm_secs = 3.0
+
 # Model-drift alarm (spec 40 §6.5): kernel updates on latent.mcmc.* whose occupancy drift_kl stays
 # ≥ halt_kl for `sustain` updates raise `model:<snapshot>` — only the strategies of that snapshot's
 # timescale pause; ≤ clear_kl for `clear_sustain` updates of every expert clears it (only halts

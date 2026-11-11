@@ -65,6 +65,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/trading/orphans", get(orphans))
         .route("/api/trading/orphans/{id}/resolve", post(resolve_orphan))
         .route("/api/trading/payouts", post(payout))
+        .route("/api/trading/restatements/fx", post(restate_fx))
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -403,6 +404,60 @@ async fn payout(State(s): State<AppState>, Json(b): Json<PayoutBody>) -> Respons
         Err(fa_ledger::pg::PgError::Invalid(m)) => err(StatusCode::BAD_REQUEST, m),
         Err(e) => db_err(e),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RestateBody {
+    #[serde(flatten)]
+    req: fa_ledger::restate::FxRestatementRequest,
+    /// Write the restatement (default false: dry run).
+    #[serde(default)]
+    apply: bool,
+    /// Required with `apply` (428 otherwise).
+    #[serde(default)]
+    confirm: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    /// Per-fill lines returned (default 20; the totals always cover every fill).
+    #[serde(default)]
+    fills: Option<usize>,
+}
+
+/// `POST /api/trading/restatements/fx` (spec 42 §6): dry run by default — the plan with the
+/// before/after book figures; `{"apply": true, "confirm": true, "reason": …}` writes it
+/// (audited `ledger.restatement`), after which the risk-engine must be restarted.
+async fn restate_fx(State(s): State<AppState>, Json(b): Json<RestateBody>) -> Response {
+    let pool = pool_or_return!(s);
+    if b.apply && !b.confirm {
+        return err(StatusCode::PRECONDITION_REQUIRED, "apply rewrites booked fills: send {\"confirm\": true} too");
+    }
+    let l = PgLedger::from_pool(pool).with_stored_settlement().await;
+    let mut plan = match l.plan_fx_restatement(&b.req).await {
+        Ok(p) => p,
+        Err(fa_ledger::pg::PgError::Invalid(m)) => return err(StatusCode::BAD_REQUEST, m),
+        Err(e) => return db_err(e),
+    };
+    let applied = if b.apply {
+        let Some(reason) = b.reason.as_deref().filter(|r| !r.trim().is_empty()) else {
+            return err(StatusCode::BAD_REQUEST, "apply needs a reason");
+        };
+        match l.apply_fx_restatement(&plan, ACTOR, reason).await {
+            Ok(a) => Some(a),
+            Err(fa_ledger::pg::PgError::Invalid(m)) => return err(StatusCode::CONFLICT, m),
+            Err(e) => return db_err(e),
+        }
+    } else {
+        None
+    };
+    if let Some(a) = &applied
+        && let Some(n) = plan.notes.first_mut()
+    {
+        *n = format!("applied as batch {}: restart the risk-engine now", a.batch_id);
+    }
+    let total = plan.fills.len();
+    plan.fills.truncate(b.fills.unwrap_or(20));
+    Json(json!({ "dry_run": applied.is_none(), "fills_total": total, "plan": plan, "applied": applied }))
+        .into_response()
 }
 
 #[cfg(test)]

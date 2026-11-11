@@ -199,6 +199,10 @@ export interface DecoderSlot {
 	shadow: SlotRole | null;
 	disabled: boolean;
 	pinned: string | null;
+	/** Wall time the current shadow took the slot, its age and the promotion minimum (model-runtime). */
+	shadow_since_ms?: number | null;
+	shadow_age_s?: number | null;
+	promote_min_s?: number;
 }
 
 export interface DecoderServing {
@@ -399,5 +403,10 @@ export const consoleApi = {
 	pnlBreakdown: (book = 'paper', from?: string, to?: string) => getApi<PnlBreakdown>(`/api/trading/pnl/breakdown${q({ book, from, to })}`),
 	statement: (book = 'paper', from?: string, to?: string) => getApi<Record<string, unknown>>(`/api/trading/statement${q({ book, from, to, format: 'json' })}`),
 	statementCsvUrl: (book = 'paper', from?: string, to?: string) => `/api/trading/statement${q({ book, from, to, format: 'csv' })}`,
-	orphans: (status = 'open') => getApi<{ count: number; orphans: Record<string, unknown>[] }>(`/api/trading/orphans${q({ status })}`)
+	orphans: (status = 'open') => getApi<{ count: number; orphans: Record<string, unknown>[] }>(`/api/trading/orphans${q({ status })}`),
+	/** Operator action on an orphan fill (`{action: book}` | `{action: dismiss, reason}`); confirm first. */
+	resolveOrphan: (id: string, body: import('./ledgerForms').OrphanResolve) =>
+		postJson<{ ok: boolean; orphan: Record<string, unknown> }>(`/api/trading/orphans/${enc(id)}/resolve`, body),
+	/** Books a payout (cash out of the book); confirm first. */
+	bookPayout: (body: import('./ledgerForms').PayoutBody) => postJson<Record<string, unknown>>('/api/trading/payouts', body)
 };

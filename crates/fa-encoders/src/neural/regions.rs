@@ -111,15 +111,16 @@ impl RegionDiscovery for DensityModes {
     }
 }
 
-/// The region discovery a family declares (spec 31 §3, spec 30): density modes for the
-/// continuous-prior families, the leader clustering otherwise (codebook / mapper discovery are
-/// not implemented; their families fall back to the leader baseline).
+/// The region discovery a family declares (spec 31 §3, spec 30 §6.2), read from its
+/// `FamilyDescriptor::region_discovery`: `density` → [`DensityModes`] (mean shift with the region
+/// radius as bandwidth, families 2 and 4); every other method (`codebook` for `fsq_hybrid`,
+/// `mapper` for `jepa_vae`) goes through [`fa_patterns::discovery_for_method`]. Callers pass
+/// next-step residuals through `RegionDiscovery::discover_with_residuals`, which the codebook
+/// uses as its merge criterion.
 pub fn discovery_for(family: super::NeuralFamily, radius: f32, max_regions: usize) -> Box<dyn RegionDiscovery> {
-    match family {
-        super::NeuralFamily::HierVaeFlow | super::NeuralFamily::LatentDiffusion => {
-            Box::new(DensityModes::new(radius, max_regions))
-        }
-        _ => Box::new(fa_patterns::LeaderClustering { radius, max_regions }),
+    match super::descriptor(family, fa_core::Timescale::Minute).region_discovery {
+        "density" => Box::new(DensityModes::new(radius, max_regions)),
+        method => fa_patterns::discovery_for_method(method, radius, max_regions),
     }
 }
 
@@ -139,9 +140,11 @@ mod tests {
         use super::super::NeuralFamily;
         assert_eq!(discovery_for(NeuralFamily::HierVaeFlow, 1.0, 8).method(), DiscoveryMethod::Density);
         assert_eq!(discovery_for(NeuralFamily::LatentDiffusion, 1.0, 8).method(), DiscoveryMethod::Density);
-        assert_eq!(discovery_for(NeuralFamily::JepaVae, 1.0, 8).method(), DiscoveryMethod::Leader);
-        let r =
-            fa_patterns::conformance::assert_conformance(&*discovery_for(NeuralFamily::FsqHybrid, 2.0, 64), 6.0, 0.3);
-        assert!(r.passes());
+        assert_eq!(discovery_for(NeuralFamily::JepaVae, 1.0, 8).method(), DiscoveryMethod::Mapper);
+        assert_eq!(discovery_for(NeuralFamily::FsqHybrid, 1.0, 8).method(), DiscoveryMethod::Codebook);
+        for f in NeuralFamily::ALL {
+            let r = fa_patterns::conformance::assert_conformance(&*discovery_for(f, 2.0, 64), 6.0, 0.3);
+            assert!(r.passes(), "{f:?}: {r:?}");
+        }
     }
 }

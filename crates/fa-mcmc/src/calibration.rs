@@ -194,6 +194,16 @@ pub struct SamplerStanding {
     pub serving: bool,
 }
 
+/// Persisted competition state of an [`Arena`] (Helix `RegionSet.kernel_state`, key
+/// `arena_calibration`): per sampler its prequential calibration, the serving sampler and the
+/// switch count, so the serving choice and its hysteresis survive a restart.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ArenaCalibrationState {
+    pub serving: String,
+    pub switches: u64,
+    pub calibration: BTreeMap<String, Calibration>,
+}
+
 /// Several samplers on one stream; one serves (spec 33 §6.4).
 pub struct Arena {
     samplers: Vec<Box<dyn KernelSampler>>,
@@ -286,6 +296,31 @@ impl Arena {
                 s.import_state(v);
             }
         }
+    }
+
+    /// Calibration scores, serving sampler and switch count (persisted next to the kernel).
+    pub fn export_calibration(&self) -> ArenaCalibrationState {
+        ArenaCalibrationState {
+            serving: self.serving().name().to_owned(),
+            switches: self.switches,
+            calibration: self.samplers.iter().zip(&self.cal).map(|(s, c)| (s.name().to_owned(), c.clone())).collect(),
+        }
+    }
+
+    /// Restores [`Arena::export_calibration`]: samplers keep their scores (decayed with the
+    /// current `decay`), the persisted serving sampler serves again when it is still in the
+    /// arena. Samplers absent from the state start fresh.
+    pub fn import_calibration(&mut self, st: &ArenaCalibrationState) {
+        for (s, c) in self.samplers.iter().zip(self.cal.iter_mut()) {
+            if let Some(saved) = st.calibration.get(s.name()) {
+                *c = saved.clone();
+                c.decay = self.cfg.decay.clamp(0.0, 1.0);
+            }
+        }
+        if let Some(i) = self.samplers.iter().position(|s| s.name() == st.serving) {
+            self.serving = i;
+        }
+        self.switches = st.switches;
     }
 
     /// Garage keys of the refits the samplers currently serve (reloaded after a restart).
@@ -417,6 +452,38 @@ mod tests {
         }
         assert!(arena.serving().graph().row_mass("a") > 0.0);
     }
+
+    /// The competition survives a restart: scores, serving choice and switch count round-trip
+    /// through JSON into a fresh arena.
+    #[test]
+    fn arena_calibration_round_trips() {
+        let mk = || -> Vec<Box<dyn KernelSampler>> {
+            vec![
+                Box::new(ConjugateExact::new(MarkovGraph::new(1.0, 0.999), 16, 1)),
+                Box::new(SmcParticle::new(MarkovGraph::new(1.0, 0.999), 16, 2)),
+            ]
+        };
+        let mut a = Arena::new(mk(), ArenaCfg { min_evals: 10, ..ArenaCfg::default() }, 3);
+        for i in 0..100 {
+            a.observe(if i % 3 == 0 { "a" } else { "b" }, if i % 2 == 0 { "a" } else { "b" });
+        }
+        // force a non-default serving sampler to prove it is restored
+        a.serving = 1;
+        a.switches = 7;
+        let st = a.export_calibration();
+        let json = serde_json::to_string(&st).unwrap();
+        let back: ArenaCalibrationState = serde_json::from_str(&json).unwrap();
+        let mut fresh = Arena::new(mk(), ArenaCfg { min_evals: 10, ..ArenaCfg::default() }, 3);
+        assert_eq!(fresh.serving().name(), "conjugate");
+        fresh.import_calibration(&back);
+        assert_eq!(fresh.serving().name(), a.serving().name());
+        assert_eq!(fresh.switches, 7);
+        for (x, y) in fresh.standings().iter().zip(a.standings()) {
+            assert_eq!(x.scores.evals, 100);
+            assert!((x.scores.log_score - y.scores.log_score).abs() < 1e-12);
+            assert!((x.scores.ece - y.scores.ece).abs() < 1e-12);
+        }
+    }
 }
 
 /// Latency benchmark of spec 33 §9.4 (online update per step per kernel ≤ 1 ms for the
@@ -460,7 +527,7 @@ mod bench {
                     instrument: format!("inst{a}"),
                     prev: prev[a].clone(),
                     dwell: dwell[a],
-                    x: [f64::from(dwell[a]).ln(), rng.normal(), rng.uniform(), 0.3],
+                    x: [f64::from(dwell[a]).ln(), rng.normal(), rng.uniform(), 0.3, rng.uniform(), 1.0],
                 };
                 if to == from {
                     dwell[a] += 1;

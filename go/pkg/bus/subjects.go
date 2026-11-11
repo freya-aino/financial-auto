@@ -30,6 +30,9 @@ func MediaChunk(source string) string       { return "media.chunk." + source }
 func MacroObs(source, series string) string { return fmt.Sprintf("macro.obs.%s.%s", source, series) }
 func OnchainEvent(chain string) string      { return "onchain.event." + chain }
 func FilingEvent(source string) string      { return "filing.event." + source }
+
+// FundamentalFact is a reported XBRL fact (stream TEXT via "filing.>").
+func FundamentalFact(source string) string { return "filing.fact." + source }
 func LatentState(ts, instrument string) string {
 	return fmt.Sprintf("latent.state.%s.%s", ts, instrument)
 }                                       // D-039

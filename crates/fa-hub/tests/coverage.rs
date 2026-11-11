@@ -12,6 +12,7 @@ const SOURCES: &[&str] = &[
     include_str!("../src/catalog.rs"),
     include_str!("../src/regions.rs"),
     include_str!("../src/experts.rs"),
+    include_str!("../src/versions.rs"),
 ];
 
 fn snake(name: &str) -> String {

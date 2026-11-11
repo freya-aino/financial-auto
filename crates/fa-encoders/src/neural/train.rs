@@ -427,8 +427,12 @@ impl NeuralTrainer {
     /// up to `max_windows` training windows: `Σ_k mse_k + λ_dec · L_decor(scalarised, gated) +
     /// λ_skill · hinge`, Adam at the genome's learning rate. Returns the last objective value.
     pub fn refit_heads(&mut self, ds: &Dataset, steps: usize, max_windows: usize) -> Result<f64> {
-        if steps == 0 || ds.train.is_empty() {
+        let constrained = self.model.cfg.head_solver == "constrained";
+        if (steps == 0 && !constrained) || ds.train.is_empty() {
             return Ok(0.0);
+        }
+        if constrained {
+            return self.solve_heads(ds, max_windows);
         }
         let stride = (ds.train.len() / max_windows.max(1)).max(1);
         let idx: Vec<(usize, usize)> = ds.train.iter().step_by(stride).copied().collect();
@@ -486,6 +490,59 @@ impl NeuralTrainer {
         let fitted: HashMap<String, Tensor> = heads.snapshot()?.into_iter().collect();
         self.model.ps.load(&fitted)?;
         Ok(last)
+    }
+
+    /// The `constrained` head solver ([`super::heads`]) on up to `max_windows` training windows:
+    /// latents and router gates (top-k, as in the health report) from the frozen model, the
+    /// heads `moe.pred<e>` replaced by the solution. Returns the solver's final objective.
+    fn solve_heads(&mut self, ds: &Dataset, max_windows: usize) -> Result<f64> {
+        let stride = (ds.train.len() / max_windows.max(1)).max(1);
+        let idx: Vec<(usize, usize)> = ds.train.iter().step_by(stride).copied().collect();
+        let top_k = self.model.cfg.moe.top_k;
+        let (mut mu, mut gates, mut y) = (Vec::new(), Vec::new(), Vec::new());
+        for chunk in idx.chunks(256) {
+            let b = self.batch(ds, chunk)?;
+            let f = self.model.forward(&b.x, None)?;
+            mu.extend(f.out.mu.to_vec3::<f32>()?);
+            gates.extend(f.out.probs.to_vec2::<f32>()?.iter().map(|p| fa_expert_space::moe::top_k_gates(p, top_k)));
+            y.extend(b.y.to_vec2::<f32>()?);
+        }
+        let names: Vec<String> = self.model.moe.active.iter().map(|e| format!("moe.pred{e}")).collect();
+        // θ[k][t][p] from w [d, T] and b [T]
+        let mut init: super::heads::Heads = Vec::with_capacity(names.len());
+        for n in &names {
+            let w = self.model.ps.w(&format!("{n}.w"))?.to_vec2::<f32>()?;
+            let b = self.model.ps.w(&format!("{n}.b"))?.to_vec1::<f32>()?;
+            let d = w.len();
+            init.push(
+                (0..b.len())
+                    .map(|t| (0..d).map(|q| f64::from(w[q][t])).chain(std::iter::once(f64::from(b[t]))).collect())
+                    .collect(),
+            );
+        }
+        let c = &self.model.cfg;
+        let cfg = super::heads::HeadSolverCfg {
+            target_corr: c.head_solver_corr,
+            sweeps: if c.head_solver_sweeps > 0 {
+                c.head_solver_sweeps
+            } else {
+                super::heads::HeadSolverCfg::default().sweeps
+            },
+            ..Default::default()
+        };
+        let (heads, report) = super::heads::solve(&mu, &gates, &y, init, &cfg);
+        let dev = self.model.device().clone();
+        let mut fitted = HashMap::new();
+        for (n, th) in names.iter().zip(&heads) {
+            let t = th.len();
+            let d = th[0].len() - 1;
+            let w: Vec<f32> = (0..d).flat_map(|q| th.iter().map(move |row| row[q] as f32)).collect();
+            let b: Vec<f32> = th.iter().map(|row| row[d] as f32).collect();
+            fitted.insert(format!("{n}.w"), Tensor::from_vec(w, (d, t), &dev)?);
+            fitted.insert(format!("{n}.b"), Tensor::from_vec(b, t, &dev)?);
+        }
+        self.model.ps.load(&fitted)?;
+        Ok(report.objective.last().copied().unwrap_or(0.0))
     }
 
     pub fn done(&self) -> bool {

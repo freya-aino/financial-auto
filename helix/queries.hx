@@ -65,6 +65,7 @@ QUERY getRegion(region_id: String) =>
 // Lifecycle marks (spec 30 §4): status merged | retired, related = absorbed / survivor region id.
 QUERY markRegionStatus(region_id: String, status: String, related_region_id: String) =>
     region <- N<LatentRegion>({region_id: region_id})::UPDATE({status: status, related_region_id: related_region_id, updated_at: NOW})
+    version <- AddN<RegionStatusVersion>({region_id: region_id, status: status, related_region_id: related_region_id, reason: "", ts: NOW}) // same batch, when region exists
     RETURN region
 
 QUERY spaceRegions(space: ID) =>
@@ -83,6 +84,7 @@ QUERY upsertTransition(from_region_id: String, to_region_id: String, sampler_id:
     existing <- from::OutE<Transition>::WHERE(AND(_::{to_region_id}::EQ(to_region_id), _::{sampler_id}::EQ(sampler_id)))
     updated <- existing::UPDATE({count: count, mean: mean, lower: lower, upper: upper, kernel_params: kernel_params, updated_at: NOW}) // when existing is not empty
     created <- AddE<Transition>({from_region_id: from_region_id, to_region_id: to_region_id, sampler_id: sampler_id, count: count, mean: mean, lower: lower, upper: upper, kernel_params: kernel_params, updated_at: NOW})::From(from)::To(to) // when existing is empty
+    version <- AddN<TransitionVersion>({edge_key: from_region_id + "|" + to_region_id + "|" + sampler_id, from_region_id: from_region_id, to_region_id: to_region_id, sampler_id: sampler_id, count: count, mean: mean, lower: lower, upper: upper, kernel_params: kernel_params, ts: NOW}) // same batch
     RETURN updated, created
 
 QUERY regionTransitions(region: ID) =>
@@ -201,6 +203,22 @@ QUERY snapshotGraphAsOf(snapshot_id: String, as_of: Date) =>
 QUERY spaceLatentsAsOf(expert_space_id: String, kind: String, as_of: Date, limit: I64) =>
     rows <- N<LatentVec>::WHERE(AND(_::{expert_space_id}::EQ(expert_space_id), _::{kind}::EQ(kind), _::{ts}::LTE(as_of)))::ORDER<Desc>(_::{ts})::RANGE(0, limit)
     RETURN rows
+
+// ── Event-time versions (spec 20 §6.3; fa-hub `versions`) ───────────────
+// As-of reads keep an edge / region unchanged when updated_at <= t, else take the newest version <= t.
+QUERY transitionVersions(from_region_id: String, to_region_id: String, sampler_id: String, as_of: Date, limit: I64) =>
+    rows <- N<TransitionVersion>::WHERE(AND(_::{edge_key}::EQ(from_region_id + "|" + to_region_id + "|" + sampler_id), _::{ts}::LTE(as_of)))::ORDER<Desc>(_::{ts})::RANGE(0, limit)
+    RETURN rows
+
+QUERY regionStatusVersions(region_id: String, as_of: Date, limit: I64) =>
+    rows <- N<RegionStatusVersion>::WHERE(AND(_::{region_id}::EQ(region_id), _::{ts}::LTE(as_of)))::ORDER<Desc>(_::{ts})::RANGE(0, limit)
+    RETURN rows
+
+// Retention: per edge key / region id of the space, versions with ts < cutoff except the newest.
+QUERY pruneSpaceVersions(space: ID, cutoff: Date) =>
+    old <- N<TransitionVersion>::WHERE(AND(_::{edge_key}::EQ(key), _::{ts}::LT(cutoff)))::ORDER<Desc>(_::{ts})::RANGE(1, N) // per key
+    DROP old
+    RETURN old
 
 // ── Text / media embeddings (NewsDoc.vec<dim>, MediaSegment.vec<dim>) ────
 QUERY addNewsDocs(doc_id: String, source_id: String, ts: Date, vector: [F64]) =>

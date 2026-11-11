@@ -23,3 +23,21 @@ message FilingEvent {
   string accession = 5;
   repeated string document_refs = 6;
 }
+
+// One reported XBRL fact (`wh.fundamental`, spec 20 §5.1): a company's value of
+// one concept for one period as published in one filing. The envelope's
+// publish_time is the filing date (the vintage); event_time is the period end.
+message FundamentalFact {
+  string issuer_cik = 1; // 10 digits, zero padded
+  string field = 2; // "<taxonomy>:<concept>", e.g. "us-gaap:Revenues"
+  string unit = 3; // XBRL unit, e.g. "USD", "USD/shares", "shares"
+  string period = 4; // "FY2025", "2025Q3", or "<start>..<end>" / "<end>" when the filing has no fy/fp
+  google.protobuf.Timestamp period_start = 5; // unset for instant facts
+  google.protobuf.Timestamp period_end = 6;
+  double value = 7;
+  google.protobuf.Timestamp vintage = 8; // filing date: when the value became public
+  string form = 9; // 10-K, 10-Q, 8-K, ...
+  string accession = 10;
+  string fiscal_year = 11; // fy as reported (the filing's fiscal year)
+  string fiscal_period = 12; // fp as reported (FY, Q1..Q4)
+}

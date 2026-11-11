@@ -93,6 +93,10 @@ pub struct ReplaySpec {
     /// Smallest rebalance executed, as a fraction of the sleeve's capital (smaller target
     /// changes are carried to the next step); avoids micro-churn on constant-fraction targets.
     pub min_trade_fraction: f64,
+    /// Per-source knowledge delays applied to the bars before use (spec 41 §6.2): series stored
+    /// at event time become visible at event time + the source's catalog delay.
+    #[serde(default = "crate::knowledge::catalog_delays")]
+    pub knowledge_delays: crate::knowledge::KnowledgeDelays,
 }
 
 impl ReplaySpec {
@@ -110,6 +114,7 @@ impl ReplaySpec {
             n_trials: 1,
             trial_sharpe_var: 0.0,
             min_trade_fraction: 0.02,
+            knowledge_delays: crate::knowledge::catalog_delays(),
         }
     }
 }
@@ -728,6 +733,14 @@ pub fn replay(
     let snapshot = match latents {
         Some(rec) => check_snapshot(spec, rec)?,
         None => SnapshotCheck { declared: spec.snapshot.clone(), ..Default::default() },
+    };
+    // knowledge time (spec 41 §6.2): late-publishing sources become visible after their delay
+    let shifted;
+    let data = if spec.knowledge_delays.is_empty() {
+        data
+    } else {
+        shifted = spec.knowledge_delays.apply(data);
+        &shifted[..]
     };
     let selected: Vec<&BarSeries> = data
         .iter()

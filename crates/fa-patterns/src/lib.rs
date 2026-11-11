@@ -20,7 +20,7 @@ pub mod region_map;
 pub use drift::{DriftMonitor, DriftReport};
 pub use hierarchy::{HierEdge, HierarchyCfg, HierarchyTracker, HierarchyUpdate};
 pub use lineage::{AlignCfg, Alignment, Descent, DescentKind, align};
-pub use methods::{CodebookRegions, DensityClusters, MapperCover, discovery_for_method};
+pub use methods::{CodebookRegions, DensityClusters, MapperCover, discovery_for_method, ks_pvalue};
 pub use online::{
     Assignment, LeaderClustering, OnlineRegionCfg, OnlineRegionDiscovery, OnlineRegionSet, RegionLifecycle, RegionStat,
     RetireReason,
@@ -64,6 +64,13 @@ pub trait RegionDiscovery: Send + Sync {
     fn method(&self) -> DiscoveryMethod;
     /// Discover regions from latent points of one expert space.
     fn discover(&self, points: &[Vec<f32>]) -> Vec<Vec<f32>>;
+    /// Discover regions with one next-step residual per point (NaN = unknown). Methods whose
+    /// criterion uses residual statistics (spec 30 §6.2 codebook merge) override this; the
+    /// default ignores the residuals.
+    fn discover_with_residuals(&self, points: &[Vec<f32>], residuals: &[f64]) -> Vec<Vec<f32>> {
+        let _ = residuals;
+        self.discover(points)
+    }
     /// Assign a point to the index of a discovered region, or `None` if outside all regions.
     fn assign(&self, centroids: &[Vec<f32>], point: &[f32]) -> Option<usize> {
         nearest(centroids, point)

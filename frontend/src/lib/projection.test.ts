@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { assignRegionColors, CategoryColors, explainedLabel, extent, heatColor, REGION_PALETTE, scale } from './projection';
+import { assignRegionColors, CategoryColors, explainedLabel, extent, heatColor, REGION_PALETTE, scale, seqColor } from './projection';
 
 describe('projection colours', () => {
 	it('assigns stable colours per category and wraps the palette', () => {
@@ -23,6 +23,15 @@ describe('projection colours', () => {
 		expect(heatColor(1)).toEqual({ color: 'var(--accent)', alpha: 1 });
 		expect(heatColor(2).alpha).toBe(1);
 		expect(heatColor(NaN).alpha).toBe(0);
+	});
+
+	it('sequential colour steps on |v| with the 0.1 target on a step boundary', () => {
+		expect(seqColor(0.01)).toEqual({ color: 'var(--seq-0)', step: 0, strong: false });
+		expect(seqColor(-0.09).step).toBe(1);
+		expect(seqColor(0.1).step).toBe(2);
+		expect(seqColor(-0.3).step).toBe(3);
+		expect(seqColor(0.95)).toEqual({ color: 'var(--seq-4)', step: 4, strong: true });
+		expect(seqColor(NaN).step).toBe(0);
 	});
 
 	it('extent pads and scale maps linearly', () => {

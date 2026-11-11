@@ -1,5 +1,7 @@
 //! `GET /api/bus/streams` (spec 50 §4.3): JetStream streams, consumers and lag, straight from
-//! `fa_bus::streams::list_streams`. Also provisions the spec 21 §5 streams once NATS is up and
+//! `fa_bus::streams::list_streams`, each with its applied `max_bytes` cap (−1 = unlimited), the
+//! spec 21 §5 `planned_max_bytes` from `fa_bus::streams::table()` and `cap_applied` (false when
+//! `ensure_streams` kept a larger cap because the stream already held more than the plan). Also provisions the spec 21 §5 streams once NATS is up and
 //! then runs the dead-letter forwarder (`fa_bus::dlq`, spec 21 §8).
 use std::time::Duration;
 
@@ -45,9 +47,30 @@ async fn list(State(state): State<AppState>) -> impl IntoResponse {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "NATS not connected" })));
     };
     match streams::list_streams(&jetstream::new(client)).await {
-        Ok(list) => (StatusCode::OK, Json(json!({ "streams": list }))),
+        Ok(list) => {
+            (StatusCode::OK, Json(json!({ "streams": with_caps(serde_json::to_value(list).unwrap_or_default()) })))
+        }
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))),
     }
+}
+
+/// Adds `planned_max_bytes` / `cap_applied` / `used_ratio` to each listed stream.
+fn with_caps(mut list: serde_json::Value) -> serde_json::Value {
+    let table = streams::table();
+    if let Some(arr) = list.as_array_mut() {
+        for s in arr.iter_mut() {
+            let name = s["name"].as_str().unwrap_or_default().to_owned();
+            let applied = s["max_bytes"].as_i64().unwrap_or(-1);
+            let planned = table.streams.iter().find(|t| t.name == name).map(|t| t.max_bytes());
+            let used = s["bytes"].as_f64().unwrap_or(0.0);
+            if let Some(o) = s.as_object_mut() {
+                o.insert("planned_max_bytes".into(), json!(planned));
+                o.insert("cap_applied".into(), json!(planned.is_none_or(|p| p == applied)));
+                o.insert("used_ratio".into(), json!((applied > 0).then(|| used / applied as f64)));
+            }
+        }
+    }
+    list
 }
 
 #[cfg(test)]
@@ -66,5 +89,21 @@ mod tests {
         let app = router().with_state(state);
         let res = app.oneshot(Request::get("/api/bus/streams").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn caps_are_annotated() {
+        let md = streams::table().streams.into_iter().find(|t| t.name == "MD").unwrap();
+        let v = with_caps(json!([
+            { "name": "MD", "max_bytes": md.max_bytes(), "bytes": md.max_bytes() / 4 },
+            { "name": "MD", "max_bytes": md.max_bytes() * 2, "bytes": 1 },
+            { "name": "ADHOC", "max_bytes": -1, "bytes": 5 },
+        ]));
+        assert_eq!(v[0]["planned_max_bytes"], md.max_bytes());
+        assert_eq!(v[0]["cap_applied"], true);
+        assert!((v[0]["used_ratio"].as_f64().unwrap() - 0.25).abs() < 1e-9);
+        assert_eq!(v[1]["cap_applied"], false, "a kept larger cap is not the plan");
+        assert!(v[2]["planned_max_bytes"].is_null() && v[2]["used_ratio"].is_null());
+        assert_eq!(v[2]["cap_applied"], true);
     }
 }

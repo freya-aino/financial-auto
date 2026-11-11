@@ -51,6 +51,68 @@ pub fn f(d: Decimal) -> f64 {
     d.to_f64().unwrap_or(0.0)
 }
 
+/// Exact sum of decimals.
+pub fn sum<I: IntoIterator<Item = Decimal>>(it: I) -> Decimal {
+    it.into_iter().fold(Decimal::ZERO, |a, b| a + b)
+}
+
+/// Serde adapter: a [`Decimal`] as a JSON number (its nearest `f64`), read back through [`dec`].
+/// Keeps the API JSON shapes of the derived analytics (numbers, not strings) while the
+/// computation is exact; use `#[serde(with = "crate::money::json")]`.
+pub mod json {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::{Decimal, dec, f};
+
+    pub fn serialize<S: Serializer>(d: &Decimal, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_f64(f(*d))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Decimal, D::Error> {
+        Ok(dec(f64::deserialize(d)?))
+    }
+}
+
+/// [`json`] for `Option<Decimal>` (`null` when absent).
+pub mod json_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::{Decimal, dec, f};
+
+    pub fn serialize<S: Serializer>(d: &Option<Decimal>, s: S) -> Result<S::Ok, S::Error> {
+        match d {
+            Some(d) => s.serialize_some(&f(*d)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Decimal>, D::Error> {
+        Ok(Option::<f64>::deserialize(d)?.filter(|x| x.is_finite()).map(dec))
+    }
+}
+
+/// [`json`] for maps of decimals (`{"key": number}`).
+pub mod json_map {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{Decimal, dec, f};
+
+    pub fn serialize<K: Serialize, S: Serializer>(m: &BTreeMap<K, Decimal>, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_map(m.iter().map(|(k, v)| (k, f(*v))))
+    }
+
+    pub fn deserialize<'de, K, D>(d: D) -> Result<BTreeMap<K, Decimal>, D::Error>
+    where
+        K: Deserialize<'de> + Ord,
+        D: Deserializer<'de>,
+    {
+        let m = BTreeMap::<K, f64>::deserialize(d)?;
+        Ok(m.into_iter().map(|(k, v)| (k, dec(v))).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +128,24 @@ mod tests {
         // 0.1 + 0.2 is exact in decimal
         assert_eq!(dec(0.1) + dec(0.2), dec(0.3));
         assert!((f(dec(99_359.901_147_101_93)) - 99_359.901_147_101_93).abs() < 1e-9);
+    }
+
+    #[test]
+    fn json_adapters_write_numbers() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct T {
+            #[serde(with = "json")]
+            a: Decimal,
+            #[serde(with = "json_opt")]
+            b: Option<Decimal>,
+            #[serde(with = "json_map")]
+            m: std::collections::BTreeMap<String, Decimal>,
+        }
+        let t = T { a: dec(0.1) + dec(0.2), b: None, m: [("x".to_owned(), dec(2.5))].into() };
+        let s = serde_json::to_string(&t).unwrap();
+        assert_eq!(s, r#"{"a":0.3,"b":null,"m":{"x":2.5}}"#);
+        assert_eq!(serde_json::from_str::<T>(&s).unwrap(), t);
+        assert_eq!(sum([dec(0.1), dec(0.2)]), dec(0.3));
     }
 
     #[test]

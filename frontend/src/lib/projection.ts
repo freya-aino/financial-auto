@@ -54,6 +54,19 @@ export function heatColor(v: number): { color: string; alpha: number } {
 	return { color: x < 0 ? 'var(--danger)' : 'var(--accent)', alpha: Math.round(Math.abs(x) * 100) / 100 };
 }
 
+/**
+ * Sequential step (one hue, `--seq-0..4`) of a magnitude in [0, 1] — for matrices where only
+ * |value| matters, like the residual correlation between experts (spec 32 target ≤ 0.1). The
+ * breaks put the target on a step boundary: < 0.05, < 0.1 (both within target), < 0.2, < 0.4,
+ * ≥ 0.4. `strong` = use the contrasting ink on the dark end of the ramp.
+ */
+export const SEQ_BREAKS = [0.05, 0.1, 0.2, 0.4] as const;
+export function seqColor(v: number): { color: string; step: number; strong: boolean } {
+	const x = Math.abs(Number.isFinite(v) ? v : 0);
+	const step = SEQ_BREAKS.filter((b) => x >= b).length;
+	return { color: `var(--seq-${step})`, step, strong: step >= 3 };
+}
+
 export interface Extent {
 	lo: number;
 	hi: number;

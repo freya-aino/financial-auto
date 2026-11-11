@@ -137,6 +137,12 @@ sources:
     tos_notes: "Public market-data endpoints need no key; trading (hmac) not implemented."
     notes: "Verified live 2026-11-11. Keyless public REST: OHLC→Bar, Trades→Trade, Ticker→Quote polled per minute (3 requests per pair); backfill limited to Kraken's latest 720 intervals."
     rate_limit: {per_second: 0.5, burst: 2}
+    # spec 41 §6.2 knowledge time: trades reach the bus after their event time (per-minute polling
+    # behind the rate limit). Measured 2026-11-11 on the MD stream (fa-backtest example
+    # knowledge_delay, 907 trades): p50 43 s, p90 76 s, p99 87 s, max 117 s. Event-time replays
+    # (fa_backtest::knowledge) shift Kraken series by this so they never look ahead.
+    backfill:
+      knowledge_delay_secs: 120
     config:
       symbols: [XBTEUR, ETHEUR, SOLEUR]
       timeframe: 1m
@@ -355,6 +361,9 @@ sources:
     tos_notes: "Unofficial endpoints; personal/research use only, may break without notice."
     notes: "First wave. Chart endpoint polled per minute (bars + synthetic trades), verified live 2026-11-10."
     rate_limit: {per_second: 1, burst: 3}
+    # measured 2026-11-11 like kraken (202 synthetic trades): p50 51 s, p99 94 s, max 94 s
+    backfill:
+      knowledge_delay_secs: 100
     config:
       symbols: [AAPL, MSFT, SPY, BTC-USD, EURUSD=X]
       timeframe: 1m

@@ -9,14 +9,16 @@
 //!   850b1098-d844-59e3-a7eb-1fb84638c1bf=0.001,01900000-0000-7000-8000-000000000001=1,9daa8cea-67a6-5f6b-8347-f9e5a30f7463=1`
 //! — market probes every 15 s on Kraken BTC (quotes, σ / ADV impact, 1 EUR minimum fee), the
 //! synthetic `sim` instrument (costless venue) and a Yahoo equity, on the throwaway account
-//! `paper-test`; the gateway priced them with the repo `costs.yaml`.
+//! `paper-test`; the gateway priced them with the repo `costs.yaml` of that time, pinned as
+//! `testdata/venue_fixture_costs.yaml` (the live file has since priced crypto as crypto instead
+//! of with the equity schedule's 1 EUR minimum, which the recorded fees still carry).
 use fa_backtest::{
     cost::CostModel,
     venue::{VenueRecord, replay_window},
 };
 
 fn costs() -> CostModel {
-    CostModel::from_yaml(include_str!("../../../go/services/broker-gateway/costs.yaml")).expect("costs.yaml")
+    CostModel::from_yaml(include_str!("../testdata/venue_fixture_costs.yaml")).expect("capture-time costs.yaml")
 }
 
 fn fixture() -> Vec<VenueRecord> {

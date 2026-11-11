@@ -1,0 +1,4708 @@
+{
+  "components": {
+    "schemas": {
+      "Error": {
+        "properties": {
+          "detail": {},
+          "error": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "spec": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Local control plane (spec 50). Generated from the route declarations of bins/control-api/src (see openapi.rs).",
+    "title": "financial-auto control-api",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/alerts": {
+      "get": {
+        "operationId": "alerts_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "List",
+        "tags": [
+          "alerts"
+        ],
+        "x-handler": "bins/control-api/src/alerts_routes.rs::list"
+      }
+    },
+    "/api/alerts/history": {
+      "get": {
+        "operationId": "alerts_history",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "History",
+        "tags": [
+          "alerts"
+        ],
+        "x-handler": "bins/control-api/src/alerts_routes.rs::history"
+      }
+    },
+    "/api/alerts/vmalert/api/v2/alerts": {
+      "post": {
+        "operationId": "alerts_receive_v2",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Receive v2",
+        "tags": [
+          "alerts"
+        ],
+        "x-handler": "bins/control-api/src/alerts_routes.rs::receive_v2"
+      }
+    },
+    "/api/alerts/webhook": {
+      "post": {
+        "operationId": "alerts_receive_webhook",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Receive webhook",
+        "tags": [
+          "alerts"
+        ],
+        "x-handler": "bins/control-api/src/alerts_routes.rs::receive_webhook"
+      }
+    },
+    "/api/audit": {
+      "get": {
+        "operationId": "ledger_audit",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Audit",
+        "tags": [
+          "ledger"
+        ],
+        "x-handler": "bins/control-api/src/ledger_routes.rs::audit"
+      }
+    },
+    "/api/bus/streams": {
+      "get": {
+        "operationId": "streams_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "List",
+        "tags": [
+          "streams"
+        ],
+        "x-handler": "bins/control-api/src/streams_routes.rs::list"
+      }
+    },
+    "/api/config/timescales": {
+      "get": {
+        "operationId": "routes_timescales",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Timescales",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::timescales"
+      }
+    },
+    "/api/config/{section}": {
+      "get": {
+        "operationId": "config_get_section",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "section",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Get section",
+        "tags": [
+          "config"
+        ],
+        "x-handler": "bins/control-api/src/config_routes.rs::get_section"
+      },
+      "put": {
+        "operationId": "config_put_section",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "section",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Put section",
+        "tags": [
+          "config"
+        ],
+        "x-handler": "bins/control-api/src/config_routes.rs::put_section"
+      }
+    },
+    "/api/decoders/cards": {
+      "get": {
+        "operationId": "console_decoder_cards",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "decoder cards (fa-models/decoders/**/*.card.json) newest first, card JSON inline",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::decoder_cards"
+      }
+    },
+    "/api/decoders/outputs": {
+      "get": {
+        "operationId": "routes_decoder_outputs",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Decoder outputs",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::decoder_outputs"
+      }
+    },
+    "/api/decoders/serving": {
+      "get": {
+        "operationId": "console_decoders_serving",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "ctl.decoders.status: neural slots per (family, timescale), serving vs shadow, online scores, pins, disabled slots",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::decoders_serving"
+      }
+    },
+    "/api/decoders/{verb}": {
+      "post": {
+        "operationId": "console_decoder_action",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "verb",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Decoder action",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::decoder_action"
+      }
+    },
+    "/api/evolution/generations": {
+      "get": {
+        "operationId": "routes_generations",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "generation.summary messages aggregated in live (D-049)",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::crate::evolution_routes::generations"
+      },
+      "post": {
+        "operationId": "routes_start_generation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Start generation",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::start_generation"
+      }
+    },
+    "/api/evolution/genomes/{id}": {
+      "get": {
+        "operationId": "evolution_genome",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Helix Genome + FitnessRecords + parents (fa_hub::genome_detail) and the in-memory jobs / generations naming the genome",
+        "tags": [
+          "evolution"
+        ],
+        "x-handler": "bins/control-api/src/evolution_routes.rs::genome"
+      }
+    },
+    "/api/evolution/genomes/{id}/outputs": {
+      "get": {
+        "operationId": "evolution_genome_outputs",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "recent DecoderOutputs of the genome from live + presigned eval-report URLs (fa-artifacts/evals/<generation>/<job>.json, D-045) on garage.public_endpoint",
+        "tags": [
+          "evolution"
+        ],
+        "x-handler": "bins/control-api/src/evolution_routes.rs::genome_outputs"
+      }
+    },
+    "/api/evolution/gpu": {
+      "get": {
+        "operationId": "routes_gpu",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Gpu",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::gpu"
+      }
+    },
+    "/api/evolution/jobs": {
+      "get": {
+        "operationId": "routes_jobs",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Jobs",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::jobs"
+      }
+    },
+    "/api/evolution/populations": {
+      "get": {
+        "operationId": "validation_populations",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "one row per generation: kind, loops, trials, latest deflated Sharpe / PBO",
+        "tags": [
+          "validation"
+        ],
+        "x-handler": "bins/control-api/src/validation_routes.rs::populations"
+      }
+    },
+    "/api/evolution/populations/{id}/pareto": {
+      "get": {
+        "operationId": "validation_pareto",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Pareto fronts of a generation loop recomputed from the latest trial per candidate (fa_evolution)",
+        "tags": [
+          "validation"
+        ],
+        "x-handler": "bins/control-api/src/validation_routes.rs::pareto"
+      }
+    },
+    "/api/evolution/runs": {
+      "post": {
+        "operationId": "evolution_start_generation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "alias of POST /api/evolution/generations (ctl.evo.start)",
+        "tags": [
+          "evolution"
+        ],
+        "x-handler": "bins/control-api/src/evolution_routes.rs::live_routes::start_generation"
+      }
+    },
+    "/api/evolution/runs/{id}/{action}": {
+      "post": {
+        "operationId": "evolution_run_action",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Run action",
+        "tags": [
+          "evolution"
+        ],
+        "x-handler": "bins/control-api/src/evolution_routes.rs::run_action"
+      }
+    },
+    "/api/gpu": {
+      "get": {
+        "operationId": "routes_gpu",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Gpu",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::gpu"
+      }
+    },
+    "/api/graph/lineage/{genome_id}": {
+      "get": {
+        "operationId": "graph_lineage",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "genome_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "genome_by_id + genome_ancestry + genome_fitness",
+        "tags": [
+          "graph"
+        ],
+        "x-handler": "bins/control-api/src/graph_routes.rs::lineage"
+      }
+    },
+    "/api/graph/neighborhood": {
+      "get": {
+        "operationId": "graph_neighborhood",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "HubClient::resolve_node + neighborhood",
+        "tags": [
+          "graph"
+        ],
+        "x-handler": "bins/control-api/src/graph_routes.rs::neighborhood"
+      }
+    },
+    "/api/graph/query": {
+      "get": {
+        "operationId": "graph_query_catalog",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "the named-query catalog (fa_hub::catalog::NAMED_QUERIES)",
+        "tags": [
+          "graph"
+        ],
+        "x-handler": "bins/control-api/src/graph_routes.rs::query_catalog"
+      },
+      "post": {
+        "operationId": "graph_run_query",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Run query",
+        "tags": [
+          "graph"
+        ],
+        "x-handler": "bins/control-api/src/graph_routes.rs::run_query"
+      }
+    },
+    "/api/health": {
+      "get": {
+        "operationId": "routes_health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Health",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::health"
+      }
+    },
+    "/api/ingest/{source}/{action}": {
+      "post": {
+        "operationId": "routes_ingest_control",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Ingest control",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::ingest_control"
+      }
+    },
+    "/api/instruments": {
+      "get": {
+        "operationId": "sources_instruments",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Instruments",
+        "tags": [
+          "sources"
+        ],
+        "x-handler": "bins/control-api/src/sources_routes.rs::instruments"
+      }
+    },
+    "/api/instruments/quarantine": {
+      "get": {
+        "operationId": "sources_quarantine",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Quarantine",
+        "tags": [
+          "sources"
+        ],
+        "x-handler": "bins/control-api/src/sources_routes.rs::quarantine"
+      }
+    },
+    "/api/instruments/quarantine/{id}/resolve": {
+      "post": {
+        "operationId": "sources_quarantine_resolve",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Quarantine resolve",
+        "tags": [
+          "sources"
+        ],
+        "x-handler": "bins/control-api/src/sources_routes.rs::quarantine_resolve"
+      }
+    },
+    "/api/jobs": {
+      "get": {
+        "operationId": "routes_jobs",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Jobs",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::jobs"
+      }
+    },
+    "/api/jobs/{id}/cancel": {
+      "post": {
+        "operationId": "routes_cancel_job",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Cancel job",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::cancel_job"
+      }
+    },
+    "/api/latent/regions/{region_id}/lineage": {
+      "get": {
+        "operationId": "mcmc_lineage",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "region_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "ancestors, descendants, lineage members",
+        "tags": [
+          "mcmc"
+        ],
+        "x-handler": "bins/control-api/src/mcmc_routes.rs::lineage"
+      }
+    },
+    "/api/latent/snapshots": {
+      "get": {
+        "operationId": "graph_snapshots",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "list_snapshots",
+        "tags": [
+          "graph"
+        ],
+        "x-handler": "bins/control-api/src/graph_routes.rs::snapshots"
+      }
+    },
+    "/api/latent/snapshots/{id}": {
+      "get": {
+        "operationId": "latent_snapshot_detail",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Helix row + manifest (Helix mirror, else Garage) + the promotion checklist + latest AdapterState",
+        "tags": [
+          "latent"
+        ],
+        "x-handler": "bins/control-api/src/latent_routes.rs::snapshot_detail"
+      }
+    },
+    "/api/latent/snapshots/{id}/shadow": {
+      "delete": {
+        "operationId": "latent_shadow_stop",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Shadow stop",
+        "tags": [
+          "latent"
+        ],
+        "x-handler": "bins/control-api/src/latent_routes.rs::shadow_stop"
+      },
+      "post": {
+        "operationId": "latent_shadow_start",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Shadow start",
+        "tags": [
+          "latent"
+        ],
+        "x-handler": "bins/control-api/src/latent_routes.rs::shadow_start"
+      }
+    },
+    "/api/latent/snapshots/{id}/shadow/stop": {
+      "post": {
+        "operationId": "latent_shadow_stop",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Shadow stop",
+        "tags": [
+          "latent"
+        ],
+        "x-handler": "bins/control-api/src/latent_routes.rs::shadow_stop"
+      }
+    },
+    "/api/latent/snapshots/{id}/{action}": {
+      "post": {
+        "operationId": "latent_snapshot_action",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Snapshot action",
+        "tags": [
+          "latent"
+        ],
+        "x-handler": "bins/control-api/src/latent_routes.rs::snapshot_action"
+      }
+    },
+    "/api/latent/timescales": {
+      "get": {
+        "operationId": "routes_latent_timescales",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Latent timescales",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::latent_timescales"
+      }
+    },
+    "/api/latent/timescales/{ts}/{view}": {
+      "get": {
+        "operationId": "routes_latent_view",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "ts",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "view",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Latent view",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::latent_view"
+      }
+    },
+    "/api/latent/{snapshot}/experts": {
+      "get": {
+        "operationId": "latent_experts",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Helix ExpertSpace rows (+ region counts) joined with the bus-fed routing stats and norm covariance of live::SnapshotStats",
+        "tags": [
+          "latent"
+        ],
+        "x-handler": "bins/control-api/src/latent_routes.rs::experts"
+      }
+    },
+    "/api/latent/{snapshot}/projection": {
+      "get": {
+        "operationId": "latent_projection",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Helix LatentVec rows of the expert space, PCA (power iteration) server-side, cached 30 s",
+        "tags": [
+          "latent"
+        ],
+        "x-handler": "bins/control-api/src/latent_routes.rs::projection"
+      }
+    },
+    "/api/latent/{snapshot}/regions": {
+      "get": {
+        "operationId": "graph_snapshot_regions",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "snapshot_graph",
+        "tags": [
+          "graph"
+        ],
+        "x-handler": "bins/control-api/src/graph_routes.rs::snapshot_regions"
+      }
+    },
+    "/api/mcmc/cross-priors": {
+      "get": {
+        "operationId": "mcmc_cross_priors",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "ranked CrossPrior proposals",
+        "tags": [
+          "mcmc"
+        ],
+        "x-handler": "bins/control-api/src/mcmc_routes.rs::cross_priors"
+      }
+    },
+    "/api/mcmc/{snapshot}/graph": {
+      "get": {
+        "operationId": "graph_mcmc_graph",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "snapshot_graph",
+        "tags": [
+          "graph"
+        ],
+        "x-handler": "bins/control-api/src/graph_routes.rs::mcmc_graph"
+      }
+    },
+    "/api/mcmc/{snapshot}/hierarchy": {
+      "get": {
+        "operationId": "mcmc_hierarchy",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Hier (REFINES) edges of the snapshot's regions",
+        "tags": [
+          "mcmc"
+        ],
+        "x-handler": "bins/control-api/src/mcmc_routes.rs::hierarchy"
+      }
+    },
+    "/api/mcmc/{snapshot}/hitting": {
+      "get": {
+        "operationId": "mcmc_hitting",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "hitting_time: P(hit), E[steps], pmf",
+        "tags": [
+          "mcmc"
+        ],
+        "x-handler": "bins/control-api/src/mcmc_routes.rs::hitting"
+      }
+    },
+    "/api/mcmc/{snapshot}/k-step": {
+      "get": {
+        "operationId": "mcmc_k_step",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "k-step distribution over regions",
+        "tags": [
+          "mcmc"
+        ],
+        "x-handler": "bins/control-api/src/mcmc_routes.rs::k_step"
+      }
+    },
+    "/api/mcmc/{snapshot}/kernels": {
+      "get": {
+        "operationId": "mcmc_kernels",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "KernelModel rows: serving sampler, calibration standings, stationary, relaxation, drift",
+        "tags": [
+          "mcmc"
+        ],
+        "x-handler": "bins/control-api/src/mcmc_routes.rs::kernels"
+      }
+    },
+    "/api/mcmc/{snapshot}/neighbors": {
+      "get": {
+        "operationId": "mcmc_neighbors",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "one-step successors with uncertainty",
+        "tags": [
+          "mcmc"
+        ],
+        "x-handler": "bins/control-api/src/mcmc_routes.rs::neighbors"
+      }
+    },
+    "/api/mcmc/{snapshot}/path-prob": {
+      "get": {
+        "operationId": "mcmc_path_prob",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "path_prob",
+        "tags": [
+          "mcmc"
+        ],
+        "x-handler": "bins/control-api/src/mcmc_routes.rs::path_prob"
+      }
+    },
+    "/api/mcmc/{snapshot}/paths": {
+      "get": {
+        "operationId": "mcmc_paths",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "sample_paths (one kernel draw per path)",
+        "tags": [
+          "mcmc"
+        ],
+        "x-handler": "bins/control-api/src/mcmc_routes.rs::paths"
+      }
+    },
+    "/api/mcmc/{snapshot}/stationary": {
+      "get": {
+        "operationId": "mcmc_stationary",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "stationary + relaxation time",
+        "tags": [
+          "mcmc"
+        ],
+        "x-handler": "bins/control-api/src/mcmc_routes.rs::stationary"
+      }
+    },
+    "/api/mcmc/{snapshot}/transition": {
+      "get": {
+        "operationId": "mcmc_transition",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "transition_prob(a, b, k)",
+        "tags": [
+          "mcmc"
+        ],
+        "x-handler": "bins/control-api/src/mcmc_routes.rs::transition"
+      }
+    },
+    "/api/openapi.json": {
+      "get": {
+        "operationId": "openapi_serve",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Serve",
+        "tags": [
+          "openapi"
+        ],
+        "x-handler": "bins/control-api/src/openapi.rs::serve"
+      }
+    },
+    "/api/ops/config-snapshots": {
+      "get": {
+        "operationId": "ops_snapshots",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Snapshots",
+        "tags": [
+          "ops"
+        ],
+        "x-handler": "bins/control-api/src/ops_routes.rs::snapshots"
+      }
+    },
+    "/api/ops/jobs": {
+      "get": {
+        "operationId": "ops_jobs",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Jobs",
+        "tags": [
+          "ops"
+        ],
+        "x-handler": "bins/control-api/src/ops_routes.rs::jobs"
+      }
+    },
+    "/api/ops/jobs/summary": {
+      "get": {
+        "operationId": "ops_summary",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Summary",
+        "tags": [
+          "ops"
+        ],
+        "x-handler": "bins/control-api/src/ops_routes.rs::summary"
+      }
+    },
+    "/api/refdata/calendar/{venue}": {
+      "get": {
+        "operationId": "console_calendar_range",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "venue",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "sessions per day: table rows, else the built-in rule",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::calendar_range"
+      }
+    },
+    "/api/refdata/calendar/{venue}/materialize": {
+      "post": {
+        "operationId": "refdata_materialize",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "venue",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Materialize",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::materialize"
+      }
+    },
+    "/api/refdata/contract-specs": {
+      "post": {
+        "operationId": "refdata_add_contract_spec",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Add contract spec",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::add_contract_spec"
+      }
+    },
+    "/api/refdata/corporate-actions": {
+      "get": {
+        "operationId": "console_corporate_actions",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "corporate actions (point-in-time when instrument_id is given)",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::corporate_actions"
+      },
+      "post": {
+        "operationId": "refdata_add_action",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Add action",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::add_action"
+      }
+    },
+    "/api/refdata/corporate-actions/{id}/cancel": {
+      "post": {
+        "operationId": "refdata_cancel_action",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Cancel action",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::cancel_action"
+      }
+    },
+    "/api/refdata/fx": {
+      "get": {
+        "operationId": "refdata_fx",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Fx",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::fx"
+      }
+    },
+    "/api/refdata/identifiers": {
+      "post": {
+        "operationId": "refdata_add_identifier",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Add identifier",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::add_identifier"
+      }
+    },
+    "/api/refdata/instruments/{id}": {
+      "get": {
+        "operationId": "refdata_instrument",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Instrument",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::instrument"
+      }
+    },
+    "/api/refdata/resolve": {
+      "get": {
+        "operationId": "refdata_resolve",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Resolve",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::resolve"
+      }
+    },
+    "/api/refdata/session": {
+      "get": {
+        "operationId": "refdata_session",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Session",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::session"
+      }
+    },
+    "/api/refdata/symbol-change": {
+      "post": {
+        "operationId": "refdata_symbol_change",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Symbol change",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::symbol_change"
+      }
+    },
+    "/api/refdata/venues": {
+      "get": {
+        "operationId": "console_venues",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "venues with their calendar rule and materialised session range",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::venues"
+      }
+    },
+    "/api/services": {
+      "get": {
+        "operationId": "services_services",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Services",
+        "tags": [
+          "services"
+        ],
+        "x-handler": "bins/control-api/src/services_routes.rs::services"
+      }
+    },
+    "/api/services/{name}/container": {
+      "get": {
+        "operationId": "services_container",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Container",
+        "tags": [
+          "services"
+        ],
+        "x-handler": "bins/control-api/src/services_routes.rs::container"
+      }
+    },
+    "/api/services/{name}/{action}": {
+      "post": {
+        "operationId": "services_action",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Action",
+        "tags": [
+          "services"
+        ],
+        "x-handler": "bins/control-api/src/services_routes.rs::action"
+      }
+    },
+    "/api/sources": {
+      "get": {
+        "operationId": "sources_list_sources",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "List sources",
+        "tags": [
+          "sources"
+        ],
+        "x-handler": "bins/control-api/src/sources_routes.rs::list_sources"
+      }
+    },
+    "/api/sources/{id}": {
+      "get": {
+        "operationId": "sources_get_source",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Get source",
+        "tags": [
+          "sources"
+        ],
+        "x-handler": "bins/control-api/src/sources_routes.rs::get_source"
+      }
+    },
+    "/api/sources/{id}/{action}": {
+      "post": {
+        "operationId": "sources_source_action",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Source action",
+        "tags": [
+          "sources"
+        ],
+        "x-handler": "bins/control-api/src/sources_routes.rs::source_action"
+      }
+    },
+    "/api/trading/allocators": {
+      "get": {
+        "operationId": "console_allocators",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "ctl.risk.allocators (live paper allocator tournament)",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::allocators"
+      }
+    },
+    "/api/trading/fills": {
+      "get": {
+        "operationId": "routes_fills",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Fills",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::fills"
+      }
+    },
+    "/api/trading/flatten": {
+      "post": {
+        "operationId": "trading_flatten",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Flatten",
+        "tags": [
+          "trading"
+        ],
+        "x-handler": "bins/control-api/src/trading_routes.rs::flatten"
+      }
+    },
+    "/api/trading/halt": {
+      "post": {
+        "operationId": "routes_halt",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Halt",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::halt"
+      }
+    },
+    "/api/trading/halts": {
+      "get": {
+        "operationId": "console_halts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "persisted halts (ledger.risk_state, survive restarts) merged with the halts control-api saw on the bus",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::halts"
+      }
+    },
+    "/api/trading/halts/{scope}/rearm": {
+      "post": {
+        "operationId": "console_rearm",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "{\"confirm\": true, \"reason\"?} → fa.v1.Resume on risk.resume.<scope>; 428 without confirm; audited halt.rearm",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::rearm"
+      }
+    },
+    "/api/trading/kill-switch": {
+      "post": {
+        "operationId": "routes_halt",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Halt",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::halt"
+      }
+    },
+    "/api/trading/kill-switch/rearm": {
+      "post": {
+        "operationId": "routes_resume",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Resume",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::resume"
+      }
+    },
+    "/api/trading/limits": {
+      "get": {
+        "operationId": "trading_limits_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Limits get",
+        "tags": [
+          "trading"
+        ],
+        "x-handler": "bins/control-api/src/trading_routes.rs::limits_get"
+      },
+      "put": {
+        "operationId": "trading_limits_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Limits put",
+        "tags": [
+          "trading"
+        ],
+        "x-handler": "bins/control-api/src/trading_routes.rs::limits_put"
+      }
+    },
+    "/api/trading/lots": {
+      "get": {
+        "operationId": "refdata_lots",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Lots",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::lots"
+      }
+    },
+    "/api/trading/orders": {
+      "get": {
+        "operationId": "routes_orders",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Orders",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::orders"
+      },
+      "post": {
+        "operationId": "routes_paper_order",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Paper order",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::paper_order"
+      }
+    },
+    "/api/trading/orphans": {
+      "get": {
+        "operationId": "refdata_orphans",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Orphans",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::orphans"
+      }
+    },
+    "/api/trading/orphans/{id}/resolve": {
+      "post": {
+        "operationId": "refdata_resolve_orphan",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Resolve orphan",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::resolve_orphan"
+      }
+    },
+    "/api/trading/paper-order": {
+      "post": {
+        "operationId": "routes_paper_order",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Paper order",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::paper_order"
+      }
+    },
+    "/api/trading/payouts": {
+      "post": {
+        "operationId": "refdata_payout",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Payout",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::payout"
+      }
+    },
+    "/api/trading/pipeline": {
+      "get": {
+        "operationId": "console_pipeline_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "ctl.risk.pipeline {action: status} (spec 35 §6.4 lifecycle round, holdouts)",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::pipeline_status"
+      }
+    },
+    "/api/trading/pipeline/run": {
+      "post": {
+        "operationId": "console_pipeline_run",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "ctl.risk.pipeline {action: run} (risk-engine audits pipeline.run, actor ui)",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::pipeline_run"
+      }
+    },
+    "/api/trading/pnl": {
+      "get": {
+        "operationId": "ledger_pnl",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Pnl",
+        "tags": [
+          "ledger"
+        ],
+        "x-handler": "bins/control-api/src/ledger_routes.rs::pnl"
+      }
+    },
+    "/api/trading/pnl/breakdown": {
+      "get": {
+        "operationId": "refdata_pnl_breakdown",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Pnl breakdown",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::pnl_breakdown"
+      }
+    },
+    "/api/trading/positions": {
+      "get": {
+        "operationId": "routes_positions",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Positions",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::positions"
+      }
+    },
+    "/api/trading/reconciliation": {
+      "get": {
+        "operationId": "ledger_reconciliation",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Reconciliation",
+        "tags": [
+          "ledger"
+        ],
+        "x-handler": "bins/control-api/src/ledger_routes.rs::reconciliation"
+      }
+    },
+    "/api/trading/restatements/fx": {
+      "post": {
+        "operationId": "refdata_restate_fx",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Restate fx",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::restate_fx"
+      }
+    },
+    "/api/trading/resume": {
+      "post": {
+        "operationId": "routes_resume",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Resume",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::resume"
+      }
+    },
+    "/api/trading/risk": {
+      "get": {
+        "operationId": "routes_risk",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Risk",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::risk"
+      }
+    },
+    "/api/trading/risk-events": {
+      "get": {
+        "operationId": "console_risk_events",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "RiskEvents, halts, resumes and reconciliation diffs from audit.log, newest first",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::risk_events"
+      }
+    },
+    "/api/trading/signals": {
+      "get": {
+        "operationId": "routes_signals",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Signals",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::lr::signals"
+      }
+    },
+    "/api/trading/statement": {
+      "get": {
+        "operationId": "refdata_statement",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Statement",
+        "tags": [
+          "refdata"
+        ],
+        "x-handler": "bins/control-api/src/refdata_routes.rs::statement"
+      }
+    },
+    "/api/trading/strategies": {
+      "get": {
+        "operationId": "trading_strategies",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Strategies",
+        "tags": [
+          "trading"
+        ],
+        "x-handler": "bins/control-api/src/trading_routes.rs::strategies"
+      }
+    },
+    "/api/trading/strategies/{id}/{action}": {
+      "post": {
+        "operationId": "trading_strategy_action",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Strategy action",
+        "tags": [
+          "trading"
+        ],
+        "x-handler": "bins/control-api/src/trading_routes.rs::strategy_action"
+      }
+    },
+    "/api/validation/holdout": {
+      "get": {
+        "operationId": "validation_holdout",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "locked holdout rows per timescale (with their id)",
+        "tags": [
+          "validation"
+        ],
+        "x-handler": "bins/control-api/src/validation_routes.rs::holdout"
+      },
+      "post": {
+        "operationId": "validation_lock_holdout",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "locks a holdout {timescale, start, end, note} (D-059): 409 when it overlaps a locked range of the timescale, 400 on a bad range; immutable afterwards (trigger); audited validation.holdout.lock",
+        "tags": [
+          "validation"
+        ],
+        "x-handler": "bins/control-api/src/validation_routes.rs::lock_holdout"
+      }
+    },
+    "/api/validation/holdout/{id}/evaluate": {
+      "post": {
+        "operationId": "validation_evaluate_holdout",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "the promotion-evaluation request (spec 41 §6.4): enqueues one evo.eval.strategy.holdout job {candidate, snapshot?, budget_ms?, seed?} on jobs.evo.eval.strategy.holdout for a locked holdout; 404 unknown holdout, 503 without NATS; audited validation.holdout.evaluate; the result lands in reports/{candi",
+        "tags": [
+          "validation"
+        ],
+        "x-handler": "bins/control-api/src/validation_routes.rs::evaluate_holdout"
+      }
+    },
+    "/api/validation/reports/{candidate}": {
+      "get": {
+        "operationId": "validation_reports",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "candidate",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "selection trial rows of one candidate (genome text or gp-… strategy id) + its latest objectives; holdout evaluations (kind = holdout) listed separately under holdout",
+        "tags": [
+          "validation"
+        ],
+        "x-handler": "bins/control-api/src/validation_routes.rs::reports"
+      }
+    },
+    "/api/validation/shadow/{strategy}": {
+      "get": {
+        "operationId": "validation_shadow",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "strategy",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "shadow / lifecycle row of the risk-engine (ledger.strategy_state) plus consistency = realised shadow Sharpe (fill-marked, from ledger.fill_attribution) vs the latest backtest Sharpe (spec 40 §6.6 item 4); 503 while the table is missing",
+        "tags": [
+          "validation"
+        ],
+        "x-handler": "bins/control-api/src/validation_routes.rs::shadow"
+      }
+    },
+    "/ws/bus": {
+      "get": {
+        "operationId": "routes_ws_bus",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade (spec 50 §4.8 frames `{stream, seq, ts, topic, data}`)"
+          }
+        },
+        "summary": "Ws bus",
+        "tags": [
+          "routes"
+        ],
+        "x-handler": "bins/control-api/src/routes.rs::bus_tap::ws_bus"
+      }
+    },
+    "/ws/evolution": {
+      "get": {
+        "operationId": "evolution_ws_evolution",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade (spec 50 §4.8 frames `{stream, seq, ts, topic, data}`)"
+          }
+        },
+        "summary": "Ws evolution",
+        "tags": [
+          "evolution"
+        ],
+        "x-handler": "bins/control-api/src/evolution_routes.rs::ws_evolution"
+      }
+    },
+    "/ws/latent": {
+      "get": {
+        "operationId": "latent_ws_latent",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade (spec 50 §4.8 frames `{stream, seq, ts, topic, data}`)"
+          }
+        },
+        "summary": "Ws latent",
+        "tags": [
+          "latent"
+        ],
+        "x-handler": "bins/control-api/src/latent_routes.rs::ws_latent"
+      }
+    },
+    "/ws/trading": {
+      "get": {
+        "operationId": "ws_ws_trading",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade (spec 50 §4.8 frames `{stream, seq, ts, topic, data}`)"
+          }
+        },
+        "summary": "Ws trading",
+        "tags": [
+          "ws"
+        ],
+        "x-handler": "bins/control-api/src/ws_routes.rs::ws_trading"
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ]
+}

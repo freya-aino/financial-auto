@@ -266,6 +266,45 @@ func writeAtomic(path string, b []byte) error {
 	return os.Rename(tmp, path)
 }
 
+// MergeCalibrated returns base with the impact coefficients a calibrated model fitted per
+// (venue, class): a calibrated file written from an older costs.yaml must not resurrect its
+// fee schedules or instrument classes.
+func MergeCalibrated(base, cal *CostModel) *CostModel {
+	if base == nil || cal == nil {
+		return base
+	}
+	out := *base
+	out.Venues = map[string]VenueCosts{}
+	for v, vc := range base.Venues {
+		classes := map[string]ClassCosts{}
+		for c, cc := range vc.Classes {
+			classes[c] = cc
+		}
+		vc.Classes = classes
+		out.Venues[v] = vc
+	}
+	for v, vc := range cal.Venues {
+		for c, cc := range vc.Classes {
+			if cc.ImpactK == nil {
+				continue
+			}
+			s := base.Schedule(v, c)
+			if s.ImpactK != nil && *s.ImpactK == *cc.ImpactK {
+				continue
+			}
+			k := *cc.ImpactK
+			s.ImpactK = &k
+			ov := out.Venues[v]
+			if ov.Classes == nil {
+				ov.Classes = map[string]ClassCosts{}
+			}
+			ov.Classes[c] = s
+			out.Venues[v] = ov
+		}
+	}
+	return &out
+}
+
 // SetCosts swaps the engine's cost model (calibration applied in memory).
 func (p *PaperEngine) SetCosts(m *CostModel) {
 	p.mu.Lock()

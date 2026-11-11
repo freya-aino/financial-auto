@@ -12,9 +12,9 @@ use fa_ledger::{Fill, Ledger};
 use fa_proto::{
     Message, Timestamp,
     v1::{
-        DecoderOutput, Envelope, ExposureDistribution, Halt, Job, JobProgress, JobResult, LatentState, OrderEvent,
-        OrderIntent, RegionEvent, RiskState, Side, TradingMode, TransitionUpdate, envelope::Payload, job_result,
-        order_event, region_event,
+        DecoderOutput, Envelope, ExpertHealth, ExposureDistribution, Halt, Job, JobProgress, JobResult, LatentState,
+        OrderEvent, OrderIntent, RegionEvent, RiskState, Side, TradingMode, TransitionUpdate, envelope::Payload,
+        job_result, order_event, region_event,
     },
 };
 use serde::Serialize;
@@ -425,6 +425,8 @@ pub struct Live {
     decoder_outputs: VecDeque<DecoderOutputView>,
     /// Per-snapshot expert routing stats and norm covariance.
     snapshot_stats: BTreeMap<String, SnapshotStats>,
+    /// Latest `latent.expert.health` per snapshot (spec 32 §4.3, model-runtime on closed bars).
+    expert_health: BTreeMap<String, Value>,
     // evolution
     jobs: HashMap<String, JobView>,
     job_order: VecDeque<String>,
@@ -454,6 +456,7 @@ impl Default for Live {
             transitions: BTreeMap::new(),
             decoder_outputs: VecDeque::new(),
             snapshot_stats: BTreeMap::new(),
+            expert_health: BTreeMap::new(),
             jobs: HashMap::new(),
             job_order: VecDeque::new(),
             generations: BTreeMap::new(),
@@ -526,6 +529,8 @@ impl Live {
     pub fn ingest(&mut self, subject: &str, payload: &[u8]) {
         let r = if subject.starts_with("latent.state.") {
             LatentState::decode(payload).map(|m| self.on_latent_state(m))
+        } else if subject == "latent.expert.health" {
+            ExpertHealth::decode(payload).map(|m| self.on_expert_health(m))
         } else if subject.starts_with("latent.region.") {
             RegionEvent::decode(payload).map(|m| self.on_region(m))
         } else if subject.starts_with("latent.transition.") {
@@ -606,6 +611,37 @@ impl Live {
         let topic = format!("state.{}.{}", v.snapshot_id, v.instrument_id);
         self.emit("latent", topic, || serde_json::to_value(&v).unwrap_or_default());
         self.states.entry(m.timescale).or_default().insert(m.instrument_id, v);
+    }
+
+    fn on_expert_health(&mut self, m: ExpertHealth) {
+        if m.snapshot_id.is_empty() {
+            return;
+        }
+        let k = m.expert_ids.len();
+        let corr: Vec<Vec<f64>> = if k > 0 && m.resid_corr.len() == k * k {
+            m.resid_corr.chunks(k).map(<[f64]>::to_vec).collect()
+        } else {
+            Vec::new()
+        };
+        let v = json!({
+            "snapshot_id": m.snapshot_id, "timescale": m.timescale, "as_of": ts(m.as_of.as_ref()), "source": m.source,
+            "expert_ids": m.expert_ids, "usage": m.usage, "skill": m.skill, "resid_corr": corr,
+            "k_eff": m.k_eff, "resid_corr_max": m.resid_corr_max, "n_windows": m.n_windows,
+        });
+        let topic = format!("expert_health.{}", m.snapshot_id);
+        self.emit("latent", topic, || v.clone());
+        if !self.expert_health.contains_key(&m.snapshot_id)
+            && self.expert_health.len() >= MAX_SNAPSHOT_STATS
+            && let Some(k) = self.expert_health.keys().next().cloned()
+        {
+            self.expert_health.remove(&k);
+        }
+        self.expert_health.insert(m.snapshot_id, v);
+    }
+
+    /// Latest live expert health of a snapshot (`latent.expert.health`), if any arrived.
+    pub fn expert_health(&self, snapshot_id: &str) -> Option<Value> {
+        self.expert_health.get(snapshot_id).cloned()
     }
 
     /// Expert routing stats + norm covariance of one snapshot (`None` before any `LatentState`).
@@ -1409,6 +1445,33 @@ mod tests {
 
     fn feed<M: Message>(live: &mut Live, subject: &str, m: &M) {
         live.ingest(subject, &m.encode_to_vec());
+    }
+
+    #[test]
+    fn expert_health_is_kept_per_snapshot() {
+        let mut l = Live::default();
+        assert!(l.expert_health("s1").is_none());
+        feed(
+            &mut l,
+            "latent.expert.health",
+            &ExpertHealth {
+                snapshot_id: "s1".into(),
+                timescale: "1m".into(),
+                source: "live".into(),
+                expert_ids: vec![0, 2],
+                usage: vec![0.6, 0.4],
+                skill: vec![0.1, -0.2],
+                resid_corr: vec![1.0, 0.3, 0.3, 1.0],
+                k_eff: 1.8,
+                resid_corr_max: 0.3,
+                n_windows: 120,
+                ..Default::default()
+            },
+        );
+        let h = l.expert_health("s1").unwrap();
+        assert_eq!(h["resid_corr"][0][1], 0.3);
+        assert_eq!(h["expert_ids"][1], 2);
+        assert_eq!(h["source"], "live");
     }
 
     fn space() -> Option<ExpertSpaceRef> {

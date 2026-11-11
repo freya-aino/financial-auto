@@ -250,6 +250,7 @@ func (p *PaperEngine) startAlgo(in *fav1.OrderIntent, a AlgoSpec, m *market, tok
 		w.limit = ref * (1 - dir*a.OffsetBps/10_000)
 	}
 	p.working[in.IntentId] = w
+	p.touch()
 	p.algoCount(a.Name, "working", 1)
 	return &fav1.OrderEvent{
 		IntentId: in.IntentId, VenueOrderId: "paper-" + in.IntentId, Kind: fav1.OrderEvent_KIND_ACK,
@@ -326,6 +327,7 @@ func (p *PaperEngine) progress(token string, now time.Time) []Published {
 		}
 		if done {
 			delete(p.working, id)
+			p.touch()
 			p.algoCount(w.algo.Name, "working", -1)
 			p.algoCount(w.algo.Name, "done", 1)
 		}

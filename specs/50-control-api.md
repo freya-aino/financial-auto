@@ -22,7 +22,7 @@ A single HTTP + WebSocket surface through which the frontend (51) — and script
 - Every mutating endpoint writes an `audit_log` entry (42).
 
 ## 4. Interfaces
-Conventions: `/api/v1/...` **(proposal: version prefix)**; JSON; time as RFC3339 UTC; ids as UUID strings; list endpoints paginate with `?cursor=&limit=`; OpenAPI served at `/api/openapi.json` (generated via `utoipa` **(proposal)**).
+Conventions: `/api/v1/...` **(proposal: version prefix)**; JSON; time as RFC3339 UTC; ids as UUID strings; list endpoints paginate with `?cursor=&limit=`; OpenAPI served at `/api/openapi.json`. **Implemented (round 3, `bins/control-api/src/openapi.rs`):** OpenAPI 3.1 **generated from the route declarations** instead of `utoipa` annotations — every route module's source is embedded at compile time and its `.route("<path>", get(h).post(h2)…)` calls are parsed (test modules excluded), so no route can exist without an operation; real handlers win over the `routes.rs` 501 placeholders (later `install`ed routers layer in front), path parameters are declared, summaries come from the modules' doc tables (`| \`GET /api/x\` | … |`) or the handler name, tags = module, `x-handler` names the Rust function. Bodies are documented as generic JSON objects (the Rust handler is the schema of record). 113 paths / 121 operations at the time of writing.
 
 ### 4.1 Ops
 | Method | Path | Description |
@@ -48,7 +48,7 @@ Conventions: `/api/v1/...` **(proposal: version prefix)**; JSON; time as RFC3339
 | WS | `/ws/bus?subjects=md.>,risk.event` | live tap of NATS subjects (decoded proto → JSON), server-side sampling/rate limit |
 | GET | `/api/bus/streams` | JetStream streams, consumers, lag |
 
-`/api/bus/streams` lists every stream (spec 21 §5 limits streams incl. `DLQ`, the `JOBS_<kind>` work queues incl. `JOBS_MCMC`) with `max_bytes` (the `max_mib` cap, `-1` = none), messages, bytes, sequences and per-consumer lag. control-api also runs the dead-letter forwarder (spec 21 §8): poison messages land on `dlq.<STREAM>.<subject>` and raise a `DeadLetter` alert on `ops.alert` (seen on the bus tap) and `fa_bus_dead_letters_total{stream,consumer,reason}`; `GET /api/alerts` lists vmalert alerts only, so a vmalert rule on that counter is the way to surface dead letters there.
+`/api/bus/streams` lists every stream (spec 21 §5 limits streams incl. `DLQ`, the `JOBS_<kind>` work queues incl. `JOBS_MCMC`) with `max_bytes` (the applied cap, `-1` = none), `planned_max_bytes` (the spec 21 §5 `max_mib` from `fa_bus::streams::table()`), `cap_applied` (false when `ensure_streams` kept a larger cap rather than purge) and `used_ratio` (bytes / cap; the UI's Streams panel shows usage against the cap), messages, bytes, sequences and per-consumer lag. control-api also runs the dead-letter forwarder (spec 21 §8): poison messages land on `dlq.<STREAM>.<subject>` and raise a `DeadLetter` alert on `ops.alert` (seen on the bus tap) and `fa_bus_dead_letters_total{stream,consumer,reason}`; `GET /api/alerts` lists vmalert alerts only, so a vmalert rule on that counter is the way to surface dead letters there.
 
 ### 4.4 Hub / graph
 | GET | `/api/graph/neighborhood?node=&depth=` | Helix subgraph around a node |
@@ -57,7 +57,7 @@ Conventions: `/api/v1/...` **(proposal: version prefix)**; JSON; time as RFC3339
 
 ### 4.5 Latent / MCMC
 | GET | `/api/latent/snapshots` | encoder snapshots per timescale, status (active/candidate/retired) |
-| GET | `/api/latent/{snapshot}/experts` | experts, routing stats, residual covariance matrix |
+| GET | `/api/latent/{snapshot}/experts` | experts, routing stats, residual covariance matrix; `health` = the latest `latent.expert.health` of the snapshot (K_eff, residual correlation matrix, per-expert skill/usage on served windows; control-api's live collector keeps the last one per snapshot) |
 | GET | `/api/latent/{snapshot}/projection?expert=&range=` | 2D/3D projection points (downsampled) |
 | GET | `/api/latent/{snapshot}/regions` | regions with occupancy, stats |
 | GET | `/api/mcmc/{snapshot}/graph?timescale=` | region graph with transition posteriors |
@@ -69,7 +69,7 @@ Conventions: `/api/v1/...` **(proposal: version prefix)**; JSON; time as RFC3339
 | GET | `/api/evolution/populations/{id}/pareto?gen=` | Pareto front points + objectives |
 | GET | `/api/evolution/genomes/{id}` | genome, fitness, eval reports (41) |
 | GET | `/api/evolution/genomes/{id}/outputs` | decoder outputs (image URLs via Garage presign, text, forecasts) |
-| POST | `/api/evolution/runs` | start generation with budget (GPU-hours) |
+| POST | `/api/evolution/runs` | start generation with budget (GPU-hours); body as `POST /api/evolution/generations`: `kind`, `genomes`, `eta`, `min_budget_ms`, `max_budget_ms`, `max_generations`, `total_budget_ms`, `data_window_hours`, `mcmc_pairs` (cross-asset src→target genomes per decoder loop, D-074; absent = orchestrator default 4, 0 disables) forwarded as `ctl.evo.start` args |
 | POST | `/api/evolution/runs/{id}/pause\|resume\|stop` | |
 | WS | `/ws/evolution` | generation progress, survivors per halving round |
 
@@ -99,7 +99,7 @@ Envelope: `{ "stream": "...", "seq": n, "ts": "...", "data": {...} }`. Client ma
 | GET | `/api/mcmc/{snapshot}/transition\|k-step\|neighbors\|paths\|path-prob\|hitting\|stationary` | spec 33 §4.2 queries, each a posterior `{mean, sd, lower, upper, median, level, n}` |
 | GET | `/api/mcmc/{snapshot}/hierarchy`, `/api/mcmc/cross-priors?timescale=&limit=` | REFINES edges; ranked cross-asset priors (gain, lead-lag and score on expert residuals, spec 33 §6.5) |
 | GET | `/api/latent/regions/{id}/lineage?depth=` | ancestors, descendants, lineage members (DescendsFrom) |
-| GET | `/api/latent/snapshots/{id}` | snapshot, manifest, promotion checklist (incl. neural `expert_k_eff`, `expert_resid_corr`, `expert_min_skill`), not-evaluated items, shadow gauges |
+| GET | `/api/latent/snapshots/{id}` | snapshot, manifest, promotion checklist (incl. neural `ssl_regression`, `expert_k_eff`, `expert_resid_corr`, `expert_min_skill`), not-evaluated items (items now reported as checks are dropped from it), shadow gauges. A trained snapshot always carries `ssl_regression`: the parent-vs-candidate mixture-skill regression when the parent is neural, else an n/a pass (`value: null`, the detail names the statistical parent — there is no SSL objective to regress against) |
 | POST/DELETE | `/api/latent/snapshots/{id}/shadow`, `POST .../shadow/stop` | shadow serving via `ctl.model` (audited) |
 | GET | `/api/decoders/serving` | `ctl.decoders.status`: slots per (family, timescale), serving vs shadow, online n / loss, pins, disabled |
 | GET | `/api/decoders/cards?limit=` | decoder cards in `fa-models/decoders/**/*.card.json`, newest first |
@@ -141,6 +141,8 @@ Stateless except a small cache. Reads: Postgres (catalog, ledger, audit, jobs), 
 
 ## 9. Acceptance criteria
 - OpenAPI document covers every REST endpoint.
+
+**Status (round 3):** generated from the route declarations, so it covers every endpoint by construction (`document_covers_the_known_routes`); the frontend's committed copy `frontend/src/lib/openapi.json` is checked against the generated document (`openapi_snapshot_is_current`; `FA_UPDATE_OPENAPI=1 cargo test -p control-api openapi` rewrites it) and every `/api/…` call of the frontend against it (vitest `openapi.test.ts`). Request/response schemas are generic objects — typed schemas would need annotating ~120 handlers.
 - Every mutating endpoint creates an audit entry.
 - Limit loosening via `PUT /api/trading/limits` returns 409.
 - Bus tap streams decoded events for any subject pattern at bounded rate.
@@ -149,7 +151,7 @@ Stateless except a small cache. Reads: Postgres (catalog, ledger, audit, jobs), 
 ## 10. Open questions
 1. Service start/stop: via Docker API, a process supervisor, or out of scope (compose only)? — blocks 4.1 service control.
 2. Version prefix `/api/v1` now or later.
-3. Typed client generation for the frontend (OpenAPI → TS) vs hand-written.
+3. Typed client generation for the frontend (OpenAPI → TS) vs hand-written. *Decided (round 3): hand-written fetch layer (`frontend/src/lib/{api,console}.ts`, typed by hand) checked against the generated OpenAPI document: a vitest scans every `/api/…` literal in the frontend sources and fails on a path or method the document does not have. A generated TS client would only add value once the document carries real body schemas.*
 
 ## 11. Deferred
 - Auth, TLS, multi-user (local only).

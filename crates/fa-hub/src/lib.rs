@@ -19,6 +19,8 @@
 //!   `NewsDoc` / `MediaSegment` embedding indexes.
 //! - [`meta`]: the schema/migration version marker stored in Helix (`SchemaMeta`).
 //! - [`asof`]: as-of variants of the snapshot-scoped reads (`created_at <= t`).
+//! - [`versions`]: event-time versions of transition posteriors and region status marks, so
+//!   as-of reads return the values in force at `t` (not the current ones).
 //! - [`retention`]: pruning of old `observation` latents into per-region aggregates.
 //! - [`buffer`]: a bounded, drop-oldest write buffer for when Helix is unavailable.
 //! - [`regions`]: region lifecycle/lineage (`DescendsFrom`), hierarchy (`Hier`), persisted region
@@ -35,6 +37,7 @@ pub mod regions;
 pub mod retention;
 pub mod schema;
 pub mod vectors;
+pub mod versions;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -55,6 +58,7 @@ pub use regions::{
 };
 pub use retention::{PruneReport, RetentionPolicy};
 pub use vectors::{EmbeddingHit, KnnFilter, NewEmbedding};
+pub use versions::{RegionStatusVersion, TransitionVersion, edge_key};
 
 /// Default base URL (D-014: host port 6969 maps to the container's 8080).
 pub const DEFAULT_URL: &str = "http://127.0.0.1:6969";

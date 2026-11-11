@@ -79,6 +79,25 @@ pub fn expert_space_id(snapshot: &str, expert: u32) -> String {
 // ------------------------------------------------------------- experts
 
 async fn experts(State(s): State<AppState>, Path(snapshot): Path<String>) -> Response {
+    let mut res = experts_inner(&s, &snapshot).await;
+    // spec 32 §4.3: the live expert health model-runtime publishes on `latent.expert.health`
+    let health = s.live().expert_health(&snapshot);
+    if res.status() == StatusCode::OK
+        && let Some(h) = health
+    {
+        let (parts, body) = res.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+        let mut v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        if let Some(o) = v.as_object_mut() {
+            o.insert("health".into(), h);
+        }
+        res = (parts, Json(v)).into_response();
+    }
+    res
+}
+
+async fn experts_inner(s: &AppState, snapshot: &str) -> Response {
+    let snapshot = snapshot.to_owned();
     let live_stats = s.live().snapshot_stats(&snapshot).map(|st| st.view());
     match s.hub.snapshot_graph(&snapshot).await {
         Ok(Some(g)) => {
@@ -556,8 +575,25 @@ pub fn manifest_health_checks(manifest: &Value) -> Vec<Check> {
     };
     let metric = |k: &str| manifest["metrics"][k].as_f64();
     let mut out = Vec::new();
+    let tol = env("FA_PROMOTE_REGRESS_TOL", 0.02);
+    // a trained (neural) snapshot always reports item 1; without a neural parent there is no
+    // SSL objective to regress against, which the check says instead of being silent
+    let trained = metric("k_eff").is_some() || metric("mix_skill").is_some();
+    if trained && metric("ssl_regression").is_none() {
+        let parent = manifest["parent_snapshot_id"].as_str().unwrap_or("");
+        out.push(Check {
+            name: "ssl_regression",
+            ok: true,
+            value: None,
+            threshold: Some(tol),
+            detail: if parent.is_empty() {
+                "no parent snapshot: nothing to regress against (n/a)".into()
+            } else {
+                format!("parent {parent} has no SSL objective (statistical family): nothing to regress against (n/a)")
+            },
+        });
+    }
     if let Some(r) = metric("ssl_regression") {
-        let tol = env("FA_PROMOTE_REGRESS_TOL", 0.02);
         out.push(Check {
             name: "ssl_regression",
             ok: r <= tol,
@@ -571,7 +607,13 @@ pub fn manifest_health_checks(manifest: &Value) -> Vec<Check> {
         });
     }
     for (name, key, th, at_least, what) in [
-        ("expert_k_eff", "k_eff", env("FA_PROMOTE_MIN_K_EFF", 2.0), true, "effective independent experts (spec 32 §6.4)"),
+        (
+            "expert_k_eff",
+            "k_eff",
+            env("FA_PROMOTE_MIN_K_EFF", 2.0),
+            true,
+            "effective independent experts (spec 32 §6.4)",
+        ),
         (
             "expert_resid_corr",
             "resid_corr_max",
@@ -637,12 +679,21 @@ async fn snapshot_detail(State(s): State<AppState>, Path(id): Path<String>) -> R
     if let Some(o) = snapshot.as_object_mut() {
         o.remove("manifest");
     }
+    // items reported as checks are no longer "not evaluated"
+    let has = |n: &str| checklist.checks.iter().any(|c| c.name == n);
+    let not_evaluated: Vec<&str> = NOT_EVALUATED
+        .iter()
+        .copied()
+        .filter(|item| {
+            !(item.starts_with("1 ") && has("ssl_regression")) && !(item.starts_with("2 ") && has("expert_k_eff"))
+        })
+        .collect();
     Json(json!({
         "snapshot": snapshot,
         "manifest": manifest,
         "manifest_source": source,
         "checklist": checklist,
-        "not_evaluated": NOT_EVALUATED,
+        "not_evaluated": not_evaluated,
         "shadow_gauges": shadow,
         "latest_adapter": adapter,
     }))
@@ -1298,5 +1349,10 @@ mod tests {
         assert_eq!(c.len(), 4);
         assert!(by("ssl_regression") && by("expert_k_eff") && by("expert_min_skill"));
         assert!(!by("expert_resid_corr"), "0.4 > 0.1 target");
+        // a neural child of a statistical parent still reports item 1 (n/a, passing)
+        let first = json!({ "parent_snapshot_id": "stat-v1-1m", "metrics": { "mix_skill": 0.3, "k_eff": 1.7 } });
+        let c = manifest_health_checks(&first);
+        let ssl = c.iter().find(|x| x.name == "ssl_regression").expect("ssl_regression present");
+        assert!(ssl.ok && ssl.value.is_none() && ssl.detail.contains("stat-v1-1m"), "{ssl:?}");
     }
 }

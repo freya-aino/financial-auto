@@ -24,7 +24,7 @@ use crate::{
         Attribution, BookPosition, BookState, CashEvent, Lot, LotClosing, LotMethod, Marks, PnlBreakdown, TradeEvent,
         UNATTRIBUTED, replay, strategy_pnls, strategy_trades,
     },
-    money::dec,
+    money::{self, Decimal, dec},
     pg::{CashMovement, FillDetails, IntentRecord, PAPER_VENUE, PgError, PgLedger, uuid_of},
     statement::{Statement, build_statement},
 };
@@ -53,6 +53,42 @@ pub struct FillEvent {
     /// Venue (defaults to [`PAPER_VENUE`]).
     #[serde(default)]
     pub venue: Option<Uuid>,
+    /// The venue's symbol of the traded instrument. Only used for an orphan whose
+    /// `fill.instrument` is nil: it is resolved through `ref.listing` as of the fill time.
+    #[serde(default)]
+    pub venue_symbol: Option<String>,
+    /// The venue's fee in its own currency, when the caller could not convert it: an orphan
+    /// stores it natively (`fee`, `fee_ccy`) and converts it with `ref.fx_rate` (else leaves
+    /// `fee_eur` NULL). `None`: `fill.fee_eur` is already in EUR.
+    #[serde(default)]
+    pub fee_native: Option<NativeFee>,
+}
+
+/// A fee in the venue's currency (empty `ccy` = the fill currency, whatever it turns out to be).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeFee {
+    pub amount: f64,
+    #[serde(default)]
+    pub ccy: String,
+}
+
+/// How an orphan's instrument was determined (`ledger.orphan_fill.instrument_status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstrumentStatus {
+    Resolved,
+    Unresolved,
+    Ambiguous,
+}
+
+impl InstrumentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Unresolved => "unresolved",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
 }
 
 /// Anything the ledger records (spec 42 §4 `Ledger::record`).
@@ -78,7 +114,9 @@ pub enum Recorded {
     },
 }
 
-/// A row of `ledger.orphan_fill`.
+/// A row of `ledger.orphan_fill`. Nothing is assumed: an instrument the venue symbol does not
+/// resolve to is `None` (`instrument_status` says why), an unknown fill currency is `None`, and
+/// the fee is kept in the venue's currency with its EUR value only when a rate was known.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrphanFill {
     pub id: Uuid,
@@ -86,16 +124,29 @@ pub struct OrphanFill {
     pub venue_id: Uuid,
     pub client_order_id: String,
     pub venue_fill_id: String,
-    pub instrument: InstrumentId,
+    pub instrument: Option<InstrumentId>,
+    /// `resolved` | `unresolved` | `ambiguous`
+    pub instrument_status: String,
+    pub venue_symbol: Option<String>,
     /// Signed (+ buy).
-    pub qty: f64,
-    pub price: f64,
-    pub ccy: String,
-    pub fee_eur: f64,
-    pub fx_rate_eur: f64,
+    #[serde(with = "money::json")]
+    pub qty: Decimal,
+    #[serde(with = "money::json")]
+    pub price: Decimal,
+    pub ccy: Option<String>,
+    /// Fee in `fee_ccy` as reported.
+    #[serde(with = "money::json")]
+    pub fee: Decimal,
+    pub fee_ccy: String,
+    #[serde(with = "money::json_opt")]
+    pub fee_eur: Option<Decimal>,
+    #[serde(with = "money::json_opt")]
+    pub fx_rate_eur: Option<Decimal>,
     pub fx_source: String,
-    pub arrival_price: Option<f64>,
-    pub slippage_bps: Option<f64>,
+    #[serde(with = "money::json_opt")]
+    pub arrival_price: Option<Decimal>,
+    #[serde(with = "money::json_opt")]
+    pub slippage_bps: Option<Decimal>,
     pub strategy_ids: Vec<String>,
     pub filled_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
@@ -107,15 +158,16 @@ pub struct OrphanFill {
 }
 
 impl OrphanFill {
-    pub fn to_fill(&self) -> Fill {
+    /// The fill to book once instrument, rate and EUR fee are known.
+    pub fn to_fill(&self, instrument: InstrumentId, fx_to_eur: Decimal, fee_eur: Decimal) -> Fill {
         Fill {
             fill_id: self.venue_fill_id.clone(),
             intent_id: self.client_order_id.clone(),
-            instrument: self.instrument,
-            quantity: self.qty,
-            price: self.price,
-            fx_to_eur: self.fx_rate_eur,
-            fee_eur: self.fee_eur,
+            instrument,
+            quantity: money::f(self.qty),
+            price: money::f(self.price),
+            fx_to_eur: money::f(fx_to_eur),
+            fee_eur: money::f(fee_eur),
         }
     }
 }
@@ -150,9 +202,17 @@ pub struct SnapshotCheck {
     pub diffs: Vec<ReconDiff>,
 }
 
+/// A decimal from a JSON string (`numeric::text`) or number.
+fn json_dec(v: Option<&Value>) -> Option<Decimal> {
+    match v? {
+        Value::String(s) => s.parse::<Decimal>().ok().map(money::round),
+        Value::Number(n) => n.as_f64().map(dec),
+        _ => None,
+    }
+}
+
 fn trade_row(r: &PgRow) -> TradeEvent {
-    let qty: f64 = r.get("qty");
-    let fee: f64 = r.get("fee");
+    let qty: Decimal = r.get("qty");
     let side: String = r.get("side");
     let attr: Value = r.get("attr");
     let attribution = attr
@@ -161,11 +221,9 @@ fn trade_row(r: &PgRow) -> TradeEvent {
         .flatten()
         .filter_map(|a| {
             let s = Uuid::parse_str(a.get(0)?.as_str()?).ok()?;
-            let q = a.get(1)?.as_f64()?;
-            let f = a.get(2)?.as_f64().unwrap_or(0.0);
-            let qty_frac = if qty.abs() > 0.0 { q / qty.abs() } else { 0.0 };
-            let fee_frac = if fee.abs() > 0.0 { f / fee } else { qty_frac };
-            Some(Attribution { strategy: s, qty_frac, fee_frac })
+            let q = json_dec(a.get(1))?.abs();
+            let f = json_dec(a.get(2)).unwrap_or_default();
+            Some(Attribution { strategy: s, qty: q, fee_eur: f })
         })
         .collect();
     TradeEvent {
@@ -179,7 +237,7 @@ fn trade_row(r: &PgRow) -> TradeEvent {
         ccy: r.get("ccy"),
         fx_to_eur: r.get("fx"),
         fx_source: r.get("fx_source"),
-        fee_eur: fee,
+        fee_eur: r.get("fee"),
         filled_at: r.get("filled_at"),
         attribution,
         settle_native: false,
@@ -194,11 +252,15 @@ fn orphan_row(r: &PgRow) -> OrphanFill {
         venue_id: r.get("venue_id"),
         client_order_id: r.get("client_order_id"),
         venue_fill_id: r.get("venue_fill_id"),
-        instrument: InstrumentId(r.get::<Uuid, _>("instrument_id")),
+        instrument: r.get::<Option<Uuid>, _>("instrument_id").map(InstrumentId),
+        instrument_status: r.get("instrument_status"),
+        venue_symbol: r.get("venue_symbol"),
         qty: r.get("qty"),
         price: r.get("price"),
         ccy: r.get("ccy"),
-        fee_eur: r.get("fee"),
+        fee: r.get("fee"),
+        fee_ccy: r.get("fee_ccy"),
+        fee_eur: r.get("fee_eur"),
         fx_rate_eur: r.get("fx"),
         fx_source: r.get("fx_source"),
         arrival_price: r.get("arrival_price"),
@@ -213,10 +275,9 @@ fn orphan_row(r: &PgRow) -> OrphanFill {
     }
 }
 
-const ORPHAN_COLS: &str = "id, book, venue_id, client_order_id, venue_fill_id, instrument_id, qty::float8 AS qty, \
-     price::float8 AS price, ccy, fee::float8 AS fee, fx_rate_eur::float8 AS fx, fx_source, \
-     arrival_price::float8 AS arrival_price, slippage_bps::float8 AS slippage_bps, strategy_ids, filled_at, \
-     received_at, status, resolved_at, resolved_by, resolution";
+const ORPHAN_COLS: &str = "id, book, venue_id, client_order_id, venue_fill_id, instrument_id, instrument_status, \
+     venue_symbol, qty, price, ccy, fee, fee_ccy, fee_eur, fx_rate_eur AS fx, fx_source, arrival_price, slippage_bps, \
+     strategy_ids, filled_at, received_at, status, resolved_at, resolved_by, resolution";
 
 async fn audit<'e, E: sqlx::PgExecutor<'e>>(
     ex: E,
@@ -243,9 +304,8 @@ impl PgLedger {
     pub async fn trade_events(&self, book: &str, before: Option<DateTime<Utc>>) -> Result<Vec<TradeEvent>, PgError> {
         let rows = sqlx::query(
             "SELECT f.id, f.venue_fill_id, oi.idempotency_key AS intent_id, vo.venue_id, oi.instrument_id, oi.side, \
-             f.qty::float8 AS qty, f.price::float8 AS price, f.ccy, f.fx_rate_eur::float8 AS fx, f.fx_source, \
-             f.fee::float8 AS fee, f.filled_at, \
-             COALESCE((SELECT jsonb_agg(jsonb_build_array(fa.strategy_id::text, fa.qty::float8, fa.fee_share::float8) \
+             f.qty, f.price, f.ccy, f.fx_rate_eur AS fx, f.fx_source, f.fee, f.filled_at, \
+             COALESCE((SELECT jsonb_agg(jsonb_build_array(fa.strategy_id::text, fa.qty::text, fa.fee_share::text) \
                                         ORDER BY fa.strategy_id) \
                        FROM ledger.fill_attribution fa WHERE fa.fill_id = f.id), '[]'::jsonb) AS attr \
              FROM ledger.fill f \
@@ -271,7 +331,7 @@ impl PgLedger {
     /// Cash movements of a book with `occurred_at < before` (all when `None`), oldest first.
     pub async fn cash_events(&self, book: &str, before: Option<DateTime<Utc>>) -> Result<Vec<CashEvent>, PgError> {
         let rows = sqlx::query(
-            "SELECT kind, ref, amount::float8 AS amount, ccy, fx_rate_eur::float8 AS fx, occurred_at \
+            "SELECT kind, ref, amount, coalesce(ccy, 'EUR') AS ccy, coalesce(fx_rate_eur, 1) AS fx, occurred_at \
              FROM ledger.cash_movement WHERE book = $1 AND ($2::timestamptz IS NULL OR occurred_at < $2) \
              ORDER BY occurred_at, kind, ref",
         )
@@ -302,21 +362,21 @@ impl PgLedger {
     // ---------------------------------------------------------------- valuation
 
     /// Latest `ref.fx_rate.rate_to_eur` per currency with `ts ≤ at` (any source). EUR is omitted.
-    pub async fn fx_rates_at(&self, ccys: &[String], at: DateTime<Utc>) -> Result<BTreeMap<String, f64>, PgError> {
+    pub async fn fx_rates_at(&self, ccys: &[String], at: DateTime<Utc>) -> Result<BTreeMap<String, Decimal>, PgError> {
         let ccys: Vec<String> =
             ccys.iter().map(|c| c.to_ascii_uppercase()).filter(|c| c != fa_core::BASE_CURRENCY).collect();
         if ccys.is_empty() {
             return Ok(BTreeMap::new());
         }
         let rows = sqlx::query(
-            "SELECT DISTINCT ON (ccy) ccy, rate_to_eur::float8 AS rate FROM ref.fx_rate \
+            "SELECT DISTINCT ON (ccy) ccy, rate_to_eur AS rate FROM ref.fx_rate \
              WHERE ccy = ANY($1) AND ts <= $2 ORDER BY ccy, ts DESC",
         )
         .bind(&ccys)
         .bind(at)
         .fetch_all(self.pool())
         .await?;
-        Ok(rows.iter().map(|r| (r.get::<String, _>("ccy"), r.get::<f64, _>("rate"))).collect())
+        Ok(rows.iter().map(|r| (r.get::<String, _>("ccy"), money::round(r.get::<Decimal, _>("rate")))).collect())
     }
 
     /// Marks for `state` at `at` (now when `None`): `base`, then `ref.fx_rate` as of `at` for
@@ -352,7 +412,7 @@ impl PgLedger {
         book: &str,
         at: Option<DateTime<Utc>>,
         marks: Option<&Marks>,
-    ) -> Result<f64, PgError> {
+    ) -> Result<Decimal, PgError> {
         let s = self.book_state(book, inclusive(at)).await?;
         let m = self.marks_for(&s, at, marks.unwrap_or(&Marks::default())).await?;
         Ok(s.equity_eur(&m))
@@ -459,8 +519,8 @@ impl PgLedger {
             sqlx::query(
                 "INSERT INTO ledger.lot (book, method, lot_id, venue_id, instrument_id, opened_at, open_qty, \
                  remaining_qty, price, ccy, fx_rate_eur) \
-                 SELECT $1, $2, * FROM UNNEST($3::uuid[], $4::uuid[], $5::uuid[], $6::timestamptz[], $7::float8[], \
-                                              $8::float8[], $9::float8[], $10::text[], $11::float8[])",
+                 SELECT $1, $2, * FROM UNNEST($3::uuid[], $4::uuid[], $5::uuid[], $6::timestamptz[], $7::numeric[], \
+                                              $8::numeric[], $9::numeric[], $10::text[], $11::numeric[])",
             )
             .bind(book)
             .bind(method.as_str())
@@ -482,8 +542,8 @@ impl PgLedger {
                  opened_at, closed_at, qty, open_price, close_price, ccy, open_fx, close_fx, realised_native, \
                  realised_eur, fx_eur) \
                  SELECT $1, $2, * FROM UNNEST($3::uuid[], $4::uuid[], $5::uuid[], $6::uuid[], $7::timestamptz[], \
-                   $8::timestamptz[], $9::float8[], $10::float8[], $11::float8[], $12::text[], $13::float8[], \
-                   $14::float8[], $15::float8[], $16::float8[], $17::float8[])",
+                   $8::timestamptz[], $9::numeric[], $10::numeric[], $11::numeric[], $12::text[], $13::numeric[], \
+                   $14::numeric[], $15::numeric[], $16::numeric[], $17::numeric[])",
             )
             .bind(book)
             .bind(method.as_str())
@@ -533,8 +593,8 @@ impl PgLedger {
     /// [`Self::rebuild_lots`], ordered by `(venue, instrument, opened_at, lot_id)`.
     pub async fn cached_lots(&self, book: &str) -> Result<Vec<Lot>, PgError> {
         let rows = sqlx::query(
-            "SELECT lot_id, venue_id, instrument_id, opened_at, open_qty::float8 AS open_qty, \
-             remaining_qty::float8 AS qty, price::float8 AS price, ccy, fx_rate_eur::float8 AS fx \
+            "SELECT lot_id, venue_id, instrument_id, opened_at, open_qty, remaining_qty AS qty, price, ccy, \
+             fx_rate_eur AS fx \
              FROM ledger.lot WHERE book = $1 AND method = $2 ORDER BY venue_id, instrument_id, opened_at, lot_id",
         )
         .bind(book)
@@ -566,9 +626,8 @@ impl PgLedger {
     ) -> Result<Vec<LotClosing>, PgError> {
         let rows = sqlx::query(
             "SELECT c.lot_id, c.close_fill_id, f.venue_fill_id, c.venue_id, c.instrument_id, c.opened_at, c.closed_at, \
-             c.qty::float8 AS qty, c.open_price::float8 AS op, c.close_price::float8 AS cp, c.ccy, \
-             c.open_fx::float8 AS ofx, c.close_fx::float8 AS cfx, c.realised_native::float8 AS rn, \
-             c.realised_eur::float8 AS re, c.fx_eur::float8 AS fe \
+             c.qty, c.open_price AS op, c.close_price AS cp, c.ccy, c.open_fx AS ofx, c.close_fx AS cfx, \
+             c.realised_native AS rn, c.realised_eur AS re, c.fx_eur AS fe \
              FROM ledger.lot_closing c LEFT JOIN ledger.fill f ON f.id = c.close_fill_id \
              WHERE c.book = $1 AND c.method = $2 \
                AND ($3::timestamptz IS NULL OR c.closed_at >= $3) AND ($4::timestamptz IS NULL OR c.closed_at < $4) \
@@ -608,6 +667,7 @@ impl PgLedger {
     /// Derived quantities as of the latest `position_snapshot` batch vs that batch (spec 42 §9
     /// "positions derived from events equal the latest position snapshot").
     pub async fn snapshot_check(&self, book: &str, qty_tol: f64) -> Result<SnapshotCheck, PgError> {
+        let tol = dec(qty_tol);
         let (as_of,): (Option<DateTime<Utc>>,) =
             sqlx::query_as("SELECT max(as_of) FROM ledger.position_snapshot WHERE book = $1")
                 .bind(book)
@@ -617,15 +677,22 @@ impl PgLedger {
             return Ok(SnapshotCheck { as_of: None, instruments: 0, diffs: Vec::new() });
         };
         let rows = sqlx::query(
-            "SELECT instrument_id, sum(qty)::float8 AS qty FROM ledger.position_snapshot \
+            "SELECT instrument_id, sum(qty) AS qty FROM ledger.position_snapshot \
              WHERE book = $1 AND as_of = $2 GROUP BY instrument_id",
         )
         .bind(book)
         .bind(as_of)
         .fetch_all(self.pool())
         .await?;
-        let snap: BTreeMap<InstrumentId, f64> =
-            rows.iter().map(|r| (InstrumentId(r.get::<Uuid, _>("instrument_id")), r.get::<f64, _>("qty"))).collect();
+        let snap: BTreeMap<InstrumentId, Decimal> = rows
+            .iter()
+            .map(|r| {
+                (
+                    InstrumentId(r.get::<Uuid, _>("instrument_id")),
+                    r.get::<Option<Decimal>, _>("qty").unwrap_or_default(),
+                )
+            })
+            .collect();
         let derived = self.book_state(book, inclusive(Some(as_of))).await?.quantities();
         let mut keys: Vec<InstrumentId> = snap.keys().chain(derived.keys()).copied().collect();
         keys.sort();
@@ -633,9 +700,9 @@ impl PgLedger {
         let diffs = keys
             .iter()
             .filter_map(|i| {
-                let o = derived.get(i).copied().unwrap_or(0.0);
-                let b = snap.get(i).copied().unwrap_or(0.0);
-                ((o - b).abs() > qty_tol).then_some(ReconDiff { instrument: *i, ours: o, broker: b })
+                let o = derived.get(i).copied().unwrap_or_default();
+                let b = snap.get(i).copied().unwrap_or_default();
+                ((o - b).abs() > tol).then(|| ReconDiff { instrument: *i, ours: money::f(o), broker: money::f(b) })
             })
             .collect();
         Ok(SnapshotCheck { as_of: Some(as_of), instruments: keys.len(), diffs })
@@ -692,18 +759,108 @@ impl PgLedger {
         }
     }
 
+    /// Instrument of an orphan: the fill's own (when not nil), else its venue symbol through
+    /// `ref.listing` as of the fill time (one instrument → resolved, several → ambiguous).
+    pub async fn resolve_orphan_instrument(
+        &self,
+        instrument: InstrumentId,
+        venue_symbol: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<(Option<InstrumentId>, InstrumentStatus), PgError> {
+        if !instrument.0.is_nil() {
+            return Ok((Some(instrument), InstrumentStatus::Resolved));
+        }
+        let Some(sym) = venue_symbol.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok((None, InstrumentStatus::Unresolved));
+        };
+        let ids: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT DISTINCT instrument_id FROM ref.listing \
+             WHERE venue_symbol = $1 AND valid_from <= $2 AND valid_to > $2 LIMIT 2",
+        )
+        .bind(sym)
+        .bind(at)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(match ids.as_slice() {
+            [(id,)] => (Some(InstrumentId(*id)), InstrumentStatus::Resolved),
+            [] => (None, InstrumentStatus::Unresolved),
+            _ => (None, InstrumentStatus::Ambiguous),
+        })
+    }
+
+    /// Quote currency of an instrument (`ref.instrument.quote_ccy`).
+    pub async fn quote_ccy(&self, instrument: InstrumentId) -> Result<Option<String>, PgError> {
+        let row: Option<(Option<String>,)> = sqlx::query_as("SELECT quote_ccy FROM ref.instrument WHERE id = $1")
+            .bind(instrument.0)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(row.and_then(|r| r.0).map(|c| c.trim().to_ascii_uppercase()).filter(|c| !c.is_empty()))
+    }
+
+    /// EUR per unit of `ccy` at `at`: 1 for EUR, else the latest `ref.fx_rate` at or before `at`
+    /// (any source) with its source id.
+    pub async fn rate_to_eur(&self, ccy: &str, at: DateTime<Utc>) -> Result<Option<(Decimal, String)>, PgError> {
+        let ccy = ccy.trim().to_ascii_uppercase();
+        if ccy == fa_core::BASE_CURRENCY {
+            return Ok(Some((Decimal::ONE, "eur".to_owned())));
+        }
+        let row: Option<(Decimal, String)> = sqlx::query_as(
+            "SELECT rate_to_eur, source_id FROM ref.fx_rate WHERE ccy = $1 AND ts <= $2 ORDER BY ts DESC LIMIT 1",
+        )
+        .bind(&ccy)
+        .bind(at)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(|(r, s)| (money::round(r), s)))
+    }
+
     async fn record_orphan(&self, e: &FillEvent) -> Result<Recorded, PgError> {
         let f = &e.fill;
         let x = crate::ExactFill::of(f);
         let id = uuid_of(&format!("orphan:{}:{}", f.intent_id, f.fill_id));
         let venue = e.venue.unwrap_or(PAPER_VENUE);
-        let ccy = if e.details.ccy.is_empty() { fa_core::BASE_CURRENCY } else { e.details.ccy.as_str() };
-        let src = if e.details.fx_source.is_empty() { "fixed" } else { e.details.fx_source.as_str() };
+        let (instrument, status) =
+            self.resolve_orphan_instrument(f.instrument, e.venue_symbol.as_deref(), e.filled_at).await?;
+        // fill currency: as given, else the instrument's quote currency, else unknown
+        let ccy = match e.details.ccy.trim() {
+            "" => match instrument {
+                Some(i) => self.quote_ccy(i).await?,
+                None => None,
+            },
+            c => Some(c.to_ascii_uppercase()),
+        };
+        let given_fx = !matches!(e.details.fx_source.trim(), "" | "unknown" | "missing");
+        let (fx, src) = match &ccy {
+            Some(_) if given_fx => (Some(x.fx_to_eur), e.details.fx_source.clone()),
+            Some(c) => match self.rate_to_eur(c, e.filled_at).await? {
+                Some((r, s)) => (Some(r), s),
+                None => (None, "missing".to_owned()),
+            },
+            None => (None, "unknown".to_owned()),
+        };
+        // fee: in EUR as given, or natively with its EUR value when a rate is known
+        let (fee, fee_ccy, fee_eur) = match &e.fee_native {
+            None => (x.fee_eur, fa_core::BASE_CURRENCY.to_owned(), Some(x.fee_eur)),
+            Some(n) => {
+                let amount = dec(n.amount);
+                let fccy = match n.ccy.trim() {
+                    "" => ccy.clone(),
+                    c => Some(c.to_ascii_uppercase()),
+                };
+                let eur = match &fccy {
+                    Some(c) if Some(c) == ccy.as_ref() && fx.is_some() => fx.map(|r| money::mul(amount, r)),
+                    Some(c) => self.rate_to_eur(c, e.filled_at).await?.map(|(r, _)| money::mul(amount, r)),
+                    None => None,
+                };
+                (amount, fccy.unwrap_or_default(), eur)
+            }
+        };
         let mut tx = self.pool().begin().await?;
         let n = sqlx::query(
-            "INSERT INTO ledger.orphan_fill (id, book, venue_id, client_order_id, venue_fill_id, instrument_id, qty, \
-             price, ccy, fee, fee_ccy, fx_rate_eur, fx_source, arrival_price, slippage_bps, strategy_ids, filled_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'EUR', $11, $12, $13, $14, $15, $16) \
+            "INSERT INTO ledger.orphan_fill (id, book, venue_id, client_order_id, venue_fill_id, instrument_id, \
+             instrument_status, venue_symbol, qty, price, ccy, fee, fee_ccy, fee_eur, fx_rate_eur, fx_source, \
+             arrival_price, slippage_bps, strategy_ids, filled_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
              ON CONFLICT DO NOTHING",
         )
         .bind(id)
@@ -711,13 +868,17 @@ impl PgLedger {
         .bind(venue)
         .bind(&f.intent_id)
         .bind(&f.fill_id)
-        .bind(f.instrument.0)
+        .bind(instrument.map(|i| i.0))
+        .bind(status.as_str())
+        .bind(e.venue_symbol.as_deref())
         .bind(x.qty)
         .bind(x.price)
-        .bind(ccy)
-        .bind(x.fee_eur)
-        .bind(x.fx_to_eur)
-        .bind(src)
+        .bind(ccy.as_deref())
+        .bind(fee)
+        .bind(&fee_ccy)
+        .bind(fee_eur)
+        .bind(fx)
+        .bind(&src)
         .bind(e.details.arrival_price.filter(|v| v.is_finite()).map(dec))
         .bind(e.details.slippage_bps.filter(|v| v.is_finite()).map(dec))
         .bind(json!(e.strategy_ids))
@@ -732,7 +893,8 @@ impl PgLedger {
                 "ledger.orphan_fill",
                 &f.intent_id,
                 json!({"orphan_id": id, "venue_id": venue, "book": e.book, "venue_fill_id": f.fill_id,
-                       "instrument_id": f.instrument, "qty": f.quantity, "price": f.price}),
+                       "instrument_id": instrument, "instrument_status": status, "venue_symbol": e.venue_symbol,
+                       "qty": f.quantity, "price": f.price, "ccy": ccy, "fee": money::f(fee), "fee_ccy": fee_ccy}),
             )
             .await?;
         }
@@ -776,32 +938,69 @@ impl PgLedger {
         }
         let (status, resolution) = match action {
             OrphanAction::Book => {
-                let side: Option<(String,)> = sqlx::query_as(
-                    "SELECT oi.side FROM ledger.venue_order vo JOIN ledger.order_intent oi ON oi.id = vo.intent_id \
-                     WHERE vo.client_order_id = $1",
+                let order: Option<(String, Uuid)> = sqlx::query_as(
+                    "SELECT oi.side, oi.instrument_id FROM ledger.venue_order vo \
+                     JOIN ledger.order_intent oi ON oi.id = vo.intent_id WHERE vo.client_order_id = $1",
                 )
                 .bind(&o.client_order_id)
                 .fetch_optional(self.pool())
                 .await?;
-                let Some((side,)) = side else {
+                let Some((side, order_inst)) = order else {
                     return Err(PgError::UnknownIntent {
                         fill_id: o.venue_fill_id.clone(),
                         intent_id: o.client_order_id.clone(),
                     });
                 };
-                if (side == "sell") != (o.qty < 0.0) {
+                // a negative quantity means the venue reported a sell; a positive one may be a buy
+                // or an unsigned venue quantity (`fa.v1.OrderEvent` carries no side): the order's
+                // side decides
+                if side != "sell" && o.qty.is_sign_negative() {
                     return Err(PgError::Invalid(format!(
                         "orphan fill {id} has qty {} but order {} is a {side}",
                         o.qty, o.client_order_id
                     )));
                 }
-                let details = FillDetails {
-                    ccy: o.ccy.clone(),
-                    fx_source: o.fx_source.clone(),
-                    arrival_price: o.arrival_price,
-                    slippage_bps: o.slippage_bps,
+                let signed_qty = if side == "sell" { -o.qty.abs() } else { o.qty };
+                let instrument = InstrumentId(order_inst);
+                if o.instrument.is_some_and(|i| i != instrument) {
+                    return Err(PgError::Invalid(format!(
+                        "orphan fill {id} is for instrument {} but order {} trades {instrument}",
+                        o.instrument.map(|i| i.0.to_string()).unwrap_or_default(),
+                        o.client_order_id
+                    )));
+                }
+                // values left unknown at parking time are completed now, never assumed
+                let ccy = match &o.ccy {
+                    Some(c) => c.clone(),
+                    None => self.quote_ccy(instrument).await?.ok_or_else(|| {
+                        PgError::Invalid(format!("orphan fill {id}: currency of instrument {instrument} unknown"))
+                    })?,
                 };
-                let new = self.record_fill_with(&o.to_fill(), o.filled_at, &o.strategy_ids, &details).await?;
+                let (fx, fx_source) = match o.fx_rate_eur {
+                    Some(r) if o.ccy.is_some() => (r, o.fx_source.clone()),
+                    _ => self.rate_to_eur(&ccy, o.filled_at).await?.ok_or_else(|| {
+                        PgError::Invalid(format!("orphan fill {id}: no {ccy}→EUR rate at {}", o.filled_at))
+                    })?,
+                };
+                let fee_eur = match o.fee_eur {
+                    Some(v) => v,
+                    None => {
+                        let fccy = if o.fee_ccy.is_empty() { ccy.clone() } else { o.fee_ccy.clone() };
+                        let (r, _) = self.rate_to_eur(&fccy, o.filled_at).await?.ok_or_else(|| {
+                            PgError::Invalid(format!("orphan fill {id}: no {fccy}→EUR rate for its fee"))
+                        })?;
+                        money::mul(o.fee, r)
+                    }
+                };
+                let details = FillDetails {
+                    ccy,
+                    fx_source,
+                    arrival_price: o.arrival_price.map(money::f),
+                    slippage_bps: o.slippage_bps.map(money::f),
+                };
+                let mut fill = o.to_fill(instrument, fx, fee_eur);
+                fill.quantity = money::f(signed_qty);
+                let new = self.record_fill_with(&fill, o.filled_at, &o.strategy_ids, &details).await?;
                 ("booked", if new { "booked by operator".to_owned() } else { "already booked (duplicate)".to_owned() })
             }
             OrphanAction::Dismiss { reason } => ("dismissed", reason.clone()),
@@ -852,8 +1051,8 @@ impl PgLedger {
         let pnl = self.book_pnl(book, Some(prev_start), Some(start), None).await?;
         let prev_q = self.payout_quota(prev).await?;
         let inputs = crate::payout::PayoutInputs {
-            prev_equity_eur: dec(equity),
-            prev_net_pnl_eur: dec(pnl.net_eur),
+            prev_equity_eur: equity,
+            prev_net_pnl_eur: pnl.net_eur,
             prev_quota_eur: dec(prev_q.as_ref().map_or(0.0, |q| q.quota_eur)),
             prev_paid_eur: dec(prev_q.as_ref().map_or(0.0, |q| q.paid_eur)),
         };
@@ -977,6 +1176,8 @@ mod tests {
             },
             book: None,
             venue: None,
+            venue_symbol: None,
+            fee_native: None,
         }
     }
 
@@ -1040,15 +1241,19 @@ mod tests {
         // orphans: one booked once its order is known, one dismissed
         let mut orphan = fe(&id(5), a, 2.0, 99.0, 1.0, "EUR", s(40), &[&s1]);
         orphan.book = Some(book.clone());
+        // a throwaway venue: the live risk-engine halts on open orphans of the paper venue
+        let test_venue = uuid_of(&format!("{book}-venue"));
+        orphan.venue = Some(test_venue);
         let Recorded::Orphaned { id: oid, new: true } = pg.record_fill_event(&orphan).await.unwrap() else {
             panic!("expected a new orphan")
         };
         assert_eq!(pg.record_fill_event(&orphan).await.unwrap(), Recorded::Orphaned { id: oid, new: false });
         let mut stray = fe(&format!("{book}-nosuch"), a, 1.0, 1.0, 1.0, "EUR", s(41), &[]);
         stray.book = Some(book.clone());
+        stray.venue = Some(test_venue);
         let Recorded::Orphaned { id: sid, .. } = pg.record_fill_event(&stray).await.unwrap() else { panic!() };
-        assert!(pg.open_orphan_count(Some(PAPER_VENUE)).await.unwrap() >= 2);
-        assert!(pg.orphan_fills(Some("open"), 1000).await.unwrap().iter().any(|o| o.id == oid && o.qty == 2.0));
+        assert_eq!(pg.open_orphan_count(Some(test_venue)).await.unwrap(), 2);
+        assert!(pg.orphan_fills(Some("open"), 1000).await.unwrap().iter().any(|o| o.id == oid && o.qty == dec(2.0)));
         assert!(matches!(pg.resolve_orphan(oid, &OrphanAction::Book, "ui").await, Err(PgError::UnknownIntent { .. })));
         pg.record_intent(&intent(&book, &id(5), a, "buy", 2.0, s(40))).await.unwrap();
         let booked = pg.resolve_orphan(oid, &OrphanAction::Book, "ui").await.unwrap();
@@ -1062,12 +1267,13 @@ mod tests {
         assert!(pg.record_payout(&book, day, 25.0).await.unwrap());
         assert!(!pg.record_payout(&book, day, 25.0).await.unwrap(), "one payout per book and day");
         assert!(pg.record_payout(&book, day, -1.0).await.is_err());
-        let (paid,): (f64,) =
-            sqlx::query_as("SELECT -sum(amount)::float8 FROM ledger.cash_movement WHERE kind = 'payout' AND ref = $1")
-                .bind(day.to_string())
-                .fetch_one(pg.pool())
-                .await
-                .unwrap();
+        let (paid,): (f64,) = sqlx::query_as(
+            "SELECT (-sum(amount))::float8 FROM ledger.cash_movement WHERE kind = 'payout' AND ref = $1",
+        )
+        .bind(day.to_string())
+        .fetch_one(pg.pool())
+        .await
+        .unwrap();
         assert!(paid >= 25.0);
         assert!((pg.payout_quota(day).await.unwrap().unwrap().paid_eur - paid).abs() < 1e-9);
 
@@ -1077,44 +1283,49 @@ mod tests {
         assert_eq!(st.positions(), again.positions());
         assert_eq!(st.closings, again.closings);
         assert_eq!(st.fills, 5);
-        assert!((st.payouts_eur - 25.0).abs() < 1e-9);
+        assert_eq!(st.payouts_eur, dec(25.0));
         let mem = pg.load_book(&book).await.unwrap();
-        assert!((mem.cash_eur - st.cash_eur).abs() < 1e-9, "{} vs {}", mem.cash_eur, st.cash_eur);
+        assert_eq!(mem.exact().cash_eur, st.cash_eur, "derived cash equals the book of record exactly");
         assert_eq!(
-            crate::pg::quantities(&mem).into_iter().filter(|(_, q)| *q != 0.0).collect::<BTreeMap<_, _>>(),
-            st.quantities().into_iter().filter(|(_, q)| *q != 0.0).collect::<BTreeMap<_, _>>()
+            mem.exact()
+                .positions
+                .iter()
+                .filter(|(_, p)| !p.qty.is_zero())
+                .map(|(i, p)| (*i, p.qty))
+                .collect::<BTreeMap<_, _>>(),
+            st.quantities().into_iter().filter(|(_, q)| !q.is_zero()).collect::<BTreeMap<_, _>>()
         );
 
         // as-of positions
         let early = pg.positions(&book, Some(s(15))).await.unwrap();
-        assert_eq!(early.iter().map(|p| p.qty).collect::<Vec<_>>().iter().sum::<f64>(), 15.0);
+        assert_eq!(money::sum(early.iter().map(|p| p.qty)), dec(15.0));
         let now = pg.positions(&book, None).await.unwrap();
         let qa = now.iter().find(|p| p.instrument == a).unwrap();
-        assert_eq!((qa.qty, qa.open_lots), (8.0, 2));
-        assert_eq!(now.iter().find(|p| p.instrument == b).unwrap().qty, 0.0);
-        let marks = Marks { prices: BTreeMap::from([(a, 101.0)]), ..Marks::default() };
+        assert_eq!((qa.qty, qa.open_lots), (dec(8.0), 2));
+        assert!(now.iter().find(|p| p.instrument == b).unwrap().qty.is_zero());
+        let marks = Marks { prices: BTreeMap::from([(a, dec(101.0))]), ..Marks::default() };
         let eq = pg.equity_eur(&book, None, Some(&marks)).await.unwrap();
-        assert!((eq - (st.cash_eur + 8.0 * 101.0)).abs() < 1e-9);
+        assert_eq!(eq, st.cash_eur + dec(8.0 * 101.0));
 
         // P&L breakdown, FX separated; strategies sum to the book
         let pnl = pg.book_pnl(&book, None, None, None).await.unwrap();
-        assert!((pnl.fx_realised_eur - 5.0 * 50.0 * 0.01).abs() < 1e-9, "{pnl:?}");
-        assert!((pnl.realised_eur - (4.0 * 5.0 + 5.0 * 2.0 * 0.91)).abs() < 1e-9, "{pnl:?}");
-        assert!((pnl.fees_eur - 2.5).abs() < 1e-9 && (pnl.funding_eur + 1.0).abs() < 1e-9);
+        assert_eq!(pnl.fx_realised_eur, dec(2.5), "5 × 50 × 0.01, exact: {pnl:?}");
+        assert_eq!(pnl.realised_eur, dec(20.0) + dec(9.1), "4 × 5 + 5 × 2 × 0.91, exact: {pnl:?}");
+        assert_eq!((pnl.fees_eur, pnl.funding_eur), (dec(2.5), dec(-1.0)));
         for from in [None, Some(s(5)), Some(s(25))] {
             let total = pg.book_pnl(&book, from, None, None).await.unwrap();
             let per = pg.strategy_pnls(&book, from, None).await.unwrap();
             let sum = per.values().fold(PnlBreakdown::default(), |acc, p| acc.plus(p));
-            assert!((sum.net_eur - total.net_eur).abs() < 1e-9, "{from:?}: {sum:?} vs {total:?}");
+            assert!((sum.net_eur - total.net_eur).abs() < Decimal::new(1, 15), "{from:?}: {sum:?} vs {total:?}");
             let one = pg.strategy_pnl(&book, &s1, from, None).await.unwrap();
-            assert!(one.max_abs_diff(&per[&uuid_of(&s1).to_string()]) < 1e-12);
+            assert_eq!(one.max_abs_diff(&per[&uuid_of(&s1).to_string()]), Decimal::ZERO);
         }
 
         // statement over a window explains the equity change
         let stmt = pg.statement(&book, Some(s(5)), Some(s(3600)), None).await.unwrap();
         assert_eq!(stmt.fills.len(), 4);
         assert_eq!(stmt.cash_movements.len(), 1);
-        assert!(stmt.unexplained_eur.abs() < 1e-9, "{}", stmt.unexplained_eur);
+        assert!(stmt.unexplained_eur.abs() < Decimal::new(1, 15), "{}", stmt.unexplained_eur);
         assert!(stmt.to_csv().lines().count() > 10);
         pg.daily_statement(&book, t0.date_naive()).await.unwrap();
 
@@ -1129,11 +1340,15 @@ mod tests {
         assert_eq!(c1.len(), derived.len());
         for (x, y) in c1.iter().zip(&derived) {
             assert_eq!((x.lot_id, x.instrument, x.ccy.as_str()), (y.lot_id, y.instrument, y.ccy.as_str()));
-            assert!((x.qty - y.qty).abs() < 1e-12 && (x.price - y.price).abs() < 1e-12);
+            assert_eq!(
+                (x.qty, x.price, x.fx_to_eur),
+                (y.qty, y.price, y.fx_to_eur),
+                "the cache holds the exact decimals"
+            );
         }
         let closings = pg.cached_lot_closings(&book, None, None).await.unwrap();
         assert_eq!(closings.len(), 2);
-        assert!((closings.iter().map(|c| c.fx_eur).sum::<f64>() - pnl.fx_realised_eur).abs() < 1e-9);
+        assert_eq!(money::sum(closings.iter().map(|c| c.fx_eur)), pnl.fx_realised_eur);
 
         // every fill valued natively and in EUR with an FX source and time
         let usd_rate: (i64,) = sqlx::query_as(
@@ -1180,6 +1395,86 @@ mod tests {
         .unwrap();
     }
 
+    /// spec 42 §8: an orphan with no order anywhere keeps what is unknown unknown — no nil
+    /// instrument, no EUR fee assumption — and booking completes it from the order and `ref`.
+    #[tokio::test]
+    async fn orphans_never_assume_instrument_or_fee() {
+        let Some(pg) = ledger().await else { return };
+        let book = format!("test-{}", Uuid::now_v7());
+        let venue = uuid_of(&format!("{book}-venue"));
+        let at = DateTime::from_timestamp(Utc::now().timestamp() - 600, 0).unwrap();
+        // a listing whose symbol maps to exactly one instrument, with a quote currency
+        let listed: Option<(String, Uuid, Option<String>)> = sqlx::query_as(
+            "SELECT l.venue_symbol, min(l.instrument_id::text)::uuid, min(i.quote_ccy) FROM ref.listing l \
+             JOIN ref.instrument i ON i.id = l.instrument_id WHERE l.valid_from <= $1 AND l.valid_to > $1 \
+             GROUP BY l.venue_symbol HAVING count(DISTINCT l.instrument_id) = 1 AND min(i.quote_ccy) IS NOT NULL \
+             ORDER BY l.venue_symbol LIMIT 1",
+        )
+        .bind(at)
+        .fetch_optional(pg.pool())
+        .await
+        .unwrap();
+        let usd = pg.rate_to_eur("USD", at).await.unwrap();
+        let mk = |n: u32, sym: Option<&str>, fee: Option<NativeFee>| {
+            let mut e = fe(&format!("{book}-o{n}"), InstrumentId(Uuid::nil()), 1.0, 100.0, 1.0, "", at, &[]);
+            e.details.fx_source = "unknown".into();
+            e.book = Some(book.clone());
+            e.venue = Some(venue);
+            e.venue_symbol = sym.map(str::to_owned);
+            e.fee_native = fee;
+            e
+        };
+        // 1. nothing to go on: unresolved, currency and rate unknown, fee kept natively
+        let Recorded::Orphaned { id: o1, new: true } =
+            pg.record_fill_event(&mk(1, None, Some(NativeFee { amount: 0.25, ccy: String::new() }))).await.unwrap()
+        else {
+            panic!()
+        };
+        // 2. a venue symbol no listing has
+        let Recorded::Orphaned { id: o2, .. } = pg
+            .record_fill_event(&mk(2, Some("NO-SUCH-SYMBOL-XYZ"), Some(NativeFee { amount: 1.5, ccy: "USD".into() })))
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let rows = pg.orphan_fills(Some("open"), 10_000).await.unwrap();
+        let r1 = rows.iter().find(|o| o.id == o1).unwrap();
+        assert_eq!((r1.instrument, r1.instrument_status.as_str(), r1.ccy.as_deref()), (None, "unresolved", None));
+        assert_eq!((r1.fee, r1.fee_ccy.as_str(), r1.fee_eur, r1.fx_rate_eur), (dec(0.25), "", None, None));
+        let r2 = rows.iter().find(|o| o.id == o2).unwrap();
+        assert_eq!((r2.instrument, r2.venue_symbol.as_deref()), (None, Some("NO-SUCH-SYMBOL-XYZ")));
+        assert_eq!(r2.fee_ccy, "USD");
+        assert_eq!(
+            r2.fee_eur,
+            usd.as_ref().map(|(r, _)| money::mul(dec(1.5), *r)),
+            "USD fee converted with ref.fx_rate"
+        );
+        // 3. a listed symbol resolves to its instrument and quote currency
+        if let Some((sym, inst, ccy)) = &listed {
+            let Recorded::Orphaned { id: o3, .. } = pg.record_fill_event(&mk(3, Some(sym), None)).await.unwrap() else {
+                panic!()
+            };
+            let r3 = pg.orphan_fills(Some("open"), 10_000).await.unwrap().into_iter().find(|o| o.id == o3).unwrap();
+            assert_eq!((r3.instrument, r3.instrument_status.as_str()), (Some(InstrumentId(*inst)), "resolved"));
+            assert_eq!(r3.ccy, ccy.as_ref().map(|c| c.to_ascii_uppercase()));
+        }
+        // booking the unresolved one once its order is known takes the order's instrument
+        let inst = listed.as_ref().map_or_else(InstrumentId::new, |(_, i, _)| InstrumentId(*i));
+        pg.record_intent(&intent(&book, &format!("{book}-o1"), inst, "buy", 1.0, at)).await.unwrap();
+        match pg.resolve_orphan(o1, &OrphanAction::Book, "ui").await {
+            Ok(b) => assert_eq!(b.status, "booked"),
+            // no quote currency or no rate for it: refused, never assumed
+            Err(PgError::Invalid(msg)) => assert!(listed.is_none() || msg.contains("rate"), "{msg}"),
+            Err(e) => panic!("{e}"),
+        }
+        assert!(pg.trade_events(&book, None).await.unwrap().iter().all(|t| t.instrument == inst));
+        // cleanup
+        sqlx::query("DELETE FROM ledger.orphan_fill WHERE venue_id = $1").bind(venue).execute(pg.pool()).await.unwrap();
+        pg.delete_book(&book).await.unwrap();
+        sqlx::query("DELETE FROM audit.log WHERE subject LIKE $1 || '%'").bind(&book).execute(pg.pool()).await.unwrap();
+    }
+
     /// Read-only acceptance pass over an existing book (`LEDGER_VERIFY_BOOK=paper`): derived
     /// positions vs the latest snapshot, replay determinism, fill valuation, strategy P&L sums
     /// and the statement identity. Writes nothing.
@@ -1194,9 +1489,10 @@ mod tests {
         assert_eq!(st.closings, again.closings);
         let mem = pg.load_book(&book).await.unwrap();
         for (i, q) in st.quantities() {
-            let m = mem.positions.get(&i).map_or(0.0, |p| p.quantity);
-            assert!((m - q).abs() < 1e-6, "{i:?}: in-memory {m} vs derived {q}");
+            let m = mem.exact().positions.get(&i).map_or(Decimal::ZERO, |p| p.qty);
+            assert_eq!(m, q, "{i:?}: in-memory {m} vs derived {q}");
         }
+        assert_eq!(mem.exact().cash_eur, st.cash_eur, "derived cash equals the book of record");
         let chk = pg.snapshot_check(&book, 1e-6).await.unwrap();
         let gaps = pg.fill_valuation_gaps(&book).await.unwrap();
         let from = Some(now - Duration::days(1));
@@ -1218,8 +1514,8 @@ mod tests {
             stmt.unexplained_eur,
             t.elapsed()
         );
-        assert!((sum.net_eur - total.net_eur).abs() < 1e-6 * (1.0 + total.net_eur.abs()));
-        assert!(stmt.unexplained_eur.abs() < 1e-6 * (1.0 + stmt.closing.equity_eur.abs()));
+        assert!((sum.net_eur - total.net_eur).abs() < Decimal::new(1, 9), "{} vs {}", sum.net_eur, total.net_eur);
+        assert!(stmt.unexplained_eur.abs() < Decimal::new(1, 9), "{}", stmt.unexplained_eur);
         assert_eq!(gaps, 0);
     }
 }

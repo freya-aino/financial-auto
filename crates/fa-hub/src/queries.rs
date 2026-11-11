@@ -15,6 +15,7 @@ use serde_json::Value as Json;
 
 use crate::ast::{Batch, Cond, EdgeRef, Input, NodeRef, Op, Pred, Val};
 use crate::schema::{LATENT_TENANT, edge, latent_vec_property, node};
+use crate::versions::{status_version_node, transition_version_node};
 use crate::{HubClient, HubError, Result};
 
 // ── row types ───────────────────────────────────────────────────────────────
@@ -743,6 +744,13 @@ impl HubClient {
         let batch = Batch::write()
             .named("upsert_region")
             .var("existing", existing)
+            // a revival of a merged/retired region is a lifecycle change: version it before the update
+            .var("revived", Op::nodes(NodeRef::var("existing")).where_(Pred::negate(Pred::eq("status", "live"))))
+            .var_if(
+                "revived_version",
+                Cond::VarNotEmpty("revived".into()),
+                status_version_node(&region.region_id, "live", "", "revived"),
+            )
             .var_if("updated", Cond::VarNotEmpty("existing".into()), updated)
             .var_if("created", Cond::VarEmpty("existing".into()), created)
             .var_if(
@@ -754,6 +762,11 @@ impl HubClient {
                 "created_row",
                 Cond::VarNotEmpty("created".into()),
                 Op::nodes(NodeRef::var("created")).value_map(None),
+            )
+            .var_if(
+                "created_version",
+                Cond::VarNotEmpty("created".into()),
+                status_version_node(&region.region_id, "live", "", "created"),
             )
             .returning(["updated", "created_row"]);
         let mut resp = self.batch(&batch).await?;
@@ -776,19 +789,29 @@ impl HubClient {
     }
 
     /// `markRegionStatus`: lifecycle mark (`merged` | `retired`, or back to `live`) with the
-    /// related region (absorbed region / survivor). Returns the updated row, `NotFound` if none.
+    /// related region (absorbed region / survivor), versioned as a `RegionStatusVersion` in the
+    /// same batch. Returns the updated row, `NotFound` if none.
     pub async fn mark_region_status(
         &self,
         region_id: &str,
         status: &str,
         related_region_id: &str,
     ) -> Result<LatentRegion> {
-        let op = by_key_nodes(node::LATENT_REGION, "region_id", region_id)
+        let op = Op::nodes(NodeRef::var("region"))
             .set_property("status", status)
             .set_property("related_region_id", related_region_id)
             .set_property("updated_at", Input::Now)
             .value_map(None);
-        let mut resp = self.batch(&Batch::write().named("mark_region_status").ret("row", op)).await?;
+        let batch = Batch::write()
+            .named("mark_region_status")
+            .var("region", by_key_nodes(node::LATENT_REGION, "region_id", region_id))
+            .var_if(
+                "version",
+                Cond::VarNotEmpty("region".into()),
+                status_version_node(region_id, status, related_region_id, ""),
+            )
+            .ret("row", op);
+        let mut resp = self.batch(&batch).await?;
         resp.take_opt("row")?
             .ok_or_else(|| HubError::NotFound { label: node::LATENT_REGION.into(), id: region_id.into() })
     }
@@ -827,7 +850,8 @@ impl HubClient {
 
     /// `upsertTransition` for several edges in one write batch (what model-runtime flushes
     /// every `--hub-flush-secs`): for each row the edge `from → to` with the same `sampler_id`
-    /// is updated in place (count, mean, interval, kernel params, `updated_at`), else inserted.
+    /// is updated in place (count, mean, interval, kernel params, `updated_at`), else inserted;
+    /// either way a `TransitionVersion` row is appended in the same batch ([`crate::versions`]).
     /// Fails with [`HubError::NotFound`] when either region is unknown; the whole batch is then
     /// rolled back by the server (one transaction).
     pub async fn upsert_transitions(&self, rows: &[TransitionUpsert]) -> Result<Vec<Transition>> {
@@ -886,6 +910,9 @@ impl HubClient {
                     Cond::VarNotEmpty(created.clone()),
                     Op::edges(EdgeRef::Var(created.clone())).edge_properties(),
                 )
+                // event-time history (spec 20 §6.3): one version per write, same transaction
+                .var_if(&format!("ver_u{i}"), Cond::VarNotEmpty(updated.clone()), transition_version_node(r))
+                .var_if(&format!("ver_c{i}"), Cond::VarNotEmpty(created.clone()), transition_version_node(r))
                 .returning([updated.clone(), created_row.clone()]);
         }
         let mut resp = self.batch(&batch).await?;
@@ -1085,7 +1112,11 @@ impl HubClient {
             .var("existing", by_key_nodes(node::GENOME, "genome_id", &g.genome_id))
             .var_if("updated", Cond::VarNotEmpty("existing".into()), status_props(Op::nodes(NodeRef::var("existing"))))
             .var_if("created", Cond::VarEmpty("existing".into()), created)
-            .var_if("created_row", Cond::VarNotEmpty("created".into()), status_props(Op::nodes(NodeRef::var("created"))))
+            .var_if(
+                "created_row",
+                Cond::VarNotEmpty("created".into()),
+                status_props(Op::nodes(NodeRef::var("created"))),
+            )
             .returning(["updated", "created_row"]);
         let mut resp = self.batch(&batch).await?;
         if let Some(row) = resp.take_opt::<Genome>("updated")? {

@@ -2,10 +2,12 @@
 //! `created_at`; snapshot-scoped queries filter by snapshot id and `created_at ≤ t`").
 //!
 //! `as_of_ms` is unix milliseconds; rows without the timestamp property (written before it
-//! existed) are treated as not visible. Limits of the model: `ExpertSpace` has no `created_at`
-//! and is visible with its snapshot; `Transition` edges are updated in place, so an as-of read
-//! returns the edges among visible regions with their **latest** posterior (no history), and
-//! `status` marks on regions/snapshots are likewise current values.
+//! existed) are treated as not visible. `Transition` posteriors and region lifecycle `status`
+//! are updated in place, so the reads overlay their event-time versions ([`crate::versions`]):
+//! edges carry the posterior in force at `t` (edges first written after `t` are dropped), regions
+//! the `status` / `related_region_id` in force at `t` (`None` when unknown, i.e. a pre-versioning
+//! row changed after `t`). Limits: `ExpertSpace` has no `created_at` and is visible with its
+//! snapshot; `Snapshot.status` and region statistics (`mass`, `occupancy`, …) are current values.
 
 use std::collections::HashSet;
 
@@ -33,12 +35,13 @@ impl HubClient {
     pub async fn space_regions_as_of(&self, space: u64, as_of_ms: i64) -> Result<Vec<LatentRegion>> {
         let op = Op::nodes(space).r#in(Some(edge::IN_SPACE)).where_(created_before(as_of_ms)).value_map(None);
         let mut resp = self.batch(&Batch::read().named("space_regions_as_of").ret("rows", op)).await?;
-        resp.take("rows")
+        self.regions_as_of(resp.take("rows")?, as_of_ms).await
     }
 
     /// `snapshotGraphAsOf`: [`Self::snapshot_graph`] restricted to what existed at `as_of_ms`:
     /// `None` when the snapshot is unknown or created later; regions with `created_at <= t`;
-    /// transitions whose both endpoints are visible (current posterior values, see module docs).
+    /// transitions whose both endpoints are visible, with the posterior and region status in force
+    /// at `t` (see module docs).
     pub async fn snapshot_graph_as_of(&self, snapshot_id: &str, as_of_ms: i64) -> Result<Option<SnapshotGraph>> {
         let batch = Batch::read()
             .named("snapshot_graph_as_of")
@@ -66,7 +69,10 @@ impl HubClient {
         let visible: HashSet<u64> = regions.iter().map(|r| r.id).collect();
         let mut transitions: Vec<Transition> = resp.take("transitions")?;
         transitions.retain(|t| visible.contains(&t.to));
-        Ok(Some(SnapshotGraph { snapshot, spaces: resp.take("space_rows")?, regions, transitions }))
+        let spaces = resp.take("space_rows")?;
+        let transitions = self.transitions_as_of(transitions, as_of_ms).await?;
+        let regions = self.regions_as_of(regions, as_of_ms).await?;
+        Ok(Some(SnapshotGraph { snapshot, spaces, regions, transitions }))
     }
 
     /// `spaceLatentsAsOf`: `LatentVec` rows of one space with `ts <= as_of_ms`, newest first, at

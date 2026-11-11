@@ -5,19 +5,24 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::accounting::{
-    BookPosition, BookState, CashBalance, CashEvent, LotClosing, LotMethod, Marks, PnlBreakdown, TradeEvent, replay,
+use crate::{
+    accounting::{
+        BookPosition, BookState, CashBalance, CashEvent, LotClosing, LotMethod, Marks, PnlBreakdown, TradeEvent, replay,
+    },
+    money::{self, Decimal},
 };
 
 /// Balances at one end of a statement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatementBalances {
     pub at: Option<DateTime<Utc>>,
-    pub cash_eur: f64,
+    #[serde(with = "crate::money::json")]
+    pub cash_eur: Decimal,
     pub foreign_cash: Vec<CashBalance>,
     /// Open positions only.
     pub positions: Vec<BookPosition>,
-    pub equity_eur: f64,
+    #[serde(with = "crate::money::json")]
+    pub equity_eur: Decimal,
     /// Marks used for valuation (after completion from the latest fills).
     pub marks: Marks,
 }
@@ -28,7 +33,7 @@ impl StatementBalances {
             at,
             cash_eur: s.cash_eur,
             foreign_cash: s.foreign_cash.values().cloned().collect(),
-            positions: s.positions().into_iter().filter(|p| p.qty != 0.0).collect(),
+            positions: s.positions().into_iter().filter(|p| !p.qty.is_zero()).collect(),
             equity_eur: s.equity_eur(marks),
             marks: marks.clone(),
         }
@@ -43,14 +48,20 @@ pub struct StatementFill {
     pub intent_id: String,
     pub venue: uuid::Uuid,
     pub instrument: fa_core::InstrumentId,
-    pub qty: f64,
-    pub price: f64,
+    #[serde(with = "crate::money::json")]
+    pub qty: Decimal,
+    #[serde(with = "crate::money::json")]
+    pub price: Decimal,
     pub ccy: String,
-    pub fx_to_eur: f64,
+    #[serde(with = "crate::money::json")]
+    pub fx_to_eur: Decimal,
     pub fx_source: String,
-    pub notional_native: f64,
-    pub notional_eur: f64,
-    pub fee_eur: f64,
+    #[serde(with = "crate::money::json")]
+    pub notional_native: Decimal,
+    #[serde(with = "crate::money::json")]
+    pub notional_eur: Decimal,
+    #[serde(with = "crate::money::json")]
+    pub fee_eur: Decimal,
 }
 
 impl From<&TradeEvent> for StatementFill {
@@ -85,13 +96,19 @@ pub struct Statement {
     pub cash_movements: Vec<CashEvent>,
     pub lot_closings: Vec<LotClosing>,
     pub pnl: PnlBreakdown,
-    pub fees_eur: f64,
-    pub turnover_eur: f64,
+    #[serde(with = "crate::money::json")]
+    pub fees_eur: Decimal,
+    #[serde(with = "crate::money::json")]
+    pub turnover_eur: Decimal,
     /// Net capital flows (deposits − withdrawals − payouts) in the range, EUR.
-    pub external_flows_eur: f64,
-    pub payouts_eur: f64,
-    /// `closing.equity − opening.equity − external_flows − pnl.net`; ≈ 0 for a consistent book.
-    pub unexplained_eur: f64,
+    #[serde(with = "crate::money::json")]
+    pub external_flows_eur: Decimal,
+    #[serde(with = "crate::money::json")]
+    pub payouts_eur: Decimal,
+    /// `closing.equity − opening.equity − external_flows − pnl.net`; 0 (to the 18th place) for a
+    /// consistent book.
+    #[serde(with = "crate::money::json")]
+    pub unexplained_eur: Decimal,
 }
 
 /// Builds the statement of `[from, to)`. `marks_from` / `marks_to` override prices and rates at
@@ -137,7 +154,7 @@ pub fn build_statement(
         to,
         method,
         fees_eur: pnl.fees_eur,
-        turnover_eur: fills.iter().map(|t| t.notional_eur().abs()).sum(),
+        turnover_eur: money::sum(fills.iter().map(|t| t.notional_eur().abs())),
         fills: fills.into_iter().map(StatementFill::from).collect(),
         cash_movements,
         lot_closings,
@@ -170,9 +187,10 @@ impl Statement {
                        venue: String,
                        inst: String,
                        ccy: &str,
-                       nums: [Option<f64>; 5],
+                       nums: [Option<Decimal>; 5],
                        note: &str| {
-            let n: Vec<String> = nums.iter().map(|x| x.map(|v| v.to_string()).unwrap_or_default()).collect();
+            let n: Vec<String> =
+                nums.iter().map(|x| x.map(|v| v.normalize().to_string()).unwrap_or_default()).collect();
             out.push(
                 [section, &at, r, &venue, &inst, ccy, &n[0], &n[1], &n[2], &n[3], &n[4], note]
                     .iter()
@@ -260,7 +278,7 @@ impl Statement {
     }
 }
 
-type RowFn<'a> = dyn FnMut(&str, String, &str, String, String, &str, [Option<f64>; 5], &str) + 'a;
+type RowFn<'a> = dyn FnMut(&str, String, &str, String, String, &str, [Option<Decimal>; 5], &str) + 'a;
 
 fn balance_rows(row: &mut RowFn<'_>, pos_section: &str, cash_section: &str, b: &StatementBalances) {
     for p in &b.positions {
@@ -271,7 +289,7 @@ fn balance_rows(row: &mut RowFn<'_>, pos_section: &str, cash_section: &str, b: &
             p.venue.to_string(),
             p.instrument.0.to_string(),
             &p.ccy,
-            [Some(p.qty), Some(p.avg_price), None, Some(p.qty * p.avg_price), Some(p.cost_eur)],
+            [Some(p.qty), Some(p.avg_price), None, Some(money::mul(p.qty, p.avg_price)), Some(p.cost_eur)],
             &format!("open_lots={}", p.open_lots),
         );
     }
@@ -282,7 +300,7 @@ fn balance_rows(row: &mut RowFn<'_>, pos_section: &str, cash_section: &str, b: &
         String::new(),
         String::new(),
         "EUR",
-        [None, None, Some(1.0), Some(b.cash_eur), Some(b.cash_eur)],
+        [None, None, Some(Decimal::ONE), Some(b.cash_eur), Some(b.cash_eur)],
         "",
     );
     for c in &b.foreign_cash {
@@ -308,6 +326,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::money::dec;
 
     fn t(n: u128, i: InstrumentId, q: f64, px: f64, at: i64) -> TradeEvent {
         TradeEvent {
@@ -316,12 +335,12 @@ mod tests {
             intent_id: format!("i{n}"),
             venue: Uuid::from_u128(1),
             instrument: i,
-            qty: q,
-            price: px,
+            qty: dec(q),
+            price: dec(px),
             ccy: "EUR".into(),
-            fx_to_eur: 1.0,
+            fx_to_eur: Decimal::ONE,
             fx_source: "eur".into(),
-            fee_eur: 1.0,
+            fee_eur: Decimal::ONE,
             filled_at: Utc.timestamp_opt(1_800_000_000 + at, 0).unwrap(),
             attribution: vec![],
             settle_native: false,
@@ -338,21 +357,21 @@ mod tests {
             CashEvent {
                 kind: "deposit".into(),
                 reference: "initial".into(),
-                amount: 5_000.0,
+                amount: dec(5_000.0),
                 ccy: "EUR".into(),
-                fx_to_eur: 1.0,
+                fx_to_eur: Decimal::ONE,
                 occurred_at: at(-1),
             },
             CashEvent {
                 kind: "payout".into(),
                 reference: "d1".into(),
-                amount: -50.0,
+                amount: dec(-50.0),
                 ccy: "EUR".into(),
-                fx_to_eur: 1.0,
+                fx_to_eur: Decimal::ONE,
                 occurred_at: at(150),
             },
         ];
-        let marks_to = Marks { prices: BTreeMap::from([(i, 92.0)]), ..Marks::default() };
+        let marks_to = Marks { prices: BTreeMap::from([(i, dec(92.0))]), ..Marks::default() };
         let s = build_statement(
             "b",
             LotMethod::Fifo,
@@ -366,12 +385,12 @@ mod tests {
         assert_eq!(s.fills.len(), 2);
         assert_eq!(s.cash_movements.len(), 1);
         assert_eq!(s.lot_closings.len(), 1);
-        assert_eq!(s.opening.positions[0].qty, 10.0);
-        assert_eq!(s.closing.positions[0].qty, 8.0);
-        assert!((s.payouts_eur - 50.0).abs() < 1e-9 && (s.external_flows_eur + 50.0).abs() < 1e-9);
-        assert!((s.pnl.realised_eur - 40.0).abs() < 1e-9);
-        assert!((s.fees_eur - 2.0).abs() < 1e-9);
-        assert!(s.unexplained_eur.abs() < 1e-9, "{s:?}");
+        assert_eq!(s.opening.positions[0].qty, dec(10.0));
+        assert_eq!(s.closing.positions[0].qty, dec(8.0));
+        assert_eq!((s.payouts_eur, s.external_flows_eur), (dec(50.0), dec(-50.0)));
+        assert_eq!(s.pnl.realised_eur, dec(40.0));
+        assert_eq!(s.fees_eur, dec(2.0));
+        assert_eq!(s.unexplained_eur, Decimal::ZERO, "exact: {s:?}");
         // reproducible regardless of input order, JSON round trip, CSV escapes
         let mut rev = trades.clone();
         rev.reverse();

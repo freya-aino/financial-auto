@@ -35,6 +35,9 @@ use fa_allocator::{Allocation, PerformanceTracker, genome::AllocatorGenome, net_
 use fa_bus::replay::RecordedMessage;
 use fa_core::{Horizon, InstrumentId, Timescale};
 use fa_proto::Message;
+use fa_risk::rebalance::{
+    CostQuote, RebalanceConfig, RebalanceStats, Rebalancer, TradeCandidate, effective_obs, strategy_edge,
+};
 use fa_strategies::{AssetExposure, ExposureDistribution};
 use serde::{Deserialize, Serialize};
 
@@ -141,6 +144,26 @@ pub struct AllocatorReplaySpec {
     /// Trials in the generation so far (deflated Sharpe); `1` = plain PSR.
     pub n_trials: usize,
     pub trial_sharpe_var: f64,
+    /// When a target change is traded (default: `min_trade_fraction` of capital).
+    #[serde(default)]
+    pub trade_rule: TradeRule,
+    /// Per-source knowledge delays applied to the marks (spec 41 §6.2).
+    #[serde(default = "crate::knowledge::catalog_delays")]
+    pub knowledge_delays: crate::knowledge::KnowledgeDelays,
+}
+
+/// The rebalance rule of a replay.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(tag = "rule", rename_all = "snake_case")]
+pub enum TradeRule {
+    /// Trade any target move above `min_trade_fraction · capital` (the tournament's rule).
+    #[default]
+    Fraction,
+    /// The risk-engine's D-041 no-trade band: `max(min_eur, frac · |target|)`.
+    Band { frac: f64, min_eur: f64 },
+    /// The live cost-aware rule (`fa_risk::rebalance`, the same [`Rebalancer`] the risk-engine
+    /// runs) on top of the band.
+    CostAware { frac: f64, min_eur: f64, cfg: RebalanceConfig },
 }
 
 impl AllocatorReplaySpec {
@@ -154,6 +177,8 @@ impl AllocatorReplaySpec {
             min_trade_fraction: 0.001,
             n_trials: 1,
             trial_sharpe_var: 0.0,
+            trade_rule: TradeRule::Fraction,
+            knowledge_delays: crate::knowledge::catalog_delays(),
         }
     }
 }
@@ -191,6 +216,12 @@ pub struct AllocatorReport {
     pub n_trades: usize,
     pub gross_pnl: f64,
     pub total_cost: f64,
+    /// Commissions alone (part of `total_cost`).
+    #[serde(default)]
+    pub total_fees: f64,
+    /// Decisions of the cost-aware rule (`TradeRule::CostAware`).
+    #[serde(default)]
+    pub rebalance: Option<RebalanceStats>,
     pub net_pnl: f64,
     pub final_equity: f64,
     /// Mean capital weight per strategy over active steps.
@@ -268,6 +299,8 @@ pub fn replay_allocator(
     if signals.is_empty() {
         return Err(ReplayError::NoData);
     }
+    // knowledge time (spec 41 §6.2): late-publishing sources become visible after their delay
+    let marks = spec.knowledge_delays.apply(marks);
     // instrument token → mark (sorted for determinism)
     let mut by_token: BTreeMap<String, Mark> = BTreeMap::new();
     for b in marks.iter().filter(|b| !b.is_empty()) {
@@ -299,7 +332,13 @@ pub fn replay_allocator(
     let mut returns = Vec::new();
     let (mut peak, mut max_dd) = (spec.capital, 0.0f64);
     let (mut gross_pnl, mut total_cost, mut step_cost) = (0.0, 0.0, 0.0);
-    let (mut turnover_notional, mut n_trades) = (0.0f64, 0usize);
+    let (mut turnover_notional, mut n_trades, mut total_fees) = (0.0f64, 0usize, 0.0f64);
+    let mut rebalancer = match &spec.trade_rule {
+        TradeRule::CostAware { cfg, .. } => Some(Rebalancer::new(cfg.clone())),
+        _ => None,
+    };
+    let step_secs = spec.step_ms as f64 / 1000.0;
+    let mut last_dists: BTreeMap<String, ExposureDistribution> = BTreeMap::new();
     let mut hhi_sum = 0.0;
     let mut hhi_n = 0usize;
     let mut gross_sum = 0.0;
@@ -391,15 +430,56 @@ pub fn replay_allocator(
             }
             a
         };
-        let targets = net_targets_shrunk(&held, &alloc, equity.max(0.0), genome.shrink);
+        // strategies over their turnover budget are netted with their last distribution (frozen)
+        let netted: Vec<ExposureDistribution> = match rebalancer.as_mut() {
+            Some(rb) => {
+                let frozen = rb.over_budget(t).clone();
+                held.iter()
+                    .map(|d| {
+                        if frozen.contains(&d.strategy_id) {
+                            last_dists.get(&d.strategy_id).cloned().unwrap_or_else(|| d.clone())
+                        } else {
+                            last_dists.insert(d.strategy_id.clone(), d.clone());
+                            d.clone()
+                        }
+                    })
+                    .collect()
+            }
+            None => held.clone(),
+        };
+        let targets = net_targets_shrunk(&netted, &alloc, equity.max(0.0), genome.shrink);
+        // per-instrument contributions (EUR, edge, holding) for the cost-aware rule — the
+        // risk-engine tick's computation
+        let mut contributions: BTreeMap<InstrumentId, Vec<(String, f64, f64, f64)>> = BTreeMap::new();
+        if let Some(rb) = &rebalancer {
+            let stats_now = tracker.stats_for(netted.iter().map(|d| d.strategy_id.as_str()));
+            for (d, st) in netted.iter().zip(&stats_now) {
+                let w = alloc.get(&d.strategy_id).copied().unwrap_or(0.0);
+                if w <= 0.0 || d.exposures.is_empty() {
+                    continue;
+                }
+                let mean_abs = d.exposures.iter().map(|e| e.mean.abs()).sum::<f64>() / d.exposures.len() as f64;
+                let hold = d.horizon.duration().as_secs_f64() * rb.cfg.holding_horizons.max(0.0);
+                let n_eff = effective_obs(st.observations, tracker.decay);
+                let edge = strategy_edge(&rb.cfg, st.mean_return, mean_abs, n_eff, step_secs, hold);
+                let per_asset = w * equity.max(0.0) / d.exposures.len() as f64;
+                for e in &d.exposures {
+                    let c =
+                        per_asset * e.mean.clamp(-1.0, 1.0) / (1.0 + e.stddev.max(0.0)).powf(genome.shrink.max(0.0));
+                    contributions.entry(e.instrument).or_default().push((d.strategy_id.clone(), c, edge, hold));
+                }
+            }
+        }
+        let sleeves: BTreeMap<String, f64> = alloc.iter().map(|(k, w)| (k.clone(), w * equity.max(0.0))).collect();
         let mut abs_targets = Vec::new();
         for m in by_token.values_mut() {
             let Some(p) = m.last else { continue };
-            let target_eur = targets.get(&instrument_id(&m.token)).copied().unwrap_or(0.0);
+            let inst = instrument_id(&m.token);
+            let target_eur = targets.get(&inst).copied().unwrap_or(0.0);
             abs_targets.push(target_eur.abs());
             let delta = target_eur / p - m.units;
             let notional = (delta * p).abs();
-            if notional <= spec.min_trade_fraction.max(0.0) * spec.capital || notional <= 1e-9 {
+            if notional <= 1e-9 {
                 continue;
             }
             let sigma = if m.rets.len() >= 2 {
@@ -409,6 +489,48 @@ pub fn replay_allocator(
             } else {
                 0.0
             };
+            let skip = match &spec.trade_rule {
+                TradeRule::Fraction => notional <= spec.min_trade_fraction.max(0.0) * spec.capital,
+                TradeRule::Band { frac, min_eur } => notional < min_eur.max(frac * target_eur.abs()),
+                TradeRule::CostAware { frac, min_eur, .. } => {
+                    let rb = rebalancer.as_mut().expect("cost-aware rule has a rebalancer");
+                    let parts = contributions.get(&inst).map(Vec::as_slice).unwrap_or(&[]);
+                    let weight: f64 = parts.iter().map(|(_, c, _, _)| c.abs()).sum();
+                    let dir = if target_eur != 0.0 { target_eur.signum() } else { 0.0 };
+                    let (edge, hold) = if weight > 0.0 {
+                        (
+                            parts.iter().map(|(_, c, e, _)| c.signum() * dir * c.abs() * e).sum::<f64>() / weight,
+                            parts.iter().map(|(_, c, _, h)| c.abs() * h).sum::<f64>() / weight,
+                        )
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    let s = cost.schedule(&m.venue, &m.class);
+                    let cand = TradeCandidate {
+                        instrument: inst,
+                        current_eur: m.units * p,
+                        target_eur,
+                        edge,
+                        holding_secs: hold,
+                        urgent: false,
+                        limit_bound: false,
+                        contributors: parts.iter().filter(|(_, c, _, _)| *c != 0.0).map(|(s, ..)| s.clone()).collect(),
+                        cost: CostQuote {
+                            commission_bps: s.commission_bps,
+                            commission_min_eur: s.commission_min_eur,
+                            half_spread_bps: s.spread_bps / 2.0,
+                            impact_k: s.impact_k.unwrap_or(cost.default_k),
+                            sigma_day: if sigma > 0.0 { sigma } else { cost.default_sigma },
+                            adv_eur: cost.default_adv_eur,
+                        },
+                    };
+                    let band = min_eur.max(frac * target_eur.abs());
+                    !rb.decide(&cand, band, *min_eur, &sleeves, t).trades()
+                }
+            };
+            if skip {
+                continue;
+            }
             let priced = cost.price(&CostInputs {
                 venue: m.venue.clone(),
                 class: m.class.clone(),
@@ -419,6 +541,7 @@ pub fn replay_allocator(
                 ..Default::default()
             });
             cash -= delta * priced.fill_price + priced.fee;
+            total_fees += priced.fee;
             let c = priced.total_cost(delta);
             step_cost += c;
             total_cost += c;
@@ -479,6 +602,8 @@ pub fn replay_allocator(
         n_trades,
         gross_pnl,
         total_cost,
+        total_fees,
+        rebalance: rebalancer.map(|r| r.stats),
         net_pnl: final_equity - spec.capital,
         final_equity,
         mean_weights,

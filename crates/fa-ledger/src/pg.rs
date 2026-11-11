@@ -111,19 +111,24 @@ pub struct FillRow {
     pub book: String,
     pub instrument: InstrumentId,
     pub side: String,
-    pub qty: f64,
-    pub price: f64,
-    pub fee_eur: f64,
-    pub fx_rate_eur: f64,
+    /// Unsigned (`side` gives the sign), exact as stored.
+    #[serde(with = "money::json")]
+    pub qty: Decimal,
+    #[serde(with = "money::json")]
+    pub price: Decimal,
+    #[serde(with = "money::json")]
+    pub fee_eur: Decimal,
+    #[serde(with = "money::json")]
+    pub fx_rate_eur: Decimal,
     pub filled_at: DateTime<Utc>,
     #[serde(default)]
     pub ccy: String,
     #[serde(default)]
     pub fx_source: String,
-    #[serde(default)]
-    pub arrival_price: Option<f64>,
-    #[serde(default)]
-    pub slippage_bps: Option<f64>,
+    #[serde(default, with = "money::json_opt")]
+    pub arrival_price: Option<Decimal>,
+    #[serde(default, with = "money::json_opt")]
+    pub slippage_bps: Option<Decimal>,
 }
 
 impl FillRow {
@@ -132,10 +137,10 @@ impl FillRow {
             fill_id: self.fill_id.clone(),
             intent_id: self.intent_id.clone(),
             instrument: self.instrument,
-            quantity: if self.side == "sell" { -self.qty } else { self.qty },
-            price: self.price,
-            fx_to_eur: self.fx_rate_eur,
-            fee_eur: self.fee_eur,
+            quantity: money::f(if self.side == "sell" { -self.qty } else { self.qty }),
+            price: money::f(self.price),
+            fx_to_eur: money::f(self.fx_rate_eur),
+            fee_eur: money::f(self.fee_eur),
         }
     }
 }
@@ -144,8 +149,10 @@ impl FillRow {
 pub struct SnapshotRow {
     pub book: String,
     pub instrument: InstrumentId,
-    pub qty: f64,
-    pub avg_price: Option<f64>,
+    #[serde(with = "money::json")]
+    pub qty: Decimal,
+    #[serde(with = "money::json_opt")]
+    pub avg_price: Option<Decimal>,
     pub as_of: DateTime<Utc>,
 }
 
@@ -456,8 +463,7 @@ impl PgLedger {
     /// Latest snapshot row per instrument of a book.
     pub async fn latest_snapshot(&self, book: &str) -> Result<Vec<SnapshotRow>, PgError> {
         let rows = sqlx::query(
-            "SELECT DISTINCT ON (instrument_id) book, instrument_id, qty::float8 AS qty, \
-             avg_price::float8 AS avg_price, as_of \
+            "SELECT DISTINCT ON (instrument_id) book, instrument_id, qty, avg_price, as_of \
              FROM ledger.position_snapshot WHERE book = $1 ORDER BY instrument_id, as_of DESC",
         )
         .bind(book)
@@ -486,9 +492,8 @@ impl PgLedger {
     ) -> Result<Vec<FillRow>, PgError> {
         let rows = sqlx::query(
             "SELECT f.venue_fill_id, oi.idempotency_key AS intent_id, oi.book, oi.instrument_id, oi.side, \
-             f.qty::float8 AS qty, f.price::float8 AS price, f.fee::float8 AS fee, \
-             f.fx_rate_eur::float8 AS fx, f.filled_at, f.ccy, f.fx_source, \
-             f.arrival_price::float8 AS arrival_price, f.slippage_bps::float8 AS slippage_bps \
+             f.qty, f.price, f.fee, f.fx_rate_eur AS fx, f.filled_at, f.ccy, f.fx_source, f.arrival_price, \
+             f.slippage_bps \
              FROM ledger.fill f \
              JOIN ledger.venue_order vo ON vo.client_order_id = f.client_order_id \
              JOIN ledger.order_intent oi ON oi.id = vo.intent_id \
@@ -930,7 +935,7 @@ mod tests {
         assert_eq!(a[0].fill_id, f1.fill_id);
         assert_eq!((a[0].ccy.as_str(), a[0].fx_source.as_str(), a[0].slippage_bps), ("EUR", "fixed", None));
         assert_eq!((a[1].ccy.as_str(), a[1].fx_source.as_str()), ("USD", "ecb_daily"));
-        assert_eq!((a[1].arrival_price, a[1].slippage_bps), (Some(109.5), Some(-4.2)));
+        assert_eq!((a[1].arrival_price, a[1].slippage_bps), (Some(dec(109.5)), Some(dec(-4.2))));
         let slip = pg.slippage_by_strategy(&book, None, None).await.unwrap();
         assert_eq!(slip[&uuid_of("strat-a")], (-4.2, 1));
         assert!(!slip.contains_key(&uuid_of("strat-b")), "no slippage recorded on strat-b's only fill");
@@ -943,7 +948,7 @@ mod tests {
         assert_eq!(pg.snapshot_positions(&book, &loaded, as_of).await.unwrap(), 0);
         let snap = pg.latest_snapshot(&book).await.unwrap();
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].qty, 0.0);
+        assert!(snap[0].qty.is_zero());
 
         // reconciliation runs
         let id = pg.record_reconciliation(PAPER_VENUE, "ok", Some(&serde_json::json!({"book": book}))).await.unwrap();

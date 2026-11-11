@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use fa_backtest::holdout::HoldoutPolicy;
 use fa_core::{AssetClass, Timescale};
 use fa_risk::{
-    RiskConfig, exec::ExecPolicy, health::FeedGuardConfig, pipeline::PipelinePolicy, strategy::PromotionGate,
+    RiskConfig, exec::ExecPolicy, health::FeedGuardConfig, pipeline::PipelinePolicy, rebalance::RebalanceConfig,
+    strategy::PromotionGate,
 };
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +69,9 @@ pub struct Settings {
     pub tournament_cost_bps: f64,
     /// Execution-algorithm choice per intent (spec 40 §6.4).
     pub exec: ExecPolicy,
+    /// Cost-aware rebalancing (spec 40 §6.1 step 6): benefit vs full expected cost, min order
+    /// notional from the fee minimum, per-strategy daily turnover budget, confirmation batching.
+    pub rebalance: RebalanceConfig,
     /// Snapshot-scoped model-drift alarm (spec 40 §6.5).
     pub model_drift: ModelDriftSettings,
     /// Daily payout quota rule (spec 42 §10 Q1, `fa_ledger::payout`); default reserves nothing.
@@ -124,6 +128,7 @@ impl Default for Settings {
             feed: FeedGuardConfig::default(),
             tournament_cost_bps: 5.0,
             exec: ExecPolicy::default(),
+            rebalance: RebalanceConfig::default(),
             model_drift: ModelDriftSettings::default(),
             payout: fa_ledger::payout::PayoutRule::default(),
         }

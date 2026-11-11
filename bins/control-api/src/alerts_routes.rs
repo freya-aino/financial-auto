@@ -18,6 +18,13 @@
 //!
 //! The module also probes the dependencies `/api/health` reports (TCP reachability) every 15 s
 //! into `fa_dependency_up{dep}`, so HelixDB, which has no metrics endpoint, can be alerted on.
+//!
+//! History (spec 20 §5.4 `ops`): every transition is also stored in `ops.alert_event`
+//! (`fa_warehouse::ops`). At start the store is restored from it once Postgres is attached:
+//! `recent` gets the last 200 transitions and alerts whose latest transition is `firing` become
+//! active again (refreshed from now), so a restart neither forgets the history nor re-publishes
+//! a firing alert vmalert keeps re-sending. `GET /api/alerts/history?since=&alertname=&limit=`
+//! reads the stored history.
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, Mutex},
@@ -195,6 +202,26 @@ impl AlertStore {
         out
     }
 
+    /// Restores the store from stored transitions (newest first): `recent` in arrival order, and
+    /// every fingerprint whose latest transition is `firing` as active again, refreshed at `now`
+    /// (it expires like any active alert if vmalert no longer sends it). Alerts already active
+    /// (received since start) are kept as they are.
+    pub fn restore(&mut self, newest_first: Vec<AlertEvent>, now: DateTime<Utc>) {
+        let mut latest: HashMap<String, AlertEvent> = HashMap::new();
+        for e in &newest_first {
+            latest.entry(e.fingerprint.clone()).or_insert_with(|| e.clone());
+        }
+        for (fp, e) in latest {
+            if e.status == "firing" && !self.active.contains_key(&fp) {
+                self.active.insert(fp, ActiveAlert { event: e, last_seen: now, refreshes: 0 });
+            }
+        }
+        let since_start: Vec<AlertEvent> = self.recent.drain(..).collect();
+        for e in newest_first.into_iter().take(RECENT_CAP).rev().chain(since_start) {
+            self.remember(e);
+        }
+    }
+
     fn remember(&mut self, e: AlertEvent) {
         if self.recent.len() == RECENT_CAP {
             self.recent.pop_front();
@@ -248,6 +275,7 @@ pub struct AlertsState {
 /// Routes plus the expiry sweep and the dependency probe.
 pub fn router(app: AppState) -> Router {
     let st = AlertsState { app, store: Arc::default() };
+    spawn_restore(st.clone());
     spawn_sweeper(st.clone());
     spawn_dependency_probe(st.app.clone());
     routes(st)
@@ -256,6 +284,7 @@ pub fn router(app: AppState) -> Router {
 pub fn routes(st: AlertsState) -> Router {
     Router::new()
         .route("/api/alerts", get(list))
+        .route("/api/alerts/history", get(history))
         .route("/api/alerts/vmalert/api/v2/alerts", post(receive_v2))
         .route("/api/alerts/webhook", post(receive_webhook))
         .with_state(st)
@@ -340,6 +369,7 @@ async fn emit(app: &AppState, events: &[AlertEvent]) -> usize {
             .inc_with(&[("status", &e.status), ("severity", &e.severity)]);
         tracing::info!(alert = %e.alertname, status = %e.status, severity = %e.severity, summary = %e.summary, "ops.alert");
         audit(app, e).await;
+        persist(app, e).await;
     }
     if published > 0
         && let Some(nc) = &app.nats
@@ -364,6 +394,98 @@ async fn audit(app: &AppState, e: &AlertEvent) {
             .await
     {
         tracing::warn!(action, error = %err, "alert audit row not written");
+    }
+}
+
+fn to_record(e: &AlertEvent) -> fa_warehouse::ops::AlertRecord {
+    fa_warehouse::ops::AlertRecord {
+        status: e.status.clone(),
+        alertname: e.alertname.clone(),
+        severity: e.severity.clone(),
+        summary: e.summary.clone(),
+        fingerprint: e.fingerprint.clone(),
+        labels: json!(e.labels),
+        annotations: json!(e.annotations),
+        starts_at: e.starts_at,
+        ends_at: e.ends_at,
+        generator_url: e.generator_url.clone(),
+        at: e.at,
+        expired: e.expired,
+    }
+}
+
+fn from_record(r: fa_warehouse::ops::AlertRecord) -> AlertEvent {
+    AlertEvent {
+        status: r.status,
+        alertname: r.alertname,
+        severity: r.severity,
+        summary: r.summary,
+        fingerprint: r.fingerprint,
+        labels: serde_json::from_value(r.labels).unwrap_or_default(),
+        annotations: serde_json::from_value(r.annotations).unwrap_or_default(),
+        starts_at: r.starts_at,
+        ends_at: r.ends_at,
+        generator_url: r.generator_url,
+        at: r.at,
+        expired: r.expired,
+    }
+}
+
+/// Stores a transition in `ops.alert_event` (spec 20 §5.4).
+async fn persist(app: &AppState, e: &AlertEvent) {
+    let Some(pool) = app.pg.get() else {
+        return;
+    };
+    if let Err(err) = fa_warehouse::ops::record_alert(pool, &to_record(e)).await {
+        tracing::warn!(alert = %e.alertname, error = %err, "alert transition not stored in ops.alert_event");
+    }
+}
+
+/// Restores `recent` and the active set from `ops.alert_event` once Postgres is attached (it is
+/// set by `ledger_routes::install` shortly after start); gives up after 5 minutes.
+fn spawn_restore(st: AlertsState) {
+    tokio::spawn(async move {
+        for _ in 0..150 {
+            if let Some(pool) = st.app.pg.get() {
+                match fa_warehouse::ops::alerts(pool, None, None, RECENT_CAP as i64).await {
+                    Ok(rows) => {
+                        let n = rows.len();
+                        let events = rows.into_iter().map(from_record).collect();
+                        let now = Utc::now();
+                        let mut store = st.store.lock().expect("alert store");
+                        store.restore(events, now);
+                        store.update_gauges(now);
+                        tracing::info!(
+                            transitions = n,
+                            active = store.active.len(),
+                            "alert state restored from ops.alert_event"
+                        );
+                    }
+                    Err(e) => tracing::warn!(error = %e, "alert history not restored"),
+                }
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    since: Option<DateTime<Utc>>,
+    alertname: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `GET /api/alerts/history`: stored transitions, newest first (503 without Postgres).
+async fn history(State(st): State<AlertsState>, Query(q): Query<HistoryQuery>) -> Response {
+    let Some(pool) = st.app.pg.get() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "postgres_unavailable"}))).into_response();
+    };
+    let limit = q.limit.unwrap_or(200).clamp(1, 5_000);
+    match fa_warehouse::ops::alerts(pool, q.since, q.alertname.as_deref(), limit).await {
+        Ok(rows) => Json(json!({"transitions": rows.into_iter().map(from_record).collect::<Vec<_>>()})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }
 
@@ -492,6 +614,24 @@ mod tests {
         assert!(s.active().is_empty());
         assert!(s.watchdog_ok(t0 + chrono::TimeDelta::minutes(2)));
         assert!(!s.watchdog_ok(t0 + chrono::TimeDelta::minutes(4)));
+    }
+
+    #[test]
+    fn restore_rebuilds_recent_and_active_without_republishing() {
+        let now = Utc::now();
+        let mut old = AlertStore::default();
+        let fired = old.apply(vec![alert("A", "warning", 300, now), alert("B", "critical", 300, now)], now);
+        let resolved = old.apply(vec![alert("B", "critical", -1, now)], now + chrono::TimeDelta::seconds(5));
+        let mut stored: Vec<AlertEvent> = fired.into_iter().chain(resolved).collect();
+        stored.reverse(); // newest first, as ops::alerts returns them
+        let mut s = AlertStore::default();
+        s.restore(stored, now + chrono::TimeDelta::seconds(10));
+        assert_eq!(s.recent.len(), 3);
+        assert_eq!(s.recent.back().unwrap().status, "resolved", "arrival order kept");
+        let active: Vec<_> = s.active().into_iter().map(|a| a.event.alertname).collect();
+        assert_eq!(active, vec!["A"], "only the alert whose latest transition fired");
+        // vmalert re-sends A after the restart: a refresh, not a new transition
+        assert!(s.apply(vec![alert("A", "warning", 300, now)], now + chrono::TimeDelta::seconds(20)).is_empty());
     }
 
     #[test]

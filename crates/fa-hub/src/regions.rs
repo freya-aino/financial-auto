@@ -265,16 +265,26 @@ impl HubClient {
     }
 
     /// Death mark: `status = retired`, `died_at = now`, `retire_reason` (`merged | support |
-    /// unmatched`), `related_region_id` (the survivor of a merge, else empty).
+    /// unmatched`), `related_region_id` (the survivor of a merge, else empty); versioned as a
+    /// `RegionStatusVersion` in the same batch ([`crate::versions`]).
     pub async fn mark_region_died(&self, region_id: &str, reason: &str, related_region_id: &str) -> Result<()> {
-        let op = by_key(node::LATENT_REGION, "region_id", region_id)
+        let op = Op::nodes(NodeRef::var("region"))
             .set_property("status", "retired")
             .set_property("retire_reason", reason)
             .set_property("related_region_id", related_region_id)
             .set_property("died_at", Input::Now)
             .set_property("updated_at", Input::Now)
             .value_map(Some(&["$id"]));
-        let mut resp = self.batch(&Batch::write().named("mark_region_died").ret("row", op)).await?;
+        let batch = Batch::write()
+            .named("mark_region_died")
+            .var("region", Op::nodes_with_label_where(node::LATENT_REGION, Pred::eq("region_id", region_id)))
+            .var_if(
+                "version",
+                Cond::VarNotEmpty("region".into()),
+                crate::versions::status_version_node(region_id, "retired", related_region_id, reason),
+            )
+            .ret("row", op);
+        let mut resp = self.batch(&batch).await?;
         let rows: Vec<Json> = resp.take("row")?;
         if rows.is_empty() {
             return Err(HubError::NotFound { label: node::LATENT_REGION.into(), id: region_id.into() });

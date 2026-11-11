@@ -7,6 +7,11 @@
 // `OrderIntent` payload decodes identically by intent id) cancels a resting limit order or the
 // remainder of a working algo order (algo.go). Live fills recalibrate the impact coefficient
 // (calib.go) and the report goes out on `exec.costs.calibrated`.
+//
+// Restart safety and fail-closed (state.go, spec 40 §8): working algo orders, resting limits,
+// recently seen intent ids and per-account positions persist in `$FA_STATE_DIR/orders.json`;
+// while `svc.heartbeat.risk-engine` is older than `-risk-heartbeat-timeout` (15 s) every
+// risk-increasing intent is rejected.
 package main
 
 import (
@@ -49,6 +54,8 @@ func main() {
 	calibMin := flag.Int("recalibrate-min-samples", 30, "informative fills per (venue, class) needed for a fit")
 	tick := flag.Duration("algo-tick", time.Second, "algo scheduler tick (TWAP/VWAP slices, timeouts)")
 	metricsBind := flag.String("metrics", bus.MetricsBindDefault(service), "Prometheus GET /metrics bind (FA_METRICS_BIND; off disables)")
+	statePath := flag.String("orders-state", envOr("FA_ORDERS_STATE", defaultStatePath()), "working/resting orders + positions persisted across restarts (empty: in memory only)")
+	riskTimeout := flag.Duration("risk-heartbeat-timeout", 15*time.Second, "fail-closed: reject risk-increasing intents while the risk-engine heartbeat is older than this (0 disables)")
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("svc", service)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -67,7 +74,9 @@ func main() {
 	if *calibPath != "" {
 		switch m, err := LoadCostModel(*calibPath); {
 		case err == nil:
-			costs = m
+			// only the fitted impact coefficients carry over: fee schedules, classes and
+			// instrument mappings always come from the current costs.yaml
+			costs = MergeCalibrated(base, m)
 			log.Info("loaded calibrated costs", "path", *calibPath)
 		case errors.Is(err, fs.ErrNotExist):
 		default:
@@ -88,6 +97,29 @@ func main() {
 
 	engine := NewPaperEngine(costs)
 	engine.Counters = counters
+	guard := &RiskGuard{Timeout: *riskTimeout}
+	engine.Guard = guard
+	var store *StateStore
+	if *statePath != "" {
+		store = &StateStore{Path: *statePath}
+		switch st, err := store.Load(); {
+		case err != nil:
+			log.Error("orders state unreadable; refusing to start with unknown working orders", "path", *statePath, "err", err)
+			os.Exit(1)
+		case st != nil:
+			if err := engine.Restore(st); err != nil {
+				log.Error("orders state", "path", *statePath, "err", err)
+				os.Exit(1)
+			}
+			log.Info("orders state restored", "path", *statePath, "working", len(st.Working), "resting", len(st.Resting),
+				"positions", len(st.Positions), "seen", len(st.Seen), "saved_at", st.SavedAt)
+			counters.Set("state.restored_working", float64(len(st.Working)))
+		}
+	}
+	if _, err := pub.NC.Subscribe(bus.Heartbeat("risk-engine"), func(*nats.Msg) { guard.Beat(time.Now()) }); err != nil {
+		log.Error("subscribe risk heartbeat", "err", err)
+		os.Exit(1)
+	}
 	calib := NewCalibrator()
 	calib.MinSamples = *calibMin
 	engine.Calib = calib
@@ -160,12 +192,33 @@ func main() {
 	go func() {
 		t := time.NewTicker(*tick)
 		defer t.Stop()
+		save := time.NewTicker(time.Second)
+		defer save.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
 				publish(engine.Tick())
+				age := guard.Age(time.Now())
+				if age > 1e9 {
+					age = -1 // never seen
+				}
+				counters.Set("risk_heartbeat_age_s", age)
+				alive := 0.0
+				if guard.Alive(time.Now()) {
+					alive = 1
+				}
+				counters.Set("risk_heartbeat_alive", alive)
+			case <-save.C:
+				if store != nil {
+					if ok, err := store.SaveIfChanged(engine, false); err != nil {
+						counters.Add("state.save_errors", 1)
+						log.Warn("orders state not saved", "err", err)
+					} else if ok {
+						counters.Add("state.saves", 1)
+					}
+				}
 			}
 		}
 	}()
@@ -212,8 +265,14 @@ func main() {
 			}
 		}()
 	}
-	log.Info("started", "mode", "paper", "costs", *costsPath, "calibrated", *calibPath)
+	log.Info("started", "mode", "paper", "costs", *costsPath, "calibrated", *calibPath, "orders_state", *statePath,
+		"risk_heartbeat_timeout", *riskTimeout)
 	<-ctx.Done()
+	if store != nil {
+		if _, err := store.SaveIfChanged(engine, true); err != nil {
+			log.Warn("orders state not saved at shutdown", "err", err)
+		}
+	}
 	log.Info("stopped")
 }
 
@@ -235,6 +294,14 @@ func decodeCancel(b []byte) (*fav1.OrderCancel, error) {
 		return nil, errors.New("cancel without intent_id")
 	}
 	return &c, nil
+}
+
+// defaultStatePath: `$FA_STATE_DIR/orders.json` (empty without a state dir).
+func defaultStatePath() string {
+	if d := os.Getenv("FA_STATE_DIR"); d != "" {
+		return filepath.Join(d, "orders.json")
+	}
+	return ""
 }
 
 // defaultCalibPath: `$FA_STATE_DIR/costs.calibrated.yaml`, else next to the costs file.

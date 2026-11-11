@@ -13,6 +13,14 @@
 	--mono: ui-monospace, 'JetBrains Mono', 'SFMono-Regular', Menlo, monospace;
 	--sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
 	--radius: 6px;
+	/* sequential magnitude ramp (one hue, dim → bright on the dark surface), e.g. |residual corr| */
+	--seq-0: #2b4b73;
+	--seq-1: #34639b;
+	--seq-2: #4a80c0;
+	--seq-3: #6ea0dc;
+	--seq-4: #a9cdf5;
+	--seq-ink: #d6dde6;
+	--seq-ink-strong: #0d1117;
 }
 
 @media (prefers-color-scheme: light) {
@@ -28,6 +36,13 @@
 		--warn: #9a6700;
 		--danger: #c4302b;
 		--ok: #0f8a64;
+		--seq-0: #86acdc;
+		--seq-1: #6a98d3;
+		--seq-2: #4a7cbf;
+		--seq-3: #2f5f9e;
+		--seq-4: #183f72;
+		--seq-ink: #1c2430;
+		--seq-ink-strong: #ffffff;
 	}
 }
 

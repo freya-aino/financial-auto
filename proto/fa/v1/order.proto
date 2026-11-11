@@ -48,6 +48,15 @@ message OrderEvent {
   // the arrival price (fill vs arrival, positive = paid). Both are 0 for non-fill events.
   double arrival_price = 10;
   double slippage_bps = 11;
+  // Venue-assigned id of this fill, unique per venue (spec 42 §5 `venue_fill_id`): two partial
+  // fills of one order in the same millisecond stay distinct. Empty from older producers;
+  // consumers then fall back to `intent:venue_order:event-ms`.
+  string venue_fill_id = 12;
+  // What was traded (spec 42 §8), so a consumer that does not know the intent (an orphan fill)
+  // can identify the instrument instead of assuming: the internal instrument id when the venue
+  // adapter knows it, and the venue's own symbol.
+  string instrument_id = 13;
+  string venue_symbol = 14;
 }
 
 // `order.cancel.<account>`: cancels a working order (resting limit or the unfilled remainder of
