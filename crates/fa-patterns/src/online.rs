@@ -157,6 +157,25 @@ pub struct RegionStat {
     pub age: u64,
 }
 
+/// The streaming form of a declared discovery method — what the live region stage runs for a
+/// snapshot whose family declares `declared` (spec 30 §6.2/§6.3).
+///
+/// Only leader clustering has an online form ([`OnlineRegionSet`]). The batch methods — HDBSCAN
+/// `density`, `mapper`, `codebook` — need the whole probe set (density estimation, a cover
+/// nerve, k-means over a codebook) and have no incremental update, so their closest supported
+/// online form is the leader set **seeded with the batch method's regions** from the snapshot's
+/// `region_map.json` ([`OnlineRegionSet::seeded`]): seeded regions keep the declared method's
+/// centroids, ids and lineages, and only regions born or split live are leader regions. Every
+/// declared method therefore maps to [`DiscoveryMethod::Leader`] here; a future online form of a
+/// batch method changes this one function.
+pub fn online_form(declared: DiscoveryMethod) -> DiscoveryMethod {
+    match declared {
+        DiscoveryMethod::Leader | DiscoveryMethod::Density | DiscoveryMethod::Mapper | DiscoveryMethod::Codebook => {
+            DiscoveryMethod::Leader
+        }
+    }
+}
+
 /// Stage boundary for online membership: assigns live latents to regions and reports
 /// lifecycle changes. Implemented by [`OnlineRegionSet`]; neural families plug in here.
 pub trait OnlineRegionDiscovery: Send + Sync {
@@ -666,6 +685,14 @@ mod tests {
         (pts, labels)
     }
 
+    #[test]
+    fn every_declared_method_streams_as_seeded_leader() {
+        for m in DiscoveryMethod::ALL {
+            assert_eq!(online_form(m), DiscoveryMethod::Leader, "{m:?}");
+            assert_eq!(DiscoveryMethod::from_name(m.as_str()), Some(m));
+        }
+        assert_eq!(DiscoveryMethod::from_name("hdbscan"), None);
+    }
     #[test]
     fn leader_clustering_recovers_mixture_components() {
         let (pts, labels) = mixture(400, 1);

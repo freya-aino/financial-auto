@@ -78,12 +78,61 @@ func (s StreamSpec) MaxBytes() int64 {
 }
 
 // safeMaxBytes never applies a cap below the bytes a stream already holds (JetStream would
-// purge the oldest messages at once); the current cap stays and the caller logs nothing.
+// purge the oldest messages at once); the current cap stays. Mirrors fa_bus::streams.
 func safeMaxBytes(have, want int64, used uint64) int64 {
 	if want > 0 && used > uint64(want) {
 		return have
 	}
 	return want
+}
+
+// safeMaxAge never lowers a live stream's max_age by config: JetStream drops every message
+// older than the new limit as soon as the update lands (D-075 incident: MD lost ~13.4k
+// messages to a shrunk max_age). A longer age, or 0 (unlimited), is applied; a shorter one
+// (including a finite age on an unlimited stream) keeps the current value, so shortening
+// retention is an operator action (`nats stream edit`), never a side effect of a service start.
+func safeMaxAge(have, want time.Duration) time.Duration {
+	if want > 0 && (have == 0 || want < have) {
+		return have
+	}
+	return want
+}
+
+// LimitHeld reports a configured limit EnsureStreams did not apply because it would purge.
+type LimitHeld struct {
+	Stream string
+	Limit  string // "max_age" | "max_bytes"
+	Have   int64  // current value (ns for max_age, bytes for max_bytes)
+	Want   int64  // configured value
+}
+
+// OnLimitHeld, when set, is called for every held limit (services log it as a warning).
+var OnLimitHeld func(LimitHeld)
+
+// mergeStreamConfig overlays the managed fields of want onto the live config, holding back any
+// limit change that would purge messages. It returns the config to send and whether an update
+// is needed at all.
+func mergeStreamConfig(have jetstream.StreamConfig, usedBytes uint64, want jetstream.StreamConfig) (jetstream.StreamConfig, bool, []LimitHeld) {
+	var held []LimitHeld
+	if mb := safeMaxBytes(have.MaxBytes, want.MaxBytes, usedBytes); mb != want.MaxBytes {
+		held = append(held, LimitHeld{Stream: want.Name, Limit: "max_bytes", Have: have.MaxBytes, Want: want.MaxBytes})
+		want.MaxBytes = mb
+	}
+	if ma := safeMaxAge(have.MaxAge, want.MaxAge); ma != want.MaxAge {
+		held = append(held, LimitHeld{Stream: want.Name, Limit: "max_age", Have: int64(have.MaxAge), Want: int64(want.MaxAge)})
+		want.MaxAge = ma
+	}
+	if configMatches(have, want) {
+		return have, false, held
+	}
+	// Keep server-side fields we do not manage and overlay ours.
+	have.Subjects = want.Subjects
+	have.MaxAge = want.MaxAge
+	have.MaxBytes = want.MaxBytes
+	have.Description = want.Description
+	have.Retention = want.Retention
+	have.Storage = want.Storage
+	return have, true, held
 }
 
 // WorkQueueName is the stream for a job kind: "evo" → "JOBS_EVO", "media.asr" → "JOBS_MEDIA_ASR".
@@ -108,8 +157,10 @@ func WorkQueueConsumer(durable string) jetstream.ConsumerConfig {
 }
 
 // EnsureStreams creates every spec 21 §5 stream and updates the ones whose live config drifted
-// (subjects, max age, max bytes, storage, description). Idempotent. A max_bytes cap below a
-// stream's current size is not applied (it would purge), mirroring fa_bus::streams. Returns the names created or updated.
+// (subjects, max age, max bytes, storage, description). Idempotent. A limit change that would
+// purge is not applied: a max_bytes cap below a stream's current size (mirroring
+// fa_bus::streams) and any max_age shorter than the live one (safeMaxAge); each is reported
+// through OnLimitHeld. Returns the names created or updated.
 func EnsureStreams(ctx context.Context, js jetstream.JetStream) ([]string, error) {
 	var changed []string
 	for _, spec := range Table().Streams {
@@ -143,19 +194,16 @@ func ensureStream(ctx context.Context, js jetstream.JetStream, want jetstream.St
 		return false, err
 	}
 	info := s.CachedInfo()
-	have := info.Config
-	want.MaxBytes = safeMaxBytes(have.MaxBytes, want.MaxBytes, info.State.Bytes)
-	if configMatches(have, want) {
+	cfg, update, held := mergeStreamConfig(info.Config, info.State.Bytes, want)
+	if OnLimitHeld != nil {
+		for _, h := range held {
+			OnLimitHeld(h)
+		}
+	}
+	if !update {
 		return false, nil
 	}
-	// Keep server-side fields we do not manage and overlay ours.
-	have.Subjects = want.Subjects
-	have.MaxAge = want.MaxAge
-	have.MaxBytes = want.MaxBytes
-	have.Description = want.Description
-	have.Retention = want.Retention
-	have.Storage = want.Storage
-	_, err = js.UpdateStream(ctx, have)
+	_, err = js.UpdateStream(ctx, cfg)
 	return err == nil, err
 }
 

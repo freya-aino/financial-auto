@@ -23,6 +23,8 @@
 //!   as-of reads return the values in force at `t` (not the current ones).
 //! - [`retention`]: pruning of old `observation` latents into per-region aggregates.
 //! - [`buffer`]: a bounded, drop-oldest write buffer for when Helix is unavailable.
+//! - [`reference`]: the Postgres `ref` mirror (`Instrument`/`Entity`/`Venue`, `IssuedBy`,
+//!   `ListedOn`, `SameExposure`; spec 12 §5), written by control-api.
 //! - [`regions`]: region lifecycle/lineage (`DescendsFrom`), hierarchy (`Hier`), persisted region
 //!   sets and kernel models, cross-asset priors (spec 30 §5, spec 33 §5).
 
@@ -33,6 +35,7 @@ pub mod catalog;
 pub mod experts;
 pub mod meta;
 pub mod queries;
+pub mod reference;
 pub mod regions;
 pub mod retention;
 pub mod schema;
@@ -52,6 +55,7 @@ pub use buffer::{BufferStats, FlushReport, WriteBuffer};
 pub use experts::{AlignmentRow, ExpertRow, NewAlignment, NewExpert, expert_uid};
 pub use meta::{SCHEMA_VERSION, SchemaMarker};
 pub use queries::*;
+pub use reference::{InstrumentReference, RefEntity, RefExposure, RefInstrument, RefListing, RefSyncReport, RefVenue};
 pub use regions::{
     LineageLink, NewCrossPrior, NewDescent, NewHierEdge, NewKernelModel, NewRegionSet, RegionLineage, RegionSetRow,
     RegionStatsUpdate,

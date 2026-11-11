@@ -199,7 +199,8 @@ impl TrialStore {
             return Ok(None);
         }
         let row = sqlx::query(
-            "select id::text as id, timescale, start_at, end_at, locked_at, note from validation.holdout where id = $1::uuid",
+            "select id::text as id, timescale, start_at, end_at, locked_at, note, (to_jsonb(h) ->> 'embargo_ms')::bigint as embargo_ms \
+             from validation.holdout h where id = $1::uuid",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -213,6 +214,7 @@ impl TrialStore {
                     start_ms: r.get::<DateTime<Utc>, _>("start_at").timestamp_millis(),
                     end_ms: r.get::<DateTime<Utc>, _>("end_at").timestamp_millis(),
                     locked_at_ms: r.get::<DateTime<Utc>, _>("locked_at").timestamp_millis(),
+                    embargo_ms: r.get::<Option<i64>, _>("embargo_ms"),
                 },
                 note: r.get::<Option<String>, _>("note"),
             })
@@ -235,10 +237,14 @@ impl TrialStore {
         Ok(row.map(|r| r.get::<String, _>("candidate")))
     }
 
-    /// Locked holdouts of a timescale.
+    /// Locked holdouts of a timescale, each with the embargo it was locked with
+    /// (`embargo_ms`, migration 20261113000040; read through `to_jsonb` so an unmigrated table
+    /// gives NULL = the timescale default instead of failing the lookup — a failed lookup
+    /// would disable the holdout check).
     pub async fn holdouts(&self, timescale: Timescale) -> Result<Vec<Holdout>, sqlx::Error> {
         let rows = sqlx::query(
-            "select start_at, end_at, locked_at from validation.holdout where timescale = $1 order by start_at",
+            "select start_at, end_at, locked_at, (to_jsonb(h) ->> 'embargo_ms')::bigint as embargo_ms \
+             from validation.holdout h where timescale = $1 order by start_at",
         )
         .bind(timescale.as_str())
         .fetch_all(&self.pool)
@@ -250,6 +256,7 @@ impl TrialStore {
                 start_ms: r.get::<DateTime<Utc>, _>("start_at").timestamp_millis(),
                 end_ms: r.get::<DateTime<Utc>, _>("end_at").timestamp_millis(),
                 locked_at_ms: r.get::<DateTime<Utc>, _>("locked_at").timestamp_millis(),
+                embargo_ms: r.get::<Option<i64>, _>("embargo_ms"),
             })
             .collect())
     }

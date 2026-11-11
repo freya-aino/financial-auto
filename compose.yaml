@@ -329,9 +329,11 @@ services:
     environment:
       <<: *rust-env
       FA_COSTS: /app/config/costs.yaml # venue cost model of the paper venue (spec 35/41 §6.3): decoder trade value, strategy replays
+      FA_RISK: /app/risk.toml # the risk-engine's rebalance rule and holdout embargo, so fitness trades like the live book
     volumes:
       - ./config/secrets.toml:/app/config/secrets.toml:ro
       - ./go/services/broker-gateway/costs.yaml:/app/config/costs.yaml:ro
+      - ./bins/risk-engine/risk.toml:/app/risk.toml:ro
     ports:
       - "127.0.0.1:9110-9119:9100" # metrics; a range so up to 10 replicas can publish (scrape uses DNS inside compose)
     depends_on: *core-deps

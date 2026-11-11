@@ -10,45 +10,73 @@
 // Mixed-dimension latents: one `LatentVec` label, vector stored in property `vec<dim>` with one
 // index per dim, each partitioned per expert space. (Resolves the earlier open question.)
 
-// ── Reference graph (mirrored from Postgres `ref`, spec 12) ─────────────
+// ── Reference graph (mirrored from Postgres `ref`, spec 12 §5) ─────────
+// Written by control-api `ref_mirror.rs` through fa-hub `reference.rs`: full sync at start and
+// every FA_REF_MIRROR_FULL_SECS, incremental on `ref.changed.*`. Ids are the Postgres UUIDs;
+// empty strings stand for NULL. Edges carry the key they are upserted by.
 N::Instrument {
     UNIQUE INDEX instrument_id: String,
     asset_class: String,
     kind: String,
     name: String,
+    status: String,      // active | provisional | merged | … ; "inactive" = no longer current in Postgres
+    base_ccy: String,
+    quote_ccy: String,
+    mirrored_at: Date,
 }
 
 N::Entity {
     UNIQUE INDEX entity_id: String,
     lei: String,
     name: String,
+    country: String,
+    sector: String,
+    mirrored_at: Date,
 }
 
 N::Venue {
     UNIQUE INDEX venue_id: String,
+    code: String,        // ref.venue.code, the subject token
     mic: String,
     name: String,
+    kind: String,        // exchange | broker | dex | otc
+    timezone: String,
+    mirrored_at: Date,
 }
 
 E::IssuedBy {
     From: Instrument,
     To: Entity,
-    Properties: {}
+    Properties: {
+        instrument_id: String,
+        entity_id: String,   // upsert key
+        mirrored_at: Date,
+    }
 }
 
 E::ListedOn {
     From: Instrument,
     To: Venue,
     Properties: {
+        listing_key: String, // "<venue_id>|<venue_symbol>", upsert key
+        instrument_id: String,
+        venue_id: String,
         venue_symbol: String,
+        source_id: String,
+        mirrored_at: Date,
     }
 }
 
+// From ref.instrument_relation rows of kind same_economic_exposure (directional as stored).
 E::SameExposure {
     From: Instrument,
     To: Instrument,
     Properties: {
-        relation: String, // e.g. "spot-perp"
+        exposure_key: String,  // "<to_instrument_id>|<relation>", upsert key
+        instrument_id: String,
+        to_instrument_id: String,
+        relation: String,      // "<from kind>-<to kind>", e.g. "crypto_spot-perp"
+        mirrored_at: Date,
     }
 }
 
@@ -379,17 +407,31 @@ E::Scored {
     Properties: {}
 }
 
+// Decoder genome → encoder snapshot whose latents it was trained/evaluated on (evo-worker,
+// `evo.vary.decoder` parents of a generation run on Job.snapshot_id). Upsert key: snapshot_id.
 E::TrainedOn {
     From: Genome,
     To: Snapshot,
-    Properties: {}
+    Properties: {
+        genome_id: String,
+        snapshot_id: String,
+        generation: U32,
+        updated_at: Date,
+    }
 }
 
+// Encoder snapshot → elite decoder genome fed back into its fit (D-009; trainer, from
+// manifest.feedback). Upsert key: genome_id.
 E::FeedbackFrom {
     From: Snapshot,
     To: Genome,
     Properties: {
-        weight: F64, // elite decoder feedback into the next encoder generation (D-009)
+        snapshot_id: String,
+        genome_id: String,
+        weight: F64,         // quota weight of the elite in the feedback set (D-068)
+        output_family: String,
+        score: F64,
+        updated_at: Date,
     }
 }
 

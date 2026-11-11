@@ -20,7 +20,9 @@
 //! Result: `{"protocol": "evo.vary.decoder/v0", "children": [..], "n_parents", "n_children",
 //! "plan": {..}?, "lineage": [{"child", "parents"}], "helix": {..}}`.
 //! Lineage is also written to Helix (`upsert_genome`, `link_parent`, `add_fitness_record` for
-//! the parents' objectives) when a hub client is configured; failures only warn.
+//! the parents' objectives, and `TrainedOn` parent → the generation's encoder snapshot
+//! `Job.snapshot_id` when set: the parents were trained/evaluated on its latents) when a hub
+//! client is configured; failures only warn.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,7 +33,7 @@ use fa_evolution::{
 };
 use fa_hub::{
     HubClient,
-    queries::{NewFitness, NewGenome},
+    queries::{NewFitness, NewGenome, TrainedOnLink},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -225,8 +227,24 @@ pub fn produce(req: &VaryRequest) -> Result<VaryOutcome, String> {
     Ok(VaryOutcome { parents, children, lineage, plan })
 }
 
+/// `TrainedOn` rows: every parent (the evaluated elites) → `snapshot_id` (empty: none).
+pub fn trained_on_links(req: &VaryRequest, out: &VaryOutcome, snapshot_id: &str) -> Vec<TrainedOnLink> {
+    if snapshot_id.trim().is_empty() {
+        return Vec::new();
+    }
+    out.parents
+        .iter()
+        .map(|p| TrainedOnLink {
+            genome_id: p.to_string(),
+            snapshot_id: snapshot_id.trim().to_owned(),
+            generation: req.generation.saturating_sub(1),
+        })
+        .collect()
+}
+
 /// Best-effort Helix lineage write. Returns a JSON summary for the result payload.
-pub async fn persist(hub: Option<&HubClient>, req: &VaryRequest, out: &VaryOutcome) -> Value {
+/// `snapshot_id` is the job's encoder snapshot (`Job.snapshot_id`; empty = no `TrainedOn`).
+pub async fn persist(hub: Option<&HubClient>, req: &VaryRequest, out: &VaryOutcome, snapshot_id: &str) -> Value {
     let Some(hub) = hub else { return json!({"persisted": false, "reason": "no helix client"}) };
     let mut genomes = 0usize;
     let mut edges = 0usize;
@@ -261,6 +279,15 @@ pub async fn persist(hub: Option<&HubClient>, req: &VaryRequest, out: &VaryOutco
             }
         }
     }
+    // parents exist now (upserted above); a missing snapshot row is skipped by the probe
+    let trained = trained_on_links(req, out, snapshot_id);
+    let mut trained_on = 0usize;
+    if !trained.is_empty() {
+        match hub.link_trained_on(&trained).await {
+            Ok(()) => trained_on = trained.len(),
+            Err(e) => err(e),
+        }
+    }
     for (c, l) in out.children.iter().zip(&out.lineage) {
         match hub.upsert_genome(&new_genome(c)).await {
             Ok(_) => genomes += 1,
@@ -276,7 +303,8 @@ pub async fn persist(hub: Option<&HubClient>, req: &VaryRequest, out: &VaryOutco
             }
         }
     }
-    json!({"persisted": errors.is_empty(), "genomes": genomes, "lineage_edges": edges, "fitness_records": fitness, "errors": errors})
+    json!({"persisted": errors.is_empty(), "genomes": genomes, "lineage_edges": edges, "fitness_records": fitness,
+           "trained_on_edges": trained_on, "errors": errors})
 }
 
 /// Result JSON for the job.
@@ -303,6 +331,19 @@ mod tests {
 
     fn req(json: &str) -> VaryRequest {
         serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn parents_are_trained_on_the_job_snapshot() {
+        let r = req(
+            r#"{"parents":["forecast:h=3;lb=16;kernel=8","retrieval:h=3;lb=8;k=10"],"n_children":2,"seed":1,"generation":3}"#,
+        );
+        let out = produce(&r).unwrap();
+        let links = trained_on_links(&r, &out, "stat-v1-1m");
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].genome_id, out.parents[0].to_string());
+        assert_eq!((links[0].snapshot_id.as_str(), links[0].generation), ("stat-v1-1m", 2));
+        assert!(trained_on_links(&r, &out, "").is_empty(), "no snapshot on the job: no edge");
     }
 
     #[test]

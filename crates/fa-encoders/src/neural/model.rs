@@ -173,8 +173,10 @@ pub struct NeuralConfig {
     pub head_refit_steps: usize,
     /// Head refit solver: `""` / `adam` (the penalised full-batch refit above) or `constrained`
     /// ([`super::heads`]: gated least squares with the pairwise residual covariance as an
-    /// equality constraint, solved exactly per expert). `trainer sweep` runs it even with
-    /// `head_refit_steps` 0; a snapshot fit refits the heads only when `head_refit_steps` > 0.
+    /// equality constraint, solved exactly per expert; it ignores `head_refit_steps`). Both
+    /// `trainer sweep` and a snapshot fit run the constrained solve whenever it is selected, even
+    /// with `head_refit_steps` 0; the penalised refit runs only when `head_refit_steps` > 0
+    /// ([`NeuralConfig::refits_heads`]).
     #[serde(default)]
     pub head_solver: String,
     /// `constrained` solver: target |residual correlation| per expert pair (0 = exact).
@@ -220,6 +222,17 @@ fn default_gated_pred() -> f64 {
 }
 
 impl NeuralConfig {
+    /// `head_solver` selects the exact constrained solver ([`super::heads`]).
+    pub fn constrained_heads(&self) -> bool {
+        self.head_solver == "constrained"
+    }
+
+    /// Whether a fit refits the next-step heads after training: the constrained solver always
+    /// when selected, the penalised refit when `head_refit_steps` > 0.
+    pub fn refits_heads(&self) -> bool {
+        self.constrained_heads() || self.head_refit_steps > 0
+    }
+
     pub fn new(family: NeuralFamily) -> Self {
         Self {
             family,

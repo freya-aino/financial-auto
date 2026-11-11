@@ -15,10 +15,11 @@ mod live_routes;
 mod mcmc_routes;
 mod openapi;
 mod ops_routes;
+mod ref_mirror;
+mod refdata_routes;
 mod routes;
 mod services_routes;
 mod sources;
-mod refdata_routes;
 mod sources_routes;
 mod state;
 mod streams_routes;
@@ -95,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(console_routes::router().with_state(state.clone())) // decoders, pipeline, halts/re-arm, risk events, refdata reads
         .merge(ops_routes::router().with_state(state.clone())); // ops schema: job history, config snapshots (spec 20 §5.4)
     ops_routes::spawn(&state); // JOB_RESULTS → ops.job_run, config → ops.config_snapshot (wait for Postgres)
+    ref_mirror::spawn(&state); // Postgres ref → Helix Instrument/Entity/Venue mirror: full at start + periodic, incremental on ref.changed.* (spec 12 §5)
     let app = ledger_routes::install(state.clone(), app).await; // Postgres pool + paper-book seed + ledger routes (D-047)
     let app = services_routes::install(state.clone(), app); // start/stop/restart via the Docker socket (D-060)
     let app = trading_routes::install(state, app); // strategy lifecycle + limits via ctl.risk.* (D-051)

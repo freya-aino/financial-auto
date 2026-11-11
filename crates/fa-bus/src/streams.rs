@@ -132,7 +132,8 @@ pub enum StreamsError {
 /// (subjects, max age, max bytes, storage, description). Idempotent; safe to call at every
 /// service start. A `max_bytes` cap below a stream's current size is **not** applied (JetStream
 /// would discard the oldest messages at once): the stream keeps its previous cap and a warning
-/// names it, so purging is always an operator decision.
+/// names it, so purging is always an operator decision. Likewise a shorter `max_age` (or a finite
+/// age on an unlimited stream) is never applied to a live stream; growing or removing it is.
 /// Returns the names that were created or updated.
 pub async fn ensure_streams(js: &jetstream::Context) -> Result<Vec<String>, StreamsError> {
     let mut changed = Vec::new();
@@ -163,7 +164,11 @@ async fn ensure_stream(js: &jetstream::Context, want: &stream::Config) -> Result
     if max_bytes != want.max_bytes {
         tracing::warn!(stream = %name, used, cap = want.max_bytes, "stream holds more than its max_bytes cap; cap not applied (would purge)");
     }
-    let want = &stream::Config { max_bytes, ..want.clone() };
+    let max_age = safe_max_age(have.max_age, want.max_age);
+    if max_age != want.max_age {
+        tracing::warn!(stream = %name, have = ?have.max_age, want = ?want.max_age, "shorter max_age not applied (would purge)");
+    }
+    let want = &stream::Config { max_bytes, max_age, ..want.clone() };
     if config_matches(have, want) {
         return Ok(false);
     }
@@ -184,6 +189,13 @@ async fn ensure_stream(js: &jetstream::Context, want: &stream::Config) -> Result
 /// (then the current cap stays).
 fn safe_max_bytes(have: i64, want: i64, used: u64) -> i64 {
     if want > 0 && used > want as u64 { have } else { want }
+}
+
+/// The age limit to apply: `want`, unless it is shorter than the live one (zero = unlimited), so
+/// config never shrinks retention on a running stream (the D-075 MD purge).
+fn safe_max_age(have: Duration, want: Duration) -> Duration {
+    let shrinks = !want.is_zero() && (have.is_zero() || want < have);
+    if shrinks { have } else { want }
 }
 
 fn config_matches(have: &stream::Config, want: &stream::Config) -> bool {
@@ -389,6 +401,16 @@ mod tests {
         assert_eq!(safe_max_bytes(-1, 100, 50), 100);
         assert_eq!(safe_max_bytes(-1, 100, 150), -1, "cap below usage is not applied");
         assert_eq!(safe_max_bytes(200, -1, 150), -1, "removing a cap is fine");
+    }
+
+    #[test]
+    fn age_never_shrinks() {
+        let h = |n: u64| Duration::from_secs(n * 3600);
+        assert_eq!(safe_max_age(h(24), h(48)), h(48), "growing is applied");
+        assert_eq!(safe_max_age(h(48), h(24)), h(48), "shrinking is held");
+        assert_eq!(safe_max_age(Duration::ZERO, h(24)), Duration::ZERO, "finite age on unlimited stream is held");
+        assert_eq!(safe_max_age(h(24), Duration::ZERO), Duration::ZERO, "removing the limit is applied");
+        assert_eq!(safe_max_age(h(24), h(24)), h(24));
     }
 
     #[test]

@@ -67,6 +67,8 @@ pub struct StrategyJobSpec {
     pub gen_index: i32,
     pub rung: i32,
     pub purpose: ReplayPurpose,
+    /// Per-job rebalance rule override (`trade_rule`, `crate::live_rule::from_envelope`).
+    pub trade_rule: Option<fa_backtest::trade_rule::TradeRule>,
 }
 
 /// Splits `Job.spec` into the genome text and the envelope fields (see module docs).
@@ -78,6 +80,7 @@ pub fn parse_spec(job: &Job) -> StrategyJobSpec {
         gen_index: 0,
         rung: 0,
         purpose: ReplayPurpose::Selection,
+        trade_rule: None,
     };
     if raw.is_empty() {
         return out;
@@ -93,6 +96,7 @@ pub fn parse_spec(job: &Job) -> StrategyJobSpec {
         out.gen_index = v.get("generation").and_then(Value::as_i64).unwrap_or(0) as i32;
         out.rung = v.get("rung").and_then(Value::as_i64).unwrap_or(0) as i32;
         out.purpose = v.get("purpose").cloned().and_then(|p| serde_json::from_value(p).ok()).unwrap_or_default();
+        out.trade_rule = crate::live_rule::from_envelope(v.get("trade_rule"));
         return out;
     }
     out.genome_text = raw.to_owned();
@@ -142,6 +146,7 @@ pub fn replay_json(rspec: &ReplaySpec, report: &EvalReport, n_holdouts: usize, r
         "final_equity": report.final_equity, "first_ts_ms": report.first_ts_ms, "last_ts_ms": report.last_ts_ms,
         "stop": report.stop, "holdouts": n_holdouts, "registry": registry,
         "snapshot": report.latents.snapshot.declared, "sources": report.sources, "latents": report.latents,
+        "trade_rule": rspec.trade_rule, "rebalance": report.rebalance,
     })
 }
 
@@ -266,9 +271,11 @@ impl Worker {
         run.progress(0.0, format!("parsed strategy {} ({} nodes)", def.id, genome.size())).await;
 
         // 2. bars at the strategy's timescale (VictoriaMetrics, buffer fallback). A now-relative
-        // selection window that would touch a locked holdout moves before it with an embargo of
-        // 2 × horizon (spec 41 §6.4 layout [selection][embargo][holdout]; holdouts are locked
-        // automatically by the risk-engine, so evaluations must not stall behind a fresh one).
+        // selection window that would touch a locked holdout (or its embargo gap) moves before
+        // it, ending max(embargo recorded with the lock, 2 × horizon, 60 s) before the holdout
+        // (spec 41 §6.4 layout [selection][embargo][holdout], `holdout::selection_embargo_ms`;
+        // holdouts are locked automatically by the risk-engine, so evaluations must not stall
+        // behind a fresh one).
         let need = genome.lookback_bars + genome.steps as usize + 2;
         if spec.window.start_ms.is_none()
             && spec.purpose == ReplayPurpose::Selection
@@ -277,8 +284,8 @@ impl Worker {
             let hs = t.holdouts(genome.timescale).await.unwrap_or_default();
             let step_ms = i64::try_from(genome.timescale.duration().as_millis()).unwrap_or(1000);
             let w = spec.window.resolve(now_ms(), self.data_window_hours, step_ms);
-            let embargo = (2 * i64::try_from(genome.horizon().duration().as_millis()).unwrap_or(0)).max(60_000);
-            let shifted = fa_backtest::holdout::avoid_holdouts(w, genome.timescale, &hs, embargo);
+            let horizon_ms = i64::try_from(genome.horizon().duration().as_millis()).unwrap_or(0);
+            let shifted = fa_backtest::holdout::avoid_holdouts(w, genome.timescale, &hs, horizon_ms);
             if shifted != w {
                 tracing::info!(job = %job.job_id, from = ?w, to = ?shifted, "selection window moved before the locked holdout");
                 spec.window = DataWindow { hours: None, start_ms: Some(shifted.0), end_ms: Some(shifted.1) };
@@ -333,6 +340,7 @@ impl Worker {
             // this trial counts too
             n_trials: n_trials + 1,
             trial_sharpe_var: sharpe_var,
+            trade_rule: spec.trade_rule.clone().unwrap_or_else(|| self.trade_rule.clone()),
             ..ReplaySpec::selection(genome.timescale, 0, 0)
         };
         if let Err(e) = replay::check_holdout(&rspec, &holdouts) {

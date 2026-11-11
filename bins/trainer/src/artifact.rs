@@ -1,13 +1,14 @@
 //! Where a fit lands: the snapshot folder (local `--out` and/or Garage through `fa_blob`) and
 //! its Helix mirror (`Snapshot` candidate, `ExpertSpace`s, `LatentRegion`s, `SnapshotParent`
-//! and `RegionMatch` edges), plus the parent's probe assignment read back from Helix and the
+//! and `RegionMatch` edges, and `FeedbackFrom{weight}` edges to the elite decoder genomes that
+//! fed back into a neural fit, D-009), plus the parent's probe assignment read back from Helix and the
 //! job checkpoint in `fa-ckpt/<job_id>/state.json`.
 
 use std::path::PathBuf;
 
 use fa_blob::{BlobStore, ObjectKey, S3BlobStore};
 use fa_encoders::{MANIFEST_FILE, REGION_MAP_FILE, REGIONS_FILE, STATISTICAL_FAMILY, SnapshotManifest, WEIGHTS_FILE};
-use fa_hub::{HubClient, NewExpertSpace, NewRegion, NewSnapshot, SnapshotGraph};
+use fa_hub::{FeedbackLink, HubClient, NewExpertSpace, NewGenome, NewRegion, NewSnapshot, SnapshotGraph};
 use fa_patterns::RegionMap;
 use serde::Serialize;
 
@@ -34,6 +35,9 @@ pub struct Written {
     pub helix_error: Option<String>,
     pub regions_written: usize,
     pub region_match_edges: usize,
+    /// `FeedbackFrom` edges written (elite decoders of `manifest.feedback`, D-009).
+    #[serde(default)]
+    pub feedback_edges: usize,
 }
 
 fn files(bundle: &Bundle) -> anyhow::Result<Vec<(&'static str, &'static str, Vec<u8>)>> {
@@ -73,10 +77,11 @@ pub async fn write_bundle(
     }
     if let Some(hub) = &stores.hub {
         match mirror(hub, bundle, w.manifest_key.clone().unwrap_or_default(), parent, op).await {
-            Ok((regions, edges)) => {
+            Ok((regions, edges, feedback)) => {
                 w.helix = true;
                 w.regions_written = regions;
                 w.region_match_edges = edges;
+                w.feedback_edges = feedback;
             }
             Err(e) => w.helix_error = Some(e.to_string()),
         }
@@ -90,7 +95,7 @@ async fn mirror(
     garage_key: String,
     parent: Option<&SnapshotGraph>,
     op: &str,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<(usize, usize, usize)> {
     let m = &bundle.manifest;
     let snap = hub
         .ensure_snapshot(&NewSnapshot {
@@ -156,7 +161,91 @@ async fn mirror(
     if let Some(g) = parent {
         hub.link_snapshot_parent(g.snapshot.id, snap.id, op).await?;
     }
-    Ok((n_regions, n_edges))
+    let n_feedback = link_feedback(hub, &m.snapshot_id, m.feedback.as_ref()).await?;
+    Ok((n_regions, n_edges, n_feedback))
+}
+
+/// One elite decoder of a fit's D-009 feedback set (`manifest.feedback.decoders[name =
+/// elite_decoders].elites[]`, written by `feedback::load_elites`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeedbackElite {
+    /// Helix `Genome.genome_id`: the canonical kv form of the card's genome.
+    pub genome_id: String,
+    pub family: String,
+    /// `DecoderGenome::params` as JSON (used only when the genome node has to be created).
+    pub params: String,
+    pub weight: f64,
+    pub output_family: String,
+    pub score: f64,
+}
+
+/// The elite decoders of `manifest.feedback` (empty for the frozen-probe stand-in, statistical
+/// fits and manifests written before the cards' genome was recorded).
+pub fn feedback_elites(feedback: Option<&serde_json::Value>) -> Vec<FeedbackElite> {
+    let Some(decoders) = feedback.and_then(|f| f.get("decoders")).and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<FeedbackElite> = Vec::new();
+    for d in decoders.iter().filter(|d| d.get("name").and_then(serde_json::Value::as_str) == Some("elite_decoders")) {
+        for e in d.get("elites").and_then(serde_json::Value::as_array).into_iter().flatten() {
+            let Some(raw) = e.get("genome").and_then(serde_json::Value::as_str).filter(|g| !g.trim().is_empty()) else {
+                continue;
+            };
+            let parsed = fa_decoders::genome::DecoderGenome::parse(raw).ok();
+            let str_of = |k: &str| e.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+            let elite = FeedbackElite {
+                genome_id: parsed.as_ref().map_or_else(|| raw.trim().to_owned(), ToString::to_string),
+                family: parsed.as_ref().map_or_else(|| str_of("family"), |g| g.family.as_str().to_owned()),
+                params: parsed
+                    .as_ref()
+                    .map_or_else(|| "{}".to_owned(), |g| serde_json::to_string(&g.params()).unwrap_or_default()),
+                weight: e.get("weight").and_then(serde_json::Value::as_f64).unwrap_or(0.0),
+                output_family: str_of("output_family"),
+                score: e.get("score").and_then(serde_json::Value::as_f64).unwrap_or(0.0),
+            };
+            // one edge per genome: the same genome trained twice keeps its largest weight
+            match out.iter_mut().find(|o| o.genome_id == elite.genome_id) {
+                Some(o) if o.weight < elite.weight => *o = elite,
+                Some(_) => {}
+                None => out.push(elite),
+            }
+        }
+    }
+    out
+}
+
+/// Writes `FeedbackFrom{weight}` snapshot → elite genome (creating a missing decoder genome like
+/// evo-worker's `upsert_genome` does). Returns the number of edges.
+async fn link_feedback(
+    hub: &HubClient,
+    snapshot_id: &str,
+    feedback: Option<&serde_json::Value>,
+) -> anyhow::Result<usize> {
+    let elites = feedback_elites(feedback);
+    if elites.is_empty() {
+        return Ok(0);
+    }
+    for e in &elites {
+        hub.upsert_genome(&NewGenome {
+            genome_id: e.genome_id.clone(),
+            kind: "decoder".into(),
+            family: e.family.clone(),
+            params: e.params.clone(),
+        })
+        .await?;
+    }
+    let links: Vec<FeedbackLink> = elites
+        .iter()
+        .map(|e| FeedbackLink {
+            snapshot_id: snapshot_id.to_owned(),
+            genome_id: e.genome_id.clone(),
+            weight: e.weight,
+            output_family: e.output_family.clone(),
+            score: e.score,
+        })
+        .collect();
+    hub.link_feedback_from(&links).await?;
+    Ok(links.len())
 }
 
 /// The parent snapshot's graph (regions with lineage) by business id.
@@ -296,5 +385,30 @@ mod tests {
         assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:01Z"), Some(1000));
         assert_eq!(parse_rfc3339_ms("nope"), None);
         assert_eq!(checkpoint_key("j").key, "j/state.json");
+    }
+
+    #[test]
+    fn feedback_elites_come_from_the_elite_summary_only() {
+        let raw = "nn_forecast:h=4;lb=16;width=24;depth=3;gru=gru;steps=120;lr=0.002;bs=32";
+        let canonical = fa_decoders::genome::DecoderGenome::parse(raw).unwrap().to_string();
+        let fb = serde_json::json!({
+            "source": "elite_decoders",
+            "decoders": [
+                { "name": "elite_decoders", "elites": [
+                    { "key": "decoders/3/a.safetensors", "genome": raw, "output_family": "forecast", "score": 0.2, "weight": 0.25 },
+                    { "key": "decoders/3/b.safetensors", "genome": canonical, "output_family": "forecast", "score": 0.3, "weight": 0.5 },
+                    { "key": "decoders/3/c.safetensors", "output_family": "forecast", "score": 0.1, "weight": 0.25 }
+                ]},
+                { "name": "frozen_linear_probe", "elites": [{ "genome": "forecast:h=3", "weight": 1.0 }] }
+            ]
+        });
+        let e = feedback_elites(Some(&fb));
+        assert_eq!(e.len(), 1, "same genome in two forms is one edge; no-genome and probe entries skipped: {e:?}");
+        assert_eq!(e[0].genome_id, canonical);
+        assert_eq!((e[0].weight, e[0].score), (0.5, 0.3));
+        assert_eq!(e[0].family, "nn_forecast");
+        assert!(e[0].params.starts_with('{'));
+        assert!(feedback_elites(None).is_empty());
+        assert!(feedback_elites(Some(&serde_json::json!({ "decoder_stats": {} }))).is_empty());
     }
 }

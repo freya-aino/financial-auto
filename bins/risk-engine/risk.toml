@@ -79,7 +79,7 @@ relock_after_days = 0       # 0 = never re-lock automatically (spec 41 Q5 open)
 "1m" = 43200
 "1h" = 7776000
 "1d" = 31536000
-[holdout.embargo_secs]      # embargo.<ts>: selection windows shifted before a holdout end this early
+[holdout.embargo_secs]      # embargo.<ts>: stored with each lock (validation.holdout.embargo_ms); evo-worker ends selection windows max(this, 2 × horizon, 60 s) before the holdout
 "1s" = 300
 "1m" = 3600
 "1h" = 172800

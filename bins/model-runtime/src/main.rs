@@ -25,6 +25,7 @@ mod hub_sink;
 mod mcmc_jobs;
 mod neural_serving;
 mod pipeline;
+mod region_method;
 mod regions;
 mod shadow;
 mod snapshot;
@@ -588,7 +589,7 @@ impl Runtime {
         let carried = loaded.region_map.as_ref().map_or(0.0, fa_patterns::RegionMap::carried_mass);
         let report = st.pipeline.swap_encoder(&self.pcfg, loaded.encoder, loaded.region_map.as_ref());
         st.adapter_ms = None;
-        tracing::info!(%ts, from = %previous, to = %loaded.desc.snapshot_id, generation = loaded.desc.generation, source = loaded.source, seeded_regions = seeded, carried_mass = carried, kernel_carried = report.carried, kernel_dropped = report.dropped, kernel_rows = report.rows_carried, "encoder swapped");
+        tracing::info!(%ts, from = %previous, to = %loaded.desc.snapshot_id, generation = loaded.desc.generation, source = loaded.source, region_method = loaded.desc.region_method.set_label(), seeded_regions = seeded, carried_mass = carried, kernel_carried = report.carried, kernel_dropped = report.dropped, kernel_rows = report.rows_carried, "encoder swapped");
         if let Some(sink) = &self.sink {
             sink.announce_snapshot(loaded.desc.clone());
         }
@@ -751,7 +752,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(l) => l,
             Err(e) => snapshot::SnapshotLoader::baseline(ts, Some(format!("active snapshot unusable: {e}"))),
         };
-        tracing::info!(%ts, snapshot = %loaded.desc.snapshot_id, generation = loaded.desc.generation, source = loaded.source, note = ?loaded.note, seeded_regions = loaded.region_map.as_ref().map_or(0, fa_patterns::RegionMap::n_regions), "encoder resolved");
+        tracing::info!(%ts, snapshot = %loaded.desc.snapshot_id, generation = loaded.desc.generation, source = loaded.source, note = ?loaded.note, region_method = loaded.desc.region_method.set_label(), seeded_regions = loaded.region_map.as_ref().map_or(0, fa_patterns::RegionMap::n_regions), "encoder resolved");
         let pipeline = TimescalePipeline::with_encoder(ts, &pcfg, loaded.encoder, loaded.region_map.as_ref());
         seeded_lifecycle.push(pipeline.seeded_lifecycle(loaded.region_map.as_ref(), now_ms()));
         states.push(TimescaleState {
@@ -784,7 +785,6 @@ async fn main() -> anyhow::Result<()> {
                 flush: Duration::from_secs(args.hub_flush_secs.max(1)),
                 latent_timescales: args.hub_latent_timescales.iter().filter_map(|t| t.trim().parse().ok()).collect(),
                 queue: args.hub_queue,
-                region_method: "leader".into(),
             },
             counters.clone(),
         );

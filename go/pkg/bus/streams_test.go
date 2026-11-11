@@ -56,6 +56,64 @@ func TestStreamTableMatchesSpec21(t *testing.T) {
 	}
 }
 
+func TestSafeMaxAgeNeverShrinks(t *testing.T) {
+	h := time.Hour
+	cases := []struct{ have, want, out time.Duration }{
+		{24 * h, 48 * h, 48 * h}, // growing is applied
+		{24 * h, 24 * h, 24 * h}, // unchanged
+		{48 * h, 24 * h, 48 * h}, // shrinking is held
+		{0, 24 * h, 0},           // a finite age on an unlimited stream would purge: held
+		{24 * h, 0, 0},           // removing the limit is fine
+	}
+	for _, c := range cases {
+		if got := safeMaxAge(c.have, c.want); got != c.out {
+			t.Errorf("safeMaxAge(%v, %v) = %v, want %v", c.have, c.want, got, c.out)
+		}
+	}
+}
+
+func TestMergeStreamConfigHoldsPurgingLimits(t *testing.T) {
+	md := Table().Streams[0].Config() // MD: 24 h, 4 GiB
+	// live MD was given a longer age and more room by an operator: config must not shrink it
+	live := md
+	live.MaxAge = 72 * time.Hour
+	live.MaxBytes = md.MaxBytes * 2
+	live.Duplicates = 2 * time.Minute // unmanaged server-side field
+	cfg, update, held := mergeStreamConfig(live, uint64(md.MaxBytes)+1, md)
+	if update {
+		t.Fatalf("nothing but held limits differ, yet an update was planned: %+v", cfg)
+	}
+	if len(held) != 2 || held[0].Limit != "max_bytes" || held[1].Limit != "max_age" || held[1].Have != int64(72*time.Hour) {
+		t.Fatalf("held: %+v", held)
+	}
+
+	// description drift plus a shorter configured age: update the description, keep the age
+	live.Description = "drifted"
+	cfg, update, held = mergeStreamConfig(live, 0, md)
+	if !update || cfg.Description != md.Description || cfg.MaxAge != 72*time.Hour || cfg.Duplicates != 2*time.Minute {
+		t.Fatalf("update=%v cfg=%+v", update, cfg)
+	}
+	if cfg.MaxBytes != md.MaxBytes { // a smaller cap above usage is fine
+		t.Errorf("max_bytes = %d", cfg.MaxBytes)
+	}
+	if len(held) != 1 || held[0].Limit != "max_age" {
+		t.Errorf("held: %+v", held)
+	}
+
+	// a longer configured age is applied
+	live = md
+	live.MaxAge = 12 * time.Hour
+	cfg, update, held = mergeStreamConfig(live, 0, md)
+	if !update || cfg.MaxAge != 24*time.Hour || len(held) != 0 {
+		t.Errorf("grow: update=%v age=%v held=%+v", update, cfg.MaxAge, held)
+	}
+
+	// identical config: no update
+	if _, update, held = mergeStreamConfig(md, 0, md); update || len(held) != 0 {
+		t.Errorf("identical: update=%v held=%+v", update, held)
+	}
+}
+
 // The embedded copy must be identical to the Rust original when the repo is available
 // (the Docker test mount is go/ only, so it is skipped there; cargo test checks the same).
 func TestStreamsFixtureMatchesRust(t *testing.T) {

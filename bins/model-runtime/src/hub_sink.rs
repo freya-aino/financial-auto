@@ -42,7 +42,10 @@ use fa_proto::v1::{
 };
 use tokio::sync::{Mutex, mpsc};
 
-use crate::pipeline::{ExpertPersist, StepOutput};
+use crate::{
+    pipeline::{ExpertPersist, StepOutput},
+    region_method::RegionMethod,
+};
 
 pub type Counters = Arc<Mutex<BTreeMap<String, f64>>>;
 
@@ -61,8 +64,6 @@ pub struct SinkConfig {
     pub latent_timescales: BTreeSet<Timescale>,
     /// Channel capacity; when full, events are dropped (`hub.dropped`).
     pub queue: usize,
-    /// Encoder method label stored on regions.
-    pub region_method: String,
 }
 
 /// A pipeline's snapshot as the sink needs it to (re)create `Snapshot` + `ExpertSpace` rows.
@@ -76,6 +77,9 @@ pub struct SnapshotDesc {
     pub generation: u32,
     pub garage_key: String,
     pub status: String,
+    /// Region discovery of the snapshot's family and its online form: the `method` labels of its
+    /// `RegionSet`s and `Region`s (D-080; follows reloads because it travels with the snapshot).
+    pub region_method: RegionMethod,
 }
 
 #[derive(Debug, Clone)]
@@ -487,7 +491,7 @@ impl Drain {
                     timescale: r.space.timescale.clone(),
                     expert_index: r.space.expert_index,
                     family: r.family.clone(),
-                    method: self.cfg.region_method.clone(),
+                    method: self.set_method(&r.space.snapshot_id),
                     n_regions: r.stats.len() as u32,
                     cfg_hash: format!("{:016x}", fnv1a(cfg.as_bytes())),
                     state: state.to_string(),
@@ -585,6 +589,16 @@ impl Drain {
         }
     }
 
+    /// `RegionSet.method` of a snapshot's sets (`leader` for an unannounced snapshot).
+    fn set_method(&self, snapshot_id: &str) -> String {
+        self.snapshots.get(snapshot_id).map_or("leader", |d| d.region_method.set_label()).to_owned()
+    }
+
+    /// `Region.method` of one region of a snapshot (`leader` for an unannounced snapshot).
+    fn region_method(&self, snapshot_id: &str, region_id: &str) -> String {
+        self.snapshots.get(snapshot_id).map_or("leader", |d| d.region_method.region_label(region_id)).to_owned()
+    }
+
     async fn space_node(&mut self, space: &ExpertSpaceRef) -> Option<u64> {
         let id = expert_space_id(&space.snapshot_id, space.expert_index);
         if let Some(n) = self.spaces.get(&id) {
@@ -610,7 +624,7 @@ impl Drain {
                     region_id: ev.region_id.clone(),
                     lineage_id: ev.lineage_id.clone(),
                     expert_space_id: expert_space_id(&space.snapshot_id, space.expert_index),
-                    method: self.cfg.region_method.clone(),
+                    method: self.region_method(&space.snapshot_id, &ev.region_id),
                     radius,
                     density: 0.0,
                 };
@@ -763,6 +777,43 @@ mod tests {
         c.prune(t0 + 3 * iv, Duration::from_secs(5));
         assert_eq!(c.last_write.len(), 1);
         assert!(c.last_write.contains_key("b"));
+    }
+
+    #[tokio::test]
+    async fn region_methods_follow_the_announced_snapshot() {
+        let cfg = SinkConfig {
+            url: "http://127.0.0.1:9".into(),
+            flush: Duration::from_secs(1),
+            latent_timescales: BTreeSet::new(),
+            queue: 1,
+        };
+        let mut drain = Drain::new(cfg, Counters::default());
+        let desc = |id: &str, rm: RegionMethod| SnapshotDesc {
+            snapshot_id: id.into(),
+            timescale: Timescale::Minute,
+            n_experts: 1,
+            dim: 2,
+            generation: 1,
+            garage_key: String::new(),
+            status: "active".into(),
+            region_method: rm,
+        };
+        let neural = RegionMethod {
+            declared: fa_patterns::DiscoveryMethod::Mapper,
+            online: fa_patterns::DiscoveryMethod::Leader,
+            seeded: ["1m-e0-r000".to_owned()].into(),
+        };
+        drain.snapshots.insert("stat".into(), desc("stat", RegionMethod::default()));
+        drain.snapshots.insert("jepa".into(), desc("jepa", neural));
+        assert_eq!(drain.set_method("stat"), "leader");
+        assert_eq!(drain.region_method("stat", "1m-e0-r000"), "leader");
+        assert_eq!(drain.set_method("jepa"), "mapper");
+        assert_eq!(drain.region_method("jepa", "1m-e0-r000"), "mapper");
+        assert_eq!(drain.region_method("jepa", "1m-e0-r009"), "leader", "born live → online form");
+        assert_eq!(drain.set_method("unknown"), "leader");
+        // a reload re-announces: the newer desc of the same id replaces the labels
+        drain.snapshots.insert("jepa".into(), desc("jepa", RegionMethod::default()));
+        assert_eq!(drain.region_method("jepa", "1m-e0-r000"), "leader");
     }
 
     #[test]

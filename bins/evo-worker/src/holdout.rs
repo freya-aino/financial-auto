@@ -164,6 +164,8 @@ impl Worker {
             capital: CAPITAL,
             n_trials: 1,
             trial_sharpe_var: 0.0,
+            // the gate judges the trades the live engine would send (same rule as selection)
+            trade_rule: self.trade_rule.clone(),
             ..ReplaySpec::selection(genome.timescale, 0, 0)
         };
         debug_assert!(replay::check_holdout(&rspec, std::slice::from_ref(&holdout.holdout)).is_ok());
@@ -259,7 +261,7 @@ pub(crate) mod tests {
         let genome = StrategyGenome::parse(r#"{ id = "gp-1", timescale = "1m", signal = "1" }"#).unwrap();
         let row = |ts: Timescale, end: i64| HoldoutRow {
             id: id.into(),
-            holdout: replay::Holdout { timescale: ts, start_ms: 1_000, end_ms: end, locked_at_ms: 5 },
+            holdout: replay::Holdout { timescale: ts, start_ms: 1_000, end_ms: end, locked_at_ms: 5, embargo_ms: None },
             note: None,
         };
         assert!(check_candidate(&genome, &row(Timescale::Minute, 2_000)).is_ok());
@@ -286,6 +288,7 @@ pub(crate) mod tests {
             blob: None,
             trials: None,
             cost: std::sync::Arc::new(fa_backtest::cost::CostModel::default()),
+            trade_rule: fa_backtest::trade_rule::TradeRule::live_default(),
             recorded: crate::recorded::RecordedStore::disabled(),
             news_refs: crate::news::NewsRefs::default(),
         }

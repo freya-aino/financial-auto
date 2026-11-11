@@ -23,7 +23,7 @@ pub use lineage::{AlignCfg, Alignment, Descent, DescentKind, align};
 pub use methods::{CodebookRegions, DensityClusters, MapperCover, discovery_for_method, ks_pvalue};
 pub use online::{
     Assignment, LeaderClustering, OnlineRegionCfg, OnlineRegionDiscovery, OnlineRegionSet, RegionLifecycle, RegionStat,
-    RetireReason,
+    RetireReason, online_form,
 };
 pub use region_map::{
     AlignInput, Ancestor, ExpertRegionMap, FittedRegion, ParentIds, RegionMap, align_expert, align_expert_with,
@@ -57,6 +57,25 @@ pub enum DiscoveryMethod {
     Mapper,
     /// Streaming leader clustering (pure-Rust baseline, [`online`]).
     Leader,
+}
+
+impl DiscoveryMethod {
+    pub const ALL: [Self; 4] = [Self::Codebook, Self::Density, Self::Mapper, Self::Leader];
+
+    /// The name families declare (`FamilyDescriptor::region_discovery`) and Helix stores.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Codebook => "codebook",
+            Self::Density => "density",
+            Self::Mapper => "mapper",
+            Self::Leader => "leader",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]; `None` for an unknown name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.as_str() == name.trim())
+    }
 }
 
 /// Region discovery; each encoder family declares its own implementation (spec 30).

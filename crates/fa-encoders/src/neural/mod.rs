@@ -482,6 +482,30 @@ mod tests {
         );
     }
 
+    /// `head_solver: "constrained"` refits the heads even with `head_refit_steps` 0 (what a
+    /// snapshot fit and `trainer sweep` both rely on); without it 0 steps is a no-op.
+    #[test]
+    fn constrained_head_solve_ignores_refit_steps() {
+        let dev = Device::Cpu;
+        let base = NeuralConfig { steps: 20, ..small(NeuralFamily::JepaVae) };
+        assert!(!base.refits_heads());
+        let ds = Dataset::build(vec![Series::new("a", synthetic(300, 4))], base.min_window, base.horizon(), 0.2);
+        let head = |tr: &NeuralTrainer| tr.model.ps.tensor("moe.pred0.w").unwrap().to_vec2::<f32>().unwrap();
+        let mut tr = NeuralTrainer::new(base.clone(), &ds, 1, &dev).unwrap();
+        tr.train_steps(&ds, 20).unwrap();
+        let before = head(&tr);
+        tr.refit_heads(&ds, 0, 512).unwrap();
+        assert_eq!(head(&tr), before, "penalised refit at 0 steps is off");
+
+        let cfg = NeuralConfig { head_solver: "constrained".into(), ..base };
+        assert!(cfg.constrained_heads() && cfg.refits_heads() && cfg.head_refit_steps == 0);
+        let mut tr = NeuralTrainer::new(cfg, &ds, 1, &dev).unwrap();
+        tr.train_steps(&ds, 20).unwrap();
+        assert_eq!(head(&tr), before, "same seed, same training");
+        tr.refit_heads(&ds, 0, 512).unwrap();
+        assert_ne!(head(&tr), before, "the constrained solve ran at 0 steps");
+    }
+
     /// Families 2 and 4 beyond the shared conformance: the learned priors score and sample, the
     /// D-010 timescale gate holds, and the declared region discovery conforms (spec 30 §9.1).
     #[test]

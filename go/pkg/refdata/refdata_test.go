@@ -240,7 +240,41 @@ func TestClassifyYahooSymbols(t *testing.T) {
 	if got := Classify("oanda", "EUR_USD", DefaultHints["oanda"]); got != (Class{"fx", "fx_pair", "EUR", "USD"}) {
 		t.Errorf("oanda: %+v", got)
 	}
-	if got := Classify("kraken", "XBT/EUR", Hint{AssetClass: "crypto", Kind: "crypto_spot"}); got != (Class{"crypto", "crypto_spot", "XBT", "EUR"}) {
-		t.Errorf("kraken: %+v", got)
+	// a non-kraken source with a crypto hint keeps the venue's own codes
+	if got := Classify("coinbase", "XBT/EUR", Hint{AssetClass: "crypto", Kind: "crypto_spot"}); got != (Class{"crypto", "crypto_spot", "XBT", "EUR"}) {
+		t.Errorf("slash pair: %+v", got)
+	}
+}
+
+func TestClassifyKrakenSymbols(t *testing.T) {
+	h, ok := DefaultHints["kraken"]
+	if !ok || h.AssetClass != "crypto" || h.Kind != "crypto_spot" || h.Venue != "kraken" || h.Scheme != "kraken_symbol" {
+		t.Fatalf("kraken hint: %+v", h)
+	}
+	cases := map[string]Class{
+		"XBTEUR":   {"crypto", "crypto_spot", "BTC", "EUR"},
+		"ETHEUR":   {"crypto", "crypto_spot", "ETH", "EUR"},
+		"SOLEUR":   {"crypto", "crypto_spot", "SOL", "EUR"},
+		"XXBTZEUR": {"crypto", "crypto_spot", "BTC", "EUR"},
+		"XETHZUSD": {"crypto", "crypto_spot", "ETH", "USD"},
+		"XETHXXBT": {"crypto", "crypto_spot", "ETH", "BTC"},
+		"XDGUSD":   {"crypto", "crypto_spot", "DOGE", "USD"},
+		"SOLUSDT":  {"crypto", "crypto_spot", "SOL", "USDT"},
+		"USDTUSD":  {"crypto", "crypto_spot", "USDT", "USD"},
+		"ETHXBT":   {"crypto", "crypto_spot", "ETH", "BTC"},
+		"XBT/EUR":  {"crypto", "crypto_spot", "BTC", "EUR"},
+		"xbteur":   {"crypto", "crypto_spot", "BTC", "EUR"},
+		"ZEURZUSD": {"fx", "fx_pair", "EUR", "USD"},
+		"EURUSD":   {"fx", "fx_pair", "EUR", "USD"},
+		"EUR":      {AssetClass: "crypto", Kind: "crypto_spot"}, // unrecognised shape: hint only
+	}
+	for sym, want := range cases {
+		if got := Classify("kraken", sym, h); got != want {
+			t.Errorf("%s: got %+v want %+v", sym, got, want)
+		}
+	}
+	// without the hint table the resolver's fallback still classifies by syntax
+	if got := Classify("kraken", "XBTEUR", Hint{AssetClass: "unknown", Kind: "unknown"}); got != (Class{"crypto", "crypto_spot", "BTC", "EUR"}) {
+		t.Errorf("kraken without hint: %+v", got)
 	}
 }

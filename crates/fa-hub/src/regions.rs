@@ -180,7 +180,7 @@ pub struct RegionLineage {
 /// found by `from` to the node found by `to`, matched among `from`'s out-edges by `matching`;
 /// updated with `mutable` when present, else created with `fixed ++ mutable`.
 #[allow(clippy::too_many_arguments)]
-fn edge_upsert(
+pub(crate) fn edge_upsert(
     batch: Batch,
     i: usize,
     label: &str,

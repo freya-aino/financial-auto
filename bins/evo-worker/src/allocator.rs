@@ -133,6 +133,8 @@ impl Worker {
             signal_ttl_ms: SIGNAL_TTL_MS,
             n_trials: n_trials + 1,
             trial_sharpe_var: sharpe_var,
+            // the live risk-engine's rebalance rule (crate::live_rule), unless the job overrides it
+            trade_rule: spec.trade_rule.clone().unwrap_or_else(|| self.trade_rule.clone()),
             ..AllocatorReplaySpec::new(w0, w1)
         };
         run.start_budget();
@@ -230,6 +232,7 @@ impl Worker {
                 "instruments": report.instruments.len(), "n_trades": report.n_trades, "gross_pnl": report.gross_pnl,
                 "total_cost": report.total_cost, "net_pnl": report.net_pnl, "final_equity": report.final_equity,
                 "mean_weights": report.mean_weights, "stop": report.stop,
+                "trade_rule": rspec.trade_rule, "total_fees": report.total_fees, "rebalance": report.rebalance,
             },
             "signals": {"source": "jetstream SIGNAL (signal.exposure.>, by_start_time ordered consumer)", "plan": sig.plan,
                         "messages_read": sig.messages_read, "decoded": sig.signals.len(), "undecodable": sig.undecodable,

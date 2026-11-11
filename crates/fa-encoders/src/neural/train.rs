@@ -427,7 +427,7 @@ impl NeuralTrainer {
     /// up to `max_windows` training windows: `Σ_k mse_k + λ_dec · L_decor(scalarised, gated) +
     /// λ_skill · hinge`, Adam at the genome's learning rate. Returns the last objective value.
     pub fn refit_heads(&mut self, ds: &Dataset, steps: usize, max_windows: usize) -> Result<f64> {
-        let constrained = self.model.cfg.head_solver == "constrained";
+        let constrained = self.model.cfg.constrained_heads();
         if (steps == 0 && !constrained) || ds.train.is_empty() {
             return Ok(0.0);
         }

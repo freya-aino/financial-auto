@@ -32,7 +32,7 @@ use futures::StreamExt;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::hub_sink::SnapshotDesc;
+use crate::{hub_sink::SnapshotDesc, region_method::RegionMethod};
 
 /// What serves a timescale after a resolve.
 pub struct Loaded {
@@ -80,6 +80,7 @@ impl SnapshotLoader {
                 generation: 0,
                 garage_key: String::new(),
                 status: "active".into(),
+                region_method: RegionMethod::resolve(enc.snapshot_id(), None, enc.descriptor().region_discovery, None),
             },
             encoder: Box::new(enc),
             region_map: None,
@@ -141,6 +142,8 @@ impl SnapshotLoader {
             anyhow::bail!("manifest of {id} is for {} not {ts}", manifest.timescale);
         }
         let enc = encoder_from_manifest(&manifest, &weights)?;
+        let region_method =
+            RegionMethod::resolve(id, Some(&manifest.params), enc.descriptor().region_discovery, region_map.as_ref());
         Ok(Loaded {
             desc: SnapshotDesc {
                 snapshot_id: enc.snapshot_id().to_owned(),
@@ -150,6 +153,7 @@ impl SnapshotLoader {
                 generation: manifest.generation,
                 garage_key: row.garage_key.clone(),
                 status: row.status.clone(),
+                region_method,
             },
             encoder: enc,
             region_map,

@@ -345,6 +345,153 @@ pub async fn resolve_quarantine(
     })
 }
 
+// ── Helix reference mirror read (spec 12 §5) ────────────────────────────────
+
+/// `ref.entity` row for the Helix mirror.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirrorEntity {
+    pub id: Uuid,
+    pub lei: Option<String>,
+    pub name: String,
+    pub country: Option<String>,
+    pub sector: Option<String>,
+}
+
+/// `ref.venue` row for the Helix mirror.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirrorVenue {
+    pub id: Uuid,
+    pub code: String,
+    pub mic: Option<String>,
+    pub name: String,
+    pub kind: String,
+    pub timezone: String,
+}
+
+/// A current listing (`ref.listing` valid now).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirrorListing {
+    pub venue_id: Uuid,
+    pub venue_symbol: String,
+    pub source_id: Option<String>,
+}
+
+/// A current `ref.instrument_relation` of kind `same_economic_exposure` from the instrument;
+/// `relation` = `<from kind>-<to kind>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirrorExposure {
+    pub to_id: Uuid,
+    pub relation: String,
+}
+
+/// A current `ref.instrument` (any status, `merged` included) with its current listings and
+/// same-exposure relations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirrorInstrument {
+    pub id: Uuid,
+    pub asset_class: String,
+    pub kind: String,
+    pub name: String,
+    pub status: String,
+    pub base_ccy: Option<String>,
+    pub quote_ccy: Option<String>,
+    pub issuer_id: Option<Uuid>,
+    pub listings: Vec<MirrorListing>,
+    pub exposures: Vec<MirrorExposure>,
+}
+
+/// What the Helix mirror needs from `ref` (see [`mirror_rows`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MirrorRows {
+    pub entities: Vec<MirrorEntity>,
+    pub venues: Vec<MirrorVenue>,
+    pub instruments: Vec<MirrorInstrument>,
+}
+
+/// Reference rows valid now for the Helix mirror. `only = None`: every current instrument and
+/// entity (full sync); `Some(ids)`: those instruments and their issuers (incremental). Venues are
+/// always all current venues (edge targets; a handful of rows).
+pub async fn mirror_rows(pool: &PgPool, only: Option<&[Uuid]>) -> Result<MirrorRows, WarehouseError> {
+    let ids: Option<Vec<Uuid>> = only.map(<[Uuid]>::to_vec);
+    let inst = sqlx::query(
+        "SELECT i.id, i.asset_class, i.kind, i.name, i.status, i.base_ccy, i.quote_ccy, i.issuer_id, \
+                coalesce((SELECT json_agg(json_build_object('venue_id', l.venue_id, 'venue_symbol', l.venue_symbol, \
+                                                            'source_id', l.source_id) ORDER BY l.venue_id, l.venue_symbol) \
+                            FROM ref.listing l WHERE l.instrument_id = i.id \
+                             AND now() >= l.valid_from AND now() < l.valid_to), '[]'::json) AS listings, \
+                coalesce((SELECT json_agg(json_build_object('to_id', r.to_id, 'relation', i.kind || '-' || t.kind) \
+                                          ORDER BY r.to_id) \
+                            FROM ref.instrument_relation r JOIN ref.instrument t ON t.id = r.to_id \
+                           WHERE r.from_id = i.id AND r.kind = 'same_economic_exposure' \
+                             AND now() >= r.valid_from AND now() < r.valid_to), '[]'::json) AS exposures \
+           FROM ref.instrument i \
+          WHERE now() >= i.valid_from AND now() < i.valid_to AND ($1::uuid[] IS NULL OR i.id = ANY($1)) \
+          ORDER BY i.id",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+    let instruments: Vec<MirrorInstrument> = inst
+        .iter()
+        .map(|r| {
+            let mut listings: Vec<MirrorListing> =
+                serde_json::from_value(r.get::<Value, _>("listings")).unwrap_or_default();
+            // overlapping validity rows of the same (venue, symbol) are one listing
+            listings.dedup_by(|a, b| a.venue_id == b.venue_id && a.venue_symbol == b.venue_symbol);
+            let mut exposures: Vec<MirrorExposure> =
+                serde_json::from_value(r.get::<Value, _>("exposures")).unwrap_or_default();
+            exposures.dedup();
+            MirrorInstrument {
+                id: r.get("id"),
+                asset_class: r.get("asset_class"),
+                kind: r.get("kind"),
+                name: r.get("name"),
+                status: r.get("status"),
+                base_ccy: r.get("base_ccy"),
+                quote_ccy: r.get("quote_ccy"),
+                issuer_id: r.get("issuer_id"),
+                listings,
+                exposures,
+            }
+        })
+        .collect();
+    let entities = sqlx::query(
+        "SELECT e.id, e.lei, e.name, e.country, e.sector FROM ref.entity e \
+          WHERE now() >= e.valid_from AND now() < e.valid_to \
+            AND ($1::uuid[] IS NULL OR e.id IN (SELECT issuer_id FROM ref.instrument WHERE id = ANY($1))) \
+          ORDER BY e.id",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|r| MirrorEntity {
+        id: r.get("id"),
+        lei: r.get("lei"),
+        name: r.get("name"),
+        country: r.get("country"),
+        sector: r.get("sector"),
+    })
+    .collect();
+    let venues = sqlx::query(
+        "SELECT id, code, mic, name, kind, timezone FROM ref.venue \
+          WHERE now() >= valid_from AND now() < valid_to ORDER BY code",
+    )
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|r| MirrorVenue {
+        id: r.get("id"),
+        code: r.get("code"),
+        mic: r.get("mic"),
+        name: r.get("name"),
+        kind: r.get("kind"),
+        timezone: r.get("timezone"),
+    })
+    .collect();
+    Ok(MirrorRows { entities, venues, instruments })
+}
+
 /// Live tests (`DATABASE_URL`, compose Postgres with migration `20261110000040` applied).
 #[cfg(test)]
 mod tests {
@@ -527,5 +674,24 @@ mod tests {
         let rows = quarantine_for_instrument(&pool, inst).await.unwrap();
         assert_eq!((rows[0].status.as_str(), rows[0].instrument_status.as_deref()), ("ignored", Some("provisional")));
         cleanup(&pool, &source, &[inst], venue).await;
+    }
+
+    /// Read-only: the mirror read is consistent between a full and an id-scoped call.
+    #[tokio::test]
+    async fn mirror_rows_full_and_scoped_agree() {
+        let Some(pool) = pool().await else { return };
+        let all = mirror_rows(&pool, None).await.unwrap();
+        let Some(first) = all.instruments.first() else { return };
+        let one = mirror_rows(&pool, Some(&[first.id])).await.unwrap();
+        assert_eq!(one.instruments, vec![first.clone()]);
+        assert_eq!(one.venues, all.venues);
+        assert!(one.entities.iter().all(|e| Some(e.id) == first.issuer_id));
+        for i in &all.instruments {
+            for l in &i.listings {
+                assert!(all.venues.iter().any(|v| v.id == l.venue_id), "listing venue {l:?} not current");
+            }
+        }
+        let none = mirror_rows(&pool, Some(&[])).await.unwrap();
+        assert!(none.instruments.is_empty() && none.entities.is_empty());
     }
 }

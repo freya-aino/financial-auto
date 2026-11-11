@@ -23,8 +23,20 @@ integration tests, see below). Supersedes the D-012 assumption of CLI-compiled
   `carried_mass` on the `Snapshot` node, read by control-api's promotion checklist),
   `add_adapter_state` / `snapshot_adapters` / `latest_adapter` (`AdapterState` node,
   `adapter_id = <snapshot_id>@<version>`, `HasAdapter` edge from the snapshot).
+  Evolution edges: `link_trained_on` (`TrainedOn` genome → snapshot, upsert by `snapshot_id`;
+  evo-worker's `evo.vary.decoder`), `link_feedback_from` (`FeedbackFrom{weight, output_family,
+  score}` snapshot → elite decoder genome, upsert by `genome_id`; trainer, D-009),
+  `genome_trained_on`, `snapshot_feedback`.
+- `reference` – the Postgres `ref` mirror (spec 12 §5), written by control-api `ref_mirror.rs`:
+  `upsert_ref_entities`, `upsert_ref_venues`, `upsert_ref_instruments` (nodes first, then each
+  instrument's `IssuedBy` / `ListedOn` / `SameExposure` out-edges made equal to the given sets:
+  stale edges dropped, current ones upserted by an edge key), `retire_ref_instruments`
+  (`status = inactive`, out-edges dropped), `sync_reference(entities, venues, instruments, full)`
+  (`full` retires mirrored instruments absent from the input), `ref_instrument_ids`,
+  `instrument_reference`. 25 rows per write batch.
 - `catalog` – the **whitelist** of read-only named queries behind `POST /api/graph/query`
   (`NAMED_QUERIES`, `HubClient::run_named(name, params)`); business-id parameters, no raw trees.
+  Includes `instrumentReference`, `genomeTrainedOn` and `snapshotFeedback`.
 - `HubClient::{new, with_timeout, from_env, url_from_env_or, health, ready, diagnostics, batch,
   query, ensure_schema, ensure_latent_index, wait_for_index, clear_caches}`.
 - `vectors` – vector validation (`InvalidVector`: empty / zero-norm / non-finite), registered-dim

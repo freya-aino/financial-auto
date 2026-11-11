@@ -408,7 +408,9 @@ impl Persist {
     /// Every locked holdout with its id.
     pub async fn holdouts(&self) -> anyhow::Result<Vec<(String, fa_backtest::replay::Holdout)>> {
         let rows = sqlx::query(
-            "SELECT id::text AS id, timescale, start_at, end_at, locked_at FROM validation.holdout ORDER BY timescale, start_at",
+            // `embargo_ms` through to_jsonb: readable before migration 20261113000040 too (NULL)
+            "SELECT id::text AS id, timescale, start_at, end_at, locked_at, (to_jsonb(h) ->> 'embargo_ms')::bigint AS embargo_ms \
+             FROM validation.holdout h ORDER BY timescale, start_at",
         )
         .fetch_all(self.pg.pool())
         .await?;
@@ -422,6 +424,7 @@ impl Persist {
                         start_ms: r.get::<DateTime<Utc>, _>("start_at").timestamp_millis(),
                         end_ms: r.get::<DateTime<Utc>, _>("end_at").timestamp_millis(),
                         locked_at_ms: r.get::<DateTime<Utc>, _>("locked_at").timestamp_millis(),
+                        embargo_ms: r.get::<Option<i64>, _>("embargo_ms"),
                     },
                 ))
             })
@@ -436,6 +439,7 @@ impl Persist {
         timescale: &str,
         start_ms: i64,
         end_ms: i64,
+        embargo_ms: i64,
         note: &str,
     ) -> anyhow::Result<Option<String>> {
         let mut tx = self.pg.pool().begin().await?;
@@ -452,15 +456,39 @@ impl Persist {
             tx.rollback().await?;
             return Ok(None);
         }
-        let id: String = sqlx::query_scalar(
-            "INSERT INTO validation.holdout (timescale, start_at, end_at, note) VALUES ($1, $2, $3, $4) RETURNING id::text",
+        // the embargo travels with the lock (spec 41 §6.4); before migration 20261113000040 the
+        // column is missing and the row is locked without it (readers use the default)
+        let has_embargo: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = 'validation' AND table_name = 'holdout' AND column_name = 'embargo_ms')",
         )
-        .bind(timescale)
-        .bind(at(start_ms))
-        .bind(at(end_ms))
-        .bind(note)
         .fetch_one(&mut *tx)
         .await?;
+        let id: String = if has_embargo {
+            sqlx::query_scalar(
+                "INSERT INTO validation.holdout (timescale, start_at, end_at, note, embargo_ms) VALUES ($1, $2, $3, $4, $5) RETURNING id::text",
+            )
+            .bind(timescale)
+            .bind(at(start_ms))
+            .bind(at(end_ms))
+            .bind(note)
+            .bind(embargo_ms.max(0))
+            .fetch_one(&mut *tx)
+            .await?
+        } else {
+            tracing::warn!(
+                "validation.holdout.embargo_ms missing (migration 20261113000040 not applied); locking without it"
+            );
+            sqlx::query_scalar(
+                "INSERT INTO validation.holdout (timescale, start_at, end_at, note) VALUES ($1, $2, $3, $4) RETURNING id::text",
+            )
+            .bind(timescale)
+            .bind(at(start_ms))
+            .bind(at(end_ms))
+            .bind(note)
+            .fetch_one(&mut *tx)
+            .await?
+        };
         tx.commit().await?;
         Ok(Some(id))
     }

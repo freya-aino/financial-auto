@@ -108,6 +108,9 @@ func main() {
 		os.Exit(1)
 	}
 	defer pub.Close()
+	bus.OnLimitHeld = func(h bus.LimitHeld) {
+		log.Warn("stream limit not applied (would purge messages)", "stream", h.Stream, "limit", h.Limit, "have", h.Have, "want", h.Want)
+	}
 	if _, err := bus.EnsureStreamsConn(ctx, pub.NC); err != nil {
 		log.Warn("jetstream streams", "err", err) // spec 21 §5; publishing works without them
 	}
@@ -205,9 +208,13 @@ func main() {
 				At: timestamppb.Now(), Actor: "system:ingestor", SourceId: source, Attrs: map[string]string{"venue_symbol": symbol}})
 		}
 		resolver = r
-		// spec 12 §6: reference changes (quarantine merge, symbol change, overrides) invalidate the cache
-		if _, err := pub.NC.Subscribe(bus.RefChanged(">"), func(*nats.Msg) { r.Invalidate(); counters.Add("refdata.invalidations", 1) }); err != nil {
-			log.Warn("ref.changed subscription", "err", err)
+		// spec 12 §6 / D-067: reference changes (quarantine merge, symbol change, overrides) and
+		// catalog changes (enable/disable) invalidate the cache; a catalog change also re-reads
+		// catalog.source statuses into the in-memory catalog.
+		watch := &RefWatcher{Invalidate: r.Invalidate, Statuses: store.Statuses, Catalog: cat, Counters: counters,
+			Log: func(msg string, args ...any) { log.Info(msg, args...) }}
+		if err := watch.Subscribe(pub.NC); err != nil {
+			log.Warn("ref.changed/catalog.changed subscription", "err", err)
 		}
 		cursors = refdata.NewCursors(store)
 		backfillCursors = refdata.NewBackfillCursors(store)

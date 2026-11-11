@@ -41,8 +41,14 @@ var DefaultHints = map[string]Hint{
 	"yahoo":     {Venue: "yahoo", VenueKind: "otc", VenueName: "Yahoo Finance (aggregated)", AssetClass: "equity", Kind: "equity", Scheme: "yahoo_symbol"},
 	"lemon":     {Venue: "lemon", VenueKind: "broker", VenueName: "lemon.markets", AssetClass: "equity", Kind: "equity", Scheme: "isin"},
 	"oanda":     {Venue: "oanda", VenueKind: "broker", VenueName: "OANDA", AssetClass: "fx", Kind: "fx_pair", Scheme: "oanda_instrument"},
+	"kraken":    {Venue: "kraken", VenueKind: "exchange", VenueName: "Kraken", AssetClass: "crypto", Kind: "crypto_spot", Scheme: "kraken_symbol"},
 	"heartbeat": {Venue: "sim", VenueKind: "otc", VenueName: "Simulated", AssetClass: "synthetic", Kind: "index", Scheme: "sim_symbol"},
 }
+
+// The other keyless sources (frankfurter, ecb, gdelt, sec_edgar, hackernews,
+// googlenews) carry no venue (connector.Capabilities.Venue == ""): their
+// normalizers never call the resolver and backfill skips symbol resolution
+// for them, so they provision no instruments and need no hint.
 
 // Store wraps a pgx pool.
 type Store struct {
@@ -355,7 +361,50 @@ var (
 	yahooPlain  = regexp.MustCompile(`^[A-Z.]{1,6}$`)
 	oandaPair   = regexp.MustCompile(`^([A-Z]{3})_([A-Z]{3})$`)
 	slashPair   = regexp.MustCompile(`^([A-Z0-9]{2,10})/([A-Z0-9]{2,10})$`)
+	// krakenLegacy is Kraken's X/Z-prefixed pair name: XXBTZEUR, XETHZUSD, XETHXXBT.
+	krakenLegacy = regexp.MustCompile(`^[XZ]([A-Z0-9]{3})[XZ]([A-Z0-9]{3})$`)
+	krakenBase   = regexp.MustCompile(`^[A-Z0-9]{2,10}$`)
 )
+
+// krakenQuotes are the quote assets of Kraken's altname pairs (XBTEUR, SOLUSDT),
+// longest first so USDT wins over USD.
+var krakenQuotes = []string{"USDT", "USDC", "EUR", "USD", "GBP", "JPY", "CAD", "CHF", "AUD", "XBT", "ETH", "DAI"}
+
+// krakenAsset maps Kraken's own asset codes to the common ones.
+var krakenAsset = map[string]string{"XBT": "BTC", "XDG": "DOGE"}
+
+// fiat is the set of ISO currencies a Kraken pair can be quoted in; a pair of two of
+// them is an fx pair, not crypto.
+var fiat = map[string]bool{"EUR": true, "USD": true, "GBP": true, "JPY": true, "CAD": true, "CHF": true, "AUD": true}
+
+// KrakenPair splits a Kraken pair name (altname `XBTEUR`, legacy `XXBTZEUR`,
+// wsname `XBT/EUR`) into base and quote with Kraken's asset codes normalised
+// (XBT → BTC, XDG → DOGE); ok is false for an unrecognised shape.
+func KrakenPair(symbol string) (base, quote string, ok bool) {
+	s := strings.ToUpper(strings.TrimSpace(symbol))
+	if m := slashPair.FindStringSubmatch(s); m != nil {
+		base, quote = m[1], m[2]
+	} else if m := krakenLegacy.FindStringSubmatch(s); m != nil {
+		base, quote = m[1], m[2]
+	} else {
+		for _, q := range krakenQuotes {
+			if b, found := strings.CutSuffix(s, q); found && krakenBase.MatchString(b) {
+				base, quote = b, q
+				break
+			}
+		}
+	}
+	if base == "" {
+		return "", "", false
+	}
+	if a, ok := krakenAsset[base]; ok {
+		base = a
+	}
+	if a, ok := krakenAsset[quote]; ok {
+		quote = a
+	}
+	return base, quote, true
+}
 
 // yahooSuffixCcy maps Yahoo exchange suffixes to the listing currency.
 var yahooSuffixCcy = map[string]string{".DE": "EUR", ".F": "EUR", ".PA": "EUR", ".AS": "EUR", ".MI": "EUR", ".MC": "EUR", ".L": "GBP", ".SW": "CHF", ".TO": "CAD", ".T": "JPY", ".HK": "HKD"}
@@ -388,6 +437,13 @@ func Classify(sourceID, symbol string, h Hint) Class {
 		}
 		if yahooPlain.MatchString(symbol) {
 			c.Quote = "USD"
+		}
+	case "kraken":
+		if b, q, ok := KrakenPair(symbol); ok {
+			if fiat[b] && fiat[q] {
+				return Class{"fx", "fx_pair", b, q}
+			}
+			return Class{"crypto", "crypto_spot", b, q}
 		}
 	case "oanda":
 		if m := oandaPair.FindStringSubmatch(symbol); m != nil {

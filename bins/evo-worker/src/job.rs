@@ -101,6 +101,8 @@ pub struct Worker {
     pub trials: Option<TrialStore>,
     /// Shared execution cost model (`go/services/broker-gateway/costs.yaml`).
     pub cost: Arc<fa_backtest::cost::CostModel>,
+    /// Rebalance rule of the strategy / allocator fitness replays (`crate::live_rule`).
+    pub trade_rule: fa_backtest::trade_rule::TradeRule,
     /// Recorded `LATENT` traffic for strategy replays (bounded per-window cache, D-059).
     pub recorded: crate::recorded::RecordedStore,
     /// News → instrument matcher for the text genomes (`ninst`), refreshed from Postgres.
@@ -205,11 +207,15 @@ impl Worker {
         };
         self.progress(&job.job_id, 0.5, format!("{} children from {} parents", out.children.len(), out.parents.len()))
             .await;
-        let helix =
-            match tokio::time::timeout(Duration::from_secs(20), vary::persist(self.hub.as_ref(), &req, &out)).await {
-                Ok(v) => v,
-                Err(_) => json!({"persisted": false, "reason": "helix timeout"}),
-            };
+        let helix = match tokio::time::timeout(
+            Duration::from_secs(20),
+            vary::persist(self.hub.as_ref(), &req, &out, &job.snapshot_id),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => json!({"persisted": false, "reason": "helix timeout"}),
+        };
         if helix["persisted"] != json!(true) {
             tracing::warn!(job = %job.job_id, helix = %helix, "vary lineage not (fully) persisted to Helix");
         }

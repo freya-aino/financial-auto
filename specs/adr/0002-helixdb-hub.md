@@ -6,7 +6,7 @@
 The core model is a graph over latent regions with vector embeddings (expert spaces, news, media, historical windows) plus deep lineage of evolved genomes. Queries combine traversal (transitions, lineage, instrument relations) with vector similarity (retrieval decoders, region lookup). The user designated HelixDB (Rust, graph-vector database) as the central data hub.
 
 ## Decision
-HelixDB stores: instrument/entity/venue graph (mirrored from Postgres; declared in `schema.hx` but not yet written by any service), expert-space registry, latent regions, transitions with kernel summaries, state observations at decision cadence, retrieval windows, text/media embeddings, genomes, fitness records, lineage, snapshot metadata. Schema in `helix/schema.hx`, queries in `helix/queries.hx`, Rust access via `fa-hub`.
+HelixDB stores: instrument/entity/venue graph (mirrored from Postgres `ref` by control-api: full sync at start and periodically, incremental on `ref.changed.*`), expert-space registry, latent regions, transitions with kernel summaries, state observations at decision cadence, retrieval windows, text/media embeddings, genomes, fitness records, lineage, snapshot metadata. Schema in `helix/schema.hx`, queries in `helix/queries.hx`, Rust access via `fa-hub`.
 
 ## Consequences
 - Graph + vector queries in one engine (e.g., "k-NN windows in expert space E, then follow TRANSITION edges").

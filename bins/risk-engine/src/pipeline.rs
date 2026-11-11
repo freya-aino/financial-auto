@@ -182,9 +182,9 @@ impl Pipeline {
             let plan = plan_lock(ts, &policy, now_ms(), &existing);
             let entry = match plan {
                 LockPlan::Locked(h) => {
-                    json!({"locked": true, "start_ms": h.start_ms, "end_ms": h.end_ms})
+                    json!({"locked": true, "start_ms": h.start_ms, "end_ms": h.end_ms, "embargo_ms": h.embargo_ms.unwrap_or(policy.embargo_ms)})
                 }
-                LockPlan::Lock { start_ms, end_ms, relock } if self.holdout.auto_lock => {
+                LockPlan::Lock { start_ms, end_ms, relock, embargo_ms } if self.holdout.auto_lock => {
                     match self.coverage(ts, start_ms, end_ms).await {
                         Ok(bars) if bars >= policy.min_bars => {
                             let note = format!(
@@ -192,7 +192,7 @@ impl Pipeline {
                                 humanize(end_ms - start_ms),
                                 if relock { ", re-lock" } else { "" }
                             );
-                            match self.store.lock_holdout(ts.as_str(), start_ms, end_ms, &note).await {
+                            match self.store.lock_holdout(ts.as_str(), start_ms, end_ms, embargo_ms, &note).await {
                                 Ok(Some(id)) => {
                                     tracing::warn!(%id, %ts, start_ms, end_ms, bars, "holdout locked automatically");
                                     self.store
@@ -200,10 +200,10 @@ impl Pipeline {
                                             ACTOR,
                                             "validation.holdout.lock",
                                             Some(&id),
-                                            json!({"timescale": ts.as_str(), "start_ms": start_ms, "end_ms": end_ms, "bars": bars, "relock": relock, "note": note}),
+                                            json!({"timescale": ts.as_str(), "start_ms": start_ms, "end_ms": end_ms, "embargo_ms": embargo_ms, "bars": bars, "relock": relock, "note": note}),
                                         )
                                         .await;
-                                    json!({"locked": true, "new": true, "id": id, "start_ms": start_ms, "end_ms": end_ms, "bars": bars})
+                                    json!({"locked": true, "new": true, "id": id, "start_ms": start_ms, "end_ms": end_ms, "embargo_ms": embargo_ms, "bars": bars})
                                 }
                                 Ok(None) => {
                                     json!({"locked": false, "reason": "overlaps a concurrently locked row; re-read next round"})

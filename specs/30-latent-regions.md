@@ -122,6 +122,8 @@ All methods must be implementable in Rust. HDBSCAN and Mapper need a Rust implem
 
 **Implemented:** novelty = distance to the nearest centroid / radius; `out_of_region` at `novelty_threshold` (3.0); the heartbeat counts `out_of_region`. Sustained novelty surfaces as occupancy drift (§6.6).
 
+**Online form of the declared methods (2026-11-11):** only leader clustering streams (`OnlineRegionSet`). `density`, `mapper` and `codebook` need the whole probe set and have no incremental update, so `fa_patterns::online_form` maps every declared method to `leader`, and the closest supported online form of a batch method is the leader set **seeded with that method's regions** from `region_map.json` (ids, lineages, centroids kept; only live births and splits are leader regions). model-runtime resolves the method per snapshot (manifest `params.region_discovery`, else `FamilyDescriptor::region_discovery`; unknown → `leader`), logs the fallback at load, and labels Helix accordingly: `RegionSet.method` = declared method when the set was seeded from the map, else `leader`; `LatentRegion.method` = declared for a seeded region, `leader` for a live-born one; statistical snapshots stay `leader`. The labels travel with the snapshot, so reloads, promotions and rollbacks re-label from the next snapshot on.
+
 ### 6.4 Region identity across refits and snapshots
 Regions must keep identity across retraining, otherwise the MCMC graph, strategy genomes and retrieval history break. **This is core blocker #1** (open question 1). Proposed default (proposal):
 1. Keep a fixed **probe set** of historical windows (stratified over time, assets and modalities).

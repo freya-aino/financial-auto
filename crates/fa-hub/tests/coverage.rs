@@ -5,6 +5,7 @@ const QUERIES_HX: &str = include_str!("../../../helix/queries.hx");
 const SOURCES: &[&str] = &[
     include_str!("../src/lib.rs"),
     include_str!("../src/queries.rs"),
+    include_str!("../src/reference.rs"),
     include_str!("../src/vectors.rs"),
     include_str!("../src/asof.rs"),
     include_str!("../src/retention.rs"),

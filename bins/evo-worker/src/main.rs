@@ -20,6 +20,7 @@ mod gpu;
 mod holdout;
 mod job;
 mod latent;
+mod live_rule;
 mod market;
 mod neural;
 mod news;
@@ -68,6 +69,13 @@ struct Args {
     /// Execution cost model shared with the paper venue (YAML); missing file → built-in defaults.
     #[arg(long, env = "FA_COSTS", default_value = fa_backtest::cost::COSTS_YAML_PATH)]
     costs: String,
+    /// Risk settings of the live risk-engine: fitness replays trade with its `[rebalance]`
+    /// rule (missing file → the built-in copy).
+    #[arg(long, env = "FA_RISK", default_value = "bins/risk-engine/risk.toml")]
+    risk: String,
+    /// `live` (the risk-engine's cost-aware rule) or `fraction` (the pre-D-079 fitness rule).
+    #[arg(long, env = "FA_EVO_TRADE_RULE", default_value = "live")]
+    trade_rule: String,
     /// Disable the Postgres trial registry.
     #[arg(long, env = "FA_EVO_NO_REGISTRY", default_value_t = false)]
     no_registry: bool,
@@ -183,6 +191,9 @@ async fn main() -> anyhow::Result<()> {
             fa_backtest::cost::CostModel::default()
         }
     });
+    // Rebalance rule of the fitness replays: the live risk-engine's (spec 40 §6.1 step 6, D-079).
+    let (trade_rule, rule_source) = live_rule::load(&args.trade_rule, &args.risk);
+    tracing::info!(rule = trade_rule.name(), source = %rule_source, "fitness replays trade with this rebalance rule");
     let (notices, _) = broadcast::channel(256);
     tokio::spawn(gpu::run_notices(bus.clone(), notices.clone()));
 
@@ -241,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
         blob,
         trials,
         cost,
+        trade_rule,
         recorded,
         news_refs,
     };

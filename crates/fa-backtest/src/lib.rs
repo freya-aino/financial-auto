@@ -7,7 +7,8 @@
 //! allocator genome (allocator tournament, spec 40 §6.2), and [`holdout`], the locked-holdout
 //! planner and holdout-aware selection windows (spec 41 §6.4), and [`knowledge`], the per-source
 //! knowledge delays every event-time replay applies (spec 41 §6.2), and [`venue`], the paper
-//! venue state ported from the broker-gateway so recorded live fills replay identically.
+//! venue state ported from the broker-gateway so recorded live fills replay identically, and
+//! [`trade_rule`], the live risk-engine's rebalance rule both fitness replays trade with.
 
 pub mod allocator_replay;
 pub mod cost;
@@ -17,6 +18,7 @@ pub mod knowledge;
 pub mod latents;
 pub mod replay;
 pub mod stats;
+pub mod trade_rule;
 pub mod validation;
 pub mod venue;
 

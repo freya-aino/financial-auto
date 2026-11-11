@@ -30,7 +30,12 @@ observations and versions every 6 h (`hub_retention.rs`); the trainer writes can
 snapshots, `RegionMatch`, `AdapterState` and neural `Expert` nodes with `ExpertOf`/`AlignedTo`;
 evo-worker writes genomes/lineage/fitness through `upsert_genome` / `link_parent` /
 `add_fitness_record`; risk-engine mirrors `ledger.strategy_state` onto `Genome` via
-`setGenomeStatus`. `bins/control-api` (`graph_routes.rs`, `latent_routes.rs`, `mcmc_routes.rs`)
+`setGenomeStatus`; evo-worker also links each `evo.vary.decoder` parent to the job's encoder
+snapshot (`TrainedOn`, `link_trained_on`) and the trainer links a neural snapshot to the elite
+decoder genomes of its D-009 feedback set (`FeedbackFrom{weight}`, `link_feedback_from`, from
+`manifest.feedback`). control-api (`ref_mirror.rs`) writes the **reference mirror** from Postgres
+`ref` (`Instrument`, `Entity`, `Venue`, `IssuedBy`, `ListedOn`, `SameExposure`; full sync at start
+and every `FA_REF_MIRROR_FULL_SECS`, incremental on `ref.changed.*`, spec 12 §6). `bins/control-api` (`graph_routes.rs`, `latent_routes.rs`, `mcmc_routes.rs`)
 serves spec 50 §4.4/§4.5 from these rows, including the named-query whitelist of
 `fa-hub::catalog` behind `POST /api/graph/query`.
 
@@ -51,8 +56,11 @@ serves spec 50 §4.4/§4.5 from these rows, including the named-query whitelist 
   `vec<d>` and gets one index per `d`, each partitioned per expert space via `tenant_property =
   expert_space_id`. Searches are therefore always scoped to one expert space (what spec 34 wants).
 - **Upserts:** no server-side upsert; `fa-hub` implements `upsert_*` / `ensure_*`
-  (`ensureSnapshot`, `ensureExpertSpace`, `upsertRegion`, `upsertTransition`, `upsertGenome`) as
-  conditional batches (lookup → `UPDATE`, else `AddN`/`AddE`). `Transition` edges carry
+  (`ensureSnapshot`, `ensureExpertSpace`, `upsertRegion`, `upsertTransition`, `upsertGenome`,
+  `upsertRef*`, `linkTrainedOn`, `linkFeedbackFrom`) as conditional batches (lookup → `UPDATE`,
+  else `AddN`/`AddE`). Upserted edges carry the key they are found by (`Transition.to_region_id`,
+  `ListedOn.listing_key`, `SameExposure.exposure_key`, `IssuedBy.entity_id`,
+  `TrainedOn.snapshot_id`, `FeedbackFrom.genome_id`). `Transition` edges carry
   `from_region_id`/`to_region_id` so an edge can be found again (`From::OutE<Transition>::WHERE`)
   and updated in place; `LatentRegion` has `status` (live | merged | retired) and
   `related_region_id` for the lifecycle marks (`markRegionStatus`). Plain `add*` queries rely on

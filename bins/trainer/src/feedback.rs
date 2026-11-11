@@ -378,6 +378,8 @@ pub async fn load_elites(
                 summary.push(json!({
                     "key": c.key, "family": c.meta.family, "output_family": c.meta.output_family,
                     "score": c.meta.score, "weight": w, "generation": c.meta.generation,
+                    // decoder genome (canonical kv = Helix `Genome.genome_id`): the FeedbackFrom target
+                    "genome": c.meta.genome,
                 }));
             }
             Err(e) => tracing::warn!(key = %c.key, error = %e, "elite bundle unreadable"),

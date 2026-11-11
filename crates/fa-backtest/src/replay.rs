@@ -43,9 +43,11 @@
 
 use std::{collections::BTreeMap, time::Instant};
 
+use fa_allocator::PerformanceTracker;
 use fa_core::{InstrumentId, Timescale};
+use fa_risk::rebalance::{CostQuote, RebalanceStats, Rebalancer, TradeCandidate, effective_obs, strategy_edge};
 use fa_strategies::{
-    GpStrategy, Strategy, StrategyContext,
+    ExposureDistribution, GpStrategy, Strategy, StrategyContext,
     decoders::PriceLookup,
     features::{FallbackContext, LiveContext, VirtualBook},
     population::StrategyDef,
@@ -58,6 +60,7 @@ use crate::{
     eval::Stop,
     latents::{FeedCounters, LatentFeed, RecordedLatents, SnapshotCheck, SourceCounts, check_snapshot},
     run_replay, stats,
+    trade_rule::TradeRule,
 };
 
 /// Why a replay runs (spec 41 §6.4): only `Promotion` may touch the locked holdout.
@@ -93,6 +96,11 @@ pub struct ReplaySpec {
     /// Smallest rebalance executed, as a fraction of the sleeve's capital (smaller target
     /// changes are carried to the next step); avoids micro-churn on constant-fraction targets.
     pub min_trade_fraction: f64,
+    /// When a target change is traded (spec 40 §6.1 step 6). Default `Fraction` (the rule
+    /// above, pre-D-079 trials); evo-worker passes the live risk-engine's cost-aware rule
+    /// (`TradeRule::from_risk_toml`), applied per sleeve with the strategy as sole contributor.
+    #[serde(default)]
+    pub trade_rule: TradeRule,
     /// Per-source knowledge delays applied to the bars before use (spec 41 §6.2): series stored
     /// at event time become visible at event time + the source's catalog delay.
     #[serde(default = "crate::knowledge::catalog_delays")]
@@ -114,6 +122,7 @@ impl ReplaySpec {
             n_trials: 1,
             trial_sharpe_var: 0.0,
             min_trade_fraction: 0.02,
+            trade_rule: TradeRule::Fraction,
             knowledge_delays: crate::knowledge::catalog_delays(),
         }
     }
@@ -126,6 +135,11 @@ pub struct Holdout {
     pub start_ms: i64,
     pub end_ms: i64,
     pub locked_at_ms: i64,
+    /// Embargo recorded with the lock (`validation.holdout.embargo_ms`, the locker's
+    /// `embargo.<timescale>`); `None` on rows locked without one (manual API, older rows):
+    /// readers then use `holdout::HoldoutPolicy::default_for(ts).embargo_ms`.
+    #[serde(default)]
+    pub embargo_ms: Option<i64>,
 }
 
 /// Rejects a `Selection` replay whose window intersects a locked holdout of the same timescale.
@@ -264,6 +278,12 @@ pub struct EvalReport {
     /// What the recorded latents contributed.
     #[serde(default)]
     pub latents: ReplayLatents,
+    /// Rule the trades were decided with (`fraction | band | cost_aware`).
+    #[serde(default)]
+    pub trade_rule: String,
+    /// Decisions of the cost-aware rule (`TradeRule::CostAware`).
+    #[serde(default)]
+    pub rebalance: Option<RebalanceStats>,
 }
 
 /// Recorded-latent bookkeeping of a report.
@@ -441,6 +461,27 @@ struct Engine<'a> {
     max_dd: f64,
     turnover_notional: f64,
     total_steps_hint: usize,
+    /// The live cost-aware rule (`TradeRule::CostAware`): decisions, the strategy's tracked
+    /// step returns (its edge), the last distribution and the marks it was decided at.
+    live: Option<LiveRule>,
+}
+
+/// State of the live rule inside one strategy replay: the strategy is the only contributor of
+/// every sleeve and owns the whole capital as its sleeve (turnover budget).
+struct LiveRule {
+    rb: Rebalancer,
+    frac: f64,
+    min_eur: f64,
+    tracker: PerformanceTracker,
+    last_dist: Option<ExposureDistribution>,
+    /// `last_price` of every sleeve at the previous mark (realised step returns).
+    prev_px: Vec<f64>,
+    /// Edge (fraction per holding period) and holding period (s) of the current decision.
+    edge: f64,
+    hold_secs: f64,
+    /// Over its turnover budget today: positions are held (the live engine nets its last
+    /// distribution).
+    frozen: bool,
 }
 
 impl<'a> Engine<'a> {
@@ -493,6 +534,7 @@ impl<'a> Engine<'a> {
             max_dd: 0.0,
             turnover_notional: 0.0,
             total_steps_hint,
+            live: None,
         }
     }
 
@@ -531,6 +573,18 @@ impl<'a> Engine<'a> {
         if let Some(sd) = self.pending_std.take() {
             self.calib_pairs.push(sd);
             self.calib_pairs.push(r.abs());
+        }
+        if let Some(l) = &mut self.live {
+            let mut realised: BTreeMap<InstrumentId, f64> = BTreeMap::new();
+            for (s, p0) in self.sleeves.iter().zip(l.prev_px.iter_mut()) {
+                if *p0 > 0.0 && s.last_price > 0.0 {
+                    realised.insert(s.id, s.last_price / *p0 - 1.0);
+                }
+                *p0 = s.last_price;
+            }
+            if let Some(d) = &l.last_dist {
+                l.tracker.observe(d, &realised);
+            }
         }
         for s in &mut self.sleeves {
             s.book.unrealised =
@@ -600,6 +654,23 @@ impl<'a> Engine<'a> {
         self.sources.decoder += sources.decoder;
         self.sources.fallback += sources.fallback;
         self.n_steps += 1;
+        if let Some(l) = &mut self.live {
+            // the risk-engine tick's edge (`fa_risk::rebalance::strategy_edge`) from the
+            // strategy's tracked step returns, here at the strategy's own step
+            let st = l.tracker.stats_for([dist.strategy_id.as_str()]);
+            let st = &st[0];
+            let mean_abs = if dist.exposures.is_empty() {
+                0.0
+            } else {
+                dist.exposures.iter().map(|e| e.mean.abs()).sum::<f64>() / dist.exposures.len() as f64
+            };
+            l.hold_secs = dist.horizon.duration().as_secs_f64() * l.rb.cfg.holding_horizons.max(0.0);
+            let n_eff = effective_obs(st.observations, l.tracker.decay);
+            let step_secs = timescale.duration().as_secs_f64();
+            l.edge = strategy_edge(&l.rb.cfg, st.mean_return, mean_abs, n_eff, step_secs, l.hold_secs);
+            l.frozen = l.rb.over_budget(ts).contains(&dist.strategy_id);
+            l.last_dist = Some(dist.clone());
+        }
         let mut std_sum = 0.0;
         for (k, &i) in ready.iter().enumerate() {
             let e = dist.exposures[k];
@@ -625,7 +696,42 @@ impl<'a> Engine<'a> {
         let delta = target_units - s.units;
         let notional = (delta * price).abs();
         s.book.exposure = target_exposure;
-        if notional <= self.spec.min_trade_fraction.max(0.0) * sleeve_capital || notional <= 1e-12 * sleeve_capital {
+        let skip = notional <= 1e-12 * sleeve_capital
+            || match &self.spec.trade_rule {
+                TradeRule::Fraction => notional <= self.spec.min_trade_fraction.max(0.0) * sleeve_capital,
+                TradeRule::Band { frac, min_eur } => {
+                    notional < min_eur.max(frac * (target_exposure * sleeve_capital).abs())
+                }
+                TradeRule::CostAware { .. } => {
+                    let l = self.live.as_mut().expect("cost-aware rule has its state");
+                    let target_eur = target_exposure * sleeve_capital;
+                    let sched = &s.schedule;
+                    let sigma_day = sigma * self.sigma_scale;
+                    let cand = TradeCandidate {
+                        instrument: s.id,
+                        current_eur: s.units * price,
+                        target_eur,
+                        // one contributor: its edge in the target's direction (0 when flat)
+                        edge: if target_eur != 0.0 { l.edge } else { 0.0 },
+                        holding_secs: l.hold_secs,
+                        urgent: false,
+                        limit_bound: false,
+                        contributors: if target_eur != 0.0 { vec![self.strategy.id.clone()] } else { Vec::new() },
+                        cost: CostQuote {
+                            commission_bps: sched.commission_bps,
+                            commission_min_eur: sched.commission_min_eur,
+                            half_spread_bps: sched.spread_bps / 2.0,
+                            impact_k: sched.impact_k.unwrap_or(self.cost.default_k),
+                            sigma_day: if sigma_day > 0.0 { sigma_day } else { self.cost.default_sigma },
+                            adv_eur: self.cost.default_adv_eur,
+                        },
+                    };
+                    let sleeves = BTreeMap::from([(self.strategy.id.clone(), self.spec.capital)]);
+                    let band = l.min_eur.max(l.frac * target_eur.abs());
+                    l.frozen || !l.rb.decide(&cand, band, l.min_eur, &sleeves, ts).trades()
+                }
+            };
+        if skip {
             s.book.steps_in_trade = s.book.steps_in_trade.saturating_add(1);
             return;
         }
@@ -787,7 +893,28 @@ pub fn replay(
     }
     let distinct_steps = events.windows(2).filter(|w| w[0].0 != w[1].0).count() + 1;
     let feed = latents.map(LatentFeed::new);
+    let n_sleeves = sleeves.len();
     let mut engine = Engine::new(strategy.clone(), lookback_bars, spec, controls, cost, sleeves, distinct_steps, feed);
+    if let TradeRule::CostAware { frac, min_eur, cfg, decay } = &spec.trade_rule {
+        let mut cfg = cfg.clone();
+        // The live engine re-decides every second, so a target held for `confirm_secs` is sent
+        // ~confirm_secs after the bar; a replay that decides once per bar ≥ confirm_secs
+        // would instead wait a whole bar. Its confirmation is the bar itself.
+        if spec.timescale.duration().as_secs_f64() >= cfg.confirm_secs {
+            cfg.confirm_secs = 0.0;
+        }
+        engine.live = Some(LiveRule {
+            rb: Rebalancer::new(cfg),
+            frac: *frac,
+            min_eur: *min_eur,
+            tracker: PerformanceTracker::new(*decay, 0.01),
+            last_dist: None,
+            prev_px: vec![0.0; n_sleeves],
+            edge: 0.0,
+            hold_secs: 0.0,
+            frozen: false,
+        });
+    }
     let mut src = VecSource { events: events.into_iter() };
     run_replay(&mut src, &mut engine)?;
     engine.flush_step();
@@ -856,6 +983,8 @@ pub fn replay(
         trades: engine.trades,
         sources: engine.sources,
         latents: latents_report,
+        trade_rule: spec.trade_rule.name().to_owned(),
+        rebalance: engine.live.map(|l| l.rb.stats),
     })
 }
 
@@ -934,6 +1063,49 @@ mod tests {
     }
 
     #[test]
+    fn live_cost_aware_rule_cuts_fee_churn_and_is_deterministic() {
+        // SYNTHETIC walks; a churny 1 s program on a 100 000 EUR book (50 000 per sleeve)
+        let d = data(5);
+        let cost = CostModel::default();
+        let ev =
+            PipelineReplay { data: &d, cost: &cost, holdouts: &[], controls: ReplayControls::default(), latents: None };
+        let base = ReplaySpec { capital: 100_000.0, ..ReplaySpec::selection(Timescale::Second, 0, i64::MAX) };
+        let sig = "(mul 400 analog_forecast)";
+        let old = ev.evaluate(&base, &def(sig)).unwrap();
+        assert_eq!((old.trade_rule.as_str(), old.rebalance.is_none()), ("fraction", true), "default = pre-D-079 rule");
+        let live = ReplaySpec { trade_rule: TradeRule::live_default(), ..base.clone() };
+        let a = ev.evaluate(&live, &def(sig)).unwrap();
+        let b = ev.evaluate(&live, &def(sig)).unwrap();
+        let strip = |mut r: EvalReport| {
+            r.elapsed_ms = 0.0;
+            r
+        };
+        assert_eq!(strip(a.clone()), strip(b), "deterministic under the live rule");
+        assert_eq!(a.trade_rule, "cost_aware");
+        let st = a.rebalance.clone().unwrap();
+        assert_eq!(st.trades as usize, a.n_trades, "every fill is a Rebalancer trade");
+        assert!(a.n_trades < old.n_trades, "{} vs {}", a.n_trades, old.n_trades);
+        assert!(a.total_cost < old.total_cost, "{} vs {}", a.total_cost, old.total_cost);
+        // every order clears the min notional of the fee minimum (1 EUR at ≤ 10 bp → 1 000 EUR)
+        assert!(a.trades.iter().all(|t| t.notional >= 1_000.0 - 1e-6), "{:?}", a.trades.first());
+        assert!((a.final_equity - (live.capital + a.net_pnl)).abs() < 1e-6);
+        // a band-only rule sits between: fewer trades than `Fraction` only when its band is wider
+        let band = ReplaySpec { trade_rule: TradeRule::Band { frac: 0.005, min_eur: 25.0 }, ..base.clone() };
+        let c = ev.evaluate(&band, &def(sig)).unwrap();
+        assert_eq!(c.trade_rule, "band");
+        assert!(c.n_trades >= a.n_trades);
+        // the rule with nothing worth trading (huge cost ratio) never opens a position
+        let cfg = fa_risk::rebalance::RebalanceConfig { min_benefit_cost_ratio: 1e9, ..Default::default() };
+        let none = ReplaySpec {
+            trade_rule: TradeRule::CostAware { frac: 0.005, min_eur: 25.0, cfg, decay: 0.95 },
+            ..base.clone()
+        };
+        let n = ev.evaluate(&none, &def(sig)).unwrap();
+        assert_eq!(n.n_trades, 0);
+        assert!(n.rebalance.unwrap().skipped.get("cost").copied().unwrap_or(0) > 0);
+    }
+
+    #[test]
     fn bars_are_stamped_at_close_and_ordered() {
         let s =
             BarSeries::from_points("x", "sim", &[(0, 1.0), (500, 2.0), (3000, 3.0), (2000, 9.0), (3500, -1.0)], 1000);
@@ -1007,7 +1179,13 @@ mod tests {
     fn holdout_window_and_controls() {
         let d = data(5);
         let cost = CostModel::default();
-        let h = [Holdout { timescale: Timescale::Second, start_ms: 300_000, end_ms: 400_000, locked_at_ms: 1 }];
+        let h = [Holdout {
+            timescale: Timescale::Second,
+            start_ms: 300_000,
+            end_ms: 400_000,
+            locked_at_ms: 1,
+            embargo_ms: None,
+        }];
         let spec = ReplaySpec::selection(Timescale::Second, 0, 350_000);
         assert!(matches!(check_holdout(&spec, &h), Err(ReplayError::HoldoutIntersect { .. })));
         let ev =

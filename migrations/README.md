@@ -2,7 +2,7 @@
 
 PostgreSQL warehouse + ledger schema, in sqlx format (`<timestamp>_<name>.sql`, D-013).
 
-**Status:** 24 migrations (schemas `catalog`, `ref`, `ingest`, `wh`, `ledger`, `audit`, `validation`, `ops`). control-api applies them at startup (`sqlx::migrate!`); later files are idempotent (`if not exists`) so a manually applied copy does not break that run. The initial six were verified 2026-11-06 on a scratch `postgres:17-alpine` (23 tables).
+**Status:** 26 migrations (schemas `catalog`, `ref`, `ingest`, `wh`, `ledger`, `audit`, `validation`, `ops`). control-api applies them at startup (`sqlx::migrate!`); later files are idempotent (`if not exists`) so a manually applied copy does not break that run. The initial six were verified 2026-11-06 on a scratch `postgres:17-alpine` (23 tables).
 
 | File | Schema | Spec |
 |---|---|---|
@@ -29,5 +29,7 @@ PostgreSQL warehouse + ledger schema, in sqlx format (`<timestamp>_<name>.sql`, 
 | `20261113000011_ledger_fill_restatement.sql` | `ledger.fill_restatement` (old/new currency, rate and source per restated fill, batch, actor, reason; `fa_ledger::restate`); idempotent | 42 §6 |
 | `20261113000012_wh_fundamental_xbrl.sql` | `wh.fundamental` keyed by issuer CIK (`issuer_cik`, `period_start/end`, `form`, `accession`, `fiscal_year/period`), natural key incl. unit, as-of index; written by the ingestor from SEC XBRL company facts; idempotent | 20 §5.1 |
 | `20261113000013_ops.sql` | schema `ops`: `alert_event` (alert transitions), `job_run` (JOB_RESULTS history), `config_snapshot` (redacted config per digest); written by control-api via `fa_warehouse::ops`; idempotent | 20 §5.4, 60 |
+| `20261113000020_refdata_kraken_class.sql` | corrects Kraken instruments provisioned as `unknown` to `crypto`/`crypto_spot` (or `fx_pair` for two fiat legs) with base/quote currencies (XBT→BTC, XDG→DOGE), in place with one `audit.log` row each; only provisional `unknown/unknown` rows of `source_id = 'kraken'`; idempotent | 12 §6 |
+| `20261113000040_holdout_embargo.sql` | `validation.holdout.embargo_ms` (embargo the holdout was locked with; NULL = timescale default); idempotent | 41 §6.4 |
 
 Apply with `just migrate`, which needs `sqlx-cli`: `cargo install sqlx-cli --no-default-features --features rustls,postgres`.

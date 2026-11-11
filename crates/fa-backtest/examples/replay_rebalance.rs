@@ -19,7 +19,6 @@ use fa_backtest::{
     replay::{BarSeries, ReplayControls},
 };
 use fa_bus::replay::{ReadOptions, read_range};
-use fa_risk::rebalance::RebalanceConfig;
 
 fn ms(s: &str) -> i64 {
     chrono_like(s)
@@ -108,7 +107,10 @@ async fn main() {
         ("band (D-041: 0.5 % / 25 EUR)", TradeRule::Band { frac: 0.005, min_eur: 25.0 }),
         (
             "cost-aware (risk.toml [rebalance])",
-            TradeRule::CostAware { frac: 0.005, min_eur: 25.0, cfg: RebalanceConfig::default() },
+            std::fs::read_to_string("bins/risk-engine/risk.toml")
+                .ok()
+                .and_then(|src| TradeRule::from_risk_toml(&src).ok())
+                .unwrap_or_else(TradeRule::live_default),
         ),
     ];
     println!(

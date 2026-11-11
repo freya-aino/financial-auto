@@ -22,6 +22,11 @@ pub struct NamedQuery {
 /// The whitelist. Order is the order `/api/graph/query` lists them in error replies.
 pub const NAMED_QUERIES: &[NamedQuery] = &[
     NamedQuery { name: "getInstrument", params: &["instrument_id: string"], doc: "one Instrument row" },
+    NamedQuery {
+        name: "instrumentReference",
+        params: &["instrument_id: string"],
+        doc: "instrument with issuer, ListedOn edges + venues and SameExposure edges (spec 12 mirror)",
+    },
     NamedQuery { name: "listSnapshots", params: &[], doc: "all Snapshot rows" },
     NamedQuery { name: "snapshotSpaces", params: &["snapshot_id: string"], doc: "ExpertSpaces of a snapshot" },
     NamedQuery {
@@ -47,6 +52,12 @@ pub const NAMED_QUERIES: &[NamedQuery] = &[
     },
     NamedQuery { name: "genomeParents", params: &["genome_id: string"], doc: "direct parents" },
     NamedQuery { name: "genomeFitness", params: &["genome_id: string"], doc: "FitnessRecords of a genome" },
+    NamedQuery { name: "genomeTrainedOn", params: &["genome_id: string"], doc: "snapshots a genome was trained on" },
+    NamedQuery {
+        name: "snapshotFeedback",
+        params: &["snapshot_id: string"],
+        doc: "FeedbackFrom edges (weights) and elite decoder genomes of a snapshot (D-009)",
+    },
     NamedQuery {
         name: "genomeAncestry",
         params: &["genome_id: string", "max_depth: integer?"],
@@ -140,6 +151,16 @@ impl HubClient {
         let p = params;
         let out = match name {
             "getInstrument" => json!(self.get_instrument(str_param(p, "instrument_id")?).await?),
+            "instrumentReference" => {
+                let id = str_param(p, "instrument_id")?;
+                json!(self.instrument_reference(id).await?.ok_or_else(|| not_found(node::INSTRUMENT, id))?)
+            }
+            "genomeTrainedOn" => json!(self.genome_trained_on(str_param(p, "genome_id")?).await?),
+            "snapshotFeedback" => {
+                let id = str_param(p, "snapshot_id")?;
+                let (edges, genomes) = self.snapshot_feedback(id).await?;
+                json!({ "edges": edges, "genomes": genomes })
+            }
             "listSnapshots" => json!(self.list_snapshots().await?),
             "snapshotSpaces" => {
                 let id = str_param(p, "snapshot_id")?;

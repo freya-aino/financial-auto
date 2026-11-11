@@ -15,8 +15,11 @@
 //!    the genome);
 //! 3. the allocator weighs the visible strategies from the tracker's posteriors, the weighted
 //!    exposures are netted into EUR targets on the current equity, and each instrument whose
-//!    target moved by more than `min_trade_fraction · capital` is traded at the close through
-//!    [`CostModel::price`] (σ_day from the instrument's recent step returns).
+//!    target change passes the spec's [`TradeRule`] is traded at the close through
+//!    [`CostModel::price`] (σ_day from the instrument's recent step returns). The default
+//!    `Fraction` rule trades any move above `min_trade_fraction · capital` (pre-D-079 trials);
+//!    evo-worker's tournament passes the live risk-engine's cost-aware rule
+//!    ([`TradeRule::from_risk_toml`]).
 //!
 //! Deterministic: signals ordered by `(publish time, stream sequence)`, instruments by token,
 //! the allocators and the cost model pure — identical spec + genome + data give an identical
@@ -35,12 +38,11 @@ use fa_allocator::{Allocation, PerformanceTracker, genome::AllocatorGenome, net_
 use fa_bus::replay::RecordedMessage;
 use fa_core::{Horizon, InstrumentId, Timescale};
 use fa_proto::Message;
-use fa_risk::rebalance::{
-    CostQuote, RebalanceConfig, RebalanceStats, Rebalancer, TradeCandidate, effective_obs, strategy_edge,
-};
+use fa_risk::rebalance::{CostQuote, RebalanceStats, Rebalancer, TradeCandidate, effective_obs, strategy_edge};
 use fa_strategies::{AssetExposure, ExposureDistribution};
 use serde::{Deserialize, Serialize};
 
+pub use crate::trade_rule::TradeRule;
 use crate::{
     ReplayError,
     cost::{CostInputs, CostModel},
@@ -150,20 +152,6 @@ pub struct AllocatorReplaySpec {
     /// Per-source knowledge delays applied to the marks (spec 41 §6.2).
     #[serde(default = "crate::knowledge::catalog_delays")]
     pub knowledge_delays: crate::knowledge::KnowledgeDelays,
-}
-
-/// The rebalance rule of a replay.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(tag = "rule", rename_all = "snake_case")]
-pub enum TradeRule {
-    /// Trade any target move above `min_trade_fraction · capital` (the tournament's rule).
-    #[default]
-    Fraction,
-    /// The risk-engine's D-041 no-trade band: `max(min_eur, frac · |target|)`.
-    Band { frac: f64, min_eur: f64 },
-    /// The live cost-aware rule (`fa_risk::rebalance`, the same [`Rebalancer`] the risk-engine
-    /// runs) on top of the band.
-    CostAware { frac: f64, min_eur: f64, cfg: RebalanceConfig },
 }
 
 impl AllocatorReplaySpec {
@@ -763,6 +751,26 @@ pub(crate) mod tests {
             replay_allocator(&g, &signals, &[], &spec, &cost, &ReplayControls::default()),
             Err(ReplayError::NoData)
         ));
+    }
+
+    #[test]
+    fn live_cost_aware_rule_on_the_fixture() {
+        let (signals, marks, spec) = fixture();
+        let cost = CostModel::default();
+        let g = AllocatorGenome::parse("alloc:name=equal_weight;cap=0.5").unwrap();
+        let old = replay_allocator(&g, &signals, &marks, &spec, &cost, &ReplayControls::default()).unwrap();
+        assert!(old.rebalance.is_none(), "default spec = the pre-D-079 fraction rule");
+        let live = AllocatorReplaySpec { trade_rule: TradeRule::live_default(), ..spec.clone() };
+        let a = replay_allocator(&g, &signals, &marks, &live, &cost, &ReplayControls::default()).unwrap();
+        let b = replay_allocator(&g, &signals, &marks, &live, &cost, &ReplayControls::default()).unwrap();
+        assert_eq!(a, b, "deterministic under the live rule");
+        let st = a.rebalance.clone().unwrap();
+        assert_eq!(st.trades as usize, a.n_trades);
+        assert!(a.n_trades < old.n_trades && a.total_fees < old.total_fees, "{} vs {}", a.n_trades, old.n_trades);
+        // every tournament member sees the same rule (comparable portfolio P&L)
+        let t =
+            tournament(&[g.clone(), AllocatorGenome::named(AllocatorName::RiskParity)], &signals, &marks, &live, &cost);
+        assert!(t.iter().all(|(_, r)| r.as_ref().unwrap().rebalance.is_some()));
     }
 
     #[test]

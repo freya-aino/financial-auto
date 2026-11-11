@@ -34,6 +34,8 @@ async fn cleanup(c: &HubClient, p: &str) {
         (node::LATENT_REGION, "region_id"),
         (node::LATENT_VEC, "expert_space_id"),
         (node::INSTRUMENT, "instrument_id"),
+        (node::ENTITY, "entity_id"),
+        (node::VENUE, "venue_id"),
         (node::GENOME, "genome_id"),
         (node::FITNESS_RECORD, "genome_id"),
         (node::NEWS_DOC, "doc_id"),
@@ -428,6 +430,134 @@ async fn genome_business_id_writes_for_evo_worker() {
         })
         .await;
     assert!(matches!(bad, Err(HubError::NotFound { .. })), "{bad:?}");
+    cleanup(&c, &p).await;
+}
+
+#[tokio::test]
+async fn reference_mirror_upserts_prunes_and_retires() {
+    let Some(c) = client() else { return };
+    c.ensure_schema_ready(WAIT).await.expect("schema");
+    let p = prefix();
+    let ent =
+        RefEntity { entity_id: format!("{p}e1"), lei: "LEI1".into(), name: "Issuer".into(), ..Default::default() };
+    let ven = |n: &str| RefVenue {
+        venue_id: format!("{p}v{n}"),
+        code: format!("v{n}"),
+        name: format!("Venue {n}"),
+        kind: "exchange".into(),
+        timezone: "UTC".into(),
+        ..Default::default()
+    };
+    let listing = |v: &str, sym: &str| RefListing {
+        venue_id: format!("{p}v{v}"),
+        venue_symbol: sym.into(),
+        source_id: "src".into(),
+    };
+    let mut spot = RefInstrument {
+        instrument_id: format!("{p}spot"),
+        asset_class: "crypto".into(),
+        kind: "crypto_spot".into(),
+        name: "BTC spot".into(),
+        status: "active".into(),
+        issuer_id: Some(ent.entity_id.clone()),
+        listings: vec![listing("1", "BTC-USD"), listing("2", "XBTUSD")],
+        exposures: vec![RefExposure { to_instrument_id: format!("{p}perp"), relation: "crypto_spot-perp".into() }],
+        ..Default::default()
+    };
+    let perp = RefInstrument {
+        instrument_id: format!("{p}perp"),
+        asset_class: "crypto".into(),
+        kind: "perp".into(),
+        name: "BTC perp".into(),
+        status: "active".into(),
+        listings: vec![listing("2", "PF_XBTUSD")],
+        ..Default::default()
+    };
+    let rep = c
+        .sync_reference(std::slice::from_ref(&ent), &[ven("1"), ven("2")], &[spot.clone(), perp.clone()], false)
+        .await
+        .expect("sync");
+    assert_eq!((rep.instruments, rep.listed_on, rep.issued_by, rep.same_exposure), (2, 3, 1, 1));
+    // idempotent: a second identical sync leaves exactly the same edges
+    c.sync_reference(std::slice::from_ref(&ent), &[ven("1"), ven("2")], &[spot.clone(), perp.clone()], false)
+        .await
+        .expect("sync again");
+    let r = c.instrument_reference(&spot.instrument_id).await.expect("read").expect("present");
+    assert_eq!(r.listings.len(), 2, "{r:?}");
+    assert_eq!(r.venues.len(), 2);
+    assert_eq!(r.issuer.len(), 1);
+    assert_eq!(r.exposures.len(), 1);
+    assert_eq!(r.exposures[0].properties["relation"], "crypto_spot-perp");
+
+    // a listing closes and the issuer goes away: stale edges are pruned
+    spot.listings.truncate(1);
+    spot.issuer_id = None;
+    spot.name = "BTC spot (renamed)".into();
+    c.upsert_ref_instruments(std::slice::from_ref(&spot)).await.expect("incremental");
+    let r = c.instrument_reference(&spot.instrument_id).await.expect("read").expect("present");
+    assert_eq!((r.listings.len(), r.issuer.len(), r.exposures.len()), (1, 0, 1), "{r:?}");
+    assert_eq!(r.listings[0].properties["venue_symbol"], "BTC-USD");
+    assert_eq!(r.instrument["name"], "BTC spot (renamed)");
+    let named = c
+        .run_named("instrumentReference", &serde_json::json!({ "instrument_id": perp.instrument_id }))
+        .await
+        .expect("named");
+    assert_eq!(named["listings"][0]["venue_symbol"], "PF_XBTUSD");
+
+    // retired: inactive, no out-edges, node kept
+    c.retire_ref_instruments(std::slice::from_ref(&spot.instrument_id)).await.expect("retire");
+    let r = c.instrument_reference(&spot.instrument_id).await.expect("read").expect("present");
+    assert_eq!(r.instrument["status"], "inactive");
+    assert!(r.listings.is_empty() && r.exposures.is_empty());
+    cleanup(&c, &p).await;
+}
+
+#[tokio::test]
+async fn trained_on_and_feedback_from_edges_are_upserted() {
+    let Some(c) = client() else { return };
+    c.ensure_schema_ready(WAIT).await.expect("schema");
+    let p = prefix();
+    let snap = c
+        .ensure_snapshot(&NewSnapshot {
+            snapshot_id: format!("{p}snap"),
+            timescale: "1m".into(),
+            encoder_family: "statistical".into(),
+            generation: 1,
+            garage_key: String::new(),
+            status: "candidate".into(),
+        })
+        .await
+        .expect("snapshot");
+    let g = c
+        .upsert_genome(&NewGenome {
+            genome_id: format!("{p}dec"),
+            kind: "decoder".into(),
+            family: "nn_forecast".into(),
+            params: "{}".into(),
+        })
+        .await
+        .expect("genome");
+    let link = TrainedOnLink { genome_id: g.genome_id.clone(), snapshot_id: snap.snapshot_id.clone(), generation: 3 };
+    let missing = TrainedOnLink { genome_id: format!("{p}nope"), snapshot_id: snap.snapshot_id.clone(), generation: 3 };
+    c.link_trained_on(&[link.clone(), missing]).await.expect("trained_on");
+    c.link_trained_on(&[TrainedOnLink { generation: 4, ..link }]).await.expect("trained_on again");
+    let snaps = c.genome_trained_on(&g.genome_id).await.expect("read");
+    assert_eq!(snaps.len(), 1, "upsert, not duplicate: {snaps:?}");
+    assert_eq!(snaps[0].snapshot_id, snap.snapshot_id);
+
+    let fb = FeedbackLink {
+        snapshot_id: snap.snapshot_id.clone(),
+        genome_id: g.genome_id.clone(),
+        weight: 0.25,
+        output_family: "forecast".into(),
+        score: 0.1,
+    };
+    c.link_feedback_from(std::slice::from_ref(&fb)).await.expect("feedback");
+    c.link_feedback_from(&[FeedbackLink { weight: 0.5, ..fb }]).await.expect("feedback again");
+    let (edges, genomes) = c.snapshot_feedback(&snap.snapshot_id).await.expect("read");
+    assert_eq!((edges.len(), genomes.len()), (1, 1), "{edges:?}");
+    assert_eq!(edges[0].properties["weight"], 0.5);
+    assert_eq!(genomes[0].genome_id, g.genome_id);
     cleanup(&c, &p).await;
 }
 

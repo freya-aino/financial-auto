@@ -411,6 +411,25 @@ pub struct NewFitness {
     pub pareto_rank: u32,
 }
 
+/// One `TrainedOn` edge: a genome trained / evaluated on an encoder snapshot's latents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrainedOnLink {
+    pub genome_id: String,
+    pub snapshot_id: String,
+    pub generation: u32,
+}
+
+/// One `FeedbackFrom` edge: an elite decoder genome whose frozen copy fed back into the fit of
+/// `snapshot_id` with quota `weight` (D-009, spec 36 §6.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeedbackLink {
+    pub snapshot_id: String,
+    pub genome_id: String,
+    pub weight: f64,
+    pub output_family: String,
+    pub score: f64,
+}
+
 fn s(v: &str) -> Input {
     Input::Lit(Val::Str(v.to_owned()))
 }
@@ -1170,6 +1189,76 @@ impl HubClient {
             .returning(["row"]);
         let mut resp = self.batch(&batch).await?;
         resp.take_opt("row")?.ok_or_else(|| HubError::NotFound { label: node::GENOME.into(), id: f.genome_id.clone() })
+    }
+
+    /// `linkTrainedOn`: `TrainedOn` genome → encoder snapshot whose latents it was trained /
+    /// evaluated on (spec 20 §5.2, spec 34), upserted by `(genome_id, snapshot_id)` with
+    /// `generation` and `updated_at` refreshed; one write batch. Pairs whose genome or snapshot
+    /// does not exist are skipped by the server-side probe (no error).
+    pub async fn link_trained_on(&self, links: &[TrainedOnLink]) -> Result<()> {
+        if links.is_empty() {
+            return Ok(());
+        }
+        let mut b = Batch::write().named("link_trained_on");
+        for (i, l) in links.iter().enumerate() {
+            b = crate::regions::edge_upsert(
+                b,
+                i,
+                edge::TRAINED_ON,
+                by_key_nodes(node::GENOME, "genome_id", &l.genome_id),
+                by_key_nodes(node::SNAPSHOT, "snapshot_id", &l.snapshot_id),
+                Pred::eq("snapshot_id", l.snapshot_id.as_str()),
+                vec![("genome_id", s(&l.genome_id)), ("snapshot_id", s(&l.snapshot_id))],
+                vec![("generation", l.generation.into()), ("updated_at", Input::Now)],
+            );
+        }
+        self.batch(&b.returning(Vec::<String>::new())).await.map(drop)
+    }
+
+    /// `linkFeedbackFrom`: `FeedbackFrom{weight}` snapshot → elite decoder genome that fed back
+    /// into the snapshot's fit (D-009), upserted by `(snapshot_id, genome_id)`; one write batch.
+    /// Missing genomes / snapshots are skipped by the probe.
+    pub async fn link_feedback_from(&self, links: &[FeedbackLink]) -> Result<()> {
+        if links.is_empty() {
+            return Ok(());
+        }
+        let mut b = Batch::write().named("link_feedback_from");
+        for (i, l) in links.iter().enumerate() {
+            b = crate::regions::edge_upsert(
+                b,
+                i,
+                edge::FEEDBACK_FROM,
+                by_key_nodes(node::SNAPSHOT, "snapshot_id", &l.snapshot_id),
+                by_key_nodes(node::GENOME, "genome_id", &l.genome_id),
+                Pred::eq("genome_id", l.genome_id.as_str()),
+                vec![("snapshot_id", s(&l.snapshot_id)), ("genome_id", s(&l.genome_id))],
+                vec![
+                    ("weight", l.weight.into()),
+                    ("output_family", s(&l.output_family)),
+                    ("score", l.score.into()),
+                    ("updated_at", Input::Now),
+                ],
+            );
+        }
+        self.batch(&b.returning(Vec::<String>::new())).await.map(drop)
+    }
+
+    /// `snapshotFeedback`: the `FeedbackFrom` edges of a snapshot (weights) and the elite genomes.
+    pub async fn snapshot_feedback(&self, snapshot_id: &str) -> Result<(Vec<EdgeRow>, Vec<Genome>)> {
+        let b = Batch::read()
+            .named("snapshot_feedback")
+            .var("s", by_key_nodes(node::SNAPSHOT, "snapshot_id", snapshot_id))
+            .ret("edges", Op::nodes(NodeRef::var("s")).out_e(Some(edge::FEEDBACK_FROM)).edge_properties())
+            .ret("genomes", Op::nodes(NodeRef::var("s")).out(Some(edge::FEEDBACK_FROM)).value_map(None));
+        let mut resp = self.batch(&b).await?;
+        Ok((resp.take("edges")?, resp.take("genomes")?))
+    }
+
+    /// `genomeTrainedOn`: the snapshots a genome was trained on (`TrainedOn` targets).
+    pub async fn genome_trained_on(&self, genome_id: &str) -> Result<Vec<Snapshot>> {
+        let op = by_key_nodes(node::GENOME, "genome_id", genome_id).out(Some(edge::TRAINED_ON)).value_map(None);
+        let mut resp = self.batch(&Batch::read().named("genome_trained_on").ret("rows", op)).await?;
+        resp.take("rows")
     }
 
     pub async fn genome_by_id(&self, genome_id: &str) -> Result<Option<Genome>> {

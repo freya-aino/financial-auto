@@ -5,6 +5,7 @@
 // `cargo test -p fa-hub --test live`.
 
 // ── Reference ───────────────────────────────────────────────────────────
+// Single-row upsert (lookup → UPDATE, else AddN); the mirror uses upsertRefInstruments below.
 QUERY upsertInstrument(instrument_id: String, asset_class: String, kind: String, name: String) =>
     inst <- AddN<Instrument>({instrument_id: instrument_id, asset_class: asset_class, kind: kind, name: name})
     RETURN inst
@@ -12,6 +13,51 @@ QUERY upsertInstrument(instrument_id: String, asset_class: String, kind: String,
 QUERY getInstrument(instrument_id: String) =>
     inst <- N<Instrument>({instrument_id: instrument_id})
     RETURN inst
+
+// Postgres `ref` mirror (spec 12 §5; fa-hub `reference.rs`, written by control-api `ref_mirror.rs`).
+// Row-wise forms of chunked batches (25 rows per batch); every write is an upsert by business id
+// and stamps `mirrored_at`. Node batches run before edge batches.
+QUERY upsertRefEntities(entity_id: String, lei: String, name: String, country: String, sector: String) =>
+    existing <- N<Entity>({entity_id: entity_id})
+    updated <- existing::UPDATE({lei: lei, name: name, country: country, sector: sector, mirrored_at: NOW}) // when existing is not empty
+    created <- AddN<Entity>({entity_id: entity_id, lei: lei, name: name, country: country, sector: sector, mirrored_at: NOW}) // when existing is empty
+    RETURN NONE
+
+QUERY upsertRefVenues(venue_id: String, code: String, mic: String, name: String, kind: String, timezone: String) =>
+    existing <- N<Venue>({venue_id: venue_id})
+    updated <- existing::UPDATE({code: code, mic: mic, name: name, kind: kind, timezone: timezone, mirrored_at: NOW}) // when existing is not empty
+    created <- AddN<Venue>({venue_id: venue_id, code: code, mic: mic, name: name, kind: kind, timezone: timezone, mirrored_at: NOW}) // when existing is empty
+    RETURN NONE
+
+// Node upsert like upsertInstrument (+ status, base_ccy, quote_ccy), then the instrument's out-edges
+// are made equal to the given sets: stale edges dropped, current ones upserted by their edge key.
+QUERY upsertRefInstruments(instrument_id: String, asset_class: String, kind: String, name: String, status: String, base_ccy: String, quote_ccy: String, issuer_id: String, listings: [{venue_id: String, venue_symbol: String, source_id: String}], exposures: [{to_instrument_id: String, relation: String}]) =>
+    inst <- N<Instrument>({instrument_id: instrument_id})
+    stale_issuer <- inst::OutE<IssuedBy>::WHERE(NOT(_::{entity_id}::EQ(issuer_id)))::DROP
+    issued <- AddE<IssuedBy>({instrument_id: instrument_id, entity_id: issuer_id})::From(inst)::To(N<Entity>({entity_id: issuer_id})) // unless present
+    stale_listings <- inst::OutE<ListedOn>::WHERE(NOT(_::{listing_key}::IN(listings::{venue_id|venue_symbol})))::DROP
+    listed <- AddE<ListedOn>({listing_key: "<venue_id>|<venue_symbol>", instrument_id: instrument_id, venue_id: venue_id, venue_symbol: venue_symbol, source_id: source_id})::From(inst)::To(N<Venue>({venue_id: venue_id})) // per listing, else UPDATE source_id
+    stale_exposures <- inst::OutE<SameExposure>::WHERE(NOT(_::{exposure_key}::IN(exposures::{to_instrument_id|relation})))::DROP
+    exposed <- AddE<SameExposure>({exposure_key: "<to_instrument_id>|<relation>", instrument_id: instrument_id, to_instrument_id: to_instrument_id, relation: relation})::From(inst)::To(N<Instrument>({instrument_id: to_instrument_id})) // per exposure
+    RETURN NONE
+
+// An instrument absent from Postgres stays as a node: status = "inactive", reference out-edges dropped.
+QUERY retireRefInstruments(instrument_id: String) =>
+    inst <- N<Instrument>({instrument_id: instrument_id})::UPDATE({status: "inactive", mirrored_at: NOW})
+    dropped <- inst::OutE<IssuedBy, ListedOn, SameExposure>::DROP
+    RETURN NONE
+
+QUERY refInstrumentIds() =>
+    rows <- N<Instrument>::{instrument_id, status}
+    RETURN rows
+
+QUERY instrumentReference(instrument_id: String) =>
+    instrument <- N<Instrument>({instrument_id: instrument_id})
+    issuer <- instrument::Out<IssuedBy>
+    listings <- instrument::OutE<ListedOn>
+    venues <- instrument::Out<ListedOn>
+    exposures <- instrument::OutE<SameExposure>
+    RETURN instrument, issuer, listings, venues, exposures
 
 // ── Snapshots and expert spaces ─────────────────────────────────────────
 QUERY addSnapshot(snapshot_id: String, timescale: String, encoder_family: String, generation: U32, garage_key: String, status: String) =>
@@ -289,6 +335,36 @@ QUERY addFitnessRecord(genome_id: String, generation: U32, objectives: String, p
     edge <- AddE<Scored>::From(genome)::To(rec)
     RETURN rec
 
+// Genome → encoder snapshot its latents came from (evo-worker `evo.vary.decoder`: the parents
+// evaluated on the generation's snapshot). Upsert by (genome_id, snapshot_id); missing ends skip.
+QUERY linkTrainedOn(genome_id: String, snapshot_id: String, generation: U32) =>
+    genome <- N<Genome>({genome_id: genome_id})
+    snap <- N<Snapshot>({snapshot_id: snapshot_id})
+    existing <- genome::OutE<TrainedOn>::WHERE(_::{snapshot_id}::EQ(snapshot_id))
+    updated <- existing::UPDATE({generation: generation, updated_at: NOW}) // when existing is not empty
+    created <- AddE<TrainedOn>({genome_id: genome_id, snapshot_id: snapshot_id, generation: generation})::From(genome)::To(snap) // when existing is empty and snap exists
+    RETURN NONE
+
+// Snapshot → elite decoder genome whose frozen copy fed back into its fit (D-009; trainer
+// `artifact.rs` from manifest.feedback). Upsert by (snapshot_id, genome_id).
+QUERY linkFeedbackFrom(snapshot_id: String, genome_id: String, weight: F64, output_family: String, score: F64) =>
+    snap <- N<Snapshot>({snapshot_id: snapshot_id})
+    genome <- N<Genome>({genome_id: genome_id})
+    existing <- snap::OutE<FeedbackFrom>::WHERE(_::{genome_id}::EQ(genome_id))
+    updated <- existing::UPDATE({weight: weight, output_family: output_family, score: score, updated_at: NOW}) // when existing is not empty
+    created <- AddE<FeedbackFrom>({snapshot_id: snapshot_id, genome_id: genome_id, weight: weight, output_family: output_family, score: score})::From(snap)::To(genome) // when existing is empty and genome exists
+    RETURN NONE
+
+QUERY snapshotFeedback(snapshot_id: String) =>
+    snap <- N<Snapshot>({snapshot_id: snapshot_id})
+    edges <- snap::OutE<FeedbackFrom>
+    genomes <- snap::Out<FeedbackFrom>
+    RETURN edges, genomes
+
+QUERY genomeTrainedOn(genome_id: String) =>
+    snaps <- N<Genome>({genome_id: genome_id})::Out<TrainedOn>
+    RETURN snaps
+
 // ── Adapters (spec 36 §5) ───────────────────────────────────────────────
 QUERY addAdapterState(snapshot: ID, adapter_id: String, snapshot_id: String, timescale: String, version: U64, garage_key: String, drift: F64, max_drift: F64, frozen: Boolean, n_windows: U64, window_start: Date, window_end: Date) =>
     a <- AddN<AdapterState>({adapter_id: adapter_id, snapshot_id: snapshot_id, timescale: timescale, version: version, garage_key: garage_key, drift: drift, max_drift: max_drift, frozen: frozen, n_windows: n_windows, window_start: window_start, window_end: window_end})
@@ -317,9 +393,9 @@ QUERY resolveNode(business_id: String) =>
 // batches (one Both / In<ParentOf> hop per entry); see fa-hub `queries.rs`.
 //
 // Named-query catalog exposed to `POST /api/graph/query` (fa-hub `catalog.rs`, whitelist, business-id
-// params): getInstrument, listSnapshots, snapshotSpaces, snapshotGraph, spaceRegions, getRegion,
-// regionTransitions, regionNeighbors, searchLatent, genomeParents, genomeFitness, genomeAncestry,
-// resolveNode, neighborhood.
+// params): getInstrument, instrumentReference, listSnapshots, snapshotSpaces, snapshotGraph,
+// spaceRegions, getRegion, regionTransitions, regionNeighbors, searchLatent, genomeParents,
+// genomeFitness, genomeTrainedOn, snapshotFeedback, genomeAncestry, resolveNode, neighborhood.
 
 // ── Expert identity (spec 32 §5, §6.5; fa-hub `experts.rs`) ──
 

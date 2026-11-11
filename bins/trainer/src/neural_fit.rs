@@ -14,8 +14,9 @@
 //!    preemption (checkpoint + `STATUS_PREEMPTED`) and the budget, and checkpoints every
 //!    `checkpoint_every` to `fa-ckpt/<job_id>/neural.safetensors` (+ `state.json` with the data
 //!    pins), so a redelivered job resumes bit for bit.
-//! 3. **Validate**: optional refit of the next-step heads (`head_refit_steps` > 0; `head_solver`
-//!    picks the penalised or the constrained solver), spec 32 §6.4 health on the validation windows (residual correlation,
+//! 3. **Validate**: optional refit of the next-step heads (`head_solver: "constrained"` → the
+//!    exact constrained solve, whatever `head_refit_steps`, as in `sweep`; else the penalised
+//!    refit when `head_refit_steps` > 0), spec 32 §6.4 health on the validation windows (residual correlation,
 //!    `K_eff`, per-expert skill, usage), then **prune** experts below `prune_usage_below`
 //!    (emergent count, ≥ 2 kept) and evaluate again; a neural parent is evaluated on the same
 //!    windows for the §6.4 item 1 regression check.
@@ -470,9 +471,11 @@ pub async fn run(
         return Ok(stop_outcome(kind, &meta.snapshot_id, Status::Cancelled, "cancelled", None, tr.step, started));
     }
 
-    // 3b. optional full-batch refit of the next-step heads (spec 32 §6.3 decorrelation)
-    if cfg.head_refit_steps > 0 {
-        (ctl.progress)(0.85, format!("head refit ({} full-batch steps)", cfg.head_refit_steps));
+    // 3b. optional refit of the next-step heads (spec 32 §6.3 decorrelation): the constrained
+    // solver whenever `head_solver` selects it (as `sweep` does, whatever `head_refit_steps`),
+    // else the penalised full-batch refit when `head_refit_steps` > 0
+    if cfg.refits_heads() {
+        (ctl.progress)(0.85, head_refit_label(&cfg));
         tokio::task::block_in_place(|| tr.refit_heads(&ds, cfg.head_refit_steps, 4096))?;
     }
     // 4. validation, pruning, parent regression
@@ -930,6 +933,15 @@ pub fn reorder_by_parent(matches: &[fa_expert_space::health::ExpertMatch], n: us
 
 // ── genome sweep (no writes) ────────────────────────────────────────────────
 
+/// Progress line of the post-training head refit ([`NeuralConfig::refits_heads`]).
+fn head_refit_label(cfg: &NeuralConfig) -> String {
+    if cfg.constrained_heads() {
+        "head refit (constrained solve)".to_owned()
+    } else {
+        format!("head refit ({} full-batch steps)", cfg.head_refit_steps)
+    }
+}
+
 /// Spec 32 §6.3 feasibility bound of the promotion checklist for two experts sharing windows.
 /// Write each expert's prediction as `ŷ_k = f + d_k` (`f` = the conditional mean, `d_k` any
 /// function of the window, so `d_k ⟂ ε` out of sample). The scalarised residual is `ē − d̄_k`,
@@ -1219,6 +1231,22 @@ mod tests {
             "fsq-v1-1m-g2-1700000000"
         );
         assert!(mem_estimate_mb(&cfg, 50_000) >= 16);
+    }
+
+    /// A snapshot fit refits the heads exactly when `sweep` would change them: the constrained
+    /// solver whenever selected (even at `head_refit_steps` 0), else only with refit steps.
+    #[test]
+    fn snapshot_fits_honour_the_constrained_head_solver() {
+        let cfg = |over| config_for(NeuralFamily::JepaVae, Timescale::Minute, Some(&over)).unwrap();
+        let plain = cfg(json!({}));
+        assert!(!plain.refits_heads());
+        let constrained = cfg(json!({ "head_solver": "constrained" }));
+        assert_eq!(constrained.head_refit_steps, 0);
+        assert!(constrained.refits_heads());
+        assert_eq!(head_refit_label(&constrained), "head refit (constrained solve)");
+        let adam = cfg(json!({ "head_refit_steps": 30 }));
+        assert!(adam.refits_heads());
+        assert_eq!(head_refit_label(&adam), "head refit (30 full-batch steps)");
     }
 
     #[test]

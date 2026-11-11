@@ -151,6 +151,10 @@ pub struct HoldoutSettings {
     pub timescales: Vec<String>,
     /// `holdout.length.<ts>` in seconds (defaults: `fa_backtest::holdout::HoldoutPolicy::default_for`).
     pub length_secs: BTreeMap<String, u64>,
+    /// `embargo.<ts>` in seconds: recorded with every auto-locked row
+    /// (`validation.holdout.embargo_ms`); evo-worker keeps now-relative selection windows
+    /// `max(this, 2 × strategy horizon, 60 s)` before the holdout
+    /// (`fa_backtest::holdout::selection_embargo_ms`).
     pub embargo_secs: BTreeMap<String, u64>,
     pub min_bars: usize,
     /// Re-lock a new segment once the latest holdout ended this many days ago (0 = never).
@@ -267,6 +271,38 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn holdout_embargo_travels_with_the_lock_and_fitness_uses_the_live_rule() {
+        use fa_backtest::{
+            holdout::{LockPlan, plan_lock, selection_embargo_ms},
+            replay::Holdout,
+            trade_rule::TradeRule,
+        };
+        let s = Settings::parse(include_str!("../risk.toml")).unwrap();
+        let now = 1_000 * 3_600_000;
+        for (ts, want) in [(Timescale::Second, 300_000), (Timescale::Minute, 3_600_000)] {
+            let LockPlan::Lock { start_ms, end_ms, embargo_ms, .. } = plan_lock(ts, &s.holdout.policy(ts), now, &[])
+            else {
+                panic!("first lock");
+            };
+            assert_eq!(embargo_ms, want, "[holdout.embargo_secs] {ts} reaches the lock record");
+            // what evo-worker reads back from the row: the configured floor, or 2 × horizon
+            let h = Holdout { timescale: ts, start_ms, end_ms, locked_at_ms: now, embargo_ms: Some(embargo_ms) };
+            assert_eq!(selection_embargo_ms(&h, 1_000), want);
+            assert_eq!(selection_embargo_ms(&h, want), 2 * want);
+        }
+        // the rule evo-worker's fitness replays parse from the same file is the engine's
+        assert_eq!(
+            TradeRule::from_risk_toml(include_str!("../risk.toml")).unwrap(),
+            TradeRule::CostAware {
+                frac: s.no_trade_band_frac,
+                min_eur: s.min_order_eur,
+                cfg: s.rebalance.clone(),
+                decay: s.performance_decay,
+            }
+        );
+    }
 
     #[test]
     fn repo_risk_toml_parses_and_live_is_refused() {
