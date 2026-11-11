@@ -189,6 +189,13 @@ Tensor handoff happens via host memory or a shared CUDA buffer (proposal: start 
 | Pretrained weights unavailable / license unclear | Family falls back to a learned-from-scratch front-end. Logged |
 
 ## 9. Acceptance criteria
+**Remaining (why this spec stays):**
+- Media modalities: the text, image/chart, video and audio front-ends (§4.2) and their fusion (§6.3) are not built. No pretrained tower is downloaded or run in candle; `fa_encoders::media` provides the interface and the hashed fallback only. The neural families are market-only, so acceptance 5 (masking a modality) cannot be tested.
+- Asset conditioning and selection (§6.4): there are no asset embeddings, no cross-asset attention and no `asset_attn` export. Cross-asset structure comes only from the MCMC cross-asset priors and decoder `src` genes.
+- Per-timescale capacity (§6.1, §7): only the context length is sized per timescale (`config_for`). `d_model`, the layer count and the expert width are the same CPU-sized defaults at every scale.
+- §8 failure handling: there is no posterior/codebook-collapse monitor that marks a candidate unfit, no OOM retry with a smaller batch, and no learned-from-scratch media front-end fallback.
+- Open questions 1 (spike (a)), 2, 3, 4, 5 and 6 are undecided.
+
 *Status:* 1 holds for all four families (`families_train_save_load_and_resume_deterministically` iterates `NeuralFamily::ALL`: shapes, loss decreases, seed determinism, save/load, bit-exact resume, wrong-family refusal; `hierarchical_flow_and_latent_diffusion_priors` adds the prior losses, the density / novelty ordering, seeded future sampling and the D-010 gate; their `density` discovery passes `fa_patterns::conformance`), on synthetic data; 2 holds (one snapshot per timescale, trained and loaded independently); 3 holds for the media path (`media::point_in_time`), the market path has no publish-time lag; 4 not measured (no reference GPU; CPU serving of the default genome keeps up with live 1m bars of 9 instruments, not benchmarked); 5 open (no media fused); 6 holds bitwise on CPU.
 1. Each of the 4 families implements `EncoderFamily`, trains on a synthetic multimodal dataset, and passes the conformance suite (shapes, determinism with seed, save/load round-trip, cost estimate).
 2. One model per configured timescale can be trained and loaded independently.

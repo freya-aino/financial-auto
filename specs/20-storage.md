@@ -40,6 +40,7 @@ trait Tsdb {
 }
 // fa-warehouse: sqlx pools per schema; fa-blob: S3 get/put/list with content hashing
 ```
+**Implemented as:** concrete clients, not traits — `fa_hub::HubClient` (`upsert_region`, `upsert_transitions`, `knn(space, v, k, &KnnFilter)`, `genome_ancestry`, one typed function per `queries.hx` query), `fa_tsdb::Tsdb` (`write`, `query_range`, `trade_prices`, `bars`; no `as_of` parameter, see §6.3), `fa_blob::BlobStore` (trait with `MemoryStore` / `S3BlobStore`; keys are ULID/id based rather than content-addressed; the payload SHA-256 is only the SigV4 body hash, and integrity at rest comes from the backup manifest).
 - Go: VictoriaMetrics written by the ingestor via the JSON-line import API (`go/pkg/tsdb`, `/api/v1/import`); Postgres via `pgx`; Garage via S3 SDK (`go/pkg/archive`).
 - HelixQL queries live in `helix/queries.hx`; schema in `helix/schema.hx`.
 
@@ -58,7 +59,7 @@ trait Tsdb {
 | Latent regions, transitions, embeddings, expert-space registry | Helix | snapshot-scoped ids |
 | Genomes (decoders, strategies, encoders, samplers, allocators), lineage, fitness | Helix (+ metrics in VM) | GenomeId |
 | Snapshot metadata (encoder generations, adapters) | Helix | SnapshotId |
-| Raw payloads, media, weights, checkpoints, rendered decoder outputs | Garage | content-addressed key |
+| Raw payloads, media, weights, checkpoints, rendered decoder outputs | Garage | id-based key (§5.5) |
 
 ### 5.2 Helix schema sketch (original proposal; the current model is `helix/schema.hx`, see "Implemented today" below)
 Nodes:
@@ -175,6 +176,17 @@ Original proposal: nightly Postgres dump + Helix snapshot + VM snapshot → Gara
 | Schema drift Helix ↔ Rust | generated query wrappers are compile-checked; migration version stored in Helix. **Today:** `ensure_schema_ready` builds indexes, then `migrate_schema` applies `fa_hub::meta::MIGRATIONS` above the stored `SchemaMeta.version` and stamps it (forward only); a build older than the stored version fails with `SchemaTooNew` |
 
 ## 9. Acceptance criteria
+**Remaining (2026-11-11, code checked at e25e9b5):**
+- **VM cardinality budget** (§5.3, §8, criterion 3): not enforced. `fa-tsdb` and `go/pkg/tsdb` whitelist labels, but nothing counts active series, rejects series beyond `vm.max_active_series` or demotes an instrument to bars; the criterion has never been measured.
+- **VM retention per timescale** (§6.5): not enforced. VictoriaMetrics runs with `-retentionPeriod=100y` and no writer deletes old series (the compose comment saying writers enforce it is wrong); seconds-scale series, minute bars and book top-N are kept indefinitely. Helix observation retention (§6.4) is the only scheduled pruning.
+- **Disk budget** (§8 "retention tightened automatically"): not built; open question 3 (retention values and disk budget) is still open.
+- **Genome weight GC** (§6.5 "weights of non-elite genomes GC'd after N generations"): not built; `fa-models` and `fa-artifacts` only grow.
+- **Media downsampling** (§6.5, `garage.media_downsample_after_d`): not built; no media producer exists yet (`MediaChunk` has no publisher, spec 10).
+- **Helix k-NN latency** (criterion 4, open question 2): no benchmark at 10 M vectors has been run.
+- **As-of for VictoriaMetrics** (criterion 2, open question 4): `fa-tsdb` has no `as_of`; backtests apply per-source knowledge delays instead (§6.3). Either accept that as the design (and close Q4) or add an availability index.
+- **Restore** (criterion 5): Postgres (logical + PITR) and Helix restores are drilled (`scripts/restore-drill.sh`, weekly Postgres drill in the `backup` sidecar); VictoriaMetrics is excluded by design and its rebuild from the raw archive (`ctl.ingest.replay {publish}`) has not been drilled.
+- Open question 1 (order-book modelling in VM) is moot until a `BookSnapshot` producer exists, but not decided.
+
 - Every data type in §5.1 has exactly one store of record.
 - As-of queries never return data published after `as_of` (property test on fixtures with late publications). — **met for Postgres fundamentals** (`fundamentals::tests::as_of_never_sees_late_publications`: random restatements, probed around every vintage, equal the latest vintage ≤ t), reference data (`tests/refdata_asof_live.rs`, spec 12) and Helix (§6.3); VictoriaMetrics has no publish time (§6.3: knowledge delays are applied in backtests, not in `fa-tsdb`).
 - VM series count stays under budget under first-wave load.

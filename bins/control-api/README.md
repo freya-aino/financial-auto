@@ -102,6 +102,8 @@ Starts even when NATS is down: the client retries in the background, and `/api/h
 
 Helix-backed routes (`src/graph_routes.rs`) answer `503 {"error": "helix_unavailable"}` when HelixDB cannot be reached and `502 {"error": "helix_error"}` on a server-side query error. The Helix URL is `helix.url` from the config, overridable with `FA_HELIX_URL`. These are the **persisted** view; the in-memory `/api/latent/timescales/...` views (D-032) stay as they are.
 
+**Audit coverage:** mutations are audited either here (`config_routes::audit`, `console_routes`, sources, services, latent, ledger, refdata, validation, evolution run actions, alerts) or by the risk-engine for the `ctl.risk.*` routes, the kill switch / resume (`halt` / `resume` rows) and manual paper orders (booked as `ledger` intents) — the latter only while the risk-engine runs. Not audited anywhere yet: `POST /api/evolution/generations` (= `/runs`), `POST /api/jobs/{id}/cancel`, `POST /api/ingest/{source}/start|stop` (spec 50 §9 Remaining).
+
 The bus tap decodes `ops.alert` (JSON), `latent.membership.*`, `latent.lifecycle.*`, `latent.mcmc.*`, `latent.hier.*`, `latent.crossprior.*` (`console_routes::decode_extra`) and passes any other `{`-prefixed payload through as JSON.
 
 Error replies from Go services and the risk-engine (`CtlReply{ok:false}`) are mapped by message prefix: `not_found:` → 404, `conflict:` → 409, `invalid:` → 400, else 422 (the risk-engine's `loosen:` lands here). The trading lifecycle routes are layered in front of the main router with `fallback_service` (like the ledger routes), so their `501` placeholders in `routes.rs` are shadowed, not removed.

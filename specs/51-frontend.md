@@ -103,6 +103,17 @@ Topics: `bus`, `latent`, `evolution`, `trading`, `ops`. Stores update at most at
 | Kill switch click | confirm dialog; result shown from API response, not optimistic |
 
 ## 9. Acceptance criteria
+**Remaining (checked against the code at e25e9b5):**
+1. **50k-point interactive projection** (criterion 3) is unmet: hand-written SVG `Scatter`, 2-D only, at most 20 000 server-side points, no pan/zoom; open question 1 (visualisation library) is still open.
+2. **Service start/stop/restart** (§6.2) is not in the UI although the API has it (D-060); the Services panel shows heartbeats and status only.
+3. **Genome lineage tree** (§6.4) is not in the UI: the genome drawer lists direct parents; `/api/graph/lineage/{id}` is unused.
+4. **Manual order ticket** (§6.5) does not show a risk-check result before submit; it publishes the paper intent and reports the intent id.
+5. **Latent explorer** (§6.3): no 3-D view, colour by region only (instrument / time in the tooltip), no animated live positions, no occupancy-over-time or decoder reconstructions per region.
+6. **Bus monitor** (§6.2): one total msg/s figure, no rate sparkline per subject.
+7. **API-only routes** (§6 "Not in the UI"): `ops` history and alert history, holdout lock / evaluate, shadow-vs-backtest consistency, identifier / contract-spec overrides and the FX restatement (the last one an open operator decision) — D-057's "every route of spec 50 §4" no longer holds.
+
+Met: four views reachable and populated, kill switch on every page with confirm, `pnpm check` / `pnpm build` (last run 2026-11-10), only the control API is called (`openapi.test.ts`).
+
 - All four views reachable and populated from the API (mock data acceptable before backend exists).
 - Kill switch reachable from every page within one click + confirm.
 - 50k-point projection renders interactively (pan/zoom) on the workstation.

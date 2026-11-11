@@ -238,19 +238,29 @@ Live strategies keep running on their snapshot until the replacement passes shad
 | Snapshot or region lineage breaks | Strategy suspended to shadow until revalidated |
 
 ## 9. Acceptance criteria
+**Remaining (checked against the code at e25e9b5):**
+- **Neural policies** (§4.3, §6.3, AC 2): `fa_strategies::NeuralPolicy` is a one-method trait with no implementation, no training path and no breeding pool; `min_share_per_repr` and cross-representation selection do not exist.
+- **Asset-set genes** (§3, §6.3): no asset-set gene or MCMC pair-proposal mutation; every strategy is evaluated on every instrument it sees.
+- **DSR reference vectors** (AC 4): `fa_backtest::stats` is tested for monotonicity (`deflation_penalises_many_trials`) and consistency of the normal functions, not against published Bailey & López de Prado values.
+- **Fitness objectives** (§6.2): CVaR and the diversification objective are not computed; calibration is informational only.
+- **DSL subset** (§4.2): no `exposure_gross` / `drawdown` portfolio primitives, no `clip`, `Bool` comparisons or `prob_gt`.
+- **Snapshot handling** (§6.5): the runtime does not serve the old snapshot in parallel; evo-worker does not stamp `snapshot` on evaluated genomes, so only hand-bound strategies carry region literals.
+- **Evolution lab UI** (AC 6): lifecycle is shown on `/trading/pipeline`, not in the evolution lab.
+- Open questions 2 and 3 (§10) wait on the neural representation.
+
 1. GP DSL interpreter evaluates programs type-safely; random program generation and all variation operators produce valid typed programs (property tests). **Met for GP** (`programs_respect_limits_and_round_trip_through_sexpr`, `operators_are_type_safe_bounded_and_deterministic`).
-2. Neural policies and GP programs both implement `Strategy` and emit `ExposureIntent` with mean and std.
+2. Neural policies and GP programs both implement `Strategy` and emit `ExposureIntent` with mean and std. **Met for GP only** (`GpStrategy` → `fa.v1.ExposureDistribution`); no neural implementation.
 3. Backtest of a strategy is deterministic and reproduces identical P&L given snapshot, window and seed. **Met** (`replay_is_deterministic_and_pays_costs`, recorded-latent fixture).
-4. Fitness computation includes costs, and the deflated Sharpe implementation matches reference values on known test vectors.
+4. Fitness computation includes costs, and the deflated Sharpe implementation matches reference values on known test vectors. **Half met:** costs are in every replay (`cost_sensitivity` at 2×); no reference-vector test for the DSR.
 5. PBO computation runs per generation and blocks promotion when above `pbo_max`. **Met:** a generation with PBO > `pbo_max` (or unknown) yields no candidate, and PBO is a blocking gate item.
 6. The lifecycle states and transitions are persisted in Helix and visible in the evolution lab and trading desk UI. **Partly met:** persisted and audited in Postgres (`ledger.strategy_state`, `audit.log`), served by `GET /api/trading/strategies` and mirrored onto the Helix `Genome` nodes of evolved strategies every pipeline round (§5); the console's `/trading/pipeline` page shows the pipeline state per strategy (D-077); the evolution lab does not show the lifecycle.
 
 ## 10. Open questions
-1. GP program semantics: should programs be stateful (memory registers across steps) or purely functional on the current observation?
+1. GP program semantics: should programs be stateful (memory registers across steps) or purely functional on the current observation? *(Implemented answer: purely functional; the only state is the strategy's virtual book, read through the portfolio primitives.)*
 2. Neural policy training signal: differentiable surrogate vs pure ES vs RL (e.g. policy gradients on simulated fills)?
 3. How does one fitness compare GP and neural fairly when their compute costs differ by orders of magnitude (normalisation of the cost objective)?
-4. Should strategies consume decoder outputs from **specific** elite decoders (genome references) or from an aggregated "best decoder per family" feed?
-5. Strategy capital unit: are exposures relative to a notional sleeve the allocator later scales (default) or absolute?
+4. Should strategies consume decoder outputs from **specific** elite decoders (genome references) or from an aggregated "best decoder per family" feed? *(Implemented answer: the latest fresh output per exact family and instrument, horizon-matched for forecasts; no genome references.)*
+5. Strategy capital unit: are exposures relative to a notional sleeve the allocator later scales (default) or absolute? *(Implemented answer: relative to the sleeve, `mean ∈ [-1, 1]`; risk-engine scales by allocated capital.)*
 6. Region literals in GP programs depend on spec 30 open question 1 (region identity). *(Answered by D-069 lineage: literals are bound to a snapshot and remapped through it, §6.5.)*
 
 ## 11. Deferred

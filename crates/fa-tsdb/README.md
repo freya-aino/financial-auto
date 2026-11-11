@@ -19,8 +19,11 @@ VictoriaMetrics read/write: series naming, Prometheus-line import, `query_range`
 | `trade_prices_ms(inst, start_ms, end_ms, bar)` | `trade_prices` over the buckets containing both ends, merged across venues into one ascending `(ts_ms, price)` series (strategy-runtime analog outcomes, D-063) |
 | `bars(inst, tf, start_s, end_s)` | connector bars: `last_over_time(fa_bar_<x>{inst="…",tf="<tf>"}[tf])` at `tf` resolution for open/high/low/close/volume/vwap, joined per bucket (`join_bar_series`) → `BarSeries { inst, venue, src, tf, points: BarPoint{ts_ms, open, high, low, close, volume, vwap?} }`, longest first; a bucket needs O/H/L/C (volume defaults to 0); `inst = None` reads every instrument (the trainer's `instruments: "all"`) |
 | `health()`, `force_flush()` | `/health`, `/internal/force_flush` (tests) |
+| `bar_window_s(start_ms, end_ms, bar)` | whole-second window covering the bar buckets that contain both ends |
 
 `MAX_POINTS_PER_SERIES` (20 000) is the window cap callers should respect (VM rejects > 30 000 points per series).
+
+**Not here (spec 20 §9 Remaining):** reads have no `as_of` — VictoriaMetrics stores event time only, and backtests shift series by the per-source `knowledge_delay` (`fa_backtest::knowledge`); there is no active-series budget or per-timescale retention (VM runs with `-retentionPeriod=100y`). The label whitelist is the only cardinality guard.
 
 ## Tests
 ```sh

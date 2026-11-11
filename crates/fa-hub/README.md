@@ -208,10 +208,11 @@ Also available but unused: `GET /healthz`, `GET /readyz` (503 while indexes catc
 ## Tests
 ```sh
 cargo test -p fa-hub                                   # unit tests + tests/coverage.rs (every queries.hx QUERY has a function)
-FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test live   # against `just up`'s helix
-
-Concurrent writers: `HubClient::batch` retries `409 transaction_conflict` (an aborted, uncommitted transaction) up to six times with a short backoff, so parallel writers and the parallel live suite do not fail spuriously.
+FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test live            # against `just up`'s helix
+FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test regions_live    # region lifecycle, lineage, kernels
+FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test versions_live   # event-time versions and as-of overlay
 ```
+Concurrent writers: `HubClient::batch` retries `409 transaction_conflict` (an aborted, uncommitted transaction) up to six times with a short backoff, so parallel writers and the parallel live suite do not fail spuriously.
 The live tests create `test-<nanos>-…` rows and drop them afterwards; the indexes created by
 `ensure_schema` and the `vec4` latent index remain. `live.rs` covers the typed queries, the
 idempotent `ensure_*`/`upsert_*` writers, lifecycle marks, `snapshot_graph`, `resolve_node`, the
@@ -219,5 +220,5 @@ named-query catalog, the evo-worker business-id writers and the `AdapterState` r
 (`adapter_state_round_trip_and_snapshot_manifest`).
 
 ## Governing specs
-- [20-storage](../../specs/20-storage.md) §5.2, [ADR 0002](../../specs/adr/0002-helixdb-hub.md), D-012, D-033, D-043, D-048, D-067, D-069, D-073, D-078
+- [20-storage](../../specs/20-storage.md) §5.2, [ADR 0002](../../specs/adr/0002-helixdb-hub.md), D-012, D-033, D-043, D-048, D-067, D-069, D-073, D-078, D-084
 - [helix/](../../helix/README.md) – the readable catalog this crate mirrors

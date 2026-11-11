@@ -172,6 +172,16 @@ A single local GPU scheduler (in `evo-orchestrator` or a dedicated scheduler ser
 | Holdout contamination (accidental read) | Holdout access only through gate API; any other access path fails a test; counter + audit log in Postgres |
 
 ## 9. Acceptance criteria
+**Remaining (why this spec stays):**
+- No generation state machine exists (§4.1): there is no `GenPhase`, no `Generation` row or node, no `lifecycle.*` subjects and no `/api/generations` for encoder generations. Gen-0 encoder selection by Pareto over family candidates (§6.2 step 3) and the end-to-end bootstrap of acceptance 1 (encoders → regions → MCMC → decoders → strategies in one run) are not built. The pieces run as separate jobs and loops.
+- Promotion (§6.4): items 4 (MCMC ECE) and 5 (elite transfer) have no producer (`not_evaluated`). Items 1–2 are evaluated but no neural snapshot passes them on live data (spec 32 §6.3.1).
+- Rollback does not restore the previous snapshot's last adapter; it serves without one until the next adapter. Shadows are not restored after a model-runtime restart.
+- Online adapters (§6.5, acceptance 4) are hourly jobs, not continuous training. The planner schedules adapters and generations for **statistical** snapshots only; neural ones are enqueued by hand or by the region-drift trigger. The other §6.3 drift triggers (residual-correlation breakdown, MCMC calibration degradation, adapter drift) do not start an early generation.
+- Reproducibility (§6.6, acceptance 6): the snapshot manifest pins seed, data window, instruments and genome, but there is no run manifest with git commit, `Cargo.lock` / `go.sum` hashes, config hash or device info.
+- Holdout (§6.1, acceptance 7): evolution paths respect the locked holdout (spec 41, `fa_backtest::holdout`), but the encoder trainer does not consult `validation.holdout`. Its fit windows can cover a locked period, and no test asserts otherwise. There is no `DataWindow` table.
+- §8: there is no `auto_rollback` on health halts.
+- Open questions 2, 3 and 4 are undecided. Q1 is decided (spec 34 §10 Q1), Q5 is decided (D-006: the GPU arbiter lives in evo-orchestrator) and Q6 is decided (spec 30 §10 Q1).
+
 *Status (neural lifecycle):* 3 holds (single API calls, hot swap with kernel transfer, active + shadow served concurrently; the shadow is not restored after a model-runtime restart); 2 holds for neural fits — a `generation` consumes the D-068 elite decoders as frozen feedback when elites of its step and latent width exist (verified live at 1s; `trainer::feedback` test on synthetic data) and the candidate is evaluated by the checklist, which no neural snapshot passes yet (spec 32 §6.3.1); 4 holds for neural snapshots with input + LoRA adapters (versioned `AdapterState`, guard-frozen LoRA, runtime folding), adapters are not yet trained continuously between hourly jobs; 5 holds bit for bit on CPU for all four families.
 1. A gen-0 bootstrap runs end-to-end on a small synthetic + recorded dataset: encoders → regions → MCMC → decoders → strategies, persisting all artefacts.
 2. A gen-1 run consumes gen-0 elites as feedback and produces a candidate snapshot evaluated by the promotion checks.
@@ -186,7 +196,7 @@ A single local GPU scheduler (in `evo-orchestrator` or a dedicated scheduler ser
 2. Locked holdout policy: fixed period for a long time (purer, but stale) vs rolling with re-locking (fresher, but each roll exposes old holdout to training)?
 3. Do generations run per timescale independently, or must all timescales advance together (cross-timescale `REFINES` edges in spec 30 need consistent snapshots)?
 4. Should online adapters be merged into the backbone at generation start (warm start) or discarded?
-5. Who owns GPU scheduling: `evo-orchestrator` or a separate scheduler service (spec 60)?
+5. Who owns GPU scheduling: `evo-orchestrator` or a separate scheduler service (spec 60)? *Decided (D-006): the GPU arbiter in `evo-orchestrator` (`ctl.gpu.acquire|release|preempt`).*
 6. Region identity strategy (spec 30 open question 1) affects step `RegionFit` and promotion check 3.
 
 ## 11. Deferred

@@ -34,6 +34,7 @@ pub trait Ledger {
     fn payout_quota(&self, day: Date) -> PayoutQuota;
 }
 ```
+  **Implemented as** inherent methods of `fa_ledger::pg::PgLedger` (no trait): `record(LedgerEvent)` / `record_fill_event`, `positions(book, at)`, `equity_eur(book, at, marks)`, `strategy_pnl(book, strategy, from, to)` / `strategy_pnls`, `book_pnl`, `payout_quota(day)`, plus the in-memory `fa_ledger::Ledger` the risk-engine books into.
 - Control API: `GET /api/trading/positions`, `/api/trading/orders`, `/api/trading/fills`, `/api/trading/pnl`, `/api/trading/reconciliation`, `/api/audit`.
 - Money is `fa_ledger::Decimal` (`rust_decimal`) at the ledger scale of 18 places (`fa_ledger::money`); wire values (`f64` in `fa.v1`) are converted once by `money::dec` (shortest round-tripping decimal, banker's rounding to 18 places).
 
@@ -138,21 +139,29 @@ Strategy virtual sub-positions are derived from `fill_attribution`. Beyond this 
 | Fill write fails | fill stays unconfirmed in the engine, retried every 5 s; after 60 s it counts as missing (diff → halt) |
 | Fill event for an intent unknown to the engine | intent recovered from Postgres and the fill booked in both books; no intent anywhere → orphan → halt |
 | Ledger row written by another service (payout, operator-booked orphan) | applied to the paper book on the next reconciliation (audited `ledger.synced`), not a diff |
-| Missing FX rate | use last known rate flagged `stale`; block risk-increasing orders in that currency after threshold |
+| Missing FX rate | use last known rate flagged `stale`; block risk-increasing orders in that currency after threshold. **Today:** the latest `ref.fx_rate` at or before the event is used; a currency older than `fx.max_age_hours` (72) is flagged stale (`fx.stale_now`) and, only with `fx.halt_on_stale` (default `false`), raises a book-wide reduce-only `fx` halt that clears when rates are fresh — not a per-currency block |
 
 ## 9. Acceptance criteria
-- Replaying the same venue event stream twice yields identical ledger state. — **met** (`accounting::tests::replay_is_order_independent_and_idempotent`, live `derived_accounting_round_trip`, `verify_existing_book_read_only` on `paper`).
+**Remaining (2026-11-11, code checked at e25e9b5):**
+- **Live `paper` data until the FX restatement is applied** (operator action, tool exists — §6 round 3): instrument `9daa8cea…`'s 1 080 fills booked as `EUR` at 1.0 leave the 24 h per-strategy sum −214.37 EUR off the book's net, so criterion 6 holds in tests but not on the current `paper` book, and `verify_existing_book_read_only` fails there. No code change is needed; apply the planned restatement (`POST /api/trading/restatements/fx` with `apply` + `confirm`, then restart the risk-engine) and re-run the verification.
+- **Tax reporting** (open question 2): undecided — whether a jurisdiction-specific report (e.g. Dutch box 3) is required, or tax reporting is explicitly deferred.
+- **Intraday FX** (§6 valuation, `fx.intraday_source`): not built; `ecb_daily` is used intraday too. A live mid needs a keyed FX source (OANDA) or a decision that daily ECB rates suffice for a EUR paper book.
+- **Missing FX rate** (§8): a book-wide, opt-in reduce-only halt instead of a per-currency block of risk-increasing orders.
+- **Audit criterion** (5): ledger-side manual actions are audited; whole-API coverage is tracked in spec 50.
+- Out of scope here: margin model per venue (Q3, needs a live broker connector), reconciliation against a real venue (needs a broker connector).
+
+- Replaying the same venue event stream twice yields identical ledger state. — **met** (`accounting::tests::replay_is_order_independent_and_idempotent`, live `derived_accounting_round_trip`; `verify_existing_book_read_only`, which also checks replay identity on `paper`, fails there until the FX restatement is applied — see Remaining).
 - Positions derived from events equal the latest position snapshot. — **met** (`PgLedger::snapshot_check`; 0 diffs on `paper`).
 - Every fill has native and EUR values with FX source and timestamp. — **met** (`ledger.fill_valued`, `fill_valuation_gaps` = 0 on `paper`; the timestamp is the `ref.fx_rate` validity time, or the fill time for EUR/fixed).
 - Reconciliation detects an injected mismatch and halts the venue. — **met for the paper venue** (`reconcile_cut` reports a fill missing in Postgres; risk-engine halts scope `broker`; open orphans halt too); false positives from the snapshot race are gone by construction. A real venue needs a broker connector.
 - Audit log contains an entry for every manual API action. — ledger-side manual actions (orphan resolution, payout) are audited; API coverage is spec 50's.
-- Sum of strategy-attributed P&L equals portfolio P&L (minus unattributed manual trades). — **met** (`strategy_pnls` incl. `unattributed` sums to `book_pnl`; unit test over FIFO/average and several ranges, and on `paper`).
+- Sum of strategy-attributed P&L equals portfolio P&L (minus unattributed manual trades). — **met in code** (`strategy_pnls` incl. `unattributed` sums to `book_pnl`; unit test over FIFO/average and several ranges); on the live `paper` book only after the pending FX restatement (Remaining).
 
 ## 10. Open questions
 1. ~~Payout quota rule~~ — **decided** (round 2): `fa_ledger::payout`, default `fixed_eur` 0; reserved automatically each UTC day, booked by the operator. Open only: the real amounts (user's call).
 2. Is tax-lot / tax reporting (e.g. Dutch box 3 or other jurisdiction) required? — affects lot method and retention. FIFO and average-cost lots exist; jurisdiction-specific reports do not.
 3. Margin accounting model per venue (cross vs isolated) — affects equity and leverage definitions.
-4. Ledger for paper strategies in the allocator tournament: one paper book per allocator, or virtual books? — affects schema.
+4. ~~Ledger for paper strategies in the allocator tournament~~ — **answered by the implementation** (D-064, spec 40 §6 "Live paper tournament"): virtual books. Each allocator's weights earn the same per-tick strategy sleeve returns inside the risk-engine (`fa_allocator::tournament`), records persist in `ledger.risk_state`; there is one ledger book (`paper`) and no per-allocator ledger.
 5. ~~Settlement currency per venue~~ — **decided** (round 2): EUR by default, `native` per venue via `ledger.venue_settlement`; the in-memory paper book stays EUR-settled (only the paper venue exists).
 6. ~~Money as `f64`~~ — **resolved** (round 2 for the book of record, round 3 for the derived analytics): lots, P&L breakdown, statements, the lot cache, positions/equity and the reporting reads are exact decimals; only the wire (`fa.v1`) and the risk arithmetic's read-only views are `f64`.
 

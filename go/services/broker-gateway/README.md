@@ -22,7 +22,7 @@ Children are driven by a 1 s ticker (`-algo-tick`) and by trades of the instrume
 ## Live slippage recalibration (`calib.go`, spec 41 §6.3)
 Each taker fill adds a sample per (venue, asset class): `x = 1e4 · σ_day · sqrt(notional/ADV)`, `y = realised_bps − half_spread_bps` (realised vs the parent arrival). Every `-recalibrate-every` (15 min) a key with ≥ `-recalibrate-min-samples` (30) informative samples in its rolling window (500) gets `k̂ = Σxy/Σx²`, shrunk toward the prior `k` of the base costs file with weight `n/(n+50)` and clamped to `[0.5, 2] ×` prior; a prior of 0 (costless `sim`) stays 0. The calibrated model (base + `venues.<v>.classes.<c>.impact_k`) is written to `-costs-calibrated` (default `$FA_STATE_DIR/costs.calibrated.yaml`, compose: named volume `broker-gateway-state` at `/var/lib/fa`) with `<file>.report.json`, applied in memory when `-recalibrate-apply` (default true), loaded at start when present (the base file always stays the prior), and the report JSON is published on `exec.costs.calibrated`.
 
-**Honest limit in paper:** a fill priced at the arrival price itself (market orders, single crosses) is the model echoing itself (`y = k_in_use · x`), so such samples are counted (`echo`) and excluded from the fit; only algo children, whose price drifted from the parent arrival, carry information — and in paper that information is market drift over the algo's horizon, not real impact. With a live venue adapter every fill is informative through the same code path. The Rust backtester still prices with `testdata/cost_fixture.json` (the base model), not the calibrated overlay.
+**Honest limit in paper:** a fill priced at the arrival price itself (market orders, single crosses) is the model echoing itself (`y = k_in_use · x`), so such samples are counted (`echo`) and excluded from the fit; only algo children, whose price drifted from the parent arrival, carry information — and in paper that information is market drift over the algo's horizon, not real impact. With a live venue adapter every fill is informative through the same code path. The Rust backtester (evo-worker, `FA_COSTS`) prices with the base `costs.yaml`, not the calibrated overlay; `testdata/cost_fixture.json` only pins the Rust model in tests.
 
 ## Restart safety and fail-closed (`state.go`, spec 40 §8)
 - **Orders state:** working algo orders (schedule, filled quantity, child count, parent arrival), resting limits, the last 50 000 intent ids and the net position per `account|instrument` are written to `-orders-state` (default `$FA_STATE_DIR/orders.json`, the `broker-gateway-state` volume) atomically at most once per second when they changed, and at shutdown; at start the file is restored before any subscription. Slices that fell due while the gateway was down go out with the first trade seen after the restart (never priced blind). An unreadable file stops the gateway (exit 1) rather than forgetting working orders; a missing file is a clean start. Verified live 2026-11-11 05:57 (throwaway account `paper-econ`, TWAP 6 × 1 on `sim`, gateway restarted after 3 children: `orders state restored working=1`, children 4–6 continued with the parent arrival). A calibrated costs file only contributes its fitted `impact_k`s (`MergeCalibrated`).
@@ -63,6 +63,16 @@ In compose the gateway loads the repo `costs.yaml` baked into the image (`FA_COS
 go/bin/broker-gateway -nats nats://127.0.0.1:4222 -costs go/services/broker-gateway/costs.yaml
 go test ./services/broker-gateway        # cost model, fixture, limit/cancel paths, algos, cancel decode, recalibration
 ```
+| Flag | Env | Default |
+|---|---|---|
+| `-nats` | `FA_NATS_URL` | `nats://127.0.0.1:4222` |
+| `-costs` | `FA_COSTS` | `""` (built-in default model) |
+| `-costs-calibrated` | `FA_COSTS_CALIBRATED` | `$FA_STATE_DIR/costs.calibrated.yaml`, else next to `FA_COSTS` (`""`: not persisted) |
+| `-orders-state` | `FA_ORDERS_STATE` | `$FA_STATE_DIR/orders.json`, empty without `FA_STATE_DIR` (`""`: in memory only) |
+| `-recalibrate-every` / `-recalibrate-apply` / `-recalibrate-min-samples` | | `15m` / `true` / `30` |
+| `-algo-tick` | | `1s` |
+| `-risk-heartbeat-timeout` | | `15s` (0 disables fail-closed) |
+| `-metrics` | `FA_METRICS_BIND` | host port of `docker/README.md` (compose `0.0.0.0:9100`; `off` disables) |
 
 ## Owns
 Venue adapters and exec algos transport.

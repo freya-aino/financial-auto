@@ -142,6 +142,14 @@ Strategies entering shadow run on live data with the paper venue. Tracked: calen
 | Cost model stale vs live slippage | alert, recalibration job |
 
 ## 9. Acceptance criteria
+**Remaining (checked against the code at e25e9b5):**
+- **Full-day decision replay** (AC 1): reproduced on a 240 s recorded window, not a day (`MD` retention); the recorder is an in-process `Engine`, not the deployed service; latents → strategy decisions are not compared signal-for-signal against `SIGNAL`.
+- **Coverage** (§8 "missing data in window"): `fa_backtest::replay` fails only when no bars exist at all (`ReplayError::NoData`); a partial window gets no coverage mark and no minimum-coverage cut.
+- **Holdout access audit** (§8): a Selection replay that intersects a holdout fails the job (`rejected: …`, worker log) but writes no audit event.
+- **Stale cost model alert** (§8): the gateway recalibrates `k` every 15 min, but nothing alerts on realised-vs-model slippage divergence; the backtest prices with the repo `costs.yaml`, not the calibrated overlay.
+- **Latency simulation** (§10 Q3): replays fill at the deciding bar's close (zero latency); no per-venue order latency model.
+- Open questions 1 (holdout lengths: running values scaled to the stack's history) and 5 (re-lock cadence, default never) remain the user's calibration calls.
+
 - Replaying a recorded live day reproduces the live paper decisions exactly (same orders, same timestamps). **Met for the execution half and for strategy decisions → intents on a recorded window; not for a full day or for latents → strategy decisions:**
   - execution: a recorded live venue window reproduces every paper fill (`tests/venue_identity.rs`, §6.3; pinned to the capture-time `costs.yaml`, `testdata/venue_fixture_costs.yaml`);
   - decisions (`bins/risk-engine/src/decision_replay.rs`): the deployed engine's decision ticks sit on the 1 s wall-clock grid, so a window is replayable. A recorder (`FA_DECISION_RECORD_SECS=240 cargo test -p risk-engine -- --ignored record_live_decision_window`) runs the risk-engine's `Engine` read-only on the live bus — every `signal.exposure.*` and `md.trade.*` applied at its receive time, ticks on the grid, intents filled in-process at the mark with the venue commission, nothing published — and writes inputs, ticks and approved intents to `bins/risk-engine/testdata/decision_fixture.jsonl` (2026-11-11, 240 ticks, 1 518 strategy signals, 275 trades, 30 intents under the cost-aware rule). `decision_fixture_reproduces_the_live_intents` (always run) replays the inputs through a fresh engine and requires byte-identical intents at the same ticks (ids excluded). `FA_DECISION_STREAMS=1 … --ignored decision_window_from_retained_streams` rebuilds the same window from the retained `SIGNAL` and `MD` JetStream streams alone (knowledge time = stream publish time): 1 780 inputs read, **30 of 30 live intents reproduced identically** (asserted ≥ 95 %). The same live window under the D-041 band alone yields 242 intents and 13.76 EUR of commission against the cost-aware rule's 30 and 1.05 EUR (most of it on the costless `sim` venue).
@@ -154,7 +162,7 @@ Strategies entering shadow run on live data with the paper venue. Tracked: calen
 
 ## 10. Open questions
 1. Holdout length per timescale (placeholders) — blocks gate calibration.
-2. Should online adapters be replayed online or frozen during selection replay? — affects evaluation cost and realism.
+2. Should online adapters be replayed online or frozen during selection replay? — affects evaluation cost and realism. *(Implemented answer, D-059: neither; replays feed the recorded `LATENT` outputs the serving snapshot published, which already include the online adapters' effect.)*
 3. Latency simulation: model order latency per venue, or assume next-event execution? — affects short timescales.
 4. Effective-trials estimation method for DSR with huge correlated populations. *(Mean-correlation estimate implemented; eigenvalue / clustering methods remain options.)*
 5. Re-lock cadence for the holdout as the system ages. *(Mechanism exists: `[holdout] relock_after_days`; the cadence is still open, default never.)*

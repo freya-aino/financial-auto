@@ -75,7 +75,7 @@ services:
     image: victoriametrics/victoria-metrics:v1.155.0
     command:
       - "-storageDataPath=/storage"
-      - "-retentionPeriod=100y" # per-timescale retention is enforced by our writers (spec 20)
+      - "-retentionPeriod=100y" # effectively unlimited; per-timescale retention (spec 20 §6.5) is not enforced yet
       - "-httpListenAddr=:8428"
       - "-promscrape.config=/etc/vm-scrape.yaml" # scrapes every service's /metrics (spec 60 §4, D-056)
       - "-promscrape.config.strictParse=false"

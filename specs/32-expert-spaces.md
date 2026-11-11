@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | draft |
-| **Maturity** | Low |
+| **Maturity** | Low (objective, health, identity and `ExpertView` implemented; the health targets are not met on live data, §6.3.1) |
 | **Owners (code)** | `crates/fa-expert-space`, `crates/fa-encoders`, `bins/trainer`, `bins/model-runtime` |
 | **Depends on** | 31 Expert encoders, 30 Latent regions, 33 MCMC graph, 34 Decoder population, 36 Training lifecycle |
 
@@ -175,6 +175,14 @@ The weights `λ_dec, λ_gen` are tunable and may be **evolved** as encoder genes
 *Implemented:* a neural generation encodes the probe windows with parent and child, computes linear CKA per expert pair, matches greedily (threshold 0.5) and moves matched experts to the parent's index; the matrix and matches are in `manifest.feedback.expert_alignment`. The trainer then writes one Helix **`Expert`** node per surviving expert (`expert_uid = <snapshot>/e<expert_id>`, `expert_id` = the stable index, `dim`, validation `usage` / `skill`, `specialisation` = gate mass per instrument on the probe windows, `born_gen` inherited along the chain), **`ExpertOf`** → its `Snapshot`, **`AlignedTo{cka, kind: carry}`** → the parent-generation expert it continues, and `died_gen` on parent experts no child continues (`fa_hub::experts`: `upsert_expert`, `align_expert`, `retire_expert`, `snapshot_experts`, `expert_parents`, `expert_alignments`; catalog in `helix/schema.hx` / `queries.hx`). The `ExpertSpace <snapshot>-e<k>` nodes stay for regions and vectors.
 
 ## 9. Acceptance criteria
+**Remaining (why this spec stays):**
+- The health targets are not met on market data (§6.3.1). No fit reaches `K_eff ≥ 2`, residual correlation ≤ 0.1 and min skill ≥ 0.02 together on validation, because the decorrelation found in sample does not generalise. Acceptance 1 holds only on the synthetic task, and acceptance 2 is enforced but never passed by a learned snapshot. What to target next is open question 1, which needs a decision.
+- §6.1 auxiliary-loss-free balancing (per-expert bias adjustment) and expert **split** (clone + perturb) are not implemented; only the Switch auxiliary loss and pruning exist.
+- §6.3 EMA of the residual covariance (`cov_ema`) is not implemented; the penalty uses minibatch estimates.
+- §6.4 calibration (PIT / CRPS) of each expert's `next_step` and per-expert decodability (best elite decoder per family) are not measured.
+- §5: the VictoriaMetrics series `expert_resid_corr{ts,i,j}` / `expert_usage{ts,expert}` and the per-eval matrices in Garage are not written. The matrices live in `manifest.params.health`, and live gauges exist only as `expert.<ts>.k_eff|resid_corr_max|skill_min`.
+- Open questions 1, 3 and 5 are undecided. Q2 is partly answered by genes (`decor_dual_lr` dual ascent next to fixed λ). Q4 is answered as independent per timescale. Q6 is deferred (§11).
+
 *Status:* 1 in miniature (`moe::tests::two_experts_learn_decorrelated_specialisations`: two independent factors, two experts, both beat naive, decorrelation term < 0.2), not at `target_resid_corr_max` on market data (§6.3.1); 2 measured per snapshot (`skill_e<k>`), enforced by the checklist; 3 holds (`ExpertView` with every §4.2 field, Rust → Go fixture round trip); 4 implemented with threshold 0.5 (CKA placeholder 0.7 not used), `AlignedTo` edges in Helix; 5 emitted per generation in the manifest and `Expert` nodes, live on `latent.expert.health` for learned active snapshots, kept per snapshot by control-api (`GET /api/latent/{snapshot}/experts` → `health`) and shown on the console's Encoder snapshots page next to the validation health (round 3; not visible live yet because no learned snapshot is active).
 1. On a synthetic dataset built from K independent latent factors, the router recovers ≥ K−1 experts, and the residual correlation off-diagonal max is ≤ `target_resid_corr_max`.
 2. Every active expert beats the naive baseline by ≥ `min_skill` on the validation window.

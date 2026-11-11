@@ -79,8 +79,8 @@ Helix mirror: nodes `Instrument`, `Entity`, `Venue`; edges `ISSUED_BY`, `LISTED_
 | `resolver.auto_create` | `global_id_only` | see §6; effectively `provisional` today (D-050), not configurable |
 | `fx.accounting_source` | `ecb_daily` | risk-engine `risk.toml [fx] source` |
 | `fx.live_source` | `oanda_mid` | not implemented: live risk also converts with `ecb_daily` |
-| `calendar.refresh` | monthly | |
-| `adjustment.materialize_daily` | false | |
+| `calendar.refresh` | monthly | not implemented: materialization is manual (calendars for `xnys`, `xnas`, `xetr` materialized through 2027) |
+| `adjustment.materialize_daily` | false | only `false` exists (adjusted on read) |
 
 ## 8. Failure modes
 | Failure | Response |
@@ -92,6 +92,15 @@ Helix mirror: nodes `Instrument`, `Entity`, `Venue`; edges `ISSUED_BY`, `LISTED_
 | Identifier reused (ticker recycled) | handled by `valid_from/to` on `listing` |
 
 ## 9. Acceptance criteria
+**Remaining (not fully implemented):**
+- **Resolution on miss** (§6): no OpenFIGI (equities) or CoinGecko (crypto) lookup is wired; every unknown pair is provisioned (D-050), so provisioned instruments carry no global identifier until an operator adds one (`POST /api/refdata/identifiers`).
+- **Intraday FX for live risk** (§3, §6, §7 `fx.live_source`): not implemented; live risk also converts with `ecb_daily`.
+- **Calendars:** no scheduled refresh (§7 `calendar.refresh`; materialization is manual, `POST /api/refdata/calendar/{venue}/materialize`) and no seeding from venue publications or broker APIs.
+- **FX rate missing** (§8): risk flags stale rates (`[fx] max_age_hours`, optional `halt_on_stale`); the "accounting blocks EOD close" half has no counterpart (there is no EOD-close step; orphan fills without a rate are refused, spec 42).
+- No connector feeds corporate actions (manual entry via the API); `adjustment.materialize_daily` (§7) not implemented (adjustment is on read only).
+- Helix `IN_SECTOR` edge not modelled (`Entity.sector` is a property).
+- Open questions §10 Q1–Q5 undecided.
+
 - Every canonical market event references an existing instrument UUID.
 - As-of query at time *t* returns only reference facts with `recorded_at ≤ t` and `valid_from ≤ t < valid_to`.
 - A split replayed through adjusted series yields continuous prices; raw series unchanged.

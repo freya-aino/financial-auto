@@ -164,11 +164,19 @@ youtube (Data API + capture; ToS), earnings_webcasts (IR sites; discovery via ea
 ## 8. Failure modes
 | Failure | Response |
 |---|---|
-| YAML and Postgres diverge | YAML seeds only new ids; Postgres wins for existing; diff shown in UI |
+| YAML and Postgres diverge | YAML seeds only new ids; Postgres wins for existing; diff shown in UI (implemented for the status: `GET /api/sources` returns `status` = effective and `yaml_status` = seed; descriptive fields are re-upserted from the YAML on every sync) |
 | Source deprecated / API changed | status → disabled, note recorded |
 | Missing credentials | connector refuses to start (`Init` fails, e.g. lemon/oanda `ErrNoAPIKey`), status shown in ops view |
 
 ## 9. Acceptance criteria
+**Remaining (not fully implemented):**
+- The id-list check is weaker than specified: `TestRepoCatalogIsValid` counts (≥ 70) and checks the five first-wave ids, it does not compare against the fixed list of §6.2. (Checked by hand 2026-11-11: all 70 ids named in §6.2 are in `config/sources.yaml`, 72 entries in all.)
+- Runtime edits of `rate_limit` / `config` (§4 `PATCH … rate limits`) do not exist; they are YAML-only and need an ingestor restart.
+- `catalog.reload_on_change` and `catalog.auto_disable_after_failures_h` (§7) are not implemented; a failing source degrades and halts, it is never auto-disabled, and "source deprecated → disabled, note recorded" (§8) is a manual status change.
+- `ByCapability` / `ByCategory` (§4) do not exist (no consumer needs them yet).
+- Generic adapters (§6.3: ccxt, shared SDMX, shared RSS) are not built; `ecb` and `google_news` carry their own SDMX / RSS code.
+- 62 of 72 entries are `planned` with unverified per-source facts (§6.2, §10 Q1); open questions §10 Q1–Q5 are undecided.
+
 - `config/sources.yaml` contains every API from the user's list plus first-wave and media sources (checked by a test that compares against a fixed id list). Implemented check: `TestRepoCatalogIsValid` loads and validates the file, requires ≥ 70 sources and the five first-wave ids with status `stub` or `live`.
 - Catalog loads in Go and is visible at `GET /api/sources`.
 - No secrets in the catalog or git history.

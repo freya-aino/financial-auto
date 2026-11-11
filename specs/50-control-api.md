@@ -153,14 +153,21 @@ Stateless except a small cache. Reads: Postgres (catalog, ledger, audit, jobs), 
 | Failure | Response |
 |---|---|
 | Dependency down | endpoint returns 503 with dependency name; `/api/health` shows degraded |
-| Owning service doesn't reply | 504; command not assumed applied |
+| Owning service doesn't reply | 504 after the 5 s ctl timeout; command not assumed applied. As built: when no service subscribes to the subject at all, NATS answers "no responders" at once and control-api returns 502 |
 | WS client slow | latest-value coalescing, `lagged` notice |
 
 ## 9. Acceptance criteria
+**Remaining (checked against the code at e25e9b5):**
+1. **Audit gaps (§3, criterion 2):** `POST /api/evolution/generations` (= `/api/evolution/runs`), `POST /api/jobs/{id}/cancel` and `POST /api/ingest/{source}/start|stop` write no `audit.log` row — `live_routes.rs` forwards them to `ctl.evo.start|cancel` / `ctl.ingest.start|stop` without auditing, and the Go services do not audit either. Kill switch / resume and the manual paper order are audited (or booked as `ledger` intents) by the risk-engine only, i.e. not when it is down. Every other mutating route audits in control-api or in the risk-engine.
+2. **Open question 2** (version prefix) is undecided; every path is `/api/...` today.
+3. **`/api/metrics/query`** (§5, proposal) is not built; vmui (`127.0.0.1:8428/vmui`) is the substitute. Build it or drop it from §5.
+
+Met: OpenAPI coverage, limit-loosening refusal (as 422), bounded bus tap, no business state in control-api.
+
 - OpenAPI document covers every REST endpoint.
 
 **Status (round 3):** generated from the route declarations, so it covers every endpoint by construction (`document_covers_the_known_routes`); the frontend's committed copy `frontend/src/lib/openapi.json` is checked against the generated document (`openapi_snapshot_is_current`; `FA_UPDATE_OPENAPI=1 cargo test -p control-api openapi` rewrites it) and every `/api/…` call of the frontend against it (vitest `openapi.test.ts`). Request/response schemas are generic objects — typed schemas would need annotating ~120 handlers.
-- Every mutating endpoint creates an audit entry.
+- Every mutating endpoint creates an audit entry. *(Not met for three routes, see Remaining 1.)*
 - Limit loosening via `PUT /api/trading/limits` returns 409. *(As built: 422 `loosen: <fields>` — the risk-engine's refusal mapped by reply prefix; 409 is reserved for state conflicts.)*
 - Bus tap streams decoded events for any subject pattern at bounded rate.
 - control-api restart does not affect trading (no business state).

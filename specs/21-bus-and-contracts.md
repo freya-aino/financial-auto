@@ -136,6 +136,8 @@ message JobResult {
 
 Consumers: durable pull consumers per service; `AckExplicit`; `MaxAckPending` set per consumer for backpressure; work queues use `AckWait` + heartbeat `in-progress` acks for long jobs.
 
+**Today:** durable explicit-ack pull consumers exist only for the work queues (`JOBS_EVO`, `JOBS_TRAIN`, `JOBS_MCMC`: `ack_wait` 60 s, `max_deliver` 5, `AckKind::Progress` heartbeats during long jobs) and control-api's `ops-job-history` on `JOB_RESULTS`. Live consumers (model-runtime, strategies, risk-engine on `order.*`, broker-gateway, control-api's tap) use core NATS subscriptions, so the streams are a replay/audit record rather than their delivery path; JetStream reads elsewhere are ephemeral ordered consumers (model-runtime's `TEXT` news backlog at start, `fa_bus::replay` time-range reads for backtests). No consumer sets `MaxAckPending`.
+
 **Implemented today (D-046):** the limits streams above are declared once in `crates/fa-bus/streams.json` (mirrored byte-for-byte in `go/pkg/bus/streams.json`) and ensured idempotently by control-api when NATS connects and by the ingestor at start; `GET /api/bus/streams` lists them. `ctl.*`, `svc.heartbeat.*`, `ingest.*`, `ref.changed.*`, `catalog.changed.*`, `jobs.progress.*` and `ops.alert` stay core-only.
 
 **Disk budget (`max_mib`, 2026-11-11, closes open question 1):** every stream carries a byte cap in `streams.json` (`max_bytes`, limits discard-old), sized from live `nats stream info` after the 19:48 UTC data reset with ≥ 2× headroom over the projected full-retention volume; the LATENT rate was measured after D-069's soft memberships (≈ 44 MB/h off-hours, roughly double the pre-D-069 average of 10.7 MB/h):
@@ -152,7 +154,7 @@ Consumers: durable pull consumers per service; `AckExplicit`; `MaxAckPending` se
 | `JOB_RESULTS` | 0.5 MB | bursty | < 0.1 GB / 30 d | 2048 |
 | `DLQ` | 0 | — | — | 1024 |
 
-The caps sum to 69 GiB against the server's 202 GB JetStream storage. `ensure_streams` / `EnsureStreams` never apply a cap below a stream's current bytes (that would purge at once): the old cap stays and a warning names the stream, so a purge is always an operator decision. `EnsureStreams` (Go) also never shortens a live stream's `max_age` (a longer or unlimited age is applied; a shorter one keeps the live value and is reported through `bus.OnLimitHeld`); `ensure_streams` (Rust) still applies `max_age` as configured. `GET /api/bus/streams` reports `max_bytes` per stream.
+The caps sum to 69 GiB against the server's 202 GB JetStream storage. `ensure_streams` / `EnsureStreams` never apply a cap below a stream's current bytes (that would purge at once): the old cap stays and a warning names the stream, so a purge is always an operator decision. Neither side ever shortens a live stream's `max_age` (D-082: Go `safeMaxAge`/`mergeStreamConfig`, reported through `bus.OnLimitHeld`; Rust `fa_bus::streams::safe_max_age`, logged): a longer or unlimited age is applied, a shorter one (or a finite one on an unlimited stream) keeps the live value, because shortening retention purges everything older at once. `GET /api/bus/streams` reports `max_bytes` per stream.
 
 **Since 2026-11-11 (typed contracts):** the JSON workarounds of D-030, D-042 and D-054 are replaced by `fa.v1` messages, generated for Rust (`fa-proto` build) and Go (`buf generate` via Docker, committed in `go/pkg/bus/pb`); `buf lint` and `buf breaking --against main` pass. Compatibility rules used: `Resume` keeps `Halt`'s field numbers 1–4, so consumers decoding `Halt` keep working; ingest frames are switched producer-side with consumers accepting both encodings (`fa_bus::ingest::{is_json, frame_json, health_status}`); `RiskEvent` is dual-published next to the old `OrderEvent{REJECTED}`. `Envelope` gained `raw_missing`, `publish_time_estimated`, `gap_filled`, `backfill` (fields 9–12). Subjects helpers: `fa_bus::subjects::{risk_event, ingest_health, ingest_gap, ingest_unresolved, ref_changed, catalog_changed}` and the Go mirrors in `go/pkg/bus/subjects.go`. The ingestor publishes canonical events with `Nats-Msg-Id = event_id` and stable ids (spec 10), which is what makes §3's dedup rule effective. The control-api bus tap decodes the new messages. Still JSON inside proto: `CtlReply.message` for `status`/`replay` replies and `JobResult.result` (by design, D-044); `order.cancel.<account>` carries `fa.v1.OrderCancel` since D-076 (a legacy `OrderIntent` payload still decodes). `OrderEvent` gained `venue_fill_id = 12`, `instrument_id = 13` and `venue_symbol = 14` (D-078): the paper gateway stamps every fill `pf-<unix ns>-<seq>`, and risk-engine's fill id becomes `intent:venue_order:vf:<id>` when present (legacy `intent:venue_order:<ms>` otherwise).
 
@@ -182,6 +184,14 @@ The caps sum to 69 GiB against the server's 202 GB JetStream storage. `ensure_st
 | Worker crash mid-job | ack timeout → redelivery; resume from last checkpoint |
 
 ## 9. Acceptance criteria
+**Remaining (2026-11-11, code checked at e25e9b5):**
+- **Exactly-once across worker crashes** (criterion 2): no test. Workers ack after publishing a result and `Nats-Msg-Id = job_id` deduplicates resubmission, but nothing kills a worker mid-job and checks the effect.
+- **Scaling contract** (criterion 3): no test or measurement of two evo-workers on a CPU-bound fake job.
+- **Backpressure** (§5 consumers, §6, §7 `consumer.max_ack_pending`): not implemented as specified — live consumers are core subscriptions (§5 "Today"), no `MaxAckPending` is set, and `md.quote` latest-only coalescing (§6, proposal) does not exist; open question 2 is undecided.
+- **"Runtime rejects unknown major version"** (§8): nothing checks the package version at runtime (only `fa.v1` exists).
+- **CI**: `buf breaking` is run by hand through the `bufbuild/buf` image; there is no CI job (§6 "in CI").
+- Open questions 3 (typed job specs) and 4 (work queue per priority class vs consumer priority groups) are undecided; `max_mib` should be re-measured after a week of market hours (Q1).
+
 - Rust and Go both build from the same `proto/` with `buf generate`; `buf lint` and `buf breaking` pass.
 - A job published to `jobs.<kind>` is processed exactly once in effect (idempotent result) across worker crashes in a test.
 - Adding a second evo-worker doubles throughput on a CPU-bound fake job (scaling contract works).

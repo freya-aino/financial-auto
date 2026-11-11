@@ -271,6 +271,15 @@ Weights `w_d` ∝ family quota × front rank. Family quotas ensure no single fam
 6. The elite feedback export produces a loadable bundle consumed by the encoder trainer (spec 36) in an integration test.
 7. Killing a worker mid-generation doesn't lose results (redelivery test).
 
+**Remaining (why this spec stays):**
+- On live data the text decoders (`text.news`, `text.narrative`) and the chart decoder (`visual.chart`) score below naive (D-074 open item). A card that does not beat its naive baseline is never an elite (`select_top_k` requires score > 0), so these families do not serve or feed back until a genome passes.
+- `visual.frame` (needs a broadcast-frame source) and `text.summary` (no ground-truth summaries, open question 2) have no decoder, so acceptance 1 covers 6 of 8 output families.
+- §6.1 chart perceptual loss on a frozen vision encoder is not built; the raster CE stands in, and no pretrained vision tower exists (spec 31).
+- §6.2: the hypervolume-contribution rung score and NSGA-III for ≥ 4 objectives are not implemented. Rungs rank by NSGA-II (front, then crowding).
+- §8 "decoder exploits encoder artefacts": elites are not re-evaluated on the next snapshot, and feedback weights do not decay for decoders that fail transfer (spec 36 §6.4 item 5 is `not_evaluated`).
+- §5: no `READS` / `EVALUATED_ON` edges, no `ParetoFront` node and no `decoder-out/` inspection samples are written. The mask lives in the genome string, the snapshot in the job and `TrainedOn`, and fronts are recomputed by control-api.
+- Open questions 2, 4 and 6 are undecided. Q5 is answered in code: the orchestrator calls Rust (`evo.vary.decoder`) for variation, one genome implementation.
+
 **Status of the criteria (implementation):**
 1. Every genome family (two baselines, six neural) implements the unified `Decoder` trait and passes `every_family_conforms` (forward, target, loss, cost, bundle round trip, expert mask) on SYNTHETIC data, plus the per-family tests (loss decrease, out-of-sample skill vs naive / mean target, deterministic training, point-in-time truncation, leakage gap); six of the eight output families are covered — `visual.frame` and `text.summary` have no decoder (external frames, no summary targets).
 2. kv / JSON round trip and clamped mutation of the neural genes are tested; protobuf genomes do not exist (genomes travel as strings, D-044).
@@ -290,7 +299,7 @@ Weights `w_d` ∝ family quota × front rank. Family quotas ensure no single fam
 2. Targets for the **event summary** text decoder: where do ground-truth summaries come from?
 3. ~~Should visual decoders generate pixels (expensive) or stay in embedding space for v1?~~ v1: low-resolution rasters (≤ 32×32, column distributions), no pixel generation (§4.5).
 4. Is retrieval history re-embedded on every snapshot (cost!) or only a sampled subset?
-5. Does the orchestrator implement variation operators in Go, or call Rust for them (single genome implementation)?
+5. Does the orchestrator implement variation operators in Go, or call Rust for them (single genome implementation)? *Answered in code: it calls Rust (`evo.vary.<family>` jobs on evo-worker, `fa_evolution::vary`); Go keeps only the NSGA-II ranking, pinned to the Rust reference by the shared fixture.*
 6. How are objectives normalised across families so the cross-family front is meaningful?
 
 ## 11. Deferred

@@ -171,7 +171,7 @@ On a new encoder snapshot, region lifecycle events (spec 30 §6.4) arrive:
 | `gamma_forget` | per timescale: s 0.999, m 0.9995, h 0.999, d 0.995 | |
 | `k_max` | 2 × horizon in steps | Max prediction steps |
 | `mc_draws` | 256 | For k-step predictive |
-| `smc_particles` | 1024 | |
+| `smc_particles` | 1024 | implemented: `--smc-particles` 64 (0 drops `smc` from the arena) |
 | `batch_refit_interval` | 1 h (minutes ts), 1 d (hours/days ts) | implemented: `--mcmc-refit-secs` 3600 for every timescale (event time; refits also need 125 fresh transitions, so slow timescales refit less often on their own), first refit at 500 transitions; window 20 000 |
 | `helix_flush_interval` | 10 s | |
 | `carry_discount` | 0.5 | Uncertainty inflation on snapshot change |
@@ -187,6 +187,11 @@ On a new encoder snapshot, region lifecycle events (spec 30 §6.4) arrive:
 | Graph growth (regions × experts × timescales × assets) | Asset-hierarchical kernels instead of per-asset kernels. Prune edges below support |
 
 ## 9. Acceptance criteria
+**Remaining (why this spec stays; every acceptance criterion below holds):**
+- §8 Helix lag / outage: there is no JetStream-backed observation log and no replay on reconnect. The hub sink drops writes while Helix is unreachable (`hub.dropped`). The kernels keep running in memory, and a restart restores the last `RegionSet.kernel_state` flushed every `--hub-state-secs`, so observations since that flush are lost.
+- §8 graph growth: edges are not pruned by support. Rows shrink only when regions die or merge, and Helix retention thins versions by age, not by support.
+- Open question 5 (cross-asset priors at universe scale) is undecided: the tracker scores every instrument pair of a timescale. Open question 6 (joint cross-expert transitions) is not decided here; spec 30 §11 defers joint regions.
+
 1. On synthetic data generated from a known Markov chain over known regions, the base kernel recovers transition probabilities within credible intervals at the nominal rate (e.g. 90% CI covers truth ≥ 85% of edges).
 2. At least two samplers (conjugate + SMC) implement `Sampler` and are scored by the calibration suite.
 3. All query-surface functions in §4.2 return distributions (not points) and are exposed to strategies (spec 35) and the frontend graph explorer.
@@ -224,4 +229,4 @@ On a new encoder snapshot, region lifecycle events (spec 30 §6.4) arrive:
 | Helix rows | `crates/fa-hub/src/regions.rs` (`KernelModel`, `RegionSet.kernel_state`, `CrossPrior`) |
 | Query routes | `bins/control-api/src/mcmc_routes.rs` |
 
-Still open: a GPU or evo-worker runner for refits once they outgrow model-runtime's CPU budget; whether the two cross-space covariates earn their place is measured live by `logit_cov`'s standing in the arena (not yet long enough to tell).
+Also open (not blocking): a GPU or evo-worker runner for refits once they outgrow model-runtime's CPU budget; whether the two cross-space covariates earn their place is measured live by `logit_cov`'s standing in the arena (not yet long enough to tell).

@@ -234,16 +234,24 @@ Promotion is executed manually from the UI (gate must be green); initial live sl
 | Kill switch triggered | flatten all live, halt all, persistent until manual re-arm (survives restart; implemented, `ledger.risk_state`) |
 
 ## 9. Acceptance criteria
-- No order can reach a live venue without passing the full risk chain; tested by property tests injecting random targets.
+**Remaining (checked against the code at e25e9b5; live-venue items are out of scope until a live adapter exists):**
+- **Risk-chain property test** (AC 1): no randomized test injects arbitrary targets through `cap_targets` → `gate` → diff; the chain is covered by example-based tests only (`fa_risk` lib tests, `bins/risk-engine/src/engine.rs`).
+- **Netting cost attribution** (§6.3, §10 Q3): fills are split evenly across contributors; the pro-rata / causal rule is undecided.
+- **Daily-loss day** (§6.5, §10 Q4): the UTC day applies to every venue; exchange-session days are not implemented.
+- **Borrow / funding on the paper book** (§6.5 shorts): charged by the backtest only; the paper venue carries `funding_bps_day` / `borrow_bps_day` without charging them.
+- **Persistence gaps** (§5): allocation snapshots and netted portfolio targets are not persisted; the gate is the latest `ledger.strategy_state.gate`, not a `promotion_review` history.
+- **Live-only** (out of scope): the `Venue` paper/live shared integration tests (AC 4), `trading.mode.live_enabled` (today any non-paper mode is refused at startup and by the gateway), the initial live sleeve and the first live allocator (§10 Q6).
+
+- No order can reach a live venue without passing the full risk chain; tested by property tests injecting random targets. **Not met** (no live venue; the paper chain has no property test).
 - Kill switch flattens all live positions and state survives a restart of every service. **Met for the risk-engine** (`ledger.risk_state`).
-- Loosening a limit at runtime via API is rejected; tightening succeeds and is audited.
-- Paper and live code paths differ only in the `Venue` implementation (verified by shared integration tests).
+- Loosening a limit at runtime via API is rejected; tightening succeeds and is audited. **Met** (`runtime_limit_changes_may_only_tighten`, `portfolio_flatten_pauses_all_and_limits_only_tighten`; `limits.tightened` / `limits.calibrated` in `audit.log`).
+- Paper and live code paths differ only in the `Venue` implementation (verified by shared integration tests). **Open, needs a live adapter:** the gateway's `VenueAdapter` has the paper engine as its only implementation.
 - Every fill has attribution to originating strategies and a recorded slippage vs arrival price. **Met in paper** (`ledger.fill_attribution`; `ledger.fill.arrival_price` / `slippage_bps`).
 - Promotion endpoint refuses a strategy whose gate is not green. **Met.**
 - Allocator tournament reports comparable paper P&L for all allocators on identical signals. **Met** (live: `ctl.risk.allocators`; offline: `evo.eval.allocator`).
 
 ## 10. Open questions
-1. Exact payout quota mechanics: fixed EUR/day, % of equity, or % of realised profit? Rollover if not withdrawn? — blocks liquidity/payout limit implementation.
+1. Exact payout quota mechanics: fixed EUR/day, % of equity, or % of realised profit? Rollover if not withdrawn? — blocks liquidity/payout limit implementation. *(Decided in spec 42 §10 Q1: `fa_ledger::payout::PayoutRule`, `risk.toml [payout]` = `fixed_eur` | `pct_equity` | `pct_profit`, optional `rollover`, capped at `max_equity_frac`; risk-engine raises today's `ledger.payout_quota` at the first check of each UTC day and reserves it. Default `fixed_eur` 0; the amount is the user's call.)*
 2. Can manual orders bypass limits (e.g. emergency hedge)? — blocks override API semantics. *(Paper answer implemented: no, they pass the pre-trade checks; reductions always pass.)*
 3. Netting cost attribution rule (pro-rata vs causal) — affects strategy fitness.
 4. Daily-loss "day" definition for mixed 24/7 and session venues — blocks daily loss limit.
