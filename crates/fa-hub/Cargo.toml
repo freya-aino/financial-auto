@@ -15,6 +15,10 @@ tokio.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+# ADR 0010 benches (examples/knn_floor.rs, qdrant_bench.rs, graph_bench.rs) only.
+instant-distance = "0.6"
+rayon = "1.12"
+sqlx.workspace = true
 
 [lints]
 workspace = true
