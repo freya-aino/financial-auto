@@ -632,12 +632,17 @@ pub fn card_transfer_check(cards: &[fa_decoders::neural::feedback::EliteCard], s
 }
 
 /// Spec 36 §6.4 items 1 (`ssl_regression`: next-step skill not worse than the parent by more than
-/// `FA_PROMOTE_REGRESS_TOL`, default 0.02) and 2 (expert-space health, spec 32 §6.4: `K_eff ≥
-/// FA_PROMOTE_MIN_K_EFF` (2), max off-diagonal residual correlation ≤ `FA_PROMOTE_MAX_RESID_CORR`
-/// (0.1), every expert's skill ≥ `FA_PROMOTE_MIN_SKILL` (0.02)) from the validation metrics the
-/// trainer writes into `manifest.metrics` for neural snapshots. A metric that is absent yields no
+/// `FA_PROMOTE_REGRESS_TOL`, default 0.02) and 2 (expert-space health, spec 32 §6.4, D-099 —
+/// thresholds provisional: usage `K_eff ≥ FA_PROMOTE_MIN_K_EFF` (2, `expert_k_eff` reads
+/// `k_eff_usage`), largest latent CKA between two experts ≤ `FA_PROMOTE_MAX_EXPERT_CKA` (0.7,
+/// `expert_diversity`), SSL skill ≥ `FA_PROMOTE_MIN_SSL_SKILL` (0.1, `ssl_skill`), every expert's
+/// next-step skill ≥ `FA_PROMOTE_MIN_SKILL` (0.02)) from the validation metrics the trainer writes
+/// into `manifest.metrics` for neural snapshots. `expert_resid_corr` (max off-diagonal residual
+/// correlation vs `FA_PROMOTE_MAX_RESID_CORR`, 0.1) is **informational** since D-099: always
+/// `ok`, the detail says whether it is within the reference. A metric that is absent yields no
 /// check (the statistical family has neither; a neural child of a statistical parent has no
-/// `ssl_regression`).
+/// `ssl_regression`; manifests written before D-099 have no `k_eff_usage` / `latent_cka_max` /
+/// `ssl_skill`).
 pub fn manifest_health_checks(manifest: &Value) -> Vec<Check> {
     let env = |k: &str, d: f64| {
         std::env::var(k).ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite()).unwrap_or(d)
@@ -678,17 +683,24 @@ pub fn manifest_health_checks(manifest: &Value) -> Vec<Check> {
     for (name, key, th, at_least, what) in [
         (
             "expert_k_eff",
-            "k_eff",
+            "k_eff_usage",
             env("FA_PROMOTE_MIN_K_EFF", 2.0),
             true,
-            "effective independent experts (spec 32 §6.4)",
+            "usage K_eff (Σu)²/Σu²: experts the router actually uses (spec 32 §6.4, D-099)",
         ),
         (
-            "expert_resid_corr",
-            "resid_corr_max",
-            env("FA_PROMOTE_MAX_RESID_CORR", 0.1),
+            "expert_diversity",
+            "latent_cka_max",
+            env("FA_PROMOTE_MAX_EXPERT_CKA", 0.7),
             false,
-            "max |corr| of expert residuals on validation",
+            "largest linear CKA between two experts' latents on validation (distinct, not copies)",
+        ),
+        (
+            "ssl_skill",
+            "ssl_skill",
+            env("FA_PROMOTE_MIN_SSL_SKILL", 0.1),
+            true,
+            "reconstruction / SSL skill vs the training-mean target",
         ),
         ("expert_min_skill", "skill_min", env("FA_PROMOTE_MIN_SKILL", 0.02), true, "weakest expert's skill vs naive"),
     ] {
@@ -701,6 +713,19 @@ pub fn manifest_health_checks(manifest: &Value) -> Vec<Check> {
                 detail: format!("manifest.metrics.{key}: {what}"),
             });
         }
+    }
+    if let Some(v) = metric("resid_corr_max") {
+        let th = env("FA_PROMOTE_MAX_RESID_CORR", 0.1);
+        out.push(Check {
+            name: "expert_resid_corr",
+            ok: true,
+            value: Some(v),
+            threshold: Some(th),
+            detail: format!(
+                "informational, not gating (D-099): max |corr| of expert residuals on validation {} the {th} reference",
+                if v <= th { "within" } else { "above" }
+            ),
+        });
     }
     out.extend(manifest_transfer_checks(manifest));
     out
@@ -797,7 +822,7 @@ pub fn not_evaluated_for(checklist: &Checklist) -> Vec<&'static str> {
 
 const NOT_EVALUATED: [&str; 4] = [
     "1 ssl_regression (statistical family / statistical parent: no SSL loss; neural snapshots add the check)",
-    "2 expert_space_health (statistical family; neural snapshots add expert_k_eff / expert_resid_corr / expert_min_skill)",
+    "2 expert_space_health (statistical family; neural snapshots add expert_k_eff / expert_diversity / ssl_skill / expert_min_skill, expert_resid_corr informational)",
     "4 mcmc_ece (the manifest carries no mcmc_ece metric: snapshot fitted before the producer, or no region transitions)",
     "5 elite_transfer (no frozen feedback decoder reads both the parent's and the candidate's latents)",
 ];
@@ -1728,13 +1753,18 @@ mod tests {
         assert!(manifest_health_checks(&stat).is_empty(), "statistical manifests add nothing");
         let neural = json!({ "metrics": {
             "ssl_regression": 0.01, "parent_mix_skill": 0.3, "mix_skill": 0.29,
-            "k_eff": 2.6, "resid_corr_max": 0.4, "skill_min": 0.05
+            "k_eff": 1.2, "k_eff_usage": 2.6, "latent_cka_max": 0.95, "ssl_skill": 0.3,
+            "resid_corr_max": 0.4, "skill_min": 0.05
         }});
         let c = manifest_health_checks(&neural);
         let by = |n: &str| c.iter().find(|x| x.name == n).unwrap().ok;
-        assert_eq!(c.len(), 4);
-        assert!(by("ssl_regression") && by("expert_k_eff") && by("expert_min_skill"));
-        assert!(!by("expert_resid_corr"), "0.4 > 0.1 target");
+        assert_eq!(c.len(), 6);
+        assert!(by("ssl_regression") && by("expert_k_eff") && by("expert_min_skill") && by("ssl_skill"));
+        assert!(!by("expert_diversity"), "CKA 0.95 > 0.7: experts are copies");
+        // D-099: the residual correlation is reported, not gated
+        let rc = c.iter().find(|x| x.name == "expert_resid_corr").unwrap();
+        assert!(rc.ok && rc.detail.contains("above") && rc.detail.contains("informational"), "{rc:?}");
+        assert_eq!(c.iter().find(|x| x.name == "expert_k_eff").unwrap().value, Some(2.6), "usage K_eff");
         // a neural child of a statistical parent still reports item 1 (n/a, passing)
         let first = json!({ "parent_snapshot_id": "stat-v1-1m", "metrics": { "mix_skill": 0.3, "k_eff": 1.7 } });
         let c = manifest_health_checks(&first);

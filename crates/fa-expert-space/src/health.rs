@@ -1,4 +1,13 @@
 //! Expert-space health (spec 32 §6.4) and expert identity across generations (§6.5), host side.
+//!
+//! Since D-099 the spaces are trained end to end on reconstruction (+ next step), and the
+//! promotion checklist reads three measures of "the experts are used, distinct and informative":
+//! [`HealthReport::k_eff_usage`] (effective number of experts the router actually uses),
+//! [`HealthReport::latent_cka_max`] (largest linear CKA between two experts' latents: experts must
+//! be distinct representations, not copies) and [`HealthReport::ssl_skill`] (the family's
+//! self-supervised target vs a naive predictor). The residual correlation and the **residual
+//! `K_eff`** ([`HealthReport::k_eff`], from the residual-correlation eigenvalues) stay reported as
+//! diagnostics.
 
 use serde::{Deserialize, Serialize};
 
@@ -12,8 +21,30 @@ pub struct HealthReport {
     pub resid_corr: Vec<Vec<f64>>,
     /// Largest off-diagonal |corr|.
     pub resid_corr_max: f64,
-    /// `(Σλ)² / Σλ²` over the eigenvalues of `resid_corr`.
+    /// **Residual `K_eff`**: `(Σλ)² / Σλ²` over the eigenvalues of `resid_corr` (a diagnostic
+    /// since D-099; the field name is kept for compatibility).
     pub k_eff: f64,
+    /// Usage `K_eff` (D-099): `(Σu)² / Σu²` over [`Self::usage`] — how many experts the router
+    /// actually uses (1 = one expert takes everything, `K` = uniform use).
+    #[serde(default)]
+    pub k_eff_usage: f64,
+    /// Linear CKA `[K][K]` between the experts' posterior-mean latents over the evaluated windows
+    /// (1 on the diagonal; empty when not measured).
+    #[serde(default)]
+    pub latent_cka: Vec<Vec<f64>>,
+    /// Largest off-diagonal of [`Self::latent_cka`] (0 when not measured): experts whose latents
+    /// are the same up to rotation and scale have CKA 1.
+    #[serde(default)]
+    pub latent_cka_max: f64,
+    /// Skill of the family's self-supervised target on the evaluated windows: `1 − mse / mse_naive`
+    /// with the naive predictor = the per-dimension training mean of the target (reconstruction of
+    /// the last bars for reconstructing families — then equal to [`Self::recon_skill`] — and the
+    /// EMA target embedding for `jepa_vae`). `None` when not measured.
+    #[serde(default)]
+    pub ssl_skill: Option<f64>,
+    /// [`Self::ssl_skill`] of reconstructing families (`None` for `jepa_vae`).
+    #[serde(default)]
+    pub recon_skill: Option<f64>,
     /// Per-expert skill vs the naive (training-mean) predictor: `1 − mse_k / mse_naive`.
     pub skill: Vec<f64>,
     /// Mean router probability per expert.
@@ -74,6 +105,7 @@ impl HealthReport {
         let skill = sq_err.iter().map(|m| if naive_sq_err > 0.0 { 1.0 - m / naive_sq_err } else { 0.0 }).collect();
         Self {
             k_eff: k_eff(&c),
+            k_eff_usage: k_eff_usage(&usage),
             resid_corr: c,
             resid_corr_max: mx,
             skill,
@@ -128,7 +160,16 @@ impl HealthReport {
                 if den > 0.0 { 1.0 - num / den } else { 0.0 }
             })
             .collect();
-        Self { k_eff: k_eff(&c), resid_corr: c, resid_corr_max: mx, skill, usage, n_windows: n, ..Default::default() }
+        Self {
+            k_eff: k_eff(&c),
+            k_eff_usage: k_eff_usage(&usage),
+            resid_corr: c,
+            resid_corr_max: mx,
+            skill,
+            usage,
+            n_windows: n,
+            ..Default::default()
+        }
     }
 
     /// Adds the §6.4 calibration of each expert's Gaussian `next_step`: `y[t][j]` realised
@@ -193,10 +234,31 @@ impl HealthReport {
         self
     }
 
+    /// Adds expert diversity (D-099): `mu[k][t][d]` posterior means per expert and window →
+    /// [`Self::latent_cka`] and [`Self::latent_cka_max`].
+    pub fn with_diversity(mut self, mu: &[Vec<Vec<f64>>]) -> Self {
+        let (m, mx) = latent_cka(mu);
+        self.latent_cka = m;
+        self.latent_cka_max = mx;
+        self
+    }
+
+    /// Adds the self-supervised skill (D-099): `sse` = squared error of the family's SSL head,
+    /// `sse_naive` = squared error of the per-dimension training mean, both summed over the same
+    /// windows and dimensions; `reconstructs` = the target is the window's last bars.
+    pub fn with_ssl(mut self, sse: f64, sse_naive: f64, reconstructs: bool) -> Self {
+        let s = if sse_naive > 0.0 { 1.0 - sse / sse_naive } else { 0.0 };
+        self.ssl_skill = Some(s);
+        self.recon_skill = reconstructs.then_some(s);
+        self
+    }
+
     /// The spec 32 §5 VictoriaMetrics series of this report (`metric, labels, value`):
     /// `fa_expert_resid_corr{tf, expert="<i>_<j>", src}` for every pair `i < j` and
     /// `fa_expert_usage|fa_expert_skill{tf, expert, src}` per expert, plus
-    /// `fa_expert_k_eff{tf, src}`. `expert` = the position in `expert_ids` (stable ids after
+    /// `fa_expert_k_eff{tf, src}` (residual `K_eff`), `fa_expert_k_eff_usage{tf, src}` and, when
+    /// measured, `fa_expert_latent_cka_max{tf, src}` / `fa_expert_ssl_skill{tf, src}` (D-099).
+    /// `expert` = the position in `expert_ids` (stable ids after
     /// alignment); `src` = `validation` (a fit) or `live` (model-runtime).
     pub fn vm_series(&self, tf: &str, src: &str, expert_ids: &[u32]) -> VmSeries {
         let id = |e: usize| expert_ids.get(e).map_or(e.to_string(), u32::to_string);
@@ -224,6 +286,15 @@ impl HealthReport {
             out.push(("fa_expert_skill".to_owned(), labels(Some(id(e))), *sk));
         }
         out.push(("fa_expert_k_eff".to_owned(), labels(None), self.k_eff));
+        if !self.usage.is_empty() {
+            out.push(("fa_expert_k_eff_usage".to_owned(), labels(None), self.k_eff_usage));
+        }
+        if !self.latent_cka.is_empty() {
+            out.push(("fa_expert_latent_cka_max".to_owned(), labels(None), self.latent_cka_max));
+        }
+        if let Some(s) = self.ssl_skill {
+            out.push(("fa_expert_ssl_skill".to_owned(), labels(None), s));
+        }
         out.retain(|(_, _, v)| v.is_finite());
         out
     }
@@ -313,22 +384,54 @@ pub fn k_eff(c: &[Vec<f64>]) -> f64 {
     if fro > 0.0 { tr * tr / fro } else { 0.0 }
 }
 
+/// Usage `K_eff`: `(Σu)² / Σu²` over per-expert usage shares (0 for no usage).
+pub fn k_eff_usage(usage: &[f64]) -> f64 {
+    let s: f64 = usage.iter().sum();
+    let s2: f64 = usage.iter().map(|u| u * u).sum();
+    if s2 > 0.0 { s * s / s2 } else { 0.0 }
+}
+
+/// Pairwise linear CKA of expert latents `mu[k][t][d]` (same windows `t` for every expert):
+/// the `[K][K]` matrix (diagonal 1) and its largest off-diagonal entry.
+pub fn latent_cka(mu: &[Vec<Vec<f64>>]) -> (Vec<Vec<f64>>, f64) {
+    let k = mu.len();
+    let mut m = vec![vec![0.0; k]; k];
+    let mut mx = 0.0f64;
+    for i in 0..k {
+        m[i][i] = 1.0;
+        for j in (i + 1)..k {
+            let v = linear_cka_f64(&mu[i], &mu[j]);
+            m[i][j] = v;
+            m[j][i] = v;
+            mx = mx.max(v);
+        }
+    }
+    (m, mx)
+}
+
 /// Linear CKA between two representations of the same `n` samples (`a[n][da]`, `b[n][db]`):
 /// `‖AᵀB‖_F² / (‖AᵀA‖_F · ‖BᵀB‖_F)` on column-centred matrices. 1 = same up to rotation/scale.
 pub fn linear_cka(a: &[Vec<f32>], b: &[Vec<f32>]) -> f64 {
+    let up =
+        |x: &[Vec<f32>]| -> Vec<Vec<f64>> { x.iter().map(|r| r.iter().map(|v| f64::from(*v)).collect()).collect() };
+    linear_cka_f64(&up(a), &up(b))
+}
+
+/// [`linear_cka`] on `f64` rows.
+pub fn linear_cka_f64(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
     let n = a.len().min(b.len());
-    if n < 2 {
+    if n < 2 || a[0].is_empty() || b[0].is_empty() {
         return 0.0;
     }
-    let centre = |x: &[Vec<f32>]| -> Vec<Vec<f64>> {
+    let centre = |x: &[Vec<f64>]| -> Vec<Vec<f64>> {
         let d = x[0].len();
         let mut m = vec![0.0; d];
         for r in &x[..n] {
             for (j, v) in r.iter().enumerate() {
-                m[j] += f64::from(*v) / n as f64;
+                m[j] += *v / n as f64;
             }
         }
-        x[..n].iter().map(|r| r.iter().enumerate().map(|(j, v)| f64::from(*v) - m[j]).collect()).collect()
+        x[..n].iter().map(|r| r.iter().enumerate().map(|(j, v)| *v - m[j]).collect()).collect()
     };
     let (a, b) = (centre(a), centre(b));
     let cross = |x: &[Vec<f64>], y: &[Vec<f64>]| -> f64 {
@@ -459,10 +562,48 @@ mod tests {
             .collect();
         assert_eq!(pairs, vec!["4_7", "4_9", "7_9"]);
         assert_eq!(s.iter().filter(|(m, _, _)| m == "fa_expert_usage").count(), 3);
+        assert!(s.iter().any(|(m, _, v)| m == "fa_expert_k_eff_usage" && (*v - 1.0 / 0.34).abs() < 1e-9));
+        assert!(!s.iter().any(|(m, _, _)| m == "fa_expert_latent_cka_max" || m == "fa_expert_ssl_skill"));
         assert!(
             s.iter().all(|(m, l, _)| m.starts_with("fa_")
                 && l.iter().all(|(k, _)| ["tf", "src", "expert"].contains(&k.as_str())))
         );
+    }
+
+    #[test]
+    fn k_eff_usage_counts_used_experts() {
+        assert!((k_eff_usage(&[0.25; 4]) - 4.0).abs() < 1e-12);
+        assert!((k_eff_usage(&[1.0, 0.0, 0.0]) - 1.0).abs() < 1e-12);
+        assert!((k_eff_usage(&[0.5, 0.5, 0.0]) - 2.0).abs() < 1e-12);
+        assert_eq!(k_eff_usage(&[]), 0.0);
+        let h = HealthReport::compute(&[vec![1.0, 0.0], vec![0.0, 1.0]], &[0.5, 0.5], 1.0, vec![0.9, 0.1]);
+        assert!((h.k_eff_usage - 1.0 / 0.82).abs() < 1e-9, "{}", h.k_eff_usage);
+    }
+
+    #[test]
+    fn latent_cka_identity_copies_and_orthogonal_experts() {
+        let mut rng = fa_core::rng::Rng::seed(11);
+        let n = 400;
+        let a: Vec<Vec<f64>> = (0..n).map(|_| vec![rng.normal(), rng.normal()]).collect();
+        // a scaled rotation of a (a copy), and an independent representation
+        let copy: Vec<Vec<f64>> =
+            a.iter().map(|r| vec![3.0 * (0.6 * r[0] - 0.8 * r[1]), 3.0 * (0.8 * r[0] + 0.6 * r[1])]).collect();
+        let other: Vec<Vec<f64>> = (0..n).map(|_| vec![rng.normal(), rng.normal()]).collect();
+        assert!((linear_cka_f64(&a, &a) - 1.0).abs() < 1e-9, "identity");
+        assert!((linear_cka_f64(&a, &copy) - 1.0).abs() < 1e-9, "rotation + scale");
+        assert!(linear_cka_f64(&a, &other) < 0.05, "independent: {}", linear_cka_f64(&a, &other));
+        // exactly orthogonal (uncorrelated) columns: CKA 0
+        let x: Vec<Vec<f64>> = (0..4).map(|t| vec![[1.0, -1.0, 1.0, -1.0][t]]).collect();
+        let y: Vec<Vec<f64>> = (0..4).map(|t| vec![[1.0, 1.0, -1.0, -1.0][t]]).collect();
+        assert!(linear_cka_f64(&x, &y).abs() < 1e-12);
+        let h = HealthReport::default().with_diversity(&[a.clone(), copy, other]);
+        assert_eq!(h.latent_cka.len(), 3);
+        assert!((h.latent_cka[0][1] - 1.0).abs() < 1e-9 && (h.latent_cka_max - 1.0).abs() < 1e-9);
+        assert!(h.latent_cka[0][2] < 0.05 && h.latent_cka[1][1] == 1.0);
+        // SSL skill against the naive predictor
+        let s = HealthReport::default().with_ssl(25.0, 100.0, true);
+        assert_eq!((s.ssl_skill, s.recon_skill), (Some(0.75), Some(0.75)));
+        assert_eq!(HealthReport::default().with_ssl(1.0, 2.0, false).recon_skill, None);
     }
 
     #[test]

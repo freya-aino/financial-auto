@@ -8,7 +8,8 @@
 //!   scores the previous closed window's per-expert next-step prediction against the realised
 //!   targets; every `every_ms` (≥ 30 rows) the spec 32 §6.4 measures (gated residual
 //!   correlation, `K_eff`, per-expert skill, usage) over the last `window` rows are published
-//!   and mirrored as heartbeat gauges `expert.<ts>.k_eff|resid_corr_max|skill_min`. A
+//!   and mirrored as heartbeat gauges `expert.<ts>.k_eff|k_eff_usage|resid_corr_max|skill_min`
+//!   (`k_eff` = residual `K_eff`, `k_eff_usage` = usage `K_eff`, D-099). A
 //!   residual-correlation spike is the §8 health signal.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -183,6 +184,9 @@ impl LiveHealth {
             k_eff: h.k_eff,
             resid_corr_max: h.resid_corr_max,
             n_windows: n as u64,
+            k_eff_usage: h.k_eff_usage,
+            latent_cka_max: (!h.latent_cka.is_empty()).then_some(h.latent_cka_max),
+            ssl_skill: h.ssl_skill,
         })
     }
 }
@@ -217,6 +221,7 @@ pub fn vm_samples(h: &ExpertHealth, as_of_ms: i64) -> Vec<fa_tsdb::Sample> {
         usage: h.usage.clone(),
         skill: h.skill.clone(),
         k_eff: h.k_eff,
+        k_eff_usage: fa_expert_space::health::k_eff_usage(&h.usage),
         ..Default::default()
     };
     report
@@ -302,6 +307,8 @@ pub fn gauges(h: &ExpertHealth) -> Vec<(String, f64)> {
     let ts = &h.timescale;
     let mut g = vec![
         (format!("expert.{ts}.k_eff"), h.k_eff),
+        // D-099: the experts the router actually uses (the gating `K_eff` of the checklist)
+        (format!("expert.{ts}.k_eff_usage"), fa_expert_space::health::k_eff_usage(&h.usage)),
         (format!("expert.{ts}.resid_corr_max"), h.resid_corr_max),
         (format!("expert.{ts}.health_windows"), h.n_windows as f64),
     ];
@@ -428,9 +435,10 @@ mod tests {
                 assert!(h.skill[1] < h.skill[0]);
                 assert!(h.k_eff > 1.0 && h.k_eff <= 2.0);
                 assert!(gauges(&h).iter().any(|(k, _)| k == "expert.1m.k_eff"));
-                // spec 32 §5 series: one pair, two usages, two skills, K_eff
+                assert!(gauges(&h).iter().any(|(k, v)| k == "expert.1m.k_eff_usage" && (*v - 2.0).abs() < 1e-9));
+                // spec 32 §5 series: one pair, two usages, two skills, residual and usage K_eff
                 let vm = vm_samples(&h, 1);
-                assert_eq!(vm.len(), 6);
+                assert_eq!(vm.len(), 7);
                 assert!(vm.iter().all(|s| s.validate().is_ok() && s.labels["src"] == "live"));
                 return;
             }

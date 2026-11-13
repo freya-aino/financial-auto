@@ -2023,18 +2023,24 @@ func (x *ExpertView) GetAssetAttn() map[string]float32 {
 // latent.expert.health (spec 32 §4.3, §6.4): per-expert usage, skill and the residual
 // correlation matrix of an expert space.
 type ExpertHealth struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SnapshotId    string                 `protobuf:"bytes,1,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
-	Timescale     string                 `protobuf:"bytes,2,opt,name=timescale,proto3" json:"timescale,omitempty"`
-	AsOf          *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=as_of,json=asOf,proto3" json:"as_of,omitempty"`
-	Source        string                 `protobuf:"bytes,4,opt,name=source,proto3" json:"source,omitempty"` // validation (fit) | live (served windows)
-	ExpertIds     []uint32               `protobuf:"varint,5,rep,packed,name=expert_ids,json=expertIds,proto3" json:"expert_ids,omitempty"`
-	Usage         []float64              `protobuf:"fixed64,6,rep,packed,name=usage,proto3" json:"usage,omitempty"`
-	Skill         []float64              `protobuf:"fixed64,7,rep,packed,name=skill,proto3" json:"skill,omitempty"`
-	ResidCorr     []float64              `protobuf:"fixed64,8,rep,packed,name=resid_corr,json=residCorr,proto3" json:"resid_corr,omitempty"` // row-major K × K
-	KEff          float64                `protobuf:"fixed64,9,opt,name=k_eff,json=kEff,proto3" json:"k_eff,omitempty"`
-	ResidCorrMax  float64                `protobuf:"fixed64,10,opt,name=resid_corr_max,json=residCorrMax,proto3" json:"resid_corr_max,omitempty"`
-	NWindows      uint64                 `protobuf:"varint,11,opt,name=n_windows,json=nWindows,proto3" json:"n_windows,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	SnapshotId   string                 `protobuf:"bytes,1,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	Timescale    string                 `protobuf:"bytes,2,opt,name=timescale,proto3" json:"timescale,omitempty"`
+	AsOf         *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=as_of,json=asOf,proto3" json:"as_of,omitempty"`
+	Source       string                 `protobuf:"bytes,4,opt,name=source,proto3" json:"source,omitempty"` // validation (fit) | live (served windows)
+	ExpertIds    []uint32               `protobuf:"varint,5,rep,packed,name=expert_ids,json=expertIds,proto3" json:"expert_ids,omitempty"`
+	Usage        []float64              `protobuf:"fixed64,6,rep,packed,name=usage,proto3" json:"usage,omitempty"`
+	Skill        []float64              `protobuf:"fixed64,7,rep,packed,name=skill,proto3" json:"skill,omitempty"`
+	ResidCorr    []float64              `protobuf:"fixed64,8,rep,packed,name=resid_corr,json=residCorr,proto3" json:"resid_corr,omitempty"` // row-major K × K
+	KEff         float64                `protobuf:"fixed64,9,opt,name=k_eff,json=kEff,proto3" json:"k_eff,omitempty"`
+	ResidCorrMax float64                `protobuf:"fixed64,10,opt,name=resid_corr_max,json=residCorrMax,proto3" json:"resid_corr_max,omitempty"`
+	NWindows     uint64                 `protobuf:"varint,11,opt,name=n_windows,json=nWindows,proto3" json:"n_windows,omitempty"`
+	// D-099: usage K_eff (Σu)²/Σu² gates promotion; residual K_eff (9) is informational.
+	KEffUsage float64 `protobuf:"fixed64,12,opt,name=k_eff_usage,json=kEffUsage,proto3" json:"k_eff_usage,omitempty"`
+	// Largest off-diagonal linear CKA between expert latents; ssl skill vs naive. Unset when the
+	// producer cannot compute them (live windows carry no latent buffer yet).
+	LatentCkaMax  *float64 `protobuf:"fixed64,13,opt,name=latent_cka_max,json=latentCkaMax,proto3,oneof" json:"latent_cka_max,omitempty"`
+	SslSkill      *float64 `protobuf:"fixed64,14,opt,name=ssl_skill,json=sslSkill,proto3,oneof" json:"ssl_skill,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2142,6 +2148,27 @@ func (x *ExpertHealth) GetResidCorrMax() float64 {
 func (x *ExpertHealth) GetNWindows() uint64 {
 	if x != nil {
 		return x.NWindows
+	}
+	return 0
+}
+
+func (x *ExpertHealth) GetKEffUsage() float64 {
+	if x != nil {
+		return x.KEffUsage
+	}
+	return 0
+}
+
+func (x *ExpertHealth) GetLatentCkaMax() float64 {
+	if x != nil && x.LatentCkaMax != nil {
+		return *x.LatentCkaMax
+	}
+	return 0
+}
+
+func (x *ExpertHealth) GetSslSkill() float64 {
+	if x != nil && x.SslSkill != nil {
+		return *x.SslSkill
 	}
 	return 0
 }
@@ -2347,7 +2374,7 @@ const file_fa_v1_latent_proto_rawDesc = "" +
 	"asset_attn\x18\v \x03(\v2 .fa.v1.ExpertView.AssetAttnEntryR\tassetAttn\x1a<\n" +
 	"\x0eAssetAttnEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x02R\x05value:\x028\x01\"\xd8\x02\n" +
+	"\x05value\x18\x02 \x01(\x02R\x05value:\x028\x01\"\xe6\x03\n" +
 	"\fExpertHealth\x12\x1f\n" +
 	"\vsnapshot_id\x18\x01 \x01(\tR\n" +
 	"snapshotId\x12\x1c\n" +
@@ -2363,7 +2390,13 @@ const file_fa_v1_latent_proto_rawDesc = "" +
 	"\x05k_eff\x18\t \x01(\x01R\x04kEff\x12$\n" +
 	"\x0eresid_corr_max\x18\n" +
 	" \x01(\x01R\fresidCorrMax\x12\x1b\n" +
-	"\tn_windows\x18\v \x01(\x04R\bnWindowsB\x85\x01\n" +
+	"\tn_windows\x18\v \x01(\x04R\bnWindows\x12\x1e\n" +
+	"\vk_eff_usage\x18\f \x01(\x01R\tkEffUsage\x12)\n" +
+	"\x0elatent_cka_max\x18\r \x01(\x01H\x00R\flatentCkaMax\x88\x01\x01\x12 \n" +
+	"\tssl_skill\x18\x0e \x01(\x01H\x01R\bsslSkill\x88\x01\x01B\x11\n" +
+	"\x0f_latent_cka_maxB\f\n" +
+	"\n" +
+	"_ssl_skillB\x85\x01\n" +
 	"\tcom.fa.v1B\vLatentProtoP\x01Z6github.com/fey/financial-auto/go/pkg/bus/pb/fa/v1;fav1\xa2\x02\x03FXX\xaa\x02\x05Fa.V1\xca\x02\x05Fa\\V1\xe2\x02\x11Fa\\V1\\GPBMetadata\xea\x02\x06Fa::V1b\x06proto3"
 
 var (
@@ -2453,6 +2486,7 @@ func file_fa_v1_latent_proto_init() {
 	if File_fa_v1_latent_proto != nil {
 		return
 	}
+	file_fa_v1_latent_proto_msgTypes[22].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

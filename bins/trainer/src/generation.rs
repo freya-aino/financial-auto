@@ -430,12 +430,52 @@ async fn put_artefact(svc: &Services<'_>, rec: &mut GenerationRecord, name: &str
 
 // ── selection ────────────────────────────────────────────────────────────
 
-/// Health shortfall of a candidate against the checklist targets (0 = all met).
+/// Health shortfall of a candidate against the checklist item 2 targets ([`ExpertTargets`],
+/// D-099; 0 = all met): usage `K_eff`, expert diversity (latent CKA), SSL skill and the weakest
+/// expert's next-step skill. Residual correlation is not part of it (a diagnostic since D-099).
 pub fn health_shortfall(m: &Value) -> f64 {
     let g = |k: &str, d: f64| m[k].as_f64().unwrap_or(d);
-    (2.0 - g("k_eff", 0.0)).max(0.0) / 2.0
-        + (g("resid_corr_max", 1.0) - 0.1).max(0.0)
-        + (0.02 - g("skill_min", -1.0)).max(0.0)
+    let t = ExpertTargets::from_env();
+    (t.min_k_eff - g("k_eff_usage", 0.0)).max(0.0) / t.min_k_eff.max(1e-9)
+        + (g("latent_cka_max", 1.0) - t.max_expert_cka).max(0.0)
+        + (t.min_ssl_skill - g("ssl_skill", -1.0)).max(0.0)
+        + (t.min_skill - g("skill_min", -1.0)).max(0.0)
+}
+
+/// Spec 36 §6.4 item 2 targets (D-099, **provisional** until the owner confirms them), each
+/// overridable by its environment variable: usage `K_eff ≥ FA_PROMOTE_MIN_K_EFF` (2), largest
+/// latent CKA between two experts `≤ FA_PROMOTE_MAX_EXPERT_CKA` (0.7), SSL skill
+/// `≥ FA_PROMOTE_MIN_SSL_SKILL` (0.1), every expert's next-step skill `≥ FA_PROMOTE_MIN_SKILL`
+/// (0.02). The residual correlation is reported against `FA_PROMOTE_MAX_RESID_CORR` (0.1) but
+/// does not gate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExpertTargets {
+    pub min_k_eff: f64,
+    pub max_expert_cka: f64,
+    pub min_ssl_skill: f64,
+    pub min_skill: f64,
+    pub max_resid_corr: f64,
+}
+
+impl ExpertTargets {
+    pub fn from_env() -> Self {
+        Self {
+            min_k_eff: env_f("FA_PROMOTE_MIN_K_EFF", 2.0),
+            max_expert_cka: env_f("FA_PROMOTE_MAX_EXPERT_CKA", 0.7),
+            min_ssl_skill: env_f("FA_PROMOTE_MIN_SSL_SKILL", 0.1),
+            min_skill: env_f("FA_PROMOTE_MIN_SKILL", 0.02),
+            max_resid_corr: env_f("FA_PROMOTE_MAX_RESID_CORR", 0.1),
+        }
+    }
+
+    /// Whether a health report passes item 2 (no collapse, every gating target met).
+    pub fn passes(&self, h: &fa_expert_space::health::HealthReport) -> bool {
+        h.collapsed.is_empty()
+            && h.k_eff_usage >= self.min_k_eff
+            && h.latent_cka_max <= self.max_expert_cka
+            && h.ssl_skill.is_some_and(|s| s >= self.min_ssl_skill)
+            && h.skill_min() >= self.min_skill
+    }
 }
 
 /// Minimised objectives of a candidate's metrics.
@@ -489,7 +529,7 @@ pub fn select(candidates: &[Value]) -> Option<(usize, Value)> {
         ok[best],
         json!({
             "method": "NSGA-II front 0 (fa_evolution::non_dominated_sort); ties: health shortfall, mixture skill, cost",
-            "objectives": ["val_pred_loss (min)", "mix_skill (max)", "health shortfall vs K_eff ≥ 2 / corr ≤ 0.1 / skill ≥ 0.02 (min)", "n_params × 2^oom_retries (min)"],
+            "objectives": ["val_pred_loss (min)", "mix_skill (max)", "health shortfall vs usage K_eff ≥ 2 / latent CKA ≤ 0.7 / SSL skill ≥ 0.1 / skill ≥ 0.02 (min)", "n_params × 2^oom_retries (min)"],
             "unfit": "metrics.collapsed > 0 (collapsed experts, spec 31 §8): every objective +∞",
             "table": table,
             "selected": candidates[ok[best]]["snapshot_id"],
@@ -504,8 +544,12 @@ fn env_f(k: &str, d: f64) -> f64 {
 }
 
 /// The checklist items decidable from the manifest (shadow serving is checked at promotion).
+/// Item 2 (D-099) gates on `expert_collapse`, `expert_k_eff` (usage `K_eff`, manifest
+/// `k_eff_usage`), `expert_diversity` (`latent_cka_max`), `ssl_skill` and `expert_min_skill`;
+/// `expert_resid_corr` is reported as an informational row (`"gating": false`, never failing).
 pub fn offline_checklist(manifest: &Value) -> Value {
     let m = &manifest["metrics"];
+    let t = ExpertTargets::from_env();
     let mut checks = Vec::new();
     let mut push = |name: &str, v: Option<f64>, th: f64, at_least: bool| {
         if let Some(v) = v {
@@ -522,11 +566,17 @@ pub fn offline_checklist(manifest: &Value) -> Value {
     );
     push("ssl_regression", m["ssl_regression"].as_f64(), env_f("FA_PROMOTE_REGRESS_TOL", 0.02), false);
     push("expert_collapse", m["collapsed"].as_f64(), 0.0, false);
-    push("expert_k_eff", m["k_eff"].as_f64(), env_f("FA_PROMOTE_MIN_K_EFF", 2.0), true);
-    push("expert_resid_corr", m["resid_corr_max"].as_f64(), env_f("FA_PROMOTE_MAX_RESID_CORR", 0.1), false);
-    push("expert_min_skill", m["skill_min"].as_f64(), env_f("FA_PROMOTE_MIN_SKILL", 0.02), true);
+    push("expert_k_eff", m["k_eff_usage"].as_f64(), t.min_k_eff, true);
+    push("expert_diversity", m["latent_cka_max"].as_f64(), t.max_expert_cka, false);
+    push("ssl_skill", m["ssl_skill"].as_f64(), t.min_ssl_skill, true);
+    push("expert_min_skill", m["skill_min"].as_f64(), t.min_skill, true);
     push("mcmc_ece", m["mcmc_ece_regression"].as_f64(), env_f("FA_PROMOTE_ECE_TOL", 0.02), false);
     push("elite_transfer", m["elite_transfer"].as_f64(), env_f("FA_PROMOTE_TRANSFER_TOL", 0.10), false);
+    // informational since D-099: the residual correlation is reported, not gated
+    if let Some(v) = m["resid_corr_max"].as_f64() {
+        checks.push(json!({ "name": "expert_resid_corr", "value": v, "threshold": t.max_resid_corr,
+                            "ok": true, "gating": false, "within": v <= t.max_resid_corr }));
+    }
     let failing: Vec<Value> = checks.iter().filter(|c| c["ok"] == json!(false)).map(|c| c["name"].clone()).collect();
     json!({ "checks": checks, "failing": failing, "passed": failing.is_empty(),
             "pending": ["shadow_served", "shadow_minutes", "shadow_region_agreement (checked by POST /api/latent/snapshots/{id}/promote)"] })
@@ -935,6 +985,94 @@ pub fn synthetic_bars(ts: Timescale, n_inst: usize, n_bars: usize, end_ms: i64, 
         .collect()
 }
 
+/// Synthetic **factor** bars (not market data), the offline twin of the live
+/// `go/connectors/synthetic` generator: `factors` independent latent factors, each with its own
+/// calm / volatile regime redrawn every 40 steps (vol 0.001 / 0.006, drift 0.0003 / −0.0005);
+/// instrument `k` loads `1 + 0.2·N(0,1)` on factor `k mod factors` and `0.2·N(0,1)` on the
+/// others, plus idiosyncratic noise 0.0005, so `factors` clusters of instruments are recoverable.
+/// Volume and bar range follow the regime of the instrument's own factor. Deterministic for `seed`.
+pub fn synthetic_factor_bars(
+    ts: Timescale,
+    n_inst: usize,
+    factors: usize,
+    n_bars: usize,
+    end_ms: i64,
+    seed: u64,
+) -> Vec<BarHistory> {
+    let step = data::step_ms(ts);
+    let factors = factors.max(1);
+    let mut rng = fa_core::rng::Rng::seed(seed ^ 0xFAC7_0125);
+    let load: Vec<Vec<f64>> = (0..n_inst)
+        .map(|k| {
+            let mut row: Vec<f64> = (0..factors).map(|_| 0.2 * rng.normal()).collect();
+            row[k % factors] += 1.0;
+            row
+        })
+        .collect();
+    let mut regime = vec![0usize; factors];
+    let mut price: Vec<f64> = (0..n_inst).map(|k| 50.0 + 10.0 * k as f64).collect();
+    let mut bars: Vec<Vec<fa_encoders::MarketBar>> = vec![Vec::with_capacity(n_bars); n_inst];
+    for i in 0..n_bars {
+        if i % 40 == 0 {
+            for r in regime.iter_mut() {
+                *r = rng.below(2);
+            }
+        }
+        let shock: Vec<f64> = regime
+            .iter()
+            .map(|r| {
+                let (vol, drift) = if *r == 0 { (0.001, 0.0003) } else { (0.006, -0.0005) };
+                drift + vol * rng.normal()
+            })
+            .collect();
+        for k in 0..n_inst {
+            let r = 0.0005 * rng.normal() + load[k].iter().zip(&shock).map(|(l, s)| l * s).sum::<f64>();
+            let open = price[k];
+            price[k] *= r.exp();
+            let p = price[k];
+            let dom = regime[k % factors];
+            let vol = if dom == 0 { 0.001 } else { 0.006 };
+            let volume = if dom == 0 { 100.0 } else { 400.0 } * (0.5 + rng.uniform());
+            bars[k].push(fa_encoders::MarketBar {
+                open,
+                high: open.max(p) * (1.0 + vol * rng.uniform()),
+                low: open.min(p) * (1.0 - vol * rng.uniform()),
+                close: p,
+                volume,
+                trade_count: (volume / 10.0) as u64,
+            });
+        }
+    }
+    let first = end_ms - step * (n_bars as i64 - 1);
+    bars.into_iter()
+        .enumerate()
+        .map(|(k, bars)| BarHistory {
+            instrument: format!("synthetic{k:02}"),
+            timescale: ts,
+            source: data::Source::Bars,
+            start_ms: first - step,
+            end_ms,
+            ends_ms: (0..n_bars as i64).map(|i| first + i * step).collect(),
+            bars,
+        })
+        .collect()
+}
+
+/// `--synthetic N[:K]`: `N` instruments, `K` factors (`None` = the single-factor-per-instrument
+/// [`synthetic_bars`]).
+pub fn parse_synthetic(s: &str) -> anyhow::Result<(usize, Option<usize>)> {
+    let (n, k) = match s.split_once(':') {
+        Some((n, k)) => (n, Some(k)),
+        None => (s, None),
+    };
+    let n: usize = n.trim().parse().map_err(|e| anyhow::anyhow!("--synthetic {s}: {e}"))?;
+    let k = k.map(|k| k.trim().parse::<usize>()).transpose().map_err(|e| anyhow::anyhow!("--synthetic {s}: {e}"))?;
+    if n == 0 || k == Some(0) {
+        anyhow::bail!("--synthetic {s}: need N ≥ 1 and K ≥ 1");
+    }
+    Ok((n, k))
+}
+
 /// One default genome per decoder family plus seeded jittered variants.
 pub fn decoder_seeds(ts: Timescale, snapshot_id: &str, extra: usize, seed: u64) -> Vec<Value> {
     use fa_decoders::genome::{BaselineFamily, DecoderGenome};
@@ -988,9 +1126,11 @@ mod tests {
 
     #[test]
     fn pareto_selection_prefers_the_front_then_health() {
-        let c = |f: &str, loss: f64, skill: f64, k: f64, corr: f64, smin: f64, np: f64| {
+        // `cka` doubles as the diversity metric; SSL skill fixed at a passing 0.3
+        let c = |f: &str, loss: f64, skill: f64, k: f64, cka: f64, smin: f64, np: f64| {
             json!({ "family": f, "snapshot_id": format!("s-{f}"), "metrics": {
-                "val_pred_loss": loss, "mix_skill": skill, "k_eff": k, "resid_corr_max": corr, "skill_min": smin, "n_params": np } })
+                "val_pred_loss": loss, "mix_skill": skill, "k_eff_usage": k, "latent_cka_max": cka + 0.8,
+                "ssl_skill": 0.3, "skill_min": smin, "n_params": np } })
         };
         let cands = vec![
             c("a", 1.0, 0.3, 1.5, 0.5, 0.05, 1000.0),
@@ -1009,6 +1149,83 @@ mod tests {
         assert_eq!(cands[i]["family"], "c", "{t}");
         let fronts: Vec<u64> = t["table"].as_array().unwrap().iter().map(|r| r["front"].as_u64().unwrap()).collect();
         assert_eq!(fronts, vec![0, 1, 0]);
+    }
+
+    /// Item 2 gates on usage `K_eff`, expert diversity, SSL skill, min skill and collapse; the
+    /// residual correlation is reported but never fails the checklist (D-099).
+    #[test]
+    fn checklist_item_2_gates_on_usage_diversity_and_ssl_skill() {
+        let base = json!({ "metrics": { "k_eff_usage": 2.8, "latent_cka_max": 0.6, "ssl_skill": 0.4,
+                                        "skill_min": 0.05, "collapsed": 0.0, "resid_corr_max": 0.7, "k_eff": 1.2 } });
+        let c = offline_checklist(&base);
+        assert_eq!(c["passed"], true, "{c}");
+        let row = |c: &Value, n: &str| c["checks"].as_array().unwrap().iter().find(|x| x["name"] == n).cloned();
+        let rc = row(&c, "expert_resid_corr").expect("informational row");
+        assert_eq!(
+            (rc["ok"].clone(), rc["gating"].clone(), rc["within"].clone()),
+            (json!(true), json!(false), json!(false))
+        );
+        assert_eq!(row(&c, "expert_k_eff").unwrap()["value"], 2.8, "usage K_eff, not the residual one");
+        for (key, bad, item) in [
+            ("k_eff_usage", 1.5, "expert_k_eff"),
+            ("latent_cka_max", 0.97, "expert_diversity"),
+            ("ssl_skill", 0.01, "ssl_skill"),
+            ("skill_min", -0.1, "expert_min_skill"),
+            ("collapsed", 1.0, "expert_collapse"),
+        ] {
+            let mut m = base.clone();
+            m["metrics"][key] = json!(bad);
+            let c = offline_checklist(&m);
+            assert_eq!(c["passed"], false, "{key}");
+            assert_eq!(c["failing"], json!([item]), "{key}");
+        }
+        let h = fa_expert_space::health::HealthReport {
+            k_eff_usage: 2.5,
+            latent_cka_max: 0.5,
+            ssl_skill: Some(0.2),
+            skill: vec![0.1, 0.03],
+            resid_corr_max: 0.9,
+            ..Default::default()
+        };
+        let t = ExpertTargets::from_env();
+        assert!(t.passes(&h));
+        assert!(!t.passes(&fa_expert_space::health::HealthReport { ssl_skill: None, ..h.clone() }));
+        assert!(!t.passes(&fa_expert_space::health::HealthReport { collapsed: vec![0], ..h }));
+        assert!(health_shortfall(&base["metrics"]) == 0.0);
+    }
+
+    /// The factor generator plants `K` factor clusters: instruments sharing a factor are more
+    /// return-correlated than instruments on different factors; it is deterministic and matches
+    /// the committed fixture (`UPDATE_FIXTURE=1` rewrites it).
+    #[test]
+    fn synthetic_factor_bars_plant_clusters_and_match_the_fixture() {
+        let ts = Timescale::Minute;
+        let h = synthetic_factor_bars(ts, 6, 3, 2000, 2000 * 60_000, 1);
+        assert_eq!(h.len(), 6);
+        assert_eq!(h, synthetic_factor_bars(ts, 6, 3, 2000, 2000 * 60_000, 1), "deterministic");
+        let rets: Vec<Vec<f64>> =
+            h.iter().map(|x| x.bars.windows(2).map(|w| (w[1].close / w[0].close).ln()).collect()).collect();
+        let corr = |a: usize, b: usize| fa_expert_space::pearson(&rets[a], &rets[b]);
+        let same = (corr(0, 3) + corr(1, 4) + corr(2, 5)) / 3.0;
+        let cross = (corr(0, 1) + corr(0, 2) + corr(1, 2) + corr(3, 4)) / 4.0;
+        assert!(same > 0.6 && cross.abs() < 0.4 && same > cross + 0.3, "same {same}, cross {cross}");
+        assert_eq!(parse_synthetic("9:3").unwrap(), (9, Some(3)));
+        assert_eq!(parse_synthetic("4").unwrap(), (4, None));
+        assert!(parse_synthetic("4:0").is_err());
+        // regression fixture: the sweep's offline data must not drift silently
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/synthetic_factor_bars_6x3.json");
+        let small = synthetic_factor_bars(ts, 6, 3, 300, 300 * 60_000, 7);
+        if std::env::var("UPDATE_FIXTURE").is_ok() {
+            std::fs::write(&fixture, serde_json::to_vec(&small).unwrap()).unwrap();
+        }
+        let want: Vec<BarHistory> = serde_json::from_slice(&std::fs::read(&fixture).unwrap()).unwrap();
+        assert_eq!(want.len(), small.len());
+        for (a, b) in want.iter().zip(&small) {
+            assert_eq!((a.instrument.as_str(), a.ends_ms.as_slice()), (b.instrument.as_str(), b.ends_ms.as_slice()));
+            for (x, y) in a.bars.iter().zip(&b.bars) {
+                assert!((x.close - y.close).abs() < 1e-9 * y.close && (x.volume - y.volume).abs() < 1e-9 * y.volume);
+            }
+        }
     }
 
     /// Acceptance 1 on synthetic bars: encoders (two families) → selection → re-embedding →

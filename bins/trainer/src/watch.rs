@@ -2,9 +2,12 @@
 //!
 //! **Drift triggers** (`FA_TRAIN_DRIFT_TRIGGERS=1`, default off): an early `train.generation` of
 //! the active snapshot of a timescale when
-//! * the live expert health (`latent.expert.health`, `source = live`) reports
-//!   `resid_corr_max > FA_TRIGGER_RESID_CORR` (0.6) on [`SUSTAIN`] consecutive reports
-//!   (residual-correlation breakdown, spec 32 §8);
+//! * the live expert health (`latent.expert.health`, `source = live`) fails the promotion
+//!   checklist's item-2 targets ([`ExpertTargets`], the same `FA_PROMOTE_*` variables) on
+//!   [`SUSTAIN`] consecutive reports: usage `K_eff` below its minimum, the largest expert latent
+//!   CKA above its maximum, SSL skill or the weakest expert's skill below its minimum (fields a
+//!   live report leaves unset are not checked). Since D-099 residual correlation is high by
+//!   design, so it no longer triggers (D-102);
 //! * the serving MCMC sampler's ECE in model-runtime's heartbeat
 //!   (`mcmc.<ts>.e<k>.<sampler>.ece` with `.serving = 1`) exceeds `FA_TRIGGER_ECE` (0.15) on
 //!   [`SUSTAIN`] consecutive heartbeats (calibration degradation, spec 33);
@@ -32,7 +35,7 @@ use fa_proto::v1::{ExpertHealth, Heartbeat, JobResult};
 use futures::StreamExt;
 use serde_json::{Value, json};
 
-use crate::{plan, run::Kind};
+use crate::{generation::ExpertTargets, plan, run::Kind};
 
 pub const SUSTAIN: usize = 3;
 
@@ -51,7 +54,7 @@ fn env_dur(k: &str, d: Duration) -> Duration {
 /// Why a timescale should start an early generation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Trigger {
-    ResidCorr { ts: String, value: f64 },
+    HealthBreach { ts: String, failed: Vec<&'static str> },
     McmcEce { ts: String, value: f64 },
     AdapterFrozen { ts: String, snapshot: String },
 }
@@ -59,14 +62,14 @@ pub enum Trigger {
 impl Trigger {
     pub fn timescale(&self) -> &str {
         match self {
-            Self::ResidCorr { ts, .. } | Self::McmcEce { ts, .. } | Self::AdapterFrozen { ts, .. } => ts,
+            Self::HealthBreach { ts, .. } | Self::McmcEce { ts, .. } | Self::AdapterFrozen { ts, .. } => ts,
         }
     }
 
     pub fn describe(&self) -> Value {
         match self {
-            Self::ResidCorr { ts, value } => {
-                json!({ "trigger": "resid_corr_breakdown", "timescale": ts, "value": value })
+            Self::HealthBreach { ts, failed } => {
+                json!({ "trigger": "expert_health", "timescale": ts, "failed": failed })
             }
             Self::McmcEce { ts, value } => json!({ "trigger": "mcmc_calibration", "timescale": ts, "value": value }),
             Self::AdapterFrozen { ts, snapshot } => {
@@ -79,7 +82,7 @@ impl Trigger {
 /// Pure trigger state (sustain counters + cooldown).
 #[derive(Debug)]
 pub struct TriggerState {
-    pub resid_corr_max: f64,
+    pub targets: ExpertTargets,
     pub ece_max: f64,
     pub cooldown: Duration,
     streak_corr: HashMap<String, usize>,
@@ -88,9 +91,9 @@ pub struct TriggerState {
 }
 
 impl TriggerState {
-    pub fn new(resid_corr_max: f64, ece_max: f64, cooldown: Duration) -> Self {
+    pub fn new(targets: ExpertTargets, ece_max: f64, cooldown: Duration) -> Self {
         Self {
-            resid_corr_max,
+            targets,
             ece_max,
             cooldown,
             streak_corr: HashMap::new(),
@@ -110,15 +113,31 @@ impl TriggerState {
         Some(t)
     }
 
-    pub fn on_health(&mut self, ts: &str, source: &str, resid_corr_max: f64, now: Instant) -> Option<Trigger> {
-        if source != "live" {
+    /// The item-2 checks a live health report fails (unset fields are skipped).
+    pub fn health_failures(&self, h: &ExpertHealth) -> Vec<&'static str> {
+        let t = &self.targets;
+        let min_skill = h.skill.iter().copied().reduce(f64::min);
+        [
+            ("expert_k_eff", h.k_eff_usage < t.min_k_eff),
+            ("expert_diversity", h.latent_cka_max.is_some_and(|c| c > t.max_expert_cka)),
+            ("ssl_skill", h.ssl_skill.is_some_and(|s| s < t.min_ssl_skill)),
+            ("expert_min_skill", min_skill.is_some_and(|s| s < t.min_skill)),
+        ]
+        .into_iter()
+        .filter_map(|(name, failed)| failed.then_some(name))
+        .collect()
+    }
+
+    pub fn on_health(&mut self, h: &ExpertHealth, now: Instant) -> Option<Trigger> {
+        if h.source != "live" {
             return None;
         }
-        let s = self.streak_corr.entry(ts.to_owned()).or_default();
-        *s = if resid_corr_max > self.resid_corr_max { *s + 1 } else { 0 };
+        let failed = self.health_failures(h);
+        let s = self.streak_corr.entry(h.timescale.clone()).or_default();
+        *s = if failed.is_empty() { 0 } else { *s + 1 };
         (*s >= SUSTAIN)
             .then_some(())
-            .and_then(|()| self.fire(Trigger::ResidCorr { ts: ts.into(), value: resid_corr_max }, now))
+            .and_then(|()| self.fire(Trigger::HealthBreach { ts: h.timescale.clone(), failed }, now))
     }
 
     /// Worst ECE of a serving sampler per timescale from model-runtime heartbeat counters.
@@ -200,7 +219,7 @@ pub fn spawn(bus: Bus, hub: Option<fa_hub::HubClient>, pg_url: Option<String>) {
 
 async fn run_triggers(bus: Bus, hub: fa_hub::HubClient) {
     let mut st = TriggerState::new(
-        env_f("FA_TRIGGER_RESID_CORR", 0.6),
+        ExpertTargets::from_env(),
         env_f("FA_TRIGGER_ECE", 0.15),
         env_dur("FA_TRIGGER_COOLDOWN", Duration::from_secs(6 * 3600)),
     );
@@ -213,14 +232,14 @@ async fn run_triggers(bus: Bus, hub: fa_hub::HubClient) {
         return;
     };
     tracing::info!(
-        resid_corr = st.resid_corr_max,
+        targets = ?st.targets,
         ece = st.ece_max,
         cooldown_s = st.cooldown.as_secs(),
         "drift triggers armed"
     );
     loop {
         let fired: Vec<Trigger> = tokio::select! {
-            Some((_, h)) = health.next() => st.on_health(&h.timescale, &h.source, h.resid_corr_max, Instant::now()).into_iter().collect(),
+            Some((_, h)) = health.next() => st.on_health(&h, Instant::now()).into_iter().collect(),
             Some((_, b)) = beats.next() => st.on_heartbeat(&b.counters.into_iter().collect(), Instant::now()),
             Some((_, r)) = results.next() => {
                 let v: Value = serde_json::from_slice(&r.result).unwrap_or_default();
@@ -316,20 +335,42 @@ mod tests {
     #[test]
     fn triggers_need_sustain_and_respect_the_cooldown() {
         let t0 = Instant::now();
-        let mut st = TriggerState::new(0.6, 0.15, Duration::from_secs(3600));
-        assert!(st.on_health("1m", "validation", 0.9, t0).is_none(), "fit-time health does not trigger");
-        assert!(st.on_health("1m", "live", 0.9, t0).is_none());
-        assert!(st.on_health("1m", "live", 0.9, t0).is_none());
-        assert!(matches!(st.on_health("1m", "live", 0.9, t0), Some(Trigger::ResidCorr { .. })));
+        let targets = ExpertTargets {
+            min_k_eff: 2.0,
+            max_expert_cka: 0.7,
+            min_ssl_skill: 0.1,
+            min_skill: 0.02,
+            max_resid_corr: 0.1,
+        };
+        let h = |ts: &str, source: &str, k_eff_usage: f64| ExpertHealth {
+            timescale: ts.into(),
+            source: source.into(),
+            k_eff_usage,
+            skill: vec![0.2, 0.1],
+            resid_corr_max: 0.99, // high by design since D-099: never triggers on its own
+            ..Default::default()
+        };
+        let mut st = TriggerState::new(targets, 0.15, Duration::from_secs(3600));
+        assert!(st.health_failures(&h("1m", "live", 3.0)).is_empty(), "healthy despite resid corr 0.99");
+        let bad = ExpertHealth { latent_cka_max: Some(0.95), ssl_skill: Some(0.01), ..h("1m", "live", 1.2) };
+        assert_eq!(st.health_failures(&bad), ["expert_k_eff", "expert_diversity", "ssl_skill"]);
+        assert_eq!(
+            st.health_failures(&ExpertHealth { skill: vec![0.2, -0.1], ..h("1m", "live", 3.0) }),
+            ["expert_min_skill"]
+        );
+        assert!(st.on_health(&h("1m", "validation", 1.0), t0).is_none(), "fit-time health does not trigger");
+        assert!(st.on_health(&h("1m", "live", 1.0), t0).is_none());
+        assert!(st.on_health(&h("1m", "live", 1.0), t0).is_none());
+        assert!(matches!(st.on_health(&h("1m", "live", 1.0), t0), Some(Trigger::HealthBreach { .. })));
         for _ in 0..5 {
-            assert!(st.on_health("1m", "live", 0.9, t0 + Duration::from_secs(60)).is_none(), "cooldown");
+            assert!(st.on_health(&h("1m", "live", 1.0), t0 + Duration::from_secs(60)).is_none(), "cooldown");
         }
-        // a dip resets the streak
-        let mut st = TriggerState::new(0.6, 0.15, Duration::from_secs(1));
-        st.on_health("1s", "live", 0.9, t0);
-        st.on_health("1s", "live", 0.1, t0);
-        st.on_health("1s", "live", 0.9, t0);
-        assert!(st.on_health("1s", "live", 0.9, t0).is_none());
+        // a healthy report resets the streak
+        let mut st = TriggerState::new(targets, 0.15, Duration::from_secs(1));
+        st.on_health(&h("1s", "live", 1.0), t0);
+        st.on_health(&h("1s", "live", 3.0), t0);
+        st.on_health(&h("1s", "live", 1.0), t0);
+        assert!(st.on_health(&h("1s", "live", 1.0), t0).is_none());
         // ECE of the serving sampler only
         let hb: HashMap<String, f64> = [
             ("mcmc.1m.e0.smc.ece".to_owned(), 0.3),

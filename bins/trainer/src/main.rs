@@ -191,6 +191,15 @@ enum Cmd {
         /// (repeatable; the recorded holdouts are always excluded when readable).
         #[arg(long)]
         holdout_ms: Vec<String>,
+        /// Offline: train on `N` synthetic instruments instead of loaded bars (not market data,
+        /// no holdouts apply). `N:K` plants `K` independent regime-switching factors
+        /// (`generation::synthetic_factor_bars`, the twin of `go/connectors/synthetic`); `N` alone
+        /// uses the per-instrument regime generator (`generation::synthetic_bars`).
+        #[arg(long)]
+        synthetic: Option<String>,
+        /// Bars per synthetic instrument.
+        #[arg(long, default_value_t = 3000)]
+        synthetic_bars: usize,
     },
     /// One encoder generation through the spec 36 §4.1 state machine (data freeze → family
     /// candidates → Pareto selection → re-embedding → regions → MCMC init → decoder / strategy
@@ -413,7 +422,7 @@ async fn main() -> anyhow::Result<()> {
             );
             return Ok(());
         }
-        Cmd::Sweep { fit, grid, bars_cache, holdout_ms } => {
+        Cmd::Sweep { fit, grid, bars_cache, holdout_ms, synthetic, synthetic_bars } => {
             let spec = fit.spec()?;
             let family = neural_fit::family_of(&spec)?
                 .ok_or_else(|| anyhow::anyhow!("sweep needs a neural --family (fsq_hybrid | jepa_vae | ...)"))?;
@@ -422,9 +431,24 @@ async fn main() -> anyhow::Result<()> {
                 None => grid,
             };
             let grid: Vec<serde_json::Value> = serde_json::from_str(&grid_text)?;
-            let history: Vec<data::BarHistory> = match bars_cache.as_ref().filter(|p| p.exists()) {
-                Some(p) => serde_json::from_slice(&std::fs::read(p)?)?,
-                None => {
+            let synthetic = synthetic.as_deref().map(generation::parse_synthetic).transpose()?;
+            let history: Vec<data::BarHistory> = match (synthetic, bars_cache.as_ref().filter(|p| p.exists())) {
+                (Some((n, k)), _) => {
+                    let step = data::step_ms(spec.timescale);
+                    let end = synthetic_bars as i64 * step;
+                    let h = match k {
+                        Some(k) => {
+                            generation::synthetic_factor_bars(spec.timescale, n, k, synthetic_bars, end, spec.seed)
+                        }
+                        None => generation::synthetic_bars(spec.timescale, n, synthetic_bars, end, spec.seed),
+                    };
+                    if let Some(p) = &bars_cache {
+                        std::fs::write(p, serde_json::to_vec(&h)?)?;
+                    }
+                    h
+                }
+                (None, Some(p)) => serde_json::from_slice(&std::fs::read(p)?)?,
+                (None, None) => {
                     let (start_ms, end_ms) = data::window(spec.timescale, spec.window_hours, data::now_ms());
                     let h = data::load_set(
                         &tsdb,
@@ -443,8 +467,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             // spec 36 §6.1 / acceptance 7: a sweep trains too, so cached or loaded bars lose every
-            // locked holdout (+ embargo) like a fit's
-            let history = sweep_exclude_holdouts(history, svc.pg_url, spec.timescale, &holdout_ms).await?;
+            // locked holdout (+ embargo) like a fit's (synthetic bars are not market data)
+            let history = if synthetic.is_some() {
+                history
+            } else {
+                sweep_exclude_holdouts(history, svc.pg_url, spec.timescale, &holdout_ms).await?
+            };
             let (dev, _) = fa_expert_space::nn::device_from_str(spec.device.as_deref().unwrap_or("cpu"));
             neural_fit::sweep(family, spec.timescale, &history, &grid, spec.seed, &dev, |row| {
                 println!("{row}");

@@ -107,7 +107,20 @@ Decoder genomes select an **expert subset mask** (spec 34). Strategies read `Exp
 ### 6.2 Projection to the expert manifold
 Each expert has a projector (small MLP / attention pool) → Gaussian `(mu, logvar)` in `R^expert_dim`. This is the dimensionality reduction from the large encoder latent to the "expert space". For discrete families (spec 31 family 1), the expert also carries its code subset.
 
-### 6.3 Objective (proposal — core blocker #2)
+### 6.3 Objective (decided 2026-11-13, D-099)
+**Owner decision (2026-11-13):** *"These spaces need to be end to end trained on some sort of reconstruction target, so it makes sense that the latent space does not portray residual correlation."* Residual decorrelation is therefore **no longer an objective requirement nor a promotion gate**; the expert spaces are trained end to end (backbone → router + experts → heads, one optimiser) on the family's reconstruction / SSL target plus next step:
+
+`L_32 = λ_ssl L_ssl + λ_next Σ_k L_pred,k + λ_mix L_mix + λ_div L_div + λ_bal L_balance + β KL [+ λ_dec L_decor]`
+
+- `L_ssl` — reconstruction of the window's last `recon_steps` (8) bars from the gated expert latents `Σ_k p_k mu_k H_k (+ b)` for the reconstructing families (`fsq_hybrid`, `hier_vae_flow` — with the top latent —, `latent_diffusion`), the EMA target encoder's embedding of the window `jepa_horizon` steps ahead for `jepa_vae`; `λ_ssl` 1 (default for every family).
+- `L_pred,k`, `L_mix` — per-expert and mixture next-step losses on `[next return, |next return|, next range]` as before (`gated_pred` 0.5).
+- `L_div` — **expert diversity**: `Σ_{i<j} CKA_lin(mu_i, mu_j)` over the minibatch (`moe::latent_cka_loss`), `λ_div` 0.3. Without it end-to-end training makes every expert encode the same dominant directions (validation latent CKA 0.99–1.0 on synthetic factor data, round 5), i.e. copies; a mean over pairs instead of the sum left the 8-expert day ladder at CKA ≈ 1, and `λ_div` 1 (sum) collapsed the router there.
+- `L_balance` — Switch load balancing, `λ_bal` 0.1 (0.01 let the router collapse onto one expert once the experts differ).
+- `L_decor` — the D-008 residual decorrelation below, **`λ_dec` 0 by default** (optional regulariser; the genes `lambda_dec`, `decor_scalar`, `decor_dual_lr`/`decor_eps`, `decor_holdout`, `cov_ema`, `lambda_ncl`, `lambda_skill`, the head refit and the `head_solver`s stay available, none is on by default). Residual correlation stays a reported diagnostic (§6.4).
+
+The rest of this section is the pre-D-099 proposal and its implementation, kept for the record.
+
+*Pre-D-099 proposal (core blocker #2):*
 Per expert `k`, a next-step predictor gives residuals `r_k = y_{t+1} − ŷ_k`, where `y` holds next-step targets (returns, vol, next latent) of the timescale. Over a batch, let `R ∈ R^{N×K}` (scalarised residual per expert, or residual vectors per target dimension).
 
 `L_32 = Σ_k L_pred,k  +  λ_dec · L_decor(R)  +  λ_gen · L_gen  +  λ_bal · L_balance  +  β · KL_k`
@@ -123,7 +136,7 @@ with:
 
 The weights `λ_dec, λ_gen` are tunable and may be **evolved** as encoder genes (spec 34 Pareto then decides the trade-off).
 
-*Implemented form:* residuals are vector-valued over the three next-step targets of spec 31 §6.5 (`[next return, |next return|, next range]`, normalised); `L_decor = mean_targets Σ_{i≠j} corr_w(r_i, r_j)²` over the minibatch with each window weighted by the **detached** router probabilities `p_i·p_j` (`moe::decorrelation_loss_gated`: the "gated windows" of the proposal in soft form — experts only have to disagree where both are routed, and the router cannot lower the penalty by separating them alone; no EMA of the covariance), `L_pred,k` is half ungated (every expert on every window, the gen-0 "each expert carries information" term) and half gate-weighted (`gated_pred` 0.5), `L_balance` is the Switch form `K · Σ f_i p_i` (auxiliary-loss balancing, not the bias-adjustment variant), `L_gen` at gen 0 is per-expert next-step prediction plus the family's SSL head, from gen 1 the D-009 frozen-decoder term. Defaults `λ_dec 1.0`, `λ_bal 0.01`, `β 1e-3`. Further genes of the objective (spec 31 `NeuralConfig`): `decor_scalar` (decorrelate the scalarised residual the §6.4 health measures instead of each target — both forms are allowed above), `decor_dual_lr` / `decor_eps` (open question 1 option (e): `λ_dec` by projected dual ascent on `L_decor ≤ ε`, checkpointed), `lambda_skill` / `skill_floor` (the `min_skill` collapse guard as a hinge on each expert's routed error ratio), `lambda_ncl` (option (c), negative-correlation learning on the scalarised predictions) and `head_refit_steps` (a full-batch refit of the per-expert next-step heads on frozen latents with exact correlations instead of minibatch estimates). Observed on live 1m bars (9 instruments, 12 h): `λ_dec = 1` reaches `K_eff ≈ 2.6` of 4 with residual correlations up to 0.64; `λ_dec = 0.1` gives better per-expert skill (≈ 0.25) but `K_eff ≈ 1.3` — the independence/skill trade-off of open question 1 is real on market data, and the 0.1 health target is not met by either.
+*Implemented form (pre-D-099):* residuals are vector-valued over the three next-step targets of spec 31 §6.5 (`[next return, |next return|, next range]`, normalised); `L_decor = mean_targets Σ_{i≠j} corr_w(r_i, r_j)²` over the minibatch with each window weighted by the **detached** router probabilities `p_i·p_j` (`moe::decorrelation_loss_gated`: the "gated windows" of the proposal in soft form — experts only have to disagree where both are routed, and the router cannot lower the penalty by separating them alone; no EMA of the covariance), `L_pred,k` is half ungated (every expert on every window, the gen-0 "each expert carries information" term) and half gate-weighted (`gated_pred` 0.5), `L_balance` is the Switch form `K · Σ f_i p_i` (auxiliary-loss balancing, not the bias-adjustment variant), `L_gen` at gen 0 is per-expert next-step prediction plus the family's SSL head, from gen 1 the D-009 frozen-decoder term. Defaults then `λ_dec 1.0`, `λ_bal 0.01`, `β 1e-3` (since D-099: `λ_dec 0`, `λ_div 0.3`, `λ_bal 0.1`). Further genes of the objective (spec 31 `NeuralConfig`): `decor_scalar` (decorrelate the scalarised residual the §6.4 health measures instead of each target — both forms are allowed above), `decor_dual_lr` / `decor_eps` (open question 1 option (e): `λ_dec` by projected dual ascent on `L_decor ≤ ε`, checkpointed), `lambda_skill` / `skill_floor` (the `min_skill` collapse guard as a hinge on each expert's routed error ratio), `lambda_ncl` (option (c), negative-correlation learning on the scalarised predictions) and `head_refit_steps` (a full-batch refit of the per-expert next-step heads on frozen latents with exact correlations instead of minibatch estimates). Observed on live 1m bars (9 instruments, 12 h): `λ_dec = 1` reaches `K_eff ≈ 2.6` of 4 with residual correlations up to 0.64; `λ_dec = 0.1` gives better per-expert skill (≈ 0.25) but `K_eff ≈ 1.3` — the independence/skill trade-off of open question 1 is real on market data, and the 0.1 health target is not met by either.
 
 #### 6.3.1 Can the checklist be met on the live data? (evidence, 2026-11-11)
 **Bound.** Write an expert's prediction as `ŷ_k = f + d_k` with `f` the conditional mean and `d_k` any function of the window, so `d_k ⟂ ε` out of sample. The scalarised residual is `ē − d̄_k`; for two experts sharing windows its correlation is smallest when `d̄_j = −d̄_i`, giving `(V − D)/(V + D)` with `V = var(ē)` and `D ≤` the mean per-target deviation energy, while each expert's skill is at most `R̄² − D`. Both `|corr| ≤ c` and `skill ≥ s` are therefore reachable only if `R̄² − s ≥ V (1 − c)/(1 + c)`; with three experts sharing every window (needed, since two experts give `K_eff = 2/(1 + corr²) < 2`) the pairwise version needs `D ≥ 1.5 V`. A residual correlation near 0 is **not** reachable for skilled experts when the irreducible noise dominates — it requires the experts to disagree, symmetrically, by about as much as the noise. `trainer sweep` reports the margin `R̄² − s − V(1 − c)/(1 + c)` estimated by the trained mixture.
@@ -144,9 +157,29 @@ The weights `λ_dec, λ_gen` are tunable and may be **evolved** as encoder genes
 - K 4 + split (top-1, constrained): `K_eff` 3.78, corr 0.28, skills 0.34 / 0.79 / 0.29 / −0.59 — more experts lower the correlation but one expert always pays.
 The pattern of rounds 3–4 is consistent: every method that reaches correlation ≤ 0.1 in sample gets it from directions that do not hold on validation, and every method restricted to generalising directions (hold-out, planted disagreement from noise-free moments) either stops decorrelating or costs an expert its skill. With ≈ 35 h of history the 0.1 / 0.02 / 2 checklist is **not met**; thresholds unchanged, nothing promoted.
 
+**Round 5 — end-to-end reconstruction, new item 2, synthetic factor data (2026-11-13, D-099).** Data: `trainer sweep --synthetic 6:3 --synthetic-bars 3000` (`generation::synthetic_factor_bars`: 6 instruments on 3 independent factors, calm/volatile regimes redrawn every 40 steps, vol 0.001/0.006, drift 0.0003/−0.0005, idiosyncratic 0.0005, loadings `1 + 0.2·N(0,1)` on factor `k mod 3`, `0.2·N(0,1)` elsewhere — the twin of `go/connectors/synthetic`), default genomes (`NeuralConfig::for_timescale`, 600 steps, 1m; `latent_diffusion` at 1d per D-010), release build, 3 threads per run, 1–3 min per fit; 15 % time-ordered validation split. Item 2 on validation (usage `K_eff` ≥ 2, latent CKA ≤ 0.9, SSL skill ≥ 0.05, min skill ≥ 0.02, no collapse):
+
+| family | seed | K | usage K_eff | latent CKA max | SSL skill | min skill | resid corr max | residual K_eff | pass |
+|---|---|---|---|---|---|---|---|---|---|
+| fsq_hybrid | 1 / 2 / 3 | 4 | 3.96 / 3.84 / 3.60 | 0.10 / 0.10 / 0.08 | 0.40 / 0.39 / 0.40 | 0.21 / 0.14 / 0.19 | 0.99–1.00 | 1.03–1.12 | ✓ ✓ ✓ |
+| hier_vae_flow | 1 / 2 / 3 | 4 | 3.96 / 3.86 / 3.47 | 0.06 / 0.25 / 0.46 | 0.40 / 0.39 / 0.40 | 0.19 / 0.14 / 0.17 | 1.00 | 1.01–1.02 | ✓ ✓ ✓ |
+| jepa_vae | 1 / 2 / 3 | 4 | 3.76 / 3.80 / 3.69 | 0.09 / 0.07 / 0.10 | 0.59 / 0.69 / 0.60 | 0.19 / 0.16 / 0.17 | 1.00 | 1.02 | ✓ ✓ ✓ |
+| latent_diffusion (1d) | 1 / 2 / 3 | 8 | 7.48 / 6.62 / 7.72 | 0.19 / 0.11 / 0.09 | 0.41 / 0.42 / 0.42 | 0.19 / 0.14 / 0.15 | 1.00 | 1.02–1.04 | ✓ ✓ ✓ |
+
+Ablations (seed 1): **without the diversity term** (`λ_div` 0) every family fails on diversity — latent CKA 0.995 (fsq), 0.999 (jepa, hvf), 1.000 (ldm): end-to-end reconstruction alone makes the experts copies. `λ_div` as a *mean* over pairs at 0.3 (fsq: CKA 0.99) and at 1 (8-expert ldm: 0.999) is too weak; as a sum at 1 the 8-expert ldm router collapses to 2 experts (usage `K_eff` 1.95), at 3–10 with `λ_bal` 0.01 fsq's router collapses (usage `K_eff` 1.0–1.5). `λ_bal` 0.1 / 0.3 / 1 all pass with diversity on; bias balancing (`bias_rate` 0.01) does not (usage `K_eff` 1.03). Router entropy (normalised, seed 1): fsq 0.94 (near-uniform soft routing), hvf 0.64, jepa 0.63, ldm 0.68 — routing is input-dependent for three families; in-sample CKA equals validation CKA within 0.03 (the diversity is structural and generalises, unlike the residual decorrelation of rounds 1–4). As expected under D-099 the experts' next-step residuals stay almost identical (correlation 0.99–1.00, residual `K_eff` ≈ 1), which no longer gates. Every default genome passes the new item 2 on this data; **real-data evaluation is left for the final live round.**
+
 ### 6.4 Measured quantities (health)
+**Since D-099** the checklist (spec 36 §6.4 item 2) reads, on the validation windows of each fit:
+- **Usage `K_eff`** `k_eff_usage = (Σu)² / Σu²` over the experts' usage `u` (mean router probability): how many experts the router actually uses.
+- **Expert diversity** `latent_cka [K][K]`: linear CKA between the experts' posterior-mean latents over the validation windows, and `latent_cka_max` (largest off-diagonal) — experts must be distinct representations, not copies.
+- **SSL skill** `ssl_skill = 1 − SSE / SSE_naive` of the family's SSL target, the naive predictor being its per-dimension training mean (over ≤ 2 048 training windows): reconstruction of the last bars (`recon_skill`, reconstructing families) or the JEPA target embedding (`jepa_vae`).
+- Per-expert next-step skill vs naive (below), collapse monitor (spec 31 §8).
+- Diagnostics: `router_entropy` (mean normalised router entropy per window: 1 = the router spreads every window uniformly), the residual correlation matrix and the **residual `K_eff`** (field `k_eff`, name kept for compatibility).
+Manifests carry `k_eff_usage`, `latent_cka_max`, `ssl_skill`, `recon_skill`, `router_entropy` next to the older metrics; `HealthReport::vm_series` adds `fa_expert_k_eff_usage`, `fa_expert_latent_cka_max`, `fa_expert_ssl_skill` (`src=validation`); model-runtime's live health adds the heartbeat gauge `expert.<ts>.k_eff_usage` and the `fa_expert_k_eff_usage{src=live}` series (latent CKA and SSL skill are not computed live: the `ExpertHealth` proto has no field for them).
+
+*Pre-D-099 list:*
 - Residual correlation matrix per timescale on a held-out validation window (not the locked holdout, spec 41).
-- **Effective number of independent experts:** `K_eff = (Σλ)² / Σλ²` over eigenvalues of the residual correlation matrix.
+- **Residual `K_eff`** (effective number of independent experts): `K_eff = (Σλ)² / Σλ²` over eigenvalues of the residual correlation matrix.
 - Per-expert skill vs naive baseline, calibration (PIT / CRPS) of `next_step`.
 - Per-expert decodability: best elite decoder score per family (spec 34).
 
@@ -166,40 +199,51 @@ The pattern of rounds 3–4 is consistent: every method that reaches correlation
 | `max_experts` | 16 | Per timescale |
 | `top_k` | 2 | |
 | `expert_dim` | 16 | |
-| `lambda_dec` | 1.0 | Evolvable |
+| `lambda_dec` | 0 (was 1.0; D-099) | Evolvable; optional regulariser |
+| `lambda_div` | 0.3 | Expert diversity (latent CKA, sum over pairs); D-099 |
+| `lambda_ssl` | 1.0 | Reconstruction / SSL weight (spec 31 `NeuralConfig`) |
 | `lambda_gen` | 1.0 | Evolvable |
-| `lambda_bal` | 0.01 | If aux-loss fallback used |
+| `lambda_bal` | 0.1 (was 0.01; D-099) | If aux-loss fallback used |
 | `cov_ema` | 0.99 | Residual covariance EMA |
 | `min_skill` | 2% better than naive (CRPS) | Collapse guard |
 | `prune_usage_below` | 0.01 | |
 | `prune_window` | 1 generation | |
-| `target_resid_corr_max` | 0.1 | Health target |
+| `target_resid_corr_max` | 0.1 | Informational since D-099 (`FA_PROMOTE_MAX_RESID_CORR`) |
+| min usage `K_eff` | 2 | Checklist, provisional (`FA_PROMOTE_MIN_K_EFF`) |
+| max expert latent CKA | 0.7 | Checklist, provisional (D-102) (`FA_PROMOTE_MAX_EXPERT_CKA`) |
+| min SSL skill | 0.1 | Checklist, provisional (D-102) (`FA_PROMOTE_MIN_SSL_SKILL`) |
 
 ## 8. Failure modes
 | Failure | Response |
 |---|---|
-| Router collapse (one expert takes everything) | Balancing kicks in; if `K_eff < 2` after training → snapshot not promotable (spec 36) |
-| Degenerate decorrelation (experts with no skill) | `min_skill` constraint fails → expert pruned or snapshot rejected |
-| Residual correlation spikes live (regime change) | Health signal on bus; strategies/allocator can widen uncertainty; can trigger refresh (spec 36) |
+| Router collapse (one expert takes everything) | Balancing kicks in; if usage `K_eff < 2` after training → snapshot not promotable (spec 36) |
+| Experts are copies (same representation) | Diversity term `λ_div`; `latent_cka_max > 0.9` → not promotable (D-099) |
+| Degenerate experts (no skill) | `min_skill` constraint fails → expert pruned or snapshot rejected |
+| Residual correlation spikes live (regime change) | Health signal on bus; strategies/allocator can widen uncertainty; can trigger refresh (spec 36). Since D-099 end-to-end trained experts share their next-step residuals (validation correlation ≈ 0.99 on synthetic data), so residual correlation no longer triggers a refresh: the trainer's drift trigger (off by default) fires when live expert health fails the item-2 targets (usage K_eff, latent CKA, SSL skill, min skill) on 3 consecutive reports (D-102) |
 | Expert count changes between generations | Lifecycle events. Decoders/strategies remap or re-evaluate (spec 34/35) |
 
 *Implemented:* a neural generation encodes the probe windows with parent and child, computes linear CKA per expert pair, matches greedily (threshold 0.5) and moves matched experts to the parent's index; the matrix and matches are in `manifest.feedback.expert_alignment`. The trainer then writes one Helix **`Expert`** node per surviving expert (`expert_uid = <snapshot>/e<expert_id>`, `expert_id` = the stable index, `dim`, validation `usage` / `skill`, `specialisation` = gate mass per instrument on the probe windows, `born_gen` inherited along the chain), **`ExpertOf`** → its `Snapshot`, **`AlignedTo{cka, kind: carry}`** → the parent-generation expert it continues, and `died_gen` on parent experts no child continues (`fa_hub::experts`: `upsert_expert`, `align_expert`, `retire_expert`, `snapshot_experts`, `expert_parents`, `expert_alignments`; catalog in `helix/schema.hx` / `queries.hx`). The `ExpertSpace <snapshot>-e<k>` nodes stay for regions and vectors.
 
 ## 9. Acceptance criteria
 **Remaining (why this spec stays):**
-- The health targets are not met on market data (§6.3.1, rounds 1–4). No fit reaches `K_eff ≥ 2`, residual correlation ≤ 0.1 and min skill ≥ 0.02 together on validation; decorrelation found in sample does not generalise, and the generalising fixes of round 4 either stop decorrelating or cost an expert its skill. Acceptance 1 holds only on synthetic tasks, and acceptance 2 is enforced but never passed by a learned snapshot. What would change this is more history (≈ 35 h usable after the holdout) or a spec decision on the target (e.g. decorrelating only the predictable targets' residuals) — an owner decision, not taken here.
+- The D-099 item 2 (usage `K_eff` ≥ 2, latent CKA ≤ 0.9, SSL skill ≥ 0.05, min skill ≥ 0.02, no collapse) is met by every default family on synthetic 3-factor data (§6.3.1 round 5) but has **not been evaluated on live market data** — that is the final live round.
+- The item 2 thresholds are **provisional** until the owner confirms them (D-099).
 
-*Done in round 4 (2026-11-11):* bias-adjustment balancing and expert split (§6.1), `cov_ema` (§6.3), PIT/CRPS calibration and per-expert decodability (§6.4), the `fa_expert_resid_corr` / `fa_expert_usage` series and per-eval matrices (§5), questions 1, 3, 5 (§10).
+*Superseded (owner decision 2026-11-13, D-099):* rounds 1–4 (§6.3.1) showed that `K_eff ≥ 2`, residual correlation ≤ 0.1 and min skill ≥ 0.02 are not met together on validation; residual decorrelation is no longer a criterion.
 
-*Status:* 1 in miniature (`moe::tests::two_experts_learn_decorrelated_specialisations`: two independent factors, two experts, both beat naive, decorrelation term < 0.2), not at `target_resid_corr_max` on market data (§6.3.1); 2 measured per snapshot (`skill_e<k>`), enforced by the checklist; 3 holds (`ExpertView` with every §4.2 field, Rust → Go fixture round trip); 4 implemented with threshold 0.5 (CKA placeholder 0.7 not used), `AlignedTo` edges in Helix; 5 emitted per generation in the manifest and `Expert` nodes, live on `latent.expert.health` for learned active snapshots, kept per snapshot by control-api (`GET /api/latent/{snapshot}/experts` → `health`) and shown on the console's Encoder snapshots page next to the validation health (round 3; not visible live yet because no learned snapshot is active).
-1. On a synthetic dataset built from K independent latent factors, the router recovers ≥ K−1 experts, and the residual correlation off-diagonal max is ≤ `target_resid_corr_max`.
+*Done in round 4 (2026-11-11):* bias-adjustment balancing and expert split (§6.1), `cov_ema` (§6.3), PIT/CRPS calibration and per-expert decodability (§6.4), the `fa_expert_resid_corr` / `fa_expert_usage` series and per-eval matrices (§5), questions 1, 3, 5 (§10). *Round 5 (2026-11-13):* end-to-end objective with the diversity term (§6.3), usage `K_eff` / latent CKA / SSL skill (§6.4), `trainer sweep --synthetic N:K`.
+
+*Status:* 1 holds on synthetic data for all four families, three seeds each (round 5); 2 measured per snapshot (`skill_e<k>`), enforced by the checklist, met on synthetic data; 3 holds (`ExpertView` with every §4.2 field, Rust → Go fixture round trip); 4 implemented with threshold 0.5 (CKA placeholder 0.7 not used), `AlignedTo` edges in Helix; 5 emitted per generation in the manifest and `Expert` nodes, live on `latent.expert.health` for learned active snapshots (live: usage `K_eff` gauge; latent CKA and SSL skill only from fits), kept per snapshot by control-api and shown on the console's Encoder snapshots page (the console does not show the D-099 metrics yet).
+1. On a synthetic dataset built from K independent latent factors, the default genome of each family passes item 2 on validation: usage `K_eff` ≥ 2 (≥ K−1), `latent_cka_max` ≤ 0.9, SSL skill ≥ 0.05, every expert's skill ≥ `min_skill`, no collapse. (Residual correlation is reported, not required.)
 2. Every active expert beats the naive baseline by ≥ `min_skill` on the validation window.
 3. The `ExpertView` proto round-trips between Rust and Go and contains every field listed in §4.2.
 4. Expert identity alignment keeps ids for experts with CKA ≥ 0.7 (placeholder) across two consecutive generations.
 5. Health metrics (§6.4) are emitted per generation and visible in the frontend latent explorer.
 
 ## 10. Open questions
-*Decided 2026-11-11 (provisional):* **Q1** — the loss is (a), the gated correlation penalty on next-step residuals (vector-valued per target, or scalarised as the health measures it: gene `decor_scalar`), with (e) available as dual ascent (`decor_dual_lr`, `decor_eps`), (c) as `lambda_ncl`, `cov_ema` and the decorrelation hold-out as genes, and an exact post-hoc head solve (`head_solver` `constrained` | `disagree`); (b) HSIC and (d) orthogonal gradients are not pursued (round 4 shows the obstacle is generalisation of any residual-dependence estimate, which neither changes). Targets: `[next return, |next return|, next range]` per timescale; the checklist measures the scalarised residual. Which genome wins is the Pareto selection's job (spec 36), not a fixed default. **Q3** — decoders see every expert with its gate (gated-off experts carry gate 0 and stay readable); selection is the decoder genome's expert mask, as implemented in `ExpertView`. **Q5** — asset sets are handled **outside** the router: cross-asset attention before the router (spec 31 §6.4, `asset_attn`) and MCMC priors; experts may specialise on assets emergently (the `Expert.specialisation` gate mass per instrument shows it) but are not forced to.
+*Decided 2026-11-13 (owner, D-099):* **Q1** — the spaces are trained end to end on reconstruction / SSL + next step with an expert-diversity term (latent CKA); residual decorrelation (options a–e below) is an optional regulariser, `λ_dec` 0 by default. **Q2** — λ weights are fixed genome defaults (evolvable genes). **Q6** — moot (no decorrelation requirement).
+
+*Decided 2026-11-11 (provisional, superseded for Q1 by D-099):* **Q1** — the loss is (a), the gated correlation penalty on next-step residuals (vector-valued per target, or scalarised as the health measures it: gene `decor_scalar`), with (e) available as dual ascent (`decor_dual_lr`, `decor_eps`), (c) as `lambda_ncl`, `cov_ema` and the decorrelation hold-out as genes, and an exact post-hoc head solve (`head_solver` `constrained` | `disagree`); (b) HSIC and (d) orthogonal gradients are not pursued (round 4 shows the obstacle is generalisation of any residual-dependence estimate, which neither changes). Targets: `[next return, |next return|, next range]` per timescale; the checklist measures the scalarised residual. Which genome wins is the Pareto selection's job (spec 36), not a fixed default. **Q3** — decoders see every expert with its gate (gated-off experts carry gate 0 and stay readable); selection is the decoder genome's expert mask, as implemented in `ExpertView`. **Q5** — asset sets are handled **outside** the router: cross-asset attention before the router (spec 31 §6.4, `asset_attn`) and MCMC priors; experts may specialise on assets emergently (the `Expert.specialisation` gate mass per instrument shows it) but are not forced to.
 
 1. **[Core blocker #2] The exact expert-space loss.** Blocks 31 (training loop), 34 (feedback form), 36. Options:
    - (a) Correlation penalty on residuals (default proposal, §6.3).

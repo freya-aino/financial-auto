@@ -609,9 +609,13 @@ pub async fn run(
         ("n_experts", tr.model.moe.n_active() as f64),
         ("experts_pruned", (before.len() - kept.len()) as f64),
         ("k_eff", h.k_eff),
+        ("k_eff_usage", h.k_eff_usage),
+        ("latent_cka_max", h.latent_cka_max),
+        ("ssl_skill", h.ssl_skill.unwrap_or(f64::NAN)),
         ("resid_corr_max", h.resid_corr_max),
         ("skill_min", h.skill_min()),
         ("mix_skill", post.mix_skill),
+        ("router_entropy", post.router_entropy),
         ("val_loss", post.loss.total),
         ("val_pred_loss", post.loss.pred),
         ("val_ssl_loss", post.loss.ssl),
@@ -625,6 +629,10 @@ pub async fn run(
         ("train_seconds", started.elapsed().as_secs_f64()),
     ] {
         metrics.insert(k.into(), v);
+    }
+    metrics.retain(|_, v| v.is_finite());
+    if let Some(r) = h.recon_skill {
+        metrics.insert("recon_skill".into(), r);
     }
     if let Some(last) = tr.log.last() {
         metrics.insert("train_loss".into(), last.total);
@@ -1057,7 +1065,10 @@ pub fn sweep(
         }
         let post = tr.evaluate(&ds, &val)?;
         let h = &post.health;
-        let pass = h.k_eff >= 2.0 && h.resid_corr_max <= 0.1 && h.skill_min() >= 0.02;
+        // checklist item 2 since D-099 (usage K_eff, latent CKA, SSL skill, min skill, collapse);
+        // the pre-D-099 residual verdict stays as `pass_residual` (informational)
+        let pass = crate::generation::ExpertTargets::from_env().passes(h);
+        let pass_residual = h.k_eff >= 2.0 && h.resid_corr_max <= 0.1 && h.skill_min() >= 0.02;
         // the same measures in sample (generalisation gap vs optimisation failure)
         let train_sub: Vec<(usize, usize)> =
             crate::fit::evenly(ds.train.len(), 2000).into_iter().map(|i| ds.train[i]).collect();
@@ -1066,12 +1077,19 @@ pub fn sweep(
             "i": i,
             "overrides": over,
             "pass": pass,
+            "pass_residual": pass_residual,
+            "k_eff_usage": h.k_eff_usage,
+            "latent_cka_max": h.latent_cka_max,
+            "latent_cka": h.latent_cka,
+            "ssl_skill": h.ssl_skill,
+            "recon_skill": h.recon_skill,
             "k_eff": h.k_eff,
             "resid_corr_max": h.resid_corr_max,
             "skill_min": h.skill_min(),
             "skill": h.skill,
             "usage": h.usage,
             "mix_skill": post.mix_skill,
+            "router_entropy": post.router_entropy,
             "target_skill": post.target_skill,
             "mix_resid_var": post.mix_resid_var,
             "feasibility_margin": feasibility_margin(post.mix_skill, post.mix_resid_var, 0.02, 0.1),
@@ -1084,6 +1102,8 @@ pub fn sweep(
             "oom_retries": tr.oom_retries,
             "asset_null": post.asset_null,
             "train_health": {
+                "k_eff_usage": tr_eval.health.k_eff_usage, "latent_cka_max": tr_eval.health.latent_cka_max,
+                "ssl_skill": tr_eval.health.ssl_skill,
                 "k_eff": tr_eval.health.k_eff, "resid_corr_max": tr_eval.health.resid_corr_max,
                 "skill": tr_eval.health.skill, "mix_skill": tr_eval.mix_skill,
             },

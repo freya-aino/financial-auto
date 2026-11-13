@@ -258,4 +258,10 @@ message ExpertHealth {
   double k_eff = 9;
   double resid_corr_max = 10;
   uint64 n_windows = 11;
+  // D-099: usage K_eff (Σu)²/Σu² gates promotion; residual K_eff (9) is informational.
+  double k_eff_usage = 12;
+  // Largest off-diagonal linear CKA between expert latents; ssl skill vs naive. Unset when the
+  // producer cannot compute them (live windows carry no latent buffer yet).
+  optional double latent_cka_max = 13;
+  optional double ssl_skill = 14;
 }

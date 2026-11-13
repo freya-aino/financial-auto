@@ -138,7 +138,7 @@ describe('models', () => {
 		const c = checklistRows(d);
 		expect(c.rows.map((r) => r.state)).toEqual(['fail', 'unknown']);
 		expect(c.notEvaluated).toEqual(['4 mcmc_ece']);
-		expect(missingNeuralChecks(d)).toEqual(['ssl_regression', 'expert_resid_corr', 'expert_min_skill']);
+		expect(missingNeuralChecks(d)).toEqual(['ssl_regression', 'expert_diversity', 'ssl_skill', 'expert_min_skill']);
 		expect(missingNeuralChecks({ ...d, snapshot: { ...d.snapshot, encoder_family: 'statistical' } })).toEqual([]);
 	});
 

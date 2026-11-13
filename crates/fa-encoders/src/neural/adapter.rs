@@ -63,6 +63,7 @@ fn ssl_only(model: &NeuralModel) -> NeuralTrainer {
     let mut m = model.clone();
     let c = &mut m.cfg;
     c.moe.lambda_dec = 0.0;
+    c.moe.lambda_div = 0.0;
     c.moe.lambda_bal = 0.0;
     c.moe.beta_kl = 0.0;
     c.moe.router_noise = 0.0;

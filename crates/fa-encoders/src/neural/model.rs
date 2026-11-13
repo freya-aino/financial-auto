@@ -24,8 +24,10 @@
 //!   plus a conditional diffusion model over the full expert latent that samples the latent
 //!   `jepa_horizon` steps ahead and scores latents under the unconditional prior.
 //!
-//! Both add the spec 32 terms (per-expert next-step loss, D-008 residual decorrelation, router
-//! load balancing, KL) and the mixture next-step loss that trains the router.
+//! All add the spec 32 terms (per-expert next-step loss, router load balancing, KL, the optional
+//! D-008 residual decorrelation — off by default since D-099) and the mixture next-step loss that
+//! trains the router; backbone, router, experts and heads are trained end to end on the family's
+//! reconstruction / SSL target plus next step (D-099).
 
 use std::collections::BTreeMap;
 
@@ -111,7 +113,8 @@ pub struct NeuralConfig {
     pub d_model: usize,
     pub layers: usize,
     pub moe: MoeConfig,
-    /// Bars reconstructed by `fsq_hybrid`.
+    /// Bars reconstructed from the gated expert latents by the reconstructing families
+    /// (`fsq_hybrid`, `hier_vae_flow`, `latent_diffusion`; weight `lambda_ssl`, default 1).
     pub recon_steps: usize,
     /// Steps ahead the `jepa_vae` target window ends (also the `latent_diffusion` future latent).
     pub jepa_horizon: usize,

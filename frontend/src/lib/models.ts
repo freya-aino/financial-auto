@@ -79,7 +79,8 @@ export function checklistRows(d: SnapshotDetail | null): { rows: (CheckItem & { 
 }
 
 /** The D-070 checklist items a neural snapshot must carry; missing ones are shown as gaps. */
-export const NEURAL_CHECKS = ['ssl_regression', 'expert_k_eff', 'expert_resid_corr', 'expert_min_skill'] as const;
+// D-099: expert_resid_corr is reported but no longer gates; diversity and SSL skill do.
+export const NEURAL_CHECKS = ['ssl_regression', 'expert_k_eff', 'expert_diversity', 'ssl_skill', 'expert_min_skill'] as const;
 
 export function missingNeuralChecks(d: SnapshotDetail | null): string[] {
 	if (!d || !isNeuralFamily(d.snapshot.encoder_family)) return [];

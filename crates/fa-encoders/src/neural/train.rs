@@ -1,10 +1,16 @@
 //! Training loop of the neural families (spec 31 §6.5, spec 32 §6.3, spec 36 §6.2–§6.3).
 //!
-//! `L = λ_next Σ_k L_pred,k + λ_mix L_mix + λ_dec L_decor + λ_bal L_balance + β KL + λ_ssl L_ssl
-//!      + λ_anchor L_anchor + λ_fb L_feedback`
+//! `L = λ_next Σ_k L_pred,k + λ_mix L_mix + λ_div L_div + λ_dec L_decor + λ_bal L_balance + β KL
+//!      + λ_ssl L_ssl + λ_anchor L_anchor + λ_fb L_feedback`
 //!
-//! * `L_ssl`: reconstruction of the last bars (fsq_hybrid) or the JEPA latent prediction against
-//!   the EMA target encoder (jepa_vae);
+//! trained end to end (backbone → router + experts → heads in one optimiser, D-099); `λ_dec`
+//! defaults to 0 (residual decorrelation is an optional regulariser, still logged as `decor`).
+//!
+//! * `L_div`: minibatch linear CKA between the experts' latents, summed over pairs (`moe.lambda_div`, default
+//!   0.3): experts must be distinct representations, not copies (D-099);
+//! * `L_ssl`: reconstruction of the last `recon_steps` bars from the gated expert latents
+//!   (fsq_hybrid, hier_vae_flow, latent_diffusion) or the JEPA latent prediction against the EMA
+//!   target encoder (jepa_vae);
 //! * `L_anchor` (D-007): soft-min distance of each expert's latents to the **previous generation's
 //!   region centroids** of the matched parent expert ([`Anchors`]);
 //! * `L_feedback` (D-009): auxiliary losses of frozen elite decoders on the expert latents,
@@ -21,7 +27,8 @@ use fa_core::rng::Rng;
 use fa_expert_space::{
     health::HealthReport,
     moe::{
-        DecorEma, decorrelation_loss_gated, decorrelation_loss_gated_ema, gaussian_kl, load_balance_loss, router_noise,
+        DecorEma, decorrelation_loss_gated, decorrelation_loss_gated_ema, gaussian_kl, latent_cka_loss,
+        load_balance_loss, router_noise,
     },
     nn::{Adam, from_safetensors, mse, scalar, to_safetensors},
 };
@@ -110,6 +117,9 @@ pub struct LossLog {
     pub feedback: f64,
     #[serde(default)]
     pub skill_hinge: f64,
+    /// Expert diversity term (minibatch linear CKA between experts' latents summed over pairs, D-099).
+    #[serde(default)]
+    pub div: f64,
     /// Flow-matching / diffusion loss of the family prior (families 2 and 4).
     #[serde(default)]
     pub prior: f64,
@@ -136,6 +146,10 @@ pub struct EvalReport {
     /// irreducible scalarised noise `V` every expert shares (spec 32 §6.3 feasibility bound).
     #[serde(default)]
     pub mix_resid_var: f64,
+    /// Mean over windows of the router's normalised entropy `H(p) / ln K` (1 = uniform routing on
+    /// every window, 0 = one expert per window): whether usage reflects input-dependent routing.
+    #[serde(default)]
+    pub router_entropy: f64,
     /// Mean cross-asset attention per own instrument → candidate instrument (`asset_attn`).
     #[serde(default)]
     pub asset_attn: BTreeMap<String, BTreeMap<String, f64>>,
@@ -413,18 +427,7 @@ impl NeuralTrainer {
             kl = (kl + gaussian_kl(&t.mu.unsqueeze(1)?, &t.logvar.unsqueeze(1)?)?)?;
         }
         let head = m.ssl_head_w(w, &f)?;
-        let ssl = match c.family {
-            NeuralFamily::JepaVae => {
-                let fut = b.future.as_ref().expect("future window");
-                let target = match &self.ema {
-                    Some(e) => backbone_forward(e as &dyn Weights, c, fut)?,
-                    None => backbone_forward(w, c, fut)?,
-                }
-                .detach();
-                mse(&head, &target)?
-            }
-            _ => mse(&head, b.recon.as_ref().expect("recon target"))?,
-        };
+        let ssl = mse(&head, &self.ssl_target(w, b)?)?;
         // family priors (stop-gradient into the encoder: they model the latents, the encoder is
         // trained by reconstruction / prediction)
         let prior = match c.family {
@@ -441,8 +444,10 @@ impl NeuralTrainer {
             }
             _ => None,
         };
+        let div = latent_cka_loss(&f.out.mu)?;
         let mut total = (pred.affine(c.lambda_next, 0.0)?
             + mix.affine(c.lambda_mix, 0.0)?
+            + div.affine(c.moe.lambda_div, 0.0)?
             + decor.affine(lambda_dec, 0.0)?
             + balance.affine(lambda_bal, 0.0)?
             + kl.affine(c.moe.beta_kl, 0.0)?
@@ -459,6 +464,7 @@ impl NeuralTrainer {
             pred: scalar(&pred)?,
             mix: scalar(&mix)?,
             decor: scalar(&decor)?,
+            div: scalar(&div)?,
             balance: scalar(&balance)?,
             kl: scalar(&kl)?,
             ssl: scalar(&ssl)?,
@@ -531,6 +537,46 @@ impl NeuralTrainer {
         }
         log.total = scalar(&total)?;
         Ok((total, log, f, new_ema))
+    }
+
+    /// The family's self-supervised target of a batch: the last `recon_steps` bars (reconstructing
+    /// families) or the EMA target encoder's embedding of the window `jepa_horizon` steps ahead
+    /// (`jepa_vae`, detached).
+    pub fn ssl_target(&self, w: &dyn Weights, b: &Batch) -> Result<Tensor> {
+        let c = &self.model.cfg;
+        match c.family {
+            NeuralFamily::JepaVae => {
+                let fut = b.future.as_ref().expect("future window");
+                Ok(match &self.ema {
+                    Some(e) => backbone_forward(e as &dyn Weights, c, fut)?,
+                    None => backbone_forward(w, c, fut)?,
+                }
+                .detach())
+            }
+            _ => Ok(b.recon.as_ref().expect("recon target").clone()),
+        }
+    }
+
+    /// Per-dimension mean of the SSL target over (up to `max_windows` evenly spaced) training
+    /// windows: the naive predictor of [`HealthReport::ssl_skill`].
+    pub fn ssl_target_mean(&self, ds: &Dataset, max_windows: usize) -> Result<Vec<f64>> {
+        let stride = (ds.train.len() / max_windows.max(1)).max(1);
+        let idx: Vec<(usize, usize)> = ds.train.iter().step_by(stride).copied().collect();
+        let mut acc: Vec<f64> = Vec::new();
+        let mut n = 0usize;
+        for chunk in idx.chunks(256) {
+            let b = self.batch(ds, chunk)?;
+            for row in self.ssl_target(&self.model.ps, &b)?.to_vec2::<f32>()? {
+                if acc.is_empty() {
+                    acc = vec![0.0; row.len()];
+                }
+                for (a, v) in acc.iter_mut().zip(&row) {
+                    *a += f64::from(*v);
+                }
+                n += 1;
+            }
+        }
+        Ok(acc.into_iter().map(|a| a / n.max(1) as f64).collect())
     }
 
     /// `n` optimisation steps; returns the last step's log.
@@ -736,6 +782,7 @@ impl NeuralTrainer {
         let mut gates: Vec<Vec<f32>> = Vec::new();
         let mut usage = vec![0.0; k];
         let (mut naive, mut mixsq, mut n) = (0.0, 0.0, 0usize);
+        let mut router_h = 0.0f64;
         let mut t_naive = [0.0f64; N_TARGETS];
         let mut t_sq = [0.0f64; N_TARGETS];
         let mut mix_scalar: Vec<f64> = Vec::new();
@@ -749,9 +796,20 @@ impl NeuralTrainer {
         let mut attn_sum: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
         let mut attn_n: BTreeMap<String, f64> = BTreeMap::new();
         let mut null_sum = 0.0;
+        // D-099: SSL skill vs the per-dimension training mean of the target
+        let ssl_mean = self.ssl_target_mean(ds, 2048)?;
+        let (mut ssl_sse, mut ssl_naive) = (0.0f64, 0.0f64);
         for chunk in windows.chunks(256) {
             let b = self.batch(ds, chunk)?;
             let (_, log, f) = self.losses(&b, None)?;
+            let head = self.model.ssl_head(&f)?.to_vec2::<f32>()?;
+            let target = self.ssl_target(&self.model.ps, &b)?.to_vec2::<f32>()?;
+            for (hr, tr) in head.iter().zip(&target) {
+                for (j, (hv, tv)) in hr.iter().zip(tr).enumerate() {
+                    ssl_sse += f64::from(hv - tv).powi(2);
+                    ssl_naive += (f64::from(*tv) - ssl_mean.get(j).copied().unwrap_or(0.0)).powi(2);
+                }
+            }
             let mu3 = f.out.mu.to_vec3::<f32>()?;
             let pr3 = f.out.pred.to_vec3::<f32>()?;
             let code2 = match &f.out.codes {
@@ -786,6 +844,7 @@ impl NeuralTrainer {
                 (&mut sum.pred, log.pred),
                 (&mut sum.mix, log.mix),
                 (&mut sum.decor, log.decor),
+                (&mut sum.div, log.div),
                 (&mut sum.balance, log.balance),
                 (&mut sum.kl, log.kl),
                 (&mut sum.ssl, log.ssl),
@@ -807,6 +866,10 @@ impl NeuralTrainer {
                     usage[e] += f64::from(p[bi][e]);
                 }
                 gates.push(fa_expert_space::moe::top_k_gates(&p[bi], top_k));
+                if k > 1 {
+                    let h: f64 = p[bi].iter().map(|v| f64::from(*v)).filter(|v| *v > 0.0).map(|v| -v * v.ln()).sum();
+                    router_h += h / (k as f64).ln();
+                }
                 let yy = y[bi].iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / N_TARGETS as f64;
                 y2.push(yy);
                 ys.push(y[bi].iter().map(|v| f64::from(*v)).collect());
@@ -831,6 +894,7 @@ impl NeuralTrainer {
             &mut sum.pred,
             &mut sum.mix,
             &mut sum.decor,
+            &mut sum.div,
             &mut sum.balance,
             &mut sum.kl,
             &mut sum.ssl,
@@ -857,7 +921,11 @@ impl NeuralTrainer {
             health = health.with_calibration(&ys, &means, &sd, &gates);
         }
         let code_rows: Vec<Vec<u32>> = if self.model.cfg.moe.fsq_levels.is_empty() { Vec::new() } else { codes };
-        health = health.with_collapse(&mus, &code_rows);
+        health = health.with_collapse(&mus, &code_rows).with_diversity(&mus).with_ssl(
+            ssl_sse,
+            ssl_naive,
+            self.model.cfg.reconstructs(),
+        );
         for (own, m) in attn_sum.iter_mut() {
             let cnt = attn_n.get(own).copied().unwrap_or(1.0);
             for v in m.values_mut() {
@@ -874,6 +942,7 @@ impl NeuralTrainer {
             mix_skill: if naive > 0.0 { 1.0 - mixsq / naive } else { 0.0 },
             target_skill,
             mix_resid_var,
+            router_entropy: router_h / nf,
             asset_null: if attn_n.is_empty() { 0.0 } else { null_sum / nf },
             asset_attn: attn_sum,
             n,

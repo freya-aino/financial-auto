@@ -1,7 +1,10 @@
 //! Learned expert space (spec 32 §4.1, §6.1–§6.3; D-008): a gated mixture of `K_max` experts on
-//! top of an encoder's pooled hidden state, trained with the D-008 objective
+//! top of an encoder's pooled hidden state, trained end to end with the encoder (D-099)
 //!
-//! `L_32 = Σ_k L_pred,k + λ_dec · Σ_{i≠j} corr(r_i, r_j)² + λ_bal · L_balance + β · KL`
+//! `L_32 = Σ_k L_pred,k + λ_bal · L_balance + β · KL [+ λ_dec · Σ_{i≠j} corr(r_i, r_j)²]`
+//!
+//! (plus the family's reconstruction / SSL term, `fa-encoders::neural`). The D-008 residual
+//! decorrelation term is an **optional regulariser** since D-099: `lambda_dec` defaults to 0.
 //!
 //! * **Router**: a linear gate → softmax over `K_max`; during training a seeded Gumbel-style
 //!   noise is added to the logits (noisy gating). Live inference keeps the top-k gates
@@ -37,7 +40,11 @@ pub struct MoeConfig {
     /// Finite-scalar-quantisation levels of the leading dims (empty = fully continuous).
     #[serde(default)]
     pub fsq_levels: Vec<u32>,
+    /// Weight of the D-008 residual decorrelation term — an optional regulariser since D-099
+    /// (default 0: the spaces are trained end to end on reconstruction + next step).
     pub lambda_dec: f64,
+    /// Weight of the Switch load-balancing loss (default 0.1 since D-099: with the diversity term
+    /// on, 0.01 let the router collapse onto one expert on the synthetic factor data).
     pub lambda_bal: f64,
     pub beta_kl: f64,
     /// Std of the router noise during training (0 = off).
@@ -59,10 +66,20 @@ pub struct MoeConfig {
     /// rather than one ([`decorrelation_loss_gated_ema`]). 0 = minibatch only.
     #[serde(default)]
     pub cov_ema: f64,
+    /// Weight of the expert **diversity** term (D-099): the sum over expert pairs of the
+    /// minibatch linear CKA between their latents ([`latent_cka_loss`]), so experts become
+    /// distinct representations of the window rather than copies (end-to-end reconstruction
+    /// alone lets every expert encode the same dominant directions).
+    #[serde(default = "default_lambda_div")]
+    pub lambda_div: f64,
 }
 
 fn default_bias_rate() -> f64 {
     1e-3
+}
+
+fn default_lambda_div() -> f64 {
+    0.3
 }
 
 impl Default for MoeConfig {
@@ -72,14 +89,15 @@ impl Default for MoeConfig {
             expert_dim: 8,
             top_k: 2,
             fsq_levels: Vec::new(),
-            lambda_dec: 1.0,
-            lambda_bal: 0.01,
+            lambda_dec: 0.0,
+            lambda_bal: 0.1,
             beta_kl: 1e-3,
             router_noise: 0.3,
             prune_usage_below: 0.05,
             balance: String::new(),
             bias_rate: default_bias_rate(),
             cov_ema: 0.0,
+            lambda_div: default_lambda_div(),
         }
     }
 }
@@ -462,6 +480,38 @@ pub fn decorrelation_loss_gated(resid: &Tensor, probs: &Tensor) -> Result<Tensor
     acc.expect("k ≥ 2").affine(2.0 / t as f64, 0.0)
 }
 
+/// Differentiable expert-diversity term (D-099): the **sum** over expert pairs `i < j` of the
+/// linear CKA `‖X_iᵀX_j‖_F² / (‖X_iᵀX_i‖_F · ‖X_jᵀX_j‖_F)` between the column-centred latents
+/// `X_k = mu[:, k, :]` of the minibatch (`mu [B, K, d]`), so every pair is pushed apart with the
+/// same weight whatever `K` (a mean over pairs left the 8-expert day ladder at CKA ≈ 1 on the
+/// synthetic factor data). 0 for fewer than two experts or rows. The host-side measure is
+/// [`crate::health::latent_cka`].
+pub fn latent_cka_loss(mu: &Tensor) -> Result<Tensor> {
+    let (b, k, _) = mu.dims3()?;
+    if k < 2 || b < 3 {
+        return Tensor::zeros((), DType::F32, mu.device());
+    }
+    let xs: Vec<Tensor> = (0..k)
+        .map(|e| {
+            let x = mu.narrow(1, e, 1)?.squeeze(1)?;
+            x.broadcast_sub(&x.mean_keepdim(0)?)
+        })
+        .collect::<Result<_>>()?;
+    let fro = |a: &Tensor, c: &Tensor| a.t()?.matmul(c)?.sqr()?.sum_all();
+    let selfn: Vec<Tensor> = xs.iter().map(|x| (fro(x, x)? + 1e-12)?.sqrt()).collect::<Result<_>>()?;
+    let mut acc: Option<Tensor> = None;
+    for i in 0..k {
+        for j in (i + 1)..k {
+            let c = fro(&xs[i], &xs[j])?.div(&((&selfn[i] * &selfn[j])? + 1e-12)?)?;
+            acc = Some(match acc {
+                Some(a) => (a + c)?,
+                None => c,
+            });
+        }
+    }
+    Ok(acc.expect("k ≥ 2"))
+}
+
 /// Switch-style load balancing `K · Σ_i f_i p_i` on router probabilities `[B, K]` (1 = balanced).
 pub fn load_balance_loss(probs: &Tensor) -> Result<Tensor> {
     let (b, k) = probs.dims2()?;
@@ -627,6 +677,31 @@ mod tests {
         let c = code.to_vec1::<f32>().unwrap();
         assert!(c.iter().all(|x| *x >= 0.0 && *x < 100.0), "{c:?}");
         assert_ne!(c[0], c[1]);
+    }
+
+    #[test]
+    fn latent_cka_loss_matches_host_cka_and_separates_copies() {
+        let dev = Device::Cpu;
+        let mut rng = fa_core::rng::Rng::seed(21);
+        let n = 200;
+        let a: Vec<Vec<f64>> = (0..n).map(|_| vec![rng.normal(), rng.normal()]).collect();
+        let b: Vec<Vec<f64>> = a.iter().map(|r| vec![2.0 * r[1], -2.0 * r[0]]).collect(); // a copy
+        let c: Vec<Vec<f64>> = (0..n).map(|_| vec![rng.normal(), rng.normal()]).collect();
+        let mut flat = Vec::new();
+        for t in 0..n {
+            for x in [&a, &b, &c] {
+                flat.extend(x[t].iter().map(|v| *v as f32));
+            }
+        }
+        let mu = Tensor::from_vec(flat, (n, 3, 2), &dev).unwrap();
+        let got = scalar(&latent_cka_loss(&mu).unwrap()).unwrap();
+        let host = crate::health::linear_cka_f64(&a, &b)
+            + crate::health::linear_cka_f64(&a, &c)
+            + crate::health::linear_cka_f64(&b, &c);
+        assert!((got - host).abs() < 1e-3, "{got} vs {host}");
+        assert!(got > 1.0 && got < 1.1, "one copy pair of three: {got}");
+        let one = Tensor::zeros((n, 1, 2), DType::F32, &dev).unwrap();
+        assert_eq!(scalar(&latent_cka_loss(&one).unwrap()).unwrap(), 0.0);
     }
 
     #[test]
