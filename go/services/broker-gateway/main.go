@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/oklog/ulid/v2"
 	"google.golang.org/protobuf/proto"
 
@@ -42,6 +43,8 @@ const service = "broker-gateway"
 const (
 	allMdQuotes     = "md.quote.>"
 	allOrderCancels = "order.cancel.>"
+	// mdResumeWithin: market-data consumers idle longer than this skip their backlog.
+	mdResumeWithin  = 2 * time.Minute
 	costsCalibrated = "exec.costs.calibrated"
 )
 
@@ -136,33 +139,66 @@ func main() {
 		counters.Set("resting", float64(engine.Resting()))
 		counters.Set("working", float64(engine.Working()))
 	}
-	if _, err := pub.NC.Subscribe(bus.AllMdTrades, func(m *nats.Msg) {
+	// Durable JetStream consumers (spec 21 §5): approvals and cancels always resume after a
+	// restart (Execute / CancelResting are idempotent through the restored `Seen` set); market
+	// data resumes within mdResumeWithin, quotes coalesce to latest-only when behind (Q2).
+	js, err := jetstream.New(pub.NC)
+	if err != nil {
+		log.Error("jetstream", "err", err)
+		os.Exit(1)
+	}
+	if _, err := bus.EnsureStreams(ctx, js); err != nil { // idempotent; the gateway may start first
+		log.Error("ensure streams", "err", err)
+		os.Exit(1)
+	}
+	consume := func(spec bus.LiveSpec, handle func(subject string, data []byte)) {
+		lc, err := bus.EnsureLive(ctx, js, spec)
+		if err != nil {
+			log.Error("consumer", "durable", spec.Durable, "err", err)
+			os.Exit(1)
+		}
+		go bus.WatchConsumerLag(ctx, lc.Consumer)
+		go lc.Run(ctx, handle)
+		go func() { // consumer stats into the heartbeat counters
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					counters.Set("consumer."+spec.Durable+".coalesced", float64(lc.Coalesced))
+					counters.Set("consumer."+spec.Durable+".rejected_schema", float64(lc.RejectedSchema))
+				}
+			}
+		}()
+	}
+	md := func(durable, filter string) bus.LiveSpec {
+		s := bus.MarketDataLive("MD", durable, filter)
+		s.ResumeWithin = mdResumeWithin
+		return s
+	}
+	consume(md("broker-gateway-md-trade", bus.AllMdTrades), func(subject string, data []byte) {
 		var e fav1.Envelope
-		if proto.Unmarshal(m.Data, &e) != nil || e.GetTrade() == nil {
+		if proto.Unmarshal(data, &e) != nil || e.GetTrade() == nil {
 			return
 		}
 		var at time.Time
 		if e.EventTime != nil {
 			at = e.EventTime.AsTime()
 		}
-		publish(engine.ObserveTrade(m.Subject, e.GetTrade().GetPrice(), e.GetTrade().GetSize(), at))
-	}); err != nil {
-		log.Error("subscribe trades", "err", err)
-		os.Exit(1)
-	}
-	if _, err := pub.NC.Subscribe(allMdQuotes, func(m *nats.Msg) {
+		publish(engine.ObserveTrade(subject, e.GetTrade().GetPrice(), e.GetTrade().GetSize(), at))
+	})
+	consume(md("broker-gateway-md-quote", allMdQuotes), func(subject string, data []byte) {
 		var e fav1.Envelope
-		if proto.Unmarshal(m.Data, &e) == nil && e.GetQuote() != nil {
-			engine.ObserveQuote(m.Subject, e.GetQuote().GetBidPrice(), e.GetQuote().GetAskPrice())
+		if proto.Unmarshal(data, &e) == nil && e.GetQuote() != nil {
+			engine.ObserveQuote(subject, e.GetQuote().GetBidPrice(), e.GetQuote().GetAskPrice())
 			counters.Add("quotes", 1)
 		}
-	}); err != nil {
-		log.Error("subscribe quotes", "err", err)
-		os.Exit(1)
-	}
-	if _, err := pub.NC.Subscribe(bus.AllOrderApproved, func(m *nats.Msg) {
+	})
+	consume(bus.DurableLive("ORDERS", "broker-gateway-order-approved", bus.AllOrderApproved), func(_ string, data []byte) {
 		var in fav1.OrderIntent
-		if err := proto.Unmarshal(m.Data, &in); err != nil {
+		if err := proto.Unmarshal(data, &in); err != nil {
 			counters.Add("errors.decode", 1)
 			return
 		}
@@ -172,12 +208,9 @@ func main() {
 			return
 		}
 		publish([]Published{{Account: in.AccountId, Event: ev}})
-	}); err != nil {
-		log.Error("subscribe intents", "err", err)
-		os.Exit(1)
-	}
-	if _, err := pub.NC.Subscribe(allOrderCancels, func(m *nats.Msg) {
-		in, err := decodeCancel(m.Data)
+	})
+	consume(bus.DurableLive("ORDERS", "broker-gateway-order-cancel", allOrderCancels), func(_ string, data []byte) {
+		in, err := decodeCancel(data)
 		if err != nil {
 			counters.Add("errors.decode", 1)
 			return
@@ -187,10 +220,7 @@ func main() {
 		} else {
 			counters.Add("cancels.unknown", 1)
 		}
-	}); err != nil {
-		log.Error("subscribe cancels", "err", err)
-		os.Exit(1)
-	}
+	})
 	go func() {
 		t := time.NewTicker(*tick)
 		defer t.Stop()

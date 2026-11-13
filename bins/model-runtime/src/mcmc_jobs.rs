@@ -301,7 +301,8 @@ async fn publish_result(
         error: error.into(),
         ..Default::default()
     };
-    if let Err(e) = bus.publish(subjects::job_result(JOB_KIND), &r).await {
+    // through JetStream with Nats-Msg-Id (spec 21 §7): a redelivered job's result is deduplicated
+    if let Err(e) = fa_bus::jobs::publish_result(&bus.jetstream(), subjects::job_result(JOB_KIND), &r).await {
         tracing::warn!(error = %e, "mcmc refit result publish failed");
     }
 }

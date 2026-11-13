@@ -209,7 +209,8 @@ async fn publish_result(bus: &Bus, job: &Job, worker_id: &str, outcome: &Outcome
         objectives: Default::default(),
         directions: Default::default(),
     };
-    if let Err(e) = bus.publish(subjects::job_result(&job.kind), &result).await {
+    // JetStream with Nats-Msg-Id (spec 21 §7): a redelivered job yields one result
+    if let Err(e) = fa_bus::jobs::publish_result(&bus.jetstream(), subjects::job_result(&job.kind), &result).await {
         tracing::error!(error = %e, job = %job.job_id, "result publish failed; not acking");
         return false;
     }

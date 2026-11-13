@@ -32,6 +32,9 @@ type LiveSpec struct {
 	Batch           int
 	BehindThreshold uint64
 	Coalesce        []string // subject prefixes; each must contain md.quote. or md.book.
+	// ResumeWithin: an existing consumer that acked nothing for longer than this skips its
+	// backlog (recreated at new messages); 0 = always resume (e.g. order approvals).
+	ResumeWithin time.Duration
 }
 
 // MarketDataLive returns the market-data defaults (10 000 in flight, batches of 500, coalesce
@@ -39,6 +42,13 @@ type LiveSpec struct {
 func MarketDataLive(stream, durable string, filters ...string) LiveSpec {
 	return LiveSpec{Stream: stream, Durable: durable, FilterSubjects: filters, MaxAckPending: MDMaxAckPending,
 		AckWait: 30 * time.Second, Batch: 500, BehindThreshold: 1_000, Coalesce: Coalescable}
+}
+
+// DurableLive returns the defaults for a non-market-data stream (orders, signals): 1 000 in
+// flight, batches of 100, never coalesced.
+func DurableLive(stream, durable string, filters ...string) LiveSpec {
+	return LiveSpec{Stream: stream, Durable: durable, FilterSubjects: filters, MaxAckPending: 1_000,
+		AckWait: 30 * time.Second, Batch: 100, BehindThreshold: 1_000}
 }
 
 // Validate refuses coalescing anything but quotes and books.
@@ -89,16 +99,27 @@ func Coalesce[T any](items []T, prefixes []string, subject func(T) string) (kept
 
 // LiveConsumer pulls batches from a durable consumer (see LiveSpec).
 type LiveConsumer struct {
-	Spec      LiveSpec
-	Consumer  jetstream.Consumer
-	Delivered uint64
-	Coalesced uint64
+	Spec           LiveSpec
+	Consumer       jetstream.Consumer
+	Delivered      uint64
+	Coalesced      uint64
+	RejectedSchema uint64
+	FetchErrors    uint64
 }
 
 // EnsureLive creates or updates the durable consumer.
 func EnsureLive(ctx context.Context, js jetstream.JetStream, s LiveSpec) (*LiveConsumer, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
+	}
+	if s.ResumeWithin > 0 {
+		if old, err := js.Consumer(ctx, s.Stream, s.Durable); err == nil {
+			if info, err := old.Info(ctx); err == nil && info.NumPending > 0 && !recentlyActive(info, s.ResumeWithin) {
+				if err := js.DeleteConsumer(ctx, s.Stream, s.Durable); err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
 	c, err := js.CreateOrUpdateConsumer(ctx, s.Stream, s.Config())
 	if err != nil {
@@ -107,8 +128,42 @@ func EnsureLive(ctx context.Context, js jetstream.JetStream, s LiveSpec) (*LiveC
 	return &LiveConsumer{Spec: s, Consumer: c}, nil
 }
 
-// NextBatch fetches up to one batch (waiting at most wait), coalesces when behind and acks the
-// superseded messages; the caller acks every returned message after handling it.
+func recentlyActive(info *jetstream.ConsumerInfo, window time.Duration) bool {
+	last := info.AckFloor.Last
+	if last == nil {
+		last = info.Delivered.Last
+	}
+	return last != nil && time.Since(*last) <= window
+}
+
+// Run pulls batches until ctx is done. Messages naming an unknown contract major are dropped
+// (acked, counted in RejectedSchema); every other message is passed to handle and acked after
+// it returns, so a crash mid-handling redelivers it (at least once; handlers must be
+// idempotent). Fetch errors are retried after a second.
+func (l *LiveConsumer) Run(ctx context.Context, handle func(subject string, data []byte)) {
+	for ctx.Err() == nil {
+		msgs, err := l.NextBatch(5 * time.Second)
+		if err != nil && len(msgs) == 0 {
+			l.FetchErrors++
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		for _, m := range msgs {
+			if CheckSchema(m.Headers()) != nil {
+				l.RejectedSchema++
+			} else {
+				handle(m.Subject(), m.Data())
+			}
+			_ = m.Ack()
+		}
+	}
+}
+
+// NextBatch fetches up to one batch — the messages available now, or else the first one to
+// arrive within wait — coalesces when behind and acks the superseded messages; the caller acks every returned message after handling it.
 func (l *LiveConsumer) NextBatch(wait time.Duration) ([]jetstream.Msg, error) {
 	n := l.Spec.Batch
 	if l.Spec.MaxAckPending > 0 && n > l.Spec.MaxAckPending {
@@ -117,13 +172,23 @@ func (l *LiveConsumer) NextBatch(wait time.Duration) ([]jetstream.Msg, error) {
 	if n <= 0 {
 		n = 1
 	}
-	b, err := l.Consumer.Fetch(n, jetstream.FetchMaxWait(wait))
+	// what is there now, without waiting; else block for the first message, so an idle
+	// consumer neither spins nor holds delivered messages until a full batch or the timeout
+	b, err := l.Consumer.FetchNoWait(n)
 	if err != nil {
 		return nil, err
 	}
 	var msgs []jetstream.Msg
 	for m := range b.Messages() {
 		msgs = append(msgs, m)
+	}
+	if len(msgs) == 0 {
+		if b, err = l.Consumer.Fetch(1, jetstream.FetchMaxWait(wait)); err != nil {
+			return nil, err
+		}
+		for m := range b.Messages() {
+			msgs = append(msgs, m)
+		}
 	}
 	var behind uint64
 	if len(msgs) > 0 {

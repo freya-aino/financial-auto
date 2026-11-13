@@ -860,6 +860,9 @@ async fn run_ctl(bus: Bus, serving: NeuralServing) {
         return;
     };
     while let Some(msg) = sub.next().await {
+        if !fa_bus::contract::accept(&msg.subject, msg.headers.as_ref()) {
+            continue;
+        }
         let verb = msg.subject.as_str().strip_prefix("ctl.decoders.").unwrap_or_default().to_owned();
         let answer = match <CtlRequest as fa_proto::Message>::decode(msg.payload.as_ref()) {
             Ok(req) if verb == "retrain" => retrain(&bus, &serving, &req.args.into_iter().collect()).await,

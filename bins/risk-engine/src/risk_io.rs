@@ -46,6 +46,9 @@ pub async fn spawn_carry(bus: &Bus, engine: Shared, store: Store, account: &str)
     let mut sub = bus.subscribe_raw(format!("exec.carry.{account}")).await?;
     tokio::spawn(async move {
         while let Some(m) = sub.next().await {
+            if !fa_bus::contract::accept(&m.subject, m.headers.as_ref()) {
+                continue;
+            }
             match serde_json::from_slice::<CarryCharge>(&m.payload) {
                 Ok(c) => {
                     if book_carry(&engine, &store, &c).await {
@@ -154,6 +157,9 @@ pub async fn serve_pretrade(bus: &Bus, engine: Shared) -> anyhow::Result<()> {
     let bus = bus.clone();
     tokio::spawn(async move {
         while let Some(m) = sub.next().await {
+            if !fa_bus::contract::accept(&m.subject, m.headers.as_ref()) {
+                continue;
+            }
             let Some(reply_to) = m.reply.clone() else { continue };
             let json_req = m.payload.first() == Some(&b'{');
             let verdict = match pretrade_request(&m.payload) {
@@ -161,11 +167,8 @@ pub async fn serve_pretrade(bus: &Bus, engine: Shared) -> anyhow::Result<()> {
                 Err(e) => crate::engine::PretradeReply { ok: false, reasons: vec![e] },
             };
             let body = json!(verdict).to_string();
-            let bytes: Vec<u8> = if json_req {
-                body.into_bytes()
-            } else {
-                CtlReply { ok: verdict.ok, message: body }.encode_to_vec()
-            };
+            let bytes: Vec<u8> =
+                if json_req { body.into_bytes() } else { CtlReply { ok: verdict.ok, message: body }.encode_to_vec() };
             if let Err(e) = bus.client().publish(reply_to, bytes.into()).await {
                 tracing::warn!(error = %e, "pretrade reply failed");
             }

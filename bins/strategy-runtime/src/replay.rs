@@ -269,9 +269,7 @@ impl RecordedFills {
 impl AnalogResolver for RecordedFills {
     fn resolve(&mut self, t_ms: i64, keys: Vec<AnalogKey>) -> Vec<AnalogFill> {
         let recorded = self.0.remove(&t_ms).unwrap_or_default();
-        keys.into_iter()
-            .map(|k| recorded.iter().find(|(rk, _)| *rk == k).cloned().unwrap_or((k, Err(()))))
-            .collect()
+        keys.into_iter().map(|k| recorded.iter().find(|(rk, _)| *rk == k).cloned().unwrap_or((k, Err(())))).collect()
     }
 }
 
@@ -281,9 +279,7 @@ pub struct CachedFills(pub RecordedFills);
 impl AnalogResolver for CachedFills {
     fn resolve(&mut self, t_ms: i64, keys: Vec<AnalogKey>) -> Vec<AnalogFill> {
         let recorded = self.0.0.get(&t_ms).cloned().unwrap_or_default();
-        keys.into_iter()
-            .map(|k| recorded.iter().find(|(rk, _)| *rk == k).cloned().unwrap_or((k, Err(()))))
-            .collect()
+        keys.into_iter().map(|k| recorded.iter().find(|(rk, _)| *rk == k).cloned().unwrap_or((k, Err(())))).collect()
     }
 }
 
@@ -306,7 +302,8 @@ pub fn redelivery_candidates(
     prefixes: &[&str],
 ) -> Vec<Vec<Vec<RecordedMessage>>> {
     let mut by_subject: BTreeMap<&str, Vec<&RecordedMessage>> = BTreeMap::new();
-    for r in before.iter().filter(|r| r.published_ms < restart_ms && prefixes.iter().any(|p| r.subject.starts_with(p))) {
+    for r in before.iter().filter(|r| r.published_ms < restart_ms && prefixes.iter().any(|p| r.subject.starts_with(p)))
+    {
         by_subject.entry(r.subject.as_str()).or_default().push(r);
     }
     let mut out = Vec::new();
@@ -322,7 +319,12 @@ pub fn redelivery_candidates(
         let Some(f) = first.filter(|f| f.published_ms - last_pub <= DUPLICATE_WINDOW_MS) else { continue };
         // the originals' sequences sort them before the batch they came with
         let options: Vec<Vec<RecordedMessage>> = (1..=batch.len())
-            .map(|k| batch[batch.len() - k..].iter().map(|r| RecordedMessage { published_ms: f.published_ms, ..(*r).clone() }).collect())
+            .map(|k| {
+                batch[batch.len() - k..]
+                    .iter()
+                    .map(|r| RecordedMessage { published_ms: f.published_ms, ..(*r).clone() })
+                    .collect()
+            })
             .collect();
         out.push(options);
     }
@@ -333,7 +335,8 @@ pub fn redelivery_candidates(
 /// publication time after `restart_ms` of every subject under `prefixes`, the latest of them.
 pub fn transient_end(inputs: &[RecordedMessage], restart_ms: i64, prefixes: &[&str]) -> i64 {
     let mut pubs: BTreeMap<&str, BTreeSet<i64>> = BTreeMap::new();
-    for r in inputs.iter().filter(|r| r.published_ms >= restart_ms && prefixes.iter().any(|p| r.subject.starts_with(p))) {
+    for r in inputs.iter().filter(|r| r.published_ms >= restart_ms && prefixes.iter().any(|p| r.subject.starts_with(p)))
+    {
         // a batch is published within a few ms: bucket by 1 s
         pubs.entry(r.subject.as_str()).or_default().insert(r.published_ms / 1000);
     }
@@ -354,12 +357,15 @@ pub fn infer_redelivery(
     probe_ticks: usize,
     analogs: &mut dyn AnalogResolver,
 ) -> Vec<RecordedMessage> {
-    let as_of = |r: &RecordedMessage| ExposureDistribution::decode(r.payload.as_slice()).ok().and_then(|d| ms(d.as_of.as_ref()));
+    let as_of = |r: &RecordedMessage| {
+        ExposureDistribution::decode(r.payload.as_slice()).ok().and_then(|d| ms(d.as_of.as_ref()))
+    };
     let mut ticks: Vec<i64> = live.iter().filter_map(as_of).collect();
     ticks.sort_unstable();
     ticks.dedup();
     let Some(&last_probe) = ticks.get(probe_ticks.min(ticks.len()).saturating_sub(1)) else { return Vec::new() };
-    let probe_live: Vec<RecordedMessage> = live.iter().filter(|r| as_of(r).is_some_and(|t| t <= last_probe)).cloned().collect();
+    let probe_live: Vec<RecordedMessage> =
+        live.iter().filter(|r| as_of(r).is_some_and(|t| t <= last_probe)).cloned().collect();
     let base: Vec<RecordedMessage> =
         inputs.iter().filter(|x| x.published_ms >= cut && x.published_ms <= last_probe).cloned().collect();
     let score = |extra: &[RecordedMessage], analogs: &mut dyn AnalogResolver| {
@@ -495,7 +501,9 @@ impl Replayer {
                                     .exposures
                                     .iter()
                                     .zip(&r.exposures)
-                                    .filter(|(x, y)| (x.mean - y.mean).abs() > 1e-9 || (x.stddev - y.stddev).abs() > 1e-9)
+                                    .filter(|(x, y)| {
+                                        (x.mean - y.mean).abs() > 1e-9 || (x.stddev - y.stddev).abs() > 1e-9
+                                    })
                                     .map(|(x, y)| {
                                         format!(
                                             "{}: live {:.6}/{:.6} replay {:.6}/{:.6}",
@@ -545,7 +553,9 @@ pub fn infer_subscription(
     probe_ticks: usize,
     analogs: &mut dyn AnalogResolver,
 ) -> i64 {
-    let as_of = |r: &RecordedMessage| ExposureDistribution::decode(r.payload.as_slice()).ok().and_then(|d| ms(d.as_of.as_ref()));
+    let as_of = |r: &RecordedMessage| {
+        ExposureDistribution::decode(r.payload.as_slice()).ok().and_then(|d| ms(d.as_of.as_ref()))
+    };
     let mut ticks: Vec<i64> = live.iter().filter_map(as_of).collect();
     ticks.sort_unstable();
     ticks.dedup();
@@ -628,15 +638,27 @@ mod tests {
         }
         let replayed: BTreeSet<&str> = INPUTS.iter().map(|(_, s)| *s).collect();
         assert_eq!(subscribed, replayed, "main.rs subscriptions and replay inputs must agree");
-        assert_eq!(main.matches(".subscribe::<").count(), 7, "a new input subscription in main.rs needs a replay arm");
+        assert_eq!(main.matches("durable::<").count(), 7, "a new input subscription in main.rs needs a replay arm");
     }
 
     #[test]
     fn signal_fixture_reproduces_the_deployed_runtime() {
         let (seed, inputs, live) = split(load_fixture());
-        assert!(live.len() >= 500 && inputs.len() >= 500, "fixture too small: {} signals, {} inputs", live.len(), inputs.len());
+        assert!(
+            live.len() >= 500 && inputs.len() >= 500,
+            "fixture too small: {} signals, {} inputs",
+            live.len(),
+            inputs.len()
+        );
         let file = StrategyFile::baselines();
-        let cut = infer_subscription(&file, &seed, &inputs, &live, 20, &mut CachedFills(RecordedFills::from_records(&inputs)));
+        let cut = infer_subscription(
+            &file,
+            &seed,
+            &inputs,
+            &live,
+            20,
+            &mut CachedFills(RecordedFills::from_records(&inputs)),
+        );
         let mut r = Replayer::new(&file, Settings::default());
         r.transient_until = inputs.iter().find(|x| x.subject == TRANSIENT).map_or(i64::MIN, |x| x.published_ms);
         for s in &seed {
@@ -684,8 +706,15 @@ mod tests {
                         return ((inst, req), *r);
                     }
                     let bar_ms = req.bar.duration().as_millis() as i64;
-                    let fut = self.tsdb.prices(inst, req.window_end_ms - LOOKBACK_BARS * bar_ms, req.outcome_end_ms(), req.bar);
-                    let r = tokio::task::block_in_place(|| handle.block_on(fut)).map(|pts| resolve(&pts, &req)).map_err(|_| ());
+                    let fut = self.tsdb.prices(
+                        inst,
+                        req.window_end_ms - LOOKBACK_BARS * bar_ms,
+                        req.outcome_end_ms(),
+                        req.bar,
+                    );
+                    let r = tokio::task::block_in_place(|| handle.block_on(fut))
+                        .map(|pts| resolve(&pts, &req))
+                        .map_err(|_| ());
                     self.cache.insert((inst, req), r);
                     ((inst, req), r)
                 })
@@ -694,7 +723,12 @@ mod tests {
                 let payload = serde_json::to_vec(&FillRecord::of(f)).expect("json");
                 // unique sequence: `sort_records` drops equal (sequence, subject) neighbours
                 let stream_seq = self.recorded.len() as u64 + 1;
-                self.recorded.push(RecordedMessage { subject: ANALOG_FILL.into(), stream_seq, published_ms: t_ms, payload });
+                self.recorded.push(RecordedMessage {
+                    subject: ANALOG_FILL.into(),
+                    stream_seq,
+                    published_ms: t_ms,
+                    payload,
+                });
             }
             out
         }
@@ -786,7 +820,11 @@ mod tests {
                     inputs.extend(kept);
                     r.transient_until = transient_end(&inputs, restart, &["md.trade.kraken."]);
                     transient_until = r.transient_until;
-                    eprintln!("cold-start transient until {} ({} ms after the start)", r.transient_until, r.transient_until - from);
+                    eprintln!(
+                        "cold-start transient until {} ({} ms after the start)",
+                        r.transient_until,
+                        r.transient_until - from
+                    );
                 }
                 fills.recorded.clear();
             }

@@ -35,8 +35,7 @@ use fa_proto::{
     Message,
     v1::{
         CtlReply, CtlRequest, DecoderOutput, Envelope, Heartbeat, LatentState, RegionEvent, RegionLifecycleEvent,
-        TransitionUpdate,
-        envelope::Payload,
+        TransitionUpdate, envelope::Payload,
     },
 };
 use futures::StreamExt;
@@ -49,6 +48,28 @@ use crate::{
 };
 
 const SERVICE: &str = "strategy-runtime";
+/// A durable input consumer idle longer than this skips its backlog: decisions run on the
+/// wall clock, so after a longer outage the runtime starts from live data instead of catching up.
+const RESUME_WITHIN: Duration = Duration::from_secs(120);
+
+/// Durable consumer `strategy-runtime-<name>` on `filter` (spec 21 §5); resumes after a short
+/// restart, acks each message once handled. Market data uses the MD defaults, the rest the
+/// non-coalescing ones.
+async fn durable<M: fa_proto::Message + Default + Send + 'static>(
+    bus: &Bus,
+    name: &str,
+    filter: &str,
+) -> anyhow::Result<futures::stream::BoxStream<'static, (String, M)>> {
+    use fa_bus::consume::LiveSpec;
+    let stream = LiveSpec::stream_of(filter).with_context(|| format!("no stream holds {filter}"))?;
+    let durable = format!("{SERVICE}-{name}");
+    let spec = if stream == "MD" {
+        LiveSpec::market_data(&stream, &durable, &[filter])
+    } else {
+        LiveSpec::durable(&stream, &durable, &[filter])
+    };
+    Ok(bus.subscribe_durable(spec.with_resume_within(RESUME_WITHIN)).await?)
+}
 
 #[derive(Debug, Parser)]
 #[command(about = "live GP strategy population → signal.exposure.*")]
@@ -249,7 +270,7 @@ async fn main() -> anyhow::Result<()> {
     // trades
     {
         let (bus, rt) = (bus.clone(), rt.clone());
-        let mut trades = bus.subscribe::<Envelope>(subjects::ALL_MD_TRADES.into()).await?;
+        let mut trades = durable::<Envelope>(&bus, "md-trade", subjects::ALL_MD_TRADES).await?;
         tokio::spawn(async move {
             while let Some((_, env)) = trades.next().await {
                 if let Some(Payload::Trade(t)) = &env.payload
@@ -265,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
     // latent graph feeds (model-runtime)
     {
         let (bus, rt) = (bus.clone(), rt.clone());
-        let mut states = bus.subscribe::<LatentState>(subjects::ALL_LATENT_STATES.into()).await?;
+        let mut states = durable::<LatentState>(&bus, "latent-state", subjects::ALL_LATENT_STATES).await?;
         tokio::spawn(async move {
             while let Some((_, st)) = states.next().await {
                 rt.lock().await.on_latent(&st);
@@ -275,7 +296,7 @@ async fn main() -> anyhow::Result<()> {
     {
         // a snapshot served in parallel (model-runtime `ctl.model.shadow`, spec 35 §6.5)
         let (bus, rt) = (bus.clone(), rt.clone());
-        let mut states = bus.subscribe::<LatentState>("latent.shadow.>".into()).await?;
+        let mut states = durable::<LatentState>(&bus, "latent-shadow", "latent.shadow.>").await?;
         tokio::spawn(async move {
             while let Some((_, st)) = states.next().await {
                 rt.lock().await.on_parallel_latent(&st);
@@ -284,7 +305,7 @@ async fn main() -> anyhow::Result<()> {
     }
     {
         let (bus, rt) = (bus.clone(), rt.clone());
-        let mut regions = bus.subscribe::<RegionEvent>("latent.region.>".into()).await?;
+        let mut regions = durable::<RegionEvent>(&bus, "latent-region", "latent.region.>").await?;
         tokio::spawn(async move {
             while let Some((_, ev)) = regions.next().await {
                 rt.lock().await.on_region(&ev, now_ms());
@@ -293,7 +314,7 @@ async fn main() -> anyhow::Result<()> {
     }
     {
         let (bus, rt) = (bus.clone(), rt.clone());
-        let mut transitions = bus.subscribe::<TransitionUpdate>("latent.transition.>".into()).await?;
+        let mut transitions = durable::<TransitionUpdate>(&bus, "latent-transition", "latent.transition.>").await?;
         tokio::spawn(async move {
             while let Some((_, tu)) = transitions.next().await {
                 rt.lock().await.on_transition(&tu);
@@ -304,7 +325,7 @@ async fn main() -> anyhow::Result<()> {
     // recorded ones of the LATENT stream (7 d) so a restart still knows the last swaps
     {
         let live_rt = rt.clone();
-        let mut lifecycle = bus.subscribe::<RegionLifecycleEvent>("latent.lifecycle.>".into()).await?;
+        let mut lifecycle = durable::<RegionLifecycleEvent>(&bus, "latent-lifecycle", "latent.lifecycle.>").await?;
         tokio::spawn(async move {
             while let Some((_, ev)) = lifecycle.next().await {
                 live_rt.lock().await.on_lifecycle(&ev);
@@ -332,7 +353,12 @@ async fn main() -> anyhow::Result<()> {
                             used += usize::from(r.on_lifecycle(&ev));
                         }
                     }
-                    tracing::info!(read = recs.len(), used, snapshots = r.lineage.snapshots(), "region lineage seeded from LATENT");
+                    tracing::info!(
+                        read = recs.len(),
+                        used,
+                        snapshots = r.lineage.snapshots(),
+                        "region lineage seeded from LATENT"
+                    );
                 }
                 Err(e) => tracing::warn!(error = %e, "region lineage not seeded from the LATENT stream"),
             }
@@ -341,7 +367,7 @@ async fn main() -> anyhow::Result<()> {
     // decoder outputs (evo-worker)
     {
         let (bus, rt) = (bus.clone(), rt.clone());
-        let mut outputs = bus.subscribe::<DecoderOutput>("decoder.output.>".into()).await?;
+        let mut outputs = durable::<DecoderOutput>(&bus, "decoder-output", "decoder.output.>").await?;
         tokio::spawn(async move {
             while let Some((_, out)) = outputs.next().await {
                 rt.lock().await.on_decoder_output(&out, now_ms());
@@ -367,6 +393,9 @@ async fn main() -> anyhow::Result<()> {
         let mut ctl = bus.subscribe_raw(subjects::ctl("strategy", "*")).await?;
         tokio::spawn(async move {
             while let Some(msg) = ctl.next().await {
+                if !fa_bus::contract::accept(&msg.subject, msg.headers.as_ref()) {
+                    continue;
+                }
                 let verb = msg.subject.rsplit('.').next().unwrap_or("").to_owned();
                 let req = match CtlRequest::decode(msg.payload.as_ref()) {
                     Ok(r) => r,

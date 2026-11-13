@@ -44,7 +44,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use clap::Parser;
-use fa_bus::{Bus, subjects};
+use fa_bus::{Bus, consume::LiveSpec, subjects};
 use fa_core::{InstrumentId, config::PlatformConfig};
 use fa_proto::{
     Message,
@@ -70,6 +70,9 @@ type Store = Option<Arc<Persist>>;
 type Pipe = Option<Arc<Pipeline>>;
 
 const SERVICE: &str = "risk-engine";
+/// Durable signal / trade consumers idle longer than this skip their backlog (decisions run on
+/// the wall clock); `order.>` always resumes.
+const RESUME_WITHIN: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Parser)]
 #[command(about = "allocator + hard risk limits + paper book → order.approved.paper")]
@@ -602,7 +605,12 @@ async fn main() -> anyhow::Result<()> {
     // signals
     {
         let (bus, engine) = (bus.clone(), engine.clone());
-        let mut sub = bus.subscribe::<ExposureDistribution>("signal.exposure.>".into()).await?;
+        let mut sub = bus
+            .subscribe_durable::<ExposureDistribution>(
+                LiveSpec::durable("SIGNAL", "risk-engine-signal", &["signal.exposure.>"])
+                    .with_resume_within(RESUME_WITHIN),
+            )
+            .await?;
         tokio::spawn(async move {
             while let Some((_, m)) = sub.next().await {
                 engine.lock().await.on_signal(&m, now_ms());
@@ -616,6 +624,9 @@ async fn main() -> anyhow::Result<()> {
         let mut sub = bus.subscribe_raw("exec.costs.calibrated".into()).await?;
         tokio::spawn(async move {
             while let Some(m) = sub.next().await {
+                if !fa_bus::contract::accept(&m.subject, m.headers.as_ref()) {
+                    continue;
+                }
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&m.payload) {
                     let n = engine.lock().await.apply_calibration(&v);
                     tracing::info!(entries = n, "calibrated impact coefficients applied to the rebalance cost model");
@@ -627,7 +638,12 @@ async fn main() -> anyhow::Result<()> {
     // trades: marks + volume (+ equity-driven halts)
     {
         let (bus, engine, store) = (bus.clone(), engine.clone(), store.clone());
-        let mut sub = bus.subscribe::<Envelope>(subjects::ALL_MD_TRADES.into()).await?;
+        let mut sub = bus
+            .subscribe_durable::<Envelope>(
+                LiveSpec::market_data("MD", "risk-engine-md-trade", &[subjects::ALL_MD_TRADES])
+                    .with_resume_within(RESUME_WITHIN),
+            )
+            .await?;
         tokio::spawn(async move {
             while let Some((subject, env)) = sub.next().await {
                 if let Some(Payload::Trade(t)) = &env.payload
@@ -650,7 +666,9 @@ async fn main() -> anyhow::Result<()> {
     // order.> : intents (foreign ones are gated), approvals (remembered), events (booked)
     {
         let (bus, engine, store) = (bus.clone(), engine.clone(), store.clone());
-        let mut sub = bus.subscribe_raw("order.>".into()).await?;
+        let mut sub = // durable and never skipped (spec 21 §5): every intent, approval and fill is seen once a
+        // restart resumes; fills are idempotent by fill id (`Ledger::apply_fill`)
+        bus.subscribe_durable_raw(LiveSpec::durable("ORDERS", "risk-engine-order", &["order.>"])).await?;
         let account = settings.account.clone();
         tokio::spawn(async move {
             use fa_proto::Message;
@@ -716,6 +734,9 @@ async fn main() -> anyhow::Result<()> {
         let (bus_k, engine_k, store_k) = (bus.clone(), engine.clone(), store.clone());
         tokio::spawn(async move {
             while let Some(m) = sub.next().await {
+                if !fa_bus::contract::accept(&m.subject, m.headers.as_ref()) {
+                    continue;
+                }
                 let Ok(k) = fa_proto::v1::KernelUpdate::decode(m.payload.as_ref()) else { continue };
                 let Some(space) = k.space.as_ref() else { continue };
                 let Ok(ts) = space.timescale.parse::<fa_core::Timescale>() else { continue };
@@ -781,6 +802,9 @@ async fn main() -> anyhow::Result<()> {
         let mut resumes = bus.subscribe_raw("risk.resume.>".into()).await?;
         tokio::spawn(async move {
             while let Some(m) = resumes.next().await {
+                if !fa_bus::contract::accept(&m.subject, m.headers.as_ref()) {
+                    continue;
+                }
                 if let Some(scope) = m.subject.strip_prefix("risk.resume.") {
                     tracing::info!(scope, "resume received");
                     engine.lock().await.on_resume(scope);
@@ -798,6 +822,9 @@ async fn main() -> anyhow::Result<()> {
         let mut sub = bus.subscribe_raw("ingest.health.>".into()).await?;
         tokio::spawn(async move {
             while let Some(m) = sub.next().await {
+                if !fa_bus::contract::accept(&m.subject, m.headers.as_ref()) {
+                    continue;
+                }
                 let Some(source) = m.subject.strip_prefix("ingest.health.") else { continue };
                 let Some((status, reason)) = fa_bus::ingest::health_status(&m.payload) else { continue };
                 let (status, reason) = (status.as_str(), reason.as_str());
@@ -877,6 +904,9 @@ async fn main() -> anyhow::Result<()> {
         let mut sub = bus.subscribe_raw(subjects::ctl("risk", verb)).await?;
         tokio::spawn(async move {
             while let Some(m) = sub.next().await {
+                if !fa_bus::contract::accept(&m.subject, m.headers.as_ref()) {
+                    continue;
+                }
                 let Some(reply_to) = m.reply.clone() else { continue };
                 let req = CtlRequest::decode(m.payload.as_ref()).unwrap_or_default();
                 let (ok, message) = match handle_ctl(verb, &req, &engine, &store, &pipe).await {
@@ -938,6 +968,9 @@ async fn main() -> anyhow::Result<()> {
             let refresh = refresh.clone();
             tokio::spawn(async move {
                 while let Some(m) = sub.next().await {
+                    if !fa_bus::contract::accept(&m.subject, m.headers.as_ref()) {
+                        continue;
+                    }
                     tracing::debug!(subject = %m.subject, "reference data notice");
                     refresh.notify_one();
                 }

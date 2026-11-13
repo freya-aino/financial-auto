@@ -379,6 +379,9 @@ pub async fn run_ctl_listener(bus: fa_bus::Bus, tx: mpsc::Sender<CtlCommand>) {
     };
     tracing::info!(subject, "listening for snapshot reload / shadow / adapter requests");
     while let Some(msg) = sub.next().await {
+        if !fa_bus::contract::accept(&msg.subject, msg.headers.as_ref()) {
+            continue;
+        }
         let reply_to = msg.reply.clone();
         let verb = msg.subject.as_str().strip_prefix("ctl.model.").unwrap_or_default().to_owned();
         let answer = match <CtlRequest as fa_proto::Message>::decode(msg.payload.as_ref()) {

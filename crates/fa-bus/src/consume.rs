@@ -95,6 +95,10 @@ pub struct LiveSpec {
     /// Coalesce when more than this many messages wait behind the batch.
     pub behind_threshold: u64,
     pub coalesce: CoalescePolicy,
+    /// Resume an existing consumer only when it acked something within this window; after a
+    /// longer outage the backlog is stale for a live decision path, so the consumer is recreated
+    /// at new messages instead (`None` = always resume, e.g. `order.*` booking).
+    pub resume_within: Option<Duration>,
 }
 
 impl LiveSpec {
@@ -110,7 +114,33 @@ impl LiveSpec {
             batch: 500,
             behind_threshold: 1_000,
             coalesce: CoalescePolicy::default(),
+            resume_within: None,
         }
+    }
+
+    /// Defaults for a durable consumer of a non-market-data stream (latents, signals, orders):
+    /// `max_ack_pending` 1 000, batches of 100, never coalesced.
+    pub fn durable(stream: &str, durable: &str, filters: &[&str]) -> Self {
+        Self {
+            max_ack_pending: 1_000,
+            batch: 100,
+            coalesce: CoalescePolicy::none(),
+            ..Self::market_data(stream, durable, filters)
+        }
+    }
+
+    /// The stream holding `subject` in the spec 21 §5 table (e.g. `md.trade.>` → `MD`).
+    pub fn stream_of(subject: &str) -> Option<String> {
+        crate::streams::table()
+            .streams
+            .into_iter()
+            .find(|s| s.subjects.iter().any(|f| crate::streams::subjects_overlap(f, subject)))
+            .map(|s| s.name)
+    }
+
+    pub fn with_resume_within(mut self, window: Duration) -> Self {
+        self.resume_within = Some(window);
+        self
     }
 
     pub fn config(&self) -> pull::Config {
@@ -151,7 +181,20 @@ impl LiveConsumer {
     pub async fn ensure(js: &jetstream::Context, spec: LiveSpec) -> Result<Self, LiveError> {
         let err = |msg: String| LiveError { durable: spec.durable.clone(), msg };
         let stream = js.get_stream(&spec.stream).await.map_err(|e| err(e.to_string()))?;
+        if let Some(window) = spec.resume_within
+            && let Ok(mut old) = stream.get_consumer::<pull::Config>(&spec.durable).await
+            && let Ok(info) = old.info().await
+            && info.num_pending > 0
+            && !recently_active(
+                info.ack_floor.last_active.or(info.delivered.last_active).map(|t| t.unix_timestamp()),
+                window,
+            )
+        {
+            tracing::warn!(durable = %spec.durable, backlog = info.num_pending, "consumer idle longer than resume_within; skipping its backlog");
+            stream.delete_consumer(&spec.durable).await.map_err(|e| err(e.to_string()))?;
+        }
         let consumer = stream.create_consumer(spec.config()).await.map_err(|e| err(e.to_string()))?;
+        crate::streams::spawn_consumer_lag(consumer.clone());
         Ok(Self { spec, consumer, stats: LiveStats::default() })
     }
 
@@ -159,25 +202,21 @@ impl LiveConsumer {
         &self.consumer
     }
 
-    /// Pulls up to one batch (waiting at most `wait`), coalesces it when behind and acks the
-    /// superseded messages. The caller acks every returned message after handling it.
+    /// Pulls up to one batch — the messages available now, or else the first one to arrive
+    /// within `wait` — coalesces it when behind and acks the superseded messages. The caller
+    /// acks every returned message after handling it.
     pub async fn next_batch(&mut self, wait: Duration) -> Result<Vec<jetstream::Message>, LiveError> {
         let n = self.spec.batch.min(self.spec.max_ack_pending.max(1) as usize);
         let err = |msg: String| LiveError { durable: self.spec.durable.clone(), msg };
-        let mut batch = self
-            .consumer
-            .fetch()
-            .max_messages(n)
-            .expires(wait)
-            .messages()
-            .await
-            .map_err(|e| err(e.to_string()))?;
-        let mut msgs = Vec::new();
-        while let Some(m) = batch.next().await {
-            match m {
-                Ok(m) => msgs.push(m),
-                Err(e) => return Err(err(e.to_string())),
-            }
+        // what is there now, without waiting (`fetch` is no-wait) …
+        let batch = self.consumer.fetch().max_messages(n).messages().await.map_err(|e| err(e.to_string()))?;
+        let mut msgs = collect(batch).await.map_err(err)?;
+        if msgs.is_empty() {
+            // … else block for the first message, so an idle consumer neither spins nor waits
+            // for a full batch while its messages' ack_wait runs
+            let batch =
+                self.consumer.batch().max_messages(1).expires(wait).messages().await.map_err(|e| err(e.to_string()))?;
+            msgs = collect(batch).await.map_err(err)?;
         }
         let behind = msgs.last().and_then(|m| m.info().ok()).map(|i| i.pending).unwrap_or(0);
         let (kept, superseded) = if behind > self.spec.behind_threshold {
@@ -192,6 +231,75 @@ impl LiveConsumer {
         self.stats.delivered += kept.len() as u64;
         Ok(kept)
     }
+}
+
+async fn collect(mut batch: pull::Batch) -> Result<Vec<jetstream::Message>, String> {
+    let mut msgs = Vec::new();
+    while let Some(m) = batch.next().await {
+        msgs.push(m.map_err(|e| e.to_string())?);
+    }
+    Ok(msgs)
+}
+
+/// `last_unix_s` (seconds) lies within `window` of now; unknown counts as idle.
+fn recently_active(last_unix_s: Option<i64>, window: Duration) -> bool {
+    last_unix_s.is_some_and(|t| chrono::Utc::now().timestamp() - t <= window.as_secs() as i64)
+}
+
+/// A durable consumer as a stream of raw messages, contract-checked (spec 21 §5, §6). A message
+/// is acked when the caller asks for the **next** one — i.e. after its handler finished — so a
+/// crash mid-handling redelivers it after the restart (at least once; handlers must be
+/// idempotent). Fetch errors are logged and retried with a 1 s backoff; the stream never ends.
+pub fn raw(live: LiveConsumer) -> futures::stream::BoxStream<'static, async_nats::Message> {
+    use std::collections::VecDeque;
+    struct State {
+        live: LiveConsumer,
+        queue: VecDeque<jetstream::Message>,
+        prev: Option<jetstream::Message>,
+    }
+    let state = State { live, queue: VecDeque::new(), prev: None };
+    futures::stream::unfold(state, |mut st| async move {
+        loop {
+            if let Some(done) = st.prev.take() {
+                let _ = done.ack().await;
+            }
+            let Some(m) = st.queue.pop_front() else {
+                match st.live.next_batch(Duration::from_secs(5)).await {
+                    Ok(b) => st.queue.extend(b),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "live consumer fetch failed; retrying");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+                continue;
+            };
+            let accepted = crate::contract::accept(&m.subject, m.headers.as_ref());
+            let msg = m.message.clone();
+            st.prev = Some(m);
+            if accepted {
+                return Some((msg, st));
+            }
+        }
+    })
+    .boxed()
+}
+
+/// [`raw`] decoded as `M`, with the same shape as [`crate::Bus::subscribe`]: undecodable
+/// messages are logged, acked and skipped.
+pub fn typed<M: fa_proto::Message + Default + Send + 'static>(
+    live: LiveConsumer,
+) -> futures::stream::BoxStream<'static, (String, M)> {
+    raw(live)
+        .filter_map(|m| {
+            futures::future::ready(match M::decode(m.payload.as_ref()) {
+                Ok(v) => Some((m.subject.to_string(), v)),
+                Err(e) => {
+                    tracing::warn!(subject = %m.subject, error = %e, "dropping undecodable message");
+                    None
+                }
+            })
+        })
+        .boxed()
 }
 
 #[cfg(test)]
@@ -231,7 +339,10 @@ mod tests {
         assert!(CoalescePolicy::new(&["md."]).is_err());
         assert!(CoalescePolicy::new(&["md.quote.", "t1.md.book."]).is_ok());
         let c = LiveSpec::market_data("MD", "x", &["md.quote.>"]).config();
-        assert_eq!((c.max_ack_pending, c.ack_policy, c.deliver_policy), (10_000, AckPolicy::Explicit, DeliverPolicy::New));
+        assert_eq!(
+            (c.max_ack_pending, c.ack_policy, c.deliver_policy),
+            (10_000, AckPolicy::Explicit, DeliverPolicy::New)
+        );
     }
 
     /// `FA_NATS_TEST=1 cargo test -p fa-bus live_backpressure -- --nocapture`: a scratch stream
@@ -249,9 +360,13 @@ mod tests {
         let js = jetstream::new(client.clone());
         let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() % 1_000_000_000;
         let (name, root) = (format!("FABUSBP{n}"), format!("fabustest.bp{n}"));
-        js.create_stream(stream::Config { name: name.clone(), subjects: vec![format!("{root}.>")], ..Default::default() })
-            .await
-            .unwrap();
+        js.create_stream(stream::Config {
+            name: name.clone(),
+            subjects: vec![format!("{root}.>")],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
         let mut spec = LiveSpec::market_data(&name, "slow", &[&format!("{root}.md.>")]);
         spec.max_ack_pending = 100;
         spec.batch = 100;
@@ -299,6 +414,64 @@ mod tests {
         }
         assert!(live.stats.coalesced > 1_000, "{:?}", live.stats);
         assert_eq!(live.stats.coalesced + live.stats.delivered, 2_050);
+        js.delete_stream(&name).await.unwrap();
+    }
+
+    /// `FA_NATS_TEST=1 cargo test -p fa-bus durable_typed -- --nocapture`: a message whose handler
+    /// was interrupted (stream dropped before the next `next()`) is redelivered to the restarted
+    /// consumer; nothing handled is redelivered; an idle consumer with `resume_within` skips its
+    /// stale backlog.
+    #[tokio::test]
+    async fn durable_typed_redelivers_after_crash_and_skips_stale_backlog() {
+        use fa_proto::Message;
+        if std::env::var("FA_NATS_TEST").is_err() {
+            eprintln!("skipping live JetStream test (set FA_NATS_TEST=1)");
+            return;
+        }
+        let url = std::env::var("FA_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+        let js = jetstream::new(async_nats::connect(&url).await.unwrap());
+        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() % 1_000_000_000;
+        let (name, root) = (format!("FABUSDT{n}"), format!("fabustest.dt{n}"));
+        js.create_stream(stream::Config {
+            name: name.clone(),
+            subjects: vec![format!("{root}.>")],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let publish = |i: u32| {
+            let hb = fa_proto::v1::Heartbeat { service: i.to_string(), ..Default::default() };
+            let js = js.clone();
+            let subject = format!("{root}.order.event.paper");
+            async move { js.publish(subject, hb.encode_to_vec().into()).await.unwrap().await.unwrap() }
+        };
+        let spec =
+            || LiveSpec { ack_wait: Duration::from_secs(2), ..LiveSpec::durable(&name, "dt", &[&format!("{root}.>")]) };
+        // created before publishing: DeliverPolicy::New starts at the next message
+        let live = LiveConsumer::ensure(&js, spec()).await.unwrap();
+        for i in 0..5 {
+            publish(i).await;
+        }
+        let mut sub = typed::<fa_proto::v1::Heartbeat>(live);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(sub.next().await.unwrap().1.service);
+        }
+        drop(sub); // "crash" while handling the third message: it was never acked
+        assert_eq!(seen, ["0", "1", "2"]);
+        let mut sub = typed::<fa_proto::v1::Heartbeat>(LiveConsumer::ensure(&js, spec()).await.unwrap());
+        let mut after = Vec::new();
+        for _ in 0..3 {
+            after.push(sub.next().await.unwrap().1.service);
+        }
+        assert_eq!(after, ["2", "3", "4"], "the interrupted message comes back, handled ones don't");
+        drop(sub);
+        // stale backlog: a short resume window and a consumer idle longer than it
+        let stale = spec().with_resume_within(Duration::from_millis(1));
+        publish(5).await;
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let live = LiveConsumer::ensure(&js, stale).await.unwrap();
+        assert_eq!(live.consumer.clone().info().await.unwrap().num_pending, 0, "backlog skipped");
         js.delete_stream(&name).await.unwrap();
     }
 }

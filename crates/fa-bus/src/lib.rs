@@ -113,6 +113,27 @@ impl Bus {
         }))
     }
 
+    /// Durable counterpart of [`subscribe`](Self::subscribe) (spec 21 §5 consumers): a
+    /// JetStream pull consumer that resumes after a restart, bounded by `max_ack_pending`, acking
+    /// each message once the caller has handled it (see [`consume::typed`]).
+    pub async fn subscribe_durable<M: Message + Default + Send + 'static>(
+        &self,
+        spec: consume::LiveSpec,
+    ) -> Result<futures::stream::BoxStream<'static, (String, M)>, consume::LiveError> {
+        let live = consume::LiveConsumer::ensure(&self.jetstream(), spec).await?;
+        Ok(consume::typed(live))
+    }
+
+    /// Raw-message counterpart of [`subscribe_durable`](Self::subscribe_durable) for consumers
+    /// that decode per subject (e.g. `order.>`).
+    pub async fn subscribe_durable_raw(
+        &self,
+        spec: consume::LiveSpec,
+    ) -> Result<futures::stream::BoxStream<'static, async_nats::Message>, consume::LiveError> {
+        let live = consume::LiveConsumer::ensure(&self.jetstream(), spec).await?;
+        Ok(consume::raw(live))
+    }
+
     /// Raw subscription (used by the control-api bus tap).
     pub async fn subscribe_raw(&self, subject: String) -> Result<async_nats::Subscriber, BusError> {
         Ok(self.client.subscribe(subject).await?)

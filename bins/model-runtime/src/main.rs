@@ -52,6 +52,9 @@ use serde_json::json;
 use snapshot::{CtlCommand, CtlVerb};
 use tokio::sync::{Mutex, mpsc, watch};
 
+/// A durable MD consumer idle longer than this skips its backlog instead of replaying it.
+const MD_RESUME_WITHIN: Duration = Duration::from_secs(30 * 60);
+
 #[derive(Parser)]
 struct Args {
     #[arg(long, env = "FA_CONFIG", default_value = "config/platform.toml")]
@@ -683,7 +686,8 @@ impl Runtime {
                 Ok(Some(id)) => {
                     let r = self.shadow(ts, Some(id.clone())).await;
                     tracing::info!(%ts, shadow = %id, ok = r.ok, "shadow restored after restart");
-                    *self.counters.lock().await.entry(format!("shadow_restored.{ts}")).or_default() += f64::from(u8::from(r.ok));
+                    *self.counters.lock().await.entry(format!("shadow_restored.{ts}")).or_default() +=
+                        f64::from(u8::from(r.ok));
                 }
                 Ok(None) => {}
                 Err(e) => tracing::warn!(%ts, error = %e, "persisted shadow unreadable"),
@@ -956,8 +960,13 @@ async fn main() -> anyhow::Result<()> {
     // status `shadow`, set by control-api) survive a restart.
     rt.restore_lifecycle().await;
 
-    let mut trades = bus.subscribe::<Envelope>(subjects::ALL_MD_TRADES.into()).await?;
-    let mut bars_sub = bus.subscribe::<Envelope>("md.bar.>".into()).await?;
+    // Durable MD consumers (spec 21 §5): a restart resumes where it stopped, so latents and
+    // region statistics have no gaps; after more than MD_RESUME_WITHIN down the backlog is skipped.
+    let md = |durable: &str, filter: &str| {
+        fa_bus::consume::LiveSpec::market_data("MD", durable, &[filter]).with_resume_within(MD_RESUME_WITHIN)
+    };
+    let mut trades = bus.subscribe_durable::<Envelope>(md("model-runtime-md-trade", subjects::ALL_MD_TRADES)).await?;
+    let mut bars_sub = bus.subscribe_durable::<Envelope>(md("model-runtime-md-bar", "md.bar.>")).await?;
     let mut jobs = bus.subscribe::<JobResult>("jobs.result.train.>".into()).await?;
     let mut text_tick = tokio::time::interval(Duration::from_secs(args.text_refresh_secs.max(5)));
     let mut gauge_tick = tokio::time::interval(Duration::from_secs(args.heartbeat_secs.max(1)));

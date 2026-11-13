@@ -39,11 +39,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use fa_blob::S3BlobStore;
-use fa_bus::{
-    Bus,
-    async_nats::jetstream::{AckKind, consumer::pull, stream},
-    subjects,
-};
+use fa_bus::{Bus, async_nats::jetstream::AckKind, subjects};
 use fa_core::{Secrets, config::PlatformConfig};
 use fa_proto::{
     Message,
@@ -54,7 +50,6 @@ use tokio::sync::broadcast;
 
 const STREAM: &str = "JOBS_EVO";
 const CONSUMER: &str = "evo-worker";
-const ACK_WAIT: Duration = Duration::from_secs(60);
 const ACK_PROGRESS_EVERY: Duration = Duration::from_secs(20);
 
 #[derive(Parser)]
@@ -114,25 +109,9 @@ async fn main() -> anyhow::Result<()> {
     let worker_id = format!("evo-worker-{}", ulid::Ulid::generate());
 
     let js = bus.jetstream();
-    let stream = js
-        .get_or_create_stream(stream::Config {
-            name: STREAM.into(),
-            subjects: vec!["jobs.evo.>".into()],
-            retention: stream::RetentionPolicy::WorkQueue,
-            ..Default::default()
-        })
-        .await?;
-    let consumer_cfg =
-        pull::Config { durable_name: Some(CONSUMER.into()), ack_wait: ACK_WAIT, max_deliver: 5, ..Default::default() };
-    // `create_consumer` updates an existing durable's config; fall back for older servers.
-    let consumer = match stream.create_consumer(consumer_cfg.clone()).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "consumer create/update failed; using existing config");
-            stream.get_or_create_consumer(CONSUMER, consumer_cfg).await?
-        }
-    };
-    fa_bus::streams::spawn_consumer_lag(consumer.clone()); // fa_bus_consumer_num_pending{stream,consumer} (spec 60 §6.5)
+    // JOBS_EVO work queue with the spec 21 §7 tunables (ack_wait, max_deliver, max_ack_pending);
+    // also exports fa_bus_consumer_num_pending{stream,consumer} (spec 60 §6.5)
+    let (_stream, consumer) = fa_bus::streams::ensure_work_queue(&js, "evo", CONSUMER).await?;
 
     let market = market::MarketBuffer::default();
     tokio::spawn(market.clone().run(bus.clone()));
@@ -337,7 +316,9 @@ mod worker {
     pub const KINDS: [&str; 9] = crate::job::Worker::KINDS;
 }
 
+/// Through JetStream with `Nats-Msg-Id` (spec 21 §7): a job redelivered after a crash between
+/// publish and ack produces one result, not two.
 async fn publish_result(bus: &Bus, kind: &str, result: &JobResult) -> anyhow::Result<()> {
-    bus.publish(subjects::job_result(kind), result).await?;
+    fa_bus::jobs::publish_result(&bus.jetstream(), subjects::job_result(kind), result).await?;
     Ok(())
 }
