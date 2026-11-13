@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// Services the API refuses to start/stop/restart (409).
-pub const REFUSED: [&str; 6] = ["control-api", "nats", "postgres", "helix", "victoriametrics", "garage"];
+pub const REFUSED: [&str; 7] = ["control-api", "nats", "postgres", "helix", "qdrant", "victoriametrics", "garage"];
 /// Services whose `stop` / `restart` need `{"confirm": true}` (428 otherwise).
 pub const CONFIRM: [&str; 1] = ["risk-engine"];
 pub const ACTIONS: [&str; 3] = ["start", "stop", "restart"];
@@ -379,7 +379,7 @@ mod tests {
         assert_eq!((s, v["error"].as_str()), (StatusCode::NOT_FOUND, Some("unknown_service")));
         assert!(v["known"].as_array().unwrap().iter().any(|k| k == "broker-gateway"));
 
-        for infra in ["nats", "postgres", "helix", "victoriametrics", "garage"] {
+        for infra in ["nats", "postgres", "helix", "qdrant", "victoriametrics", "garage"] {
             let (s, v) = send(app(), "POST", &format!("/api/services/{infra}/restart"), None).await;
             assert_eq!((s, v["error"].as_str()), (StatusCode::CONFLICT, Some("refused")), "{infra}");
         }

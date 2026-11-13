@@ -323,12 +323,16 @@ impl HubClient {
         if centroid.is_empty() || !centroid.iter().all(|x| x.is_finite()) || centroid.iter().all(|x| *x == 0.0) {
             return Ok(false);
         }
-        let old = Op::nodes_with_label_where(
-            node::LATENT_VEC,
-            Pred::and([Pred::eq("ref_id", region_id), Pred::eq("kind", "centroid")]),
-        )
-        .drop();
-        self.batch(&Batch::write().named("drop_centroid").var("old", old).returning(Vec::<String>::new())).await?;
+        if let Some(q) = &self.vectors {
+            self.q_drop_centroid(q, centroid.len(), region_id).await?;
+        } else {
+            let old = Op::nodes_with_label_where(
+                node::LATENT_VEC,
+                Pred::and([Pred::eq("ref_id", region_id), Pred::eq("kind", "centroid")]),
+            )
+            .drop();
+            self.batch(&Batch::write().named("drop_centroid").var("old", old).returning(Vec::<String>::new())).await?;
+        }
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
         self.add_latents(&[NewLatent {

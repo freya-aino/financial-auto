@@ -8,6 +8,8 @@
 //!   [`HubClient::knn`] reject vectors of another length with [`HubError::DimMismatch`].
 //! - **Text / media.** `NewsDoc` / `MediaSegment` embeddings use the same `vec<d>` convention with
 //!   one un-partitioned cosine index per `(label, d)` ([`crate::schema::embedding_index`]).
+//! - With a Qdrant store attached ([`crate::qdrant`], ADR 0010) the same calls run on Qdrant
+//!   collections instead; the dimension contract and validation are identical.
 //! - Every vector is validated before it is sent: empty, non-finite (NaN would serialize as
 //!   `null`) and zero-norm vectors (the cosine index answers 400 `zero_norm_cosine_vector`) fail
 //!   with [`HubError::InvalidVector`].
@@ -55,8 +57,9 @@ fn latent_props(l: &NewLatent) -> Vec<(String, Input)> {
     ]
 }
 
-/// The write batch of `addLatent` for several rows (returns `n0`, `n1`, …). Validates every
-/// vector. Used by [`HubClient::add_latents`] and for queuing in a [`crate::WriteBuffer`].
+/// The Helix write batch of `addLatent` for several rows (returns `n0`, `n1`, …). Validates every
+/// vector. Used by [`HubClient::add_latents`] on the Helix vector backend and for queuing in a
+/// [`crate::WriteBuffer`]; with Qdrant attached, write latents through [`HubClient::add_latents`].
 pub fn add_latents_batch(latents: &[NewLatent]) -> Result<Batch> {
     let mut batch = Batch::write().named("add_latents");
     for (i, l) in latents.iter().enumerate() {
@@ -220,6 +223,9 @@ impl HubClient {
         if k == 0 {
             return Ok(Vec::new());
         }
+        if let Some(q) = &self.vectors {
+            return self.q_knn(q, expert_space_id, vector, k, filter).await;
+        }
         let prop = latent_vec_property(vector.len());
         let mut op = Op::vector_search_nodes(
             node::LATENT_VEC,
@@ -268,6 +274,9 @@ impl HubClient {
                 )));
             }
         }
+        if let Some(q) = &self.vectors {
+            return self.q_add_embeddings(q, label, id_key, source_key, rows).await;
+        }
         let prop = latent_vec_property(dim);
         self.ensure_vector_index_ready(embedding_index(label, dim), label, &prop, INDEX_READY_WAIT).await?;
         let mut batch = Batch::write().named(format!("add_{}", label.to_lowercase()));
@@ -302,6 +311,9 @@ impl HubClient {
         validate_vector(vector)?;
         if k == 0 {
             return Ok(Vec::new());
+        }
+        if let Some(q) = &self.vectors {
+            return self.q_search_embeddings(q, label, vector, k, as_of_ms).await;
         }
         let prop = latent_vec_property(vector.len());
         let fetch = if as_of_ms.is_some() { k.saturating_mul(DEFAULT_OVERFETCH).min(MAX_KNN_FETCH.max(k)) } else { k };

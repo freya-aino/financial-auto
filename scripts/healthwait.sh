@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Waits for the stack to come up in the spec 60 §6.4 order and prints each step (D-056).
-#   1. infrastructure health: postgres, nats, garage, victoriametrics, helix
+#   1. infrastructure health: postgres, nats, garage, victoriametrics, helix, qdrant
 #   2. control-api /api/health: nats connected + every dependency reachable (migrations applied on start)
 #   3. risk-engine heartbeat in /api/services (ledger loaded, reconciliation armed) — trading stays
 #      halted until this reports; ingestor / broker-gateway / model-runtime are reported as they appear
@@ -27,12 +27,13 @@ wait_for "nats      :8222/healthz"   curl -fsS http://127.0.0.1:8222/healthz
 wait_for "garage    :3903/health"    curl -fsS http://127.0.0.1:3903/health
 wait_for "victoria  :8428/health"    curl -fsS http://127.0.0.1:8428/health
 wait_for "helix     :6969/healthz"   curl -fsS http://127.0.0.1:6969/healthz
+wait_for "qdrant    :6333/readyz"    curl -fsS http://127.0.0.1:6333/readyz
 
 echo "step 2: migrations + control-api /api/health (nats connected, dependencies reachable)"
 health_ok() {
     local h; h=$(curl -fsS "$API/api/health") || return 1
     echo "$h" | grep -q '"connected":true' &&
-        for d in helix victoriametrics postgres garage; do echo "$h" | grep -q "\"$d\":true" || return 1; done
+        for d in helix qdrant victoriametrics postgres garage; do echo "$h" | grep -q "\"$d\":true" || return 1; done
 }
 wait_for "control-api $API/api/health all true" health_ok
 

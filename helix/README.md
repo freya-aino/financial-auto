@@ -14,7 +14,7 @@ JSON operation tree). The executable counterpart of these files is
 |---|---|
 | `N::Label { … }` / `E::Label { From, To, Properties }` | `schema::node::*` / `schema::edge::*` label constants; properties are inferred by the server on write |
 | `UNIQUE INDEX field` / `INDEX field` | `schema::static_indexes()` → `create_index{node_equality{unique}}`, created by `HubClient::ensure_schema()` |
-| `V::LatentVec { … }` | label `LatentVec`, vector in property `vec<dim>`, one `node_vector` index per dimension partitioned by `expert_space_id` (`ensure_latent_index(dim)`) |
+| `V::LatentVec { … }` / `V::NewsDoc` / `V::MediaSegment` | **stored in Qdrant since D-101** (ADR 0010): collections `latent_d<dim>` (tenant `expert_space_id`), `news_d<dim>`, `media_d<dim>` via `fa_hub::qdrant`; with `[qdrant] vector_backend = "helix"` the old form: label `LatentVec`, vector in property `vec<dim>`, one `node_vector` index per dimension partitioned by `expert_space_id` (`ensure_latent_index(dim)`) |
 | `Date DEFAULT NOW` | `{"expr":"date_time_now"}` on insert |
 | `QUERY name(args) => … RETURN x` | `HubClient::name(args)` in `queries.rs` (snake_case, same semantics), one `/v2/query` batch each |
 

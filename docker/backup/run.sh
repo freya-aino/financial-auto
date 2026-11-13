@@ -6,12 +6,13 @@
 #   postgres/base/backup_label.txt                              START WAL LOCATION → WAL pruning point
 #   postgres/fa.dump, globals.sql, table_count.txt, row_counts.tsv   logical dump (+ exact row counts)
 #   helix/helix-data.tar.gz, files.txt                          HelixDB volume, mounted read-only (hot copy)
+#   qdrant/<collection>.snapshot                                Qdrant collection snapshots (vectors, ADR 0010)
 #   garage/<bucket>/                                            rclone copy of the critical buckets
 #   garage-mirror.txt                                           object counts of /backups/raw-mirror/<bucket>
 #                                                               (fa-raw, mirrored incrementally, never pruned)
 #   manifest.json                                               kind "scheduled", sizes, sha256
 # Then: metrics → VictoriaMetrics, retention pruning (prune.sh), optional off-machine copy (disabled).
-# Env: FA_BACKUP_BUCKETS, FA_BACKUP_SKIP (postgres,helix,garage), FA_BACKUP_KEEP (prune.sh),
+# Env: FA_BACKUP_BUCKETS, FA_BACKUP_SKIP (postgres,helix,qdrant,garage), FA_QDRANT_URL, FA_BACKUP_KEEP (prune.sh),
 #      FA_BACKUP_OFFSITE_REMOTE + FA_BACKUP_OFFSITE_ENABLED=1 (rclone remote, e.g. "offsite:fa-backup").
 set -eu
 . /usr/local/lib/fa-backup/common.sh
@@ -55,6 +56,17 @@ if ! skip helix && [ -d /helix ]; then
     mkdir -p "$DEST/helix"
     log "helix: tar of the read-only volume (hot copy; scripts/backup.sh stops helix for a cold one)"
     (cd /helix && tar czf "$DEST/helix/helix-data.tar.gz" . && find . -type f | sort > "$DEST/helix/files.txt")
+fi
+
+if ! skip qdrant && [ -n "${FA_QDRANT_URL:-}" ]; then
+    mkdir -p "$DEST/qdrant"
+    for c in $(curl -fsS "$FA_QDRANT_URL/collections" | tr '{},' '\n\n\n' | sed -n 's/.*"name":"\([^"]*\)".*/\1/p'); do
+        log "qdrant: snapshot of collection $c"
+        name=$(curl -fsS -X POST "$FA_QDRANT_URL/collections/$c/snapshots?wait=true" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+        [ -n "$name" ] || { log "qdrant: snapshot of $c failed"; continue; }
+        curl -fsS -o "$DEST/qdrant/$c.snapshot" "$FA_QDRANT_URL/collections/$c/snapshots/$name"
+        curl -fsS -X DELETE "$FA_QDRANT_URL/collections/$c/snapshots/$name" >/dev/null || true
+    done
 fi
 
 if ! skip garage; then

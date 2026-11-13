@@ -9,6 +9,10 @@ url = "nats://nats:4222"
 [helix]
 url = "http://helix:8080"
 
+[qdrant] # vector store, ADR 0010 / D-101 (the graph stays in [helix])
+url = "http://qdrant:6333"
+vector_backend = "qdrant" # or "helix" (pre-ADR-0010 HelixDB vector indexes)
+
 [victoriametrics]
 url = "http://victoriametrics:8428"
 

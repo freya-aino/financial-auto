@@ -41,6 +41,14 @@ integration tests, see below). Supersedes the D-012 assumption of CLI-compiled
   Includes `instrumentReference`, `genomeTrainedOn` and `snapshotFeedback`.
 - `HubClient::{new, with_timeout, from_env, url_from_env_or, health, ready, diagnostics, batch,
   query, ensure_schema, ensure_latent_index, wait_for_index, clear_caches}`.
+- `qdrant` (ADR 0010, D-101) – the vector store. `QdrantVectors` (REST) holds latents, news and
+  media embeddings in per-dimension collections (`latent_d<dim>` with tenant index
+  `expert_space_id`, `news_d<dim>`, `media_d<dim>`; `ts` range index; point id = FNV-1a 64 of the
+  business key; payload `norm` restores raw vectors). A `HubClient` with one attached routes every
+  vector call below — and the retention fold — to it; the graph stays in Helix.
+  `configure_vectors(&cfg)` picks the process default from `[qdrant]` (`vector_backend = "qdrant"
+  | "helix"`, `FA_QDRANT_URL`, `FA_VECTOR_BACKEND`); `HubClient::with_vectors` overrides it per
+  client. Live tests: the same suite runs on both backends (`FA_QDRANT_URL` set or not).
 - `vectors` – vector validation (`InvalidVector`: empty / zero-norm / non-finite), registered-dim
   checks (`space_dim`, `check_space_dim`, `DimMismatch`), `add_latents_checked` (validate + ensure
   index + write), `knn(space, v, k, &KnnFilter)` (kind / instrument / as-of / since / exclude /
@@ -218,6 +226,7 @@ cargo test -p fa-hub                                   # unit tests + tests/cove
 FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test live            # against `just up`'s helix
 FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test regions_live    # region lifecycle, lineage, kernels
 FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test versions_live   # event-time versions and as-of overlay
+FA_HELIX_URL=… FA_QDRANT_URL=http://127.0.0.1:6333 cargo test -p fa-hub --tests # same suites, vectors on Qdrant
 ```
 Concurrent writers: `HubClient::batch` retries `409 transaction_conflict` (an aborted, uncommitted transaction) up to six times with a short backoff, so parallel writers and the parallel live suite do not fail spuriously.
 The live tests create `test-<nanos>-…` rows and drop them afterwards; the indexes created by

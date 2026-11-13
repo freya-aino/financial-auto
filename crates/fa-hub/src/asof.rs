@@ -84,6 +84,9 @@ impl HubClient {
         as_of_ms: i64,
         limit: usize,
     ) -> Result<Vec<LatentRow>> {
+        if let Some(q) = &self.vectors {
+            return self.q_space_latents(q, expert_space_id, kind, None, Some(as_of_ms), limit).await;
+        }
         let mut preds =
             vec![Pred::eq(LATENT_TENANT, expert_space_id), Pred::lte("ts", Input::Lit(Val::DateTime(as_of_ms)))];
         if let Some(k) = kind.filter(|k| !k.is_empty()) {

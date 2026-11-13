@@ -15,6 +15,9 @@ pub struct PlatformConfig {
     pub timescales: Vec<Timescale>,
     pub nats: NatsConfig,
     pub helix: Endpoint,
+    /// Vector store (ADR 0010, D-101); absent = defaults.
+    #[serde(default)]
+    pub qdrant: QdrantConfig,
     pub victoriametrics: Endpoint,
     pub postgres: PostgresConfig,
     pub garage: GarageConfig,
@@ -32,6 +35,31 @@ pub struct NatsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Endpoint {
     pub url: String,
+}
+
+/// `[qdrant]`: where latents, news and media embeddings live (ADR 0010).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct QdrantConfig {
+    #[serde(default = "default_qdrant_url")]
+    pub url: String,
+    /// `qdrant` (default) or `helix` (the pre-ADR-0010 HelixDB vector indexes). Overridden by
+    /// `FA_VECTOR_BACKEND`; `FA_QDRANT_URL` overrides `url`.
+    #[serde(default = "default_vector_backend")]
+    pub vector_backend: String,
+}
+
+fn default_qdrant_url() -> String {
+    "http://127.0.0.1:6333".into()
+}
+
+fn default_vector_backend() -> String {
+    "qdrant".into()
+}
+
+impl Default for QdrantConfig {
+    fn default() -> Self {
+        Self { url: default_qdrant_url(), vector_backend: default_vector_backend() }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -258,6 +286,10 @@ impl PlatformConfig {
         if cfg.garage.public_endpoint.is_empty() {
             cfg.garage.public_endpoint = cfg.garage.endpoint.clone();
         }
+        if !matches!(cfg.qdrant.vector_backend.as_str(), "qdrant" | "helix") {
+            let msg = format!("qdrant.vector_backend must be `qdrant` or `helix`, not `{}`", cfg.qdrant.vector_backend);
+            return Err(ConfigError::Invalid { path: p, msg });
+        }
         cfg.runtime.validate().map_err(|msg| ConfigError::Invalid { path: p, msg })?;
         if let Some(overlay) = RuntimeConfig::load_overlay(runtime_path(path))? {
             cfg.runtime = overlay;
@@ -267,7 +299,7 @@ impl PlatformConfig {
 
     /// Section names of the platform config in file order.
     pub fn section_names() -> &'static [&'static str] {
-        &["timescales", "nats", "helix", "victoriametrics", "postgres", "garage", "control_api", "runtime"]
+        &["timescales", "nats", "helix", "qdrant", "victoriametrics", "postgres", "garage", "control_api", "runtime"]
     }
 
     /// One section as a TOML value (`None` for an unknown name). Secrets are not part of this

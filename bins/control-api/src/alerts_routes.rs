@@ -517,6 +517,7 @@ fn spawn_dependency_probe(app: AppState) {
             let cfg = &app.cfg;
             let targets = [
                 ("helix", cfg.helix.url.as_str()),
+                ("qdrant", cfg.qdrant.url.as_str()),
                 ("victoriametrics", cfg.victoriametrics.url.as_str()),
                 ("postgres", cfg.postgres.url.as_str()),
                 ("garage", cfg.garage.endpoint.as_str()),

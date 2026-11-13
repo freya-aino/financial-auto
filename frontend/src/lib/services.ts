@@ -67,7 +67,7 @@ export const SERVICE_ACTIONS: ServiceAction[] = ['start', 'stop', 'restart'];
 
 /** Mirrors control-api `services_routes::REFUSED` / `CONFIRM` (the API stays the authority:
  *  a refusal is still answered 409 and shown). */
-export const REFUSED_SERVICES = ['control-api', 'nats', 'postgres', 'helix', 'victoriametrics', 'garage'];
+export const REFUSED_SERVICES = ['control-api', 'nats', 'postgres', 'helix', 'qdrant', 'victoriametrics', 'garage'];
 export const CONFIRM_SERVICES = ['risk-engine'];
 
 export interface ContainerSummary {

@@ -3,10 +3,11 @@
 #   postgres/fa.dump        pg_dump -Fc of database `fa` (ledger, warehouse, validation registry)
 #   postgres/globals.sql    roles (pg_dumpall --globals-only)
 #   helix/helix-data.tar.gz HelixDB data volume, taken while the helix service is stopped (~seconds)
+#   qdrant/<c>.snapshot     Qdrant collection snapshots via REST (FA_QDRANT_HOST_URL, default 127.0.0.1:6333)
 #   garage/<bucket>/        rclone copy of the critical buckets (fa-models fa-ckpt fa-artifacts fa-backup)
 #   nats/<stream>/          optional `nats stream backup` per JetStream stream (FA_BACKUP_NATS=1)
 #   manifest.json           versions, sizes, sha256 of every file
-# Usage: scripts/backup.sh [--dest DIR] [--skip postgres,helix,garage] [--no-stop-helix]
+# Usage: scripts/backup.sh [--dest DIR] [--skip postgres,helix,qdrant,garage] [--no-stop-helix]
 # Env:   FA_BACKUP_BUCKETS (space-separated, default above), FA_BACKUP_NATS=1, RCLONE_IMAGE
 # Scheduled backups run in the `backup` compose sidecar (docker/backup/run.sh: adds a PITR base backup,
 # hot Helix tar, retention); this script is the on-demand / cold-Helix variant. Old crontab line:
@@ -53,6 +54,20 @@ if ! skip helix; then
         sh -c 'cd /data && tar czf /backup/helix-data.tar.gz . && find . -type f | sort > /backup/files.txt'
     if [ "$STOP_HELIX" = 1 ]; then compose start helix >/dev/null; log "helix: started"; fi
     FILES+=(helix/helix-data.tar.gz helix/files.txt)
+fi
+
+# 2b. Qdrant (vectors, ADR 0010): one snapshot per collection through the REST API (no service stop).
+if ! skip qdrant && curl -fsS -o /dev/null "${FA_QDRANT_HOST_URL:-http://127.0.0.1:6333}/readyz" 2>/dev/null; then
+    Q=${FA_QDRANT_HOST_URL:-http://127.0.0.1:6333}
+    mkdir -p "$DEST/qdrant"
+    for c in $(curl -fsS "$Q/collections" | tr '{},' '\n\n\n' | sed -n 's/.*"name":"\([^"]*\)".*/\1/p'); do
+        log "qdrant: snapshot of collection $c"
+        name=$(curl -fsS -X POST "$Q/collections/$c/snapshots?wait=true" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+        [ -n "$name" ] || { log "qdrant: snapshot of $c failed"; continue; }
+        curl -fsS -o "$DEST/qdrant/$c.snapshot" "$Q/collections/$c/snapshots/$name"
+        curl -fsS -X DELETE "$Q/collections/$c/snapshots/$name" >/dev/null || true
+        FILES+=("qdrant/$c.snapshot")
+    done
 fi
 
 # 3. Garage: critical buckets copied object-by-object (rclone sync, S3 API; no service stop).

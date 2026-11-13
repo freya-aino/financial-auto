@@ -47,6 +47,10 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["garage:3903"]
+  - job_name: qdrant # vector store (ADR 0010): collections, points, REST latency
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["qdrant:6333"]
   # Exporters and ops services inside compose (spec 60 §6.5).
   - job_name: nats
     static_configs:

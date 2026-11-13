@@ -1056,6 +1056,9 @@ async fn write_buffer_flushes_queued_batches_in_order() {
         ts_ms: 1,
         uncertainty: 0.0,
     };
+    // The buffer queues raw Helix batches; latents in such batches only exist on the Helix
+    // vector backend, so this test pins it (with Qdrant, writers go through add_latents).
+    let c = c.with_vectors(None);
     let mut buf = WriteBuffer::new(c.clone(), 2);
     buf.push(fa_hub::vectors::add_latents_batch(&[l("a")]).expect("batch"));
     buf.push(fa_hub::vectors::add_latents_batch(&[l("b")]).expect("batch"));

@@ -115,8 +115,9 @@ async fn api_not_found(uri: Uri) -> impl IntoResponse {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let cfg = &state.cfg;
-    let (helix, vm, pg, garage) = tokio::join!(
+    let (helix, qdrant, vm, pg, garage) = tokio::join!(
         probe(&cfg.helix.url),
+        probe(&cfg.qdrant.url),
         probe(&cfg.victoriametrics.url),
         probe(&cfg.postgres.url),
         probe(&cfg.garage.endpoint),
@@ -128,6 +129,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         // TCP reachability only; real health checks arrive with each client crate.
         "dependencies": {
             "helix": helix,
+            "qdrant": qdrant,
             "victoriametrics": vm,
             "postgres": pg,
             "garage": garage,

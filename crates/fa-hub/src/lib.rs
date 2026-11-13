@@ -14,6 +14,10 @@
 //! `*_ready` helpers) before relying on uniqueness or vector search.
 //!
 //! Further plumbing (spec 20 §4, §6.3–§6.5, §8):
+//! - [`qdrant`]: the Qdrant vector store (ADR 0010, D-101). When a client has one attached
+//!   (the default once a service called [`qdrant::configure_vectors`]), every vector operation
+//!   below — latents, k-NN, space scans, embeddings, the retention fold — runs on Qdrant and only
+//!   the graph stays in Helix.
 //! - [`vectors`]: per-dimension vector indexes (cached "ensured" set), dimension validation
 //!   against the registered `ExpertSpace.dim`, `knn(space, v, k, filter)`, and the
 //!   `NewsDoc` / `MediaSegment` embedding indexes.
@@ -35,6 +39,7 @@ pub mod catalog;
 pub mod evolution;
 pub mod experts;
 pub mod meta;
+pub mod qdrant;
 pub mod queries;
 pub mod reference;
 pub mod regions;
@@ -55,6 +60,7 @@ pub use ast::{Batch, Cond, EdgeRef, IndexSpec, Input, Metric, NodeRef, Op, Param
 pub use buffer::{BufferStats, FlushReport, WriteBuffer};
 pub use experts::{AlignmentRow, ExpertRow, NewAlignment, NewExpert, expert_uid};
 pub use meta::{SCHEMA_VERSION, SchemaMarker};
+pub use qdrant::{QdrantVectors, configure_vectors};
 pub use queries::*;
 pub use reference::{InstrumentReference, RefEntity, RefExposure, RefInstrument, RefListing, RefSyncReport, RefVenue};
 pub use regions::{
@@ -114,6 +120,9 @@ pub enum HubError {
     /// The `SchemaMeta` marker in Helix is newer than this build understands ([`SCHEMA_VERSION`]).
     #[error("helix schema version {stored} is newer than this build's {supported}; upgrade the service")]
     SchemaTooNew { stored: u32, supported: u32 },
+    /// A non-2xx response of the Qdrant vector store.
+    #[error("qdrant {status}: {msg}")]
+    Qdrant { status: u16, msg: String },
 }
 
 impl HubError {
@@ -250,6 +259,8 @@ pub struct HubClient {
     base: String,
     http: reqwest::Client,
     pub(crate) cache: Arc<ClientCache>,
+    /// Vector store; `None` = the Helix vector indexes.
+    pub(crate) vectors: Option<Arc<QdrantVectors>>,
 }
 
 impl HubClient {
@@ -258,6 +269,7 @@ impl HubClient {
             base: base_url.into().trim_end_matches('/').to_owned(),
             http: reqwest::Client::new(),
             cache: Arc::default(),
+            vectors: qdrant::default_url().map(|u| Arc::new(QdrantVectors::new(u, None))),
         }
     }
 
@@ -269,13 +281,37 @@ impl HubClient {
             .connect_timeout(timeout.min(Duration::from_secs(2)))
             .build()
             .unwrap_or_default();
-        Self { base: base_url.into().trim_end_matches('/').to_owned(), http, cache: Arc::default() }
+        Self {
+            base: base_url.into().trim_end_matches('/').to_owned(),
+            http,
+            cache: Arc::default(),
+            vectors: qdrant::default_url().map(|u| Arc::new(QdrantVectors::new(u, Some(timeout)))),
+        }
+    }
+
+    /// Replace the vector store (`None` = Helix vector indexes), e.g. in tests.
+    pub fn with_vectors(mut self, vectors: Option<QdrantVectors>) -> Self {
+        self.vectors = vectors.map(Arc::new);
+        self
+    }
+
+    /// The attached Qdrant store, if vectors are not in Helix.
+    pub fn vectors(&self) -> Option<&QdrantVectors> {
+        self.vectors.as_deref()
+    }
+
+    /// `"qdrant"` or `"helix"`.
+    pub fn vector_backend(&self) -> &'static str {
+        if self.vectors.is_some() { "qdrant" } else { "helix" }
     }
 
     /// Forget every cached index / expert-space fact (e.g. after a server was wiped).
     pub fn clear_caches(&self) {
         lock(&self.cache.vector_indexes).clear();
         lock(&self.cache.space_dims).clear();
+        if let Some(q) = &self.vectors {
+            q.forget_collections();
+        }
     }
 
     /// `FA_HELIX_URL` or [`DEFAULT_URL`].
@@ -460,6 +496,15 @@ impl HubClient {
     /// space). Always sends the DDL; an `already_active` receipt is remembered so that
     /// [`Self::ensure_latent_index_ready`] can skip the round trip next time.
     pub async fn ensure_latent_index(&self, dim: usize) -> Result<IndexReceipt> {
+        if let Some(q) = &self.vectors {
+            q.ensure_collection(&qdrant::latent_collection(dim), dim, true).await?;
+            return Ok(IndexReceipt {
+                kind: "already_active".into(),
+                operation_id: None,
+                index_id: None,
+                generation: None,
+            });
+        }
         self.ensure_vector_index(
             schema::latent_vec_index(dim),
             schema::node::LATENT_VEC,
@@ -473,6 +518,9 @@ impl HubClient {
     pub async fn ensure_latent_index_ready(&self, dim: usize, timeout: Duration) -> Result<()> {
         if dim == 0 {
             return Err(HubError::InvalidVector("dimension 0".into()));
+        }
+        if let Some(q) = &self.vectors {
+            return q.ensure_collection(&qdrant::latent_collection(dim), dim, true).await;
         }
         self.ensure_vector_index_ready(
             schema::latent_vec_index(dim),
@@ -517,7 +565,17 @@ impl HubClient {
     }
 
     /// Whether this client has seen the vector index `label.property` active.
+    /// With Qdrant attached: whether the matching collection (`latent_d<dim>`, …) is ensured.
     pub fn vector_index_cached(&self, label: &str, property: &str) -> bool {
+        if let Some(q) = &self.vectors {
+            let dim = property.strip_prefix("vec").and_then(|d| d.parse::<usize>().ok()).unwrap_or(0);
+            let name = if label == schema::node::LATENT_VEC {
+                Some(qdrant::latent_collection(dim))
+            } else {
+                qdrant::embedding_collection(label, dim).ok()
+            };
+            return name.is_some_and(|n| q.is_ensured(&n));
+        }
         lock(&self.cache.vector_indexes).contains(&(label.to_owned(), property.to_owned()))
     }
 }

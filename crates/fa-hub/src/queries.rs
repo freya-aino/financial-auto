@@ -1027,6 +1027,9 @@ impl HubClient {
         if latents.is_empty() {
             return Ok(Vec::new());
         }
+        if let Some(q) = &self.vectors {
+            return self.q_add_latents(q, latents).await;
+        }
         let batch = crate::vectors::add_latents_batch(latents)?;
         let mut resp = self.batch(&batch).await?;
         (0..latents.len()).map(|i| Ok(resp.take_one::<IdRow>(&format!("n{i}"))?.id)).collect()
@@ -1035,6 +1038,9 @@ impl HubClient {
     /// `searchLatent`, scoped to one expert space (the index tenant): k nearest `LatentVec`s
     /// to `vector` by cosine distance. Caller filters by `kind` / time distance (spec 34).
     pub async fn search_latent(&self, expert_space_id: &str, vector: &[f32], k: usize) -> Result<Vec<LatentHit>> {
+        if let Some(q) = &self.vectors {
+            return self.q_knn(q, expert_space_id, vector, k, &crate::KnnFilter::default()).await;
+        }
         let prop = latent_vec_property(vector.len());
         let op =
             Op::vector_search_nodes(node::LATENT_VEC, &prop, vector.to_vec(), k, Some(s(expert_space_id))).value_map(
@@ -1054,6 +1060,9 @@ impl HubClient {
         since_ms: Option<i64>,
         limit: usize,
     ) -> Result<Vec<LatentRow>> {
+        if let Some(q) = &self.vectors {
+            return self.q_space_latents(q, expert_space_id, kind, since_ms, None, limit).await;
+        }
         let mut preds = vec![Pred::eq(LATENT_TENANT, expert_space_id)];
         if let Some(k) = kind.filter(|k| !k.is_empty()) {
             preds.push(Pred::eq("kind", k));
@@ -1071,6 +1080,9 @@ impl HubClient {
 
     /// Number of `LatentVec` rows in one expert space.
     pub async fn count_space_latents(&self, expert_space_id: &str) -> Result<u64> {
+        if let Some(q) = &self.vectors {
+            return self.q_count_space_latents(q, expert_space_id).await;
+        }
         let op = Op::nodes_with_label_where(node::LATENT_VEC, Pred::eq(LATENT_TENANT, expert_space_id)).count();
         let v = self.query(op).await?;
         v.as_u64().ok_or_else(|| HubError::Shape { name: "count".into(), detail: v.to_string() })

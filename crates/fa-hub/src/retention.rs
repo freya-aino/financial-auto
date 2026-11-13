@@ -69,9 +69,9 @@ impl PruneReport {
 }
 
 #[derive(Debug, Deserialize)]
-struct AggRow {
+pub(crate) struct AggRow {
     #[serde(rename = "$id")]
-    id: u64,
+    pub(crate) id: u64,
     ref_id: String,
     #[serde(default)]
     obs_count: u64,
@@ -79,6 +79,58 @@ struct AggRow {
     uncertainty: f64,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One aggregate write of a fold page: update `prev` or create a new row for `ref_id`.
+pub(crate) struct FoldWrite<'a> {
+    pub(crate) prev: Option<&'a AggRow>,
+    pub(crate) ref_id: &'a str,
+    pub(crate) instrument_id: String,
+    pub(crate) n: i64,
+    /// `None` when the merged mean has zero norm (not storable in a cosine index).
+    pub(crate) mean: Option<Vec<f32>>,
+    pub(crate) unc: f64,
+    /// Newest folded observation, never older than a previous fold.
+    pub(crate) ts_ms: i64,
+}
+
+/// Fold a page of observations into the existing aggregates of their `ref_id`s (backend-neutral).
+pub(crate) fn plan_folds<'a>(rows: &'a [LatentRow], aggs: &'a [AggRow], cutoff_ms: i64) -> Vec<FoldWrite<'a>> {
+    let aggs: BTreeMap<&str, &AggRow> = aggs.iter().map(|a| (a.ref_id.as_str(), a)).collect();
+    let mut folds: BTreeMap<&str, Fold> = BTreeMap::new();
+    for r in rows {
+        let v = r.vector();
+        folds.entry(r.ref_id.as_str()).or_default().push(
+            v.as_deref(),
+            r.uncertainty,
+            r.ts.as_deref(),
+            &r.instrument_id,
+        );
+    }
+    folds
+        .into_iter()
+        .map(|(ref_id, fold)| {
+            let prev = aggs.get(ref_id).copied();
+            let prev_mean = prev.and_then(|a| latent_vector(&a.extra));
+            let (n, mean, unc) = fold.merged_with(
+                prev.map_or(0, |a| a.obs_count),
+                prev_mean.as_deref(),
+                prev.map_or(0.0, |a| a.uncertainty),
+            );
+            let ts_ms = fold.max_ts.as_deref().and_then(rfc3339_ms).unwrap_or(cutoff_ms - 1);
+            let ts_ms =
+                prev.and_then(|a| a.extra.get("ts")?.as_str().and_then(rfc3339_ms)).map_or(ts_ms, |p| p.max(ts_ms));
+            FoldWrite {
+                prev,
+                ref_id,
+                instrument_id: fold.instrument_id,
+                n: i64::try_from(n).unwrap_or(i64::MAX),
+                mean,
+                unc,
+                ts_ms,
+            }
+        })
+        .collect()
 }
 
 /// Running fold of one `ref_id`'s observations.
@@ -158,6 +210,24 @@ pub(crate) fn rfc3339_ms(ts: &str) -> Option<i64> {
     Some(((days * 24 + h) * 60 + mi) * 60_000 + sec * 1000 + ms)
 }
 
+/// Unix ms as RFC 3339 in the server's rendering (`YYYY-MM-DDTHH:MM:SS.fffZ`); inverse of
+/// [`rfc3339_ms`].
+pub(crate) fn ms_rfc3339(ms: i64) -> String {
+    let (days, rem) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
+    // Civil from days (H. Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let (h, mi, s, f) = (rem / 3_600_000, rem / 60_000 % 60, rem / 1000 % 60, rem % 1000);
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{f:03}Z")
+}
+
 impl HubClient {
     /// Fold `observation` latents of one expert space with `ts < cutoff_ms` into per-`ref_id`
     /// aggregates and drop them (see the module docs). Pages of [`PRUNE_PAGE`] rows, one write
@@ -174,6 +244,9 @@ impl HubClient {
     }
 
     async fn prune_page(&self, expert_space_id: &str, cutoff_ms: i64) -> Result<PruneReport> {
+        if let Some(q) = self.vectors.clone() {
+            return self.q_prune_page(&q, expert_space_id, cutoff_ms).await;
+        }
         let old = Pred::and([
             Pred::eq(LATENT_TENANT, expert_space_id),
             Pred::eq("kind", "observation"),
@@ -202,57 +275,33 @@ impl HubClient {
             return Ok(PruneReport::default());
         }
         let aggs: Vec<AggRow> = resp.take("aggs")?;
-        let aggs: BTreeMap<&str, &AggRow> = aggs.iter().map(|a| (a.ref_id.as_str(), a)).collect();
-
-        let mut folds: BTreeMap<&str, Fold> = BTreeMap::new();
-        for r in &rows {
-            let v = r.vector();
-            folds.entry(r.ref_id.as_str()).or_default().push(
-                v.as_deref(),
-                r.uncertainty,
-                r.ts.as_deref(),
-                &r.instrument_id,
-            );
-        }
 
         let mut report = PruneReport { pruned: rows.len() as u64, ..PruneReport::default() };
         let mut batch = Batch::write().named("prune_fold");
-        for (i, (ref_id, fold)) in folds.iter().enumerate() {
-            let prev = aggs.get(ref_id);
-            let prev_mean = prev.and_then(|a| latent_vector(&a.extra));
-            let (n, mean, unc) = fold.merged_with(
-                prev.map_or(0, |a| a.obs_count),
-                prev_mean.as_deref(),
-                prev.map_or(0.0, |a| a.uncertainty),
-            );
-            let n = i64::try_from(n).unwrap_or(i64::MAX);
-            // `ts` of an aggregate = newest folded observation (never older than a previous fold).
-            let ts_ms = fold.max_ts.as_deref().and_then(rfc3339_ms).unwrap_or(cutoff_ms - 1);
-            let ts_ms =
-                prev.and_then(|a| a.extra.get("ts")?.as_str().and_then(rfc3339_ms)).map_or(ts_ms, |p| p.max(ts_ms));
-            let ts = Input::Lit(Val::DateTime(ts_ms));
+        for (i, w) in plan_folds(&rows, &aggs, cutoff_ms).into_iter().enumerate() {
+            let ts = Input::Lit(Val::DateTime(w.ts_ms));
             let name = format!("a{i}");
-            if let Some(a) = prev {
+            if let Some(a) = w.prev {
                 let mut op = Op::nodes(a.id)
-                    .set_property("obs_count", n)
-                    .set_property("uncertainty", unc)
+                    .set_property("obs_count", w.n)
+                    .set_property("uncertainty", w.unc)
                     .set_property("ts", ts);
-                if let Some(m) = mean {
+                if let Some(m) = w.mean {
                     op = op.set_property(&latent_vec_property(m.len()), m);
                 }
                 batch = batch.var(&name, op);
                 report.aggregates_updated += 1;
             } else {
                 let mut props: Vec<(String, Input)> = vec![
-                    (LATENT_TENANT.into(), (*expert_space_id).into()),
+                    (LATENT_TENANT.into(), expert_space_id.into()),
                     ("kind".into(), AGGREGATE_KIND.into()),
-                    ("ref_id".into(), (*ref_id).into()),
-                    ("instrument_id".into(), fold.instrument_id.as_str().into()),
-                    ("obs_count".into(), n.into()),
-                    ("uncertainty".into(), unc.into()),
+                    ("ref_id".into(), w.ref_id.into()),
+                    ("instrument_id".into(), w.instrument_id.as_str().into()),
+                    ("obs_count".into(), w.n.into()),
+                    ("uncertainty".into(), w.unc.into()),
                     ("ts".into(), ts),
                 ];
-                if let Some(m) = mean {
+                if let Some(m) = w.mean {
                     props.push((latent_vec_property(m.len()), m.into()));
                 }
                 let props = props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
@@ -317,6 +366,10 @@ mod tests {
         assert_eq!(rfc3339_ms("2000-02-29T00:00:00Z"), Some(951_782_400_000));
         assert_eq!(rfc3339_ms("garbage"), None);
         assert_eq!(rfc3339_ms("2026-11-08T17:51:51+01:00"), None);
+        for ms in [0, 1000, 1_762_620_000_000, 1_794_160_311_867, 951_782_400_000, -1] {
+            assert_eq!(rfc3339_ms(&ms_rfc3339(ms)), Some(ms), "{}", ms_rfc3339(ms));
+        }
+        assert_eq!(ms_rfc3339(1_762_620_000_000), "2025-11-08T16:40:00.000Z");
     }
 
     #[test]

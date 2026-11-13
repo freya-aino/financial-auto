@@ -3,7 +3,7 @@
 # Usage: scripts/restore.sh <backup-dir> [--yes] [--only postgres,helix,garage] [--postgres-db NAME]
 #                           [--pitr [--target TIME]] [--pg-volume NAME]
 #   --yes          skip the confirmation prompt
-#   --only         restore only these parts (default: postgres,helix,garage; `raw` copies the
+#   --only         restore only these parts (default: postgres,helix,qdrant,garage; `raw` copies the
 #                  fa-raw mirror backups/raw-mirror back into Garage)
 #   --postgres-db  restore into this database instead of `fa` (scratch test; app services untouched)
 #   --pitr         point-in-time recovery instead of pg_restore: the backup's PITR base backup
@@ -22,7 +22,7 @@ set -euo pipefail
 
 [ $# -ge 1 ] || { sed -n '2,19p' "$0"; exit 2; }
 SRC=$(cd "$1" && pwd); shift
-YES=0; ONLY="postgres,helix,garage"; PGDB="fa"; PITR=0; TARGET=""; PGVOL=""
+YES=0; ONLY="postgres,helix,qdrant,garage"; PGDB="fa"; PITR=0; TARGET=""; PGVOL=""
 while [ $# -gt 0 ]; do
     case $1 in
         --yes|-y) YES=1; shift ;;
@@ -55,7 +55,7 @@ if [ $SCRATCH = 1 ]; then
     else echo "Postgres:     into scratch database '$PGDB' (live 'fa' untouched; helix/garage parts are skipped)"; fi
     ONLY=postgres
 else
-    echo "THIS OVERWRITES the live Postgres database 'fa', the HelixDB volume and the Garage buckets."
+    echo "THIS OVERWRITES the live Postgres database 'fa', the HelixDB volume, the Qdrant collections and the Garage buckets."
 fi
 if [ $YES != 1 ]; then
     read -r -p "Type 'restore' to continue: " ans
@@ -141,6 +141,18 @@ if want helix && [ -f "$SRC/helix/helix-data.tar.gz" ]; then
     docker run --rm -v "$vol":/data -v "$SRC/helix":/backup:ro alpine:3.21 \
         sh -c 'find /data -mindepth 1 -delete && tar xzf /backup/helix-data.tar.gz -C /data'
     compose start helix >/dev/null
+fi
+
+# 3b. Qdrant: upload each collection snapshot (replaces the collection; ADR 0010).
+if want qdrant && [ -d "$SRC/qdrant" ]; then
+    Q=${FA_QDRANT_HOST_URL:-http://127.0.0.1:6333}
+    for f in "$SRC"/qdrant/*.snapshot; do
+        [ -e "$f" ] || continue
+        c=$(basename "$f" .snapshot)
+        log "3/5 qdrant → collection $c"
+        curl -fsS -X POST "$Q/collections/$c/snapshots/upload?priority=snapshot&wait=true" -F "snapshot=@$f" >/dev/null \
+            || log "qdrant: collection $c failed"
+    done
 fi
 
 # 4. Garage: sync each backed-up bucket back (objects missing in the backup are deleted).

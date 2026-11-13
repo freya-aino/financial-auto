@@ -72,6 +72,19 @@ services:
     # From the host: curl -fsS http://127.0.0.1:6969/healthz (and /readyz).
     restart: unless-stopped
 
+  # Vector store (ADR 0010, D-101): latents, news and media embeddings; the graph stays in helix.
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    ports:
+      - "127.0.0.1:6333:6333" # REST (D-101); gRPC 6334 is not used
+    volumes:
+      - qdrant-data:/qdrant/storage
+    # no shell tools in the image, so no in-container healthcheck (like helix);
+    # from the host: curl -fsS http://127.0.0.1:6333/readyz
+    restart: unless-stopped
+
   victoriametrics:
     image: victoriametrics/victoria-metrics:v1.155.0
     command:
@@ -173,6 +186,7 @@ services:
       FA_DRILL_SCHEDULE: ${FA_DRILL_SCHEDULE:-30 4 * * 0}
       FA_BACKUP_KEEP: ${FA_BACKUP_KEEP:-7}
       FA_BACKUP_BUCKETS: fa-models fa-ckpt fa-artifacts fa-backup
+      FA_QDRANT_URL: http://qdrant:6333 # collection snapshots → /backups/<ts>/qdrant (ADR 0010)
       FA_SECRETS: /run/fa/secrets.toml
       PGHOST: postgres
       PGUSER: fa
@@ -232,6 +246,8 @@ services:
       postgres:
         condition: service_healthy
       helix:
+        condition: service_started
+      qdrant:
         condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7700/api/health"]
@@ -479,6 +495,7 @@ volumes:
   pg-wal-archive: # archived WAL for PITR (spec 60 §6.6), pruned by the backup sidecar
   nats-data:
   helix-data:
+  qdrant-data: # Qdrant collections (ADR 0010)
   postgres-data:
   vm-data:
   garage-meta:
