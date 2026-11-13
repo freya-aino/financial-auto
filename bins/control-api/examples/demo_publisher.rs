@@ -170,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
         let center = prices[0];
         let out = DecoderOutput {
             decoder_id: format!("dec-{}", rng.below(20)),
+            instrument_id: String::new(),
             genome_id: format!("g-{}", rng.below(200)),
             family: family.into(),
             snapshot_id: "demo-1h-g1".into(),

@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
 
     let frame = |family: &str, inst_ref: String, tag: String, score: f64, now: fa_proto::Timestamp| DecoderOutput {
         decoder_id: format!("synthetic-{family}"),
+        instrument_id: String::new(),
         genome_id: format!("{family}:synthetic"),
         family: family.into(),
         snapshot_id: "synthetic".into(),

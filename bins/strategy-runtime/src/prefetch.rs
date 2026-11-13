@@ -174,6 +174,7 @@ mod tests {
         let ts = |ms: i64| fa_proto::Timestamp { seconds: ms / 1000, nanos: ((ms % 1000) * 1_000_000) as i32 };
         fa_proto::v1::DecoderOutput {
             decoder_id: "baseline-retrieval-1".into(),
+            instrument_id: String::new(),
             genome_id: "retrieval:k=2".into(),
             family: "retrieval".into(),
             snapshot_id: "snap".into(),

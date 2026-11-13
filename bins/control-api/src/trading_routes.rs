@@ -126,7 +126,7 @@ async fn strategies_from_postgres(s: &AppState) -> Result<Vec<Value>, String> {
     let rows = sqlx::query(
         "SELECT strategy_id, status, prev_status, since, first_seen, shadow_since, horizons_completed, \
          sleeve_eur::float8 AS sleeve_eur, pnl_eur::float8 AS pnl_eur, peak_pnl_eur::float8 AS peak_pnl_eur, \
-         max_drawdown::float8 AS max_drawdown, gate, updated_at FROM ledger.strategy_state ORDER BY strategy_id",
+         max_drawdown::float8 AS max_drawdown, gate, pipeline, updated_at FROM ledger.strategy_state ORDER BY strategy_id",
     )
     .fetch_all(pool)
     .await
@@ -154,6 +154,7 @@ async fn strategies_from_postgres(s: &AppState) -> Result<Vec<Value>, String> {
                     "horizons_completed": r.get::<i64, _>("horizons_completed"),
                 },
                 "gate": r.get::<Option<Value>, _>("gate"),
+                "pipeline": r.get::<Option<Value>, _>("pipeline"),
                 "updated_at": r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
             })
         })
@@ -178,6 +179,7 @@ pub async fn strategies(State(s): State<AppState>) -> Response {
         .map(|mut row| {
             let id = row["strategy_id"].as_str().unwrap_or_default().to_owned();
             row["signal"] = signals.remove(&id).unwrap_or(Value::Null);
+            add_genome_id(&mut row);
             row
         })
         .collect();
@@ -194,6 +196,30 @@ pub async fn strategies(State(s): State<AppState>) -> Response {
         "signals_without_state": signals.into_values().collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+/// The genome id of a pipeline record's genome text (one-line inline TOML table,
+/// `{ id = "gp-…", … }`, `fa_strategies::genome`); `None` when it has none.
+pub fn genome_id_of(genome: &str) -> Option<String> {
+    let parsed = toml::from_str::<toml::Table>(&format!("g = {}", genome.trim()))
+        .ok()
+        .and_then(|t| t.get("g")?.get("id")?.as_str().map(str::to_owned));
+    parsed
+        .or_else(|| {
+            // not valid TOML (e.g. cut off): the leading `{ id = "…"` is enough
+            let rest = genome.trim_start().strip_prefix('{')?.trim_start().strip_prefix("id")?.trim_start();
+            let rest = rest.strip_prefix('=')?.trim_start().strip_prefix('"')?;
+            rest.split_once('"').map(|(id, _)| id.to_owned())
+        })
+        .filter(|id| !id.is_empty())
+}
+
+/// Adds the typed `pipeline.genome_id` to a strategy row with a pipeline record.
+fn add_genome_id(row: &mut Value) {
+    if let Some(p) = row.get_mut("pipeline").and_then(Value::as_object_mut) {
+        let id = p.get("genome").and_then(Value::as_str).and_then(genome_id_of);
+        p.insert("genome_id".into(), json!(id));
+    }
 }
 
 /// `pause|resume|flatten|promote|shadow` via `ctl.risk.strategy`.
@@ -310,6 +336,21 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn genome_ids_parse_from_the_one_line_toml() {
+        assert_eq!(genome_id_of(r#"{ id = "gp-01ab", repr = "gp", program = "(+ 1 2)" }"#).as_deref(), Some("gp-01ab"));
+        assert_eq!(genome_id_of(r#"{repr = "nn", id = "nn-7"}"#).as_deref(), Some("nn-7"), "any key order");
+        assert_eq!(genome_id_of(r#"{ id = "gp-9", program = "(+ 1"#).as_deref(), Some("gp-9"), "cut off");
+        assert_eq!(genome_id_of(r#"{ repr = "gp" }"#), None);
+        assert_eq!(genome_id_of(""), None);
+        let mut row = json!({ "strategy_id": "s", "pipeline": { "genome": r#"{ id = "gp-1" }"# } });
+        add_genome_id(&mut row);
+        assert_eq!(row["pipeline"]["genome_id"], "gp-1");
+        let mut row = json!({ "strategy_id": "baseline", "pipeline": null });
+        add_genome_id(&mut row);
+        assert!(row["pipeline"].is_null());
+    }
 
     fn state() -> AppState {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config");

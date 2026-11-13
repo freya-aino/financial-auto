@@ -1681,6 +1681,7 @@ mod tests {
     fn fa_strategies_scored(family: &str, inst: Option<InstrumentId>, at_ms: i64, score: f64) -> DecoderOutput {
         DecoderOutput {
             decoder_id: format!("baseline-{family}"),
+            instrument_id: String::new(),
             genome_id: format!("{family}-baseline"),
             family: family.into(),
             snapshot_id: "snap".into(),

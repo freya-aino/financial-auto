@@ -591,6 +591,7 @@ fn neural_output(job: &Job, d: &NeuralDecoder, r: &EvalReport) -> DecoderOutput 
         timescale: d.genome().timescale.to_string(),
         as_of: Some(ts_ms(r.last_ts_ms)),
         output_refs: horizon_refs(&r.instrument_id, &job.job_id, d.genome().horizon),
+        instrument_id: r.instrument_id.clone(),
         quantiles: f.quantiles.clone(),
         analogs: f
             .analogs

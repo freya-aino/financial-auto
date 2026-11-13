@@ -6,6 +6,7 @@ mod audit;
 mod bus_tap;
 mod config_routes;
 mod console_routes;
+mod decoder_store;
 mod docker;
 mod evolution_routes;
 mod graph_routes;
@@ -81,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
     streams_routes::spawn_ensure_streams(&state);
     sources::spawn_health_collector(&state); // ingest.health|gap|unresolved.* mirror (D-054)
 
+    decoder_store::spawn(&state); // decoder.output.> → wh.decoder_output (bounded writer) + 30-day retention
     ops_routes::spawn(&state); // JOB_RESULTS → ops.job_run, config → ops.config_snapshot (wait for Postgres)
     ref_mirror::spawn(&state); // Postgres ref → Helix Instrument/Entity/Venue mirror: full at start + periodic, incremental on ref.changed.* (spec 12 §5)
     refdata_maint::spawn(&state); // daily calendar refresh + adjusted daily bars (spec 12 §7)

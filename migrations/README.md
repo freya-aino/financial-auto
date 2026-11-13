@@ -2,7 +2,7 @@
 
 PostgreSQL warehouse + ledger schema, in sqlx format (`<timestamp>_<name>.sql`, D-013).
 
-**Status:** 26 migrations (schemas `catalog`, `ref`, `ingest`, `wh`, `ledger`, `audit`, `validation`, `ops`). control-api applies them at startup (`sqlx::migrate!`); later files are idempotent (`if not exists`) so a manually applied copy does not break that run. The initial six were verified 2026-11-06 on a scratch `postgres:17-alpine` (23 tables).
+**Status:** 30 migrations (schemas `catalog`, `ref`, `ingest`, `wh`, `ledger`, `audit`, `validation`, `ops`). control-api applies them at startup (`sqlx::migrate!`); later files are idempotent (`if not exists`) so a manually applied copy does not break that run. The initial six were verified 2026-11-06 on a scratch `postgres:17-alpine` (23 tables).
 
 | File | Schema | Spec |
 |---|---|---|
@@ -32,5 +32,6 @@ PostgreSQL warehouse + ledger schema, in sqlx format (`<timestamp>_<name>.sql`, 
 | `20261113000020_refdata_kraken_class.sql` | corrects Kraken instruments provisioned as `unknown` to `crypto`/`crypto_spot` (or `fx_pair` for two fiat legs) with base/quote currencies (XBT→BTC, XDG→DOGE), in place with one `audit.log` row each; only provisional `unknown/unknown` rows of `source_id = 'kraken'`; idempotent | 12 §6 |
 | `20261113000040_holdout_embargo.sql` | `validation.holdout.embargo_ms` (embargo the holdout was locked with; NULL = timescale default); idempotent | 41 §6.4 |
 | `20261114030000_ingest_runtime_catalog_adjusted.sql` | `catalog.source.rate_limit` / `config` (JSONB runtime overrides, `ctl.ingest.configure` / `PATCH /api/sources/{id}`), `status_note` / `status_changed_at` (auto-disable reason); `wh.adjusted_bar_1d` (materialised adjusted daily bars, both modes, action-set digest; `fa_warehouse::adjusted`); idempotent; verified on a scratch `postgres:17-alpine` with every migration applied | 11 §4/§7, 12 §7 (retired → catalog / fa-warehouse READMEs) |
+| `20261114090000_decoder_output.sql` | `wh.decoder_output` (every `DecoderOutput` control-api receives: decoder, genome, family, snapshot, timescale, nullable `instrument_id`, `as_of`, `output` JSONB with refs / quantiles / analogs; index on snapshot × timescale × instrument × `as_of`; 30-day retention by control-api); idempotent | 51 §6.3, D-098 |
 
 Apply with `just migrate`, which needs `sqlx-cli`: `cargo install sqlx-cli --no-default-features --features rustls,postgres`.

@@ -20,7 +20,7 @@
 //! | `GET /api/mcmc/{snapshot}/hierarchy` | `Hier` (REFINES) edges of the snapshot's regions |
 //! | `GET /api/mcmc/cross-priors?timescale=&limit=` | ranked `CrossPrior` proposals |
 //! | `GET /api/latent/regions/{region_id}/lineage?depth=` | ancestors, descendants, lineage members |
-//! | `GET /api/latent/regions/{region_id}/reconstructions?limit=&max_bars=` | the region's stored `RegionEpisode`s (latest exit first) each with the 1 m market path over `[t_enter, t_exit]` from VictoriaMetrics (connector bars, else last trade price per minute); per-region decoder outputs are not recorded |
+//! | `GET /api/latent/regions/{region_id}/reconstructions?limit=&max_bars=&max_outputs=` | the region's stored `RegionEpisode`s (latest exit first) each with the 1 m market path over `[t_enter, t_exit]` from VictoriaMetrics (connector bars, else last trade price per minute) and the decoder outputs of that instrument, snapshot and timescale inside the episode (`wh.decoder_output`, else control-api's in-memory ring) |
 //!
 //! Helix unreachable → 503 `helix_unavailable`; unknown snapshot / expert space / region → 404;
 //! no persisted kernel yet → 404 `no_kernel`; bad parameters → 400.
@@ -402,6 +402,8 @@ pub struct ReconQ {
     pub limit: Option<usize>,
     /// Bars per episode (default 240, max 1 440; the newest are kept).
     pub max_bars: Option<usize>,
+    /// Decoder outputs per episode (default 20, max 100; the newest are kept).
+    pub max_outputs: Option<usize>,
 }
 
 /// Unix ms of an episode time property (Helix returns RFC 3339 text or a number).
@@ -416,25 +418,51 @@ fn episode_ms(v: Option<&Value>) -> Option<i64> {
 /// `GET /api/latent/regions/{region_id}/reconstructions`: what the market did while instruments
 /// sat in the region. `{region_id, episodes[{episode (the RegionEpisode row), instrument_id,
 /// t_enter_ms, t_exit_ms, source: "bars"|"trades"|"none", bars[{ts_ms, open, high, low, close,
-/// volume}], truncated, error?}], decoder_outputs: null, note}`. Bars are 1 m buckets: connector
+/// volume}], truncated, decoder_outputs[DecoderOutputView], error?}], decoder_outputs: {source:
+/// "postgres"|"memory", matched, per_episode, error?}, note}`. Bars are 1 m buckets: connector
 /// `fa_bar_*` when the instrument has them, else the last trade price per minute (OHLC equal).
-/// Decoder outputs per region are not recorded anywhere, so none are returned. 503 when Helix
-/// is unreachable; a VictoriaMetrics failure is reported per episode.
-async fn reconstructions(State(s): State<AppState>, Path(region_id): Path<String>, Query(q): Query<ReconQ>) -> Response {
+/// Decoder outputs are joined on the episode's snapshot (from `expert_space_id`), timescale,
+/// instrument and `as_of ∈ [t_enter, t_exit]`, newest first: from `wh.decoder_output` when
+/// Postgres is up, else from the in-memory ring of recent outputs. 503 when Helix is
+/// unreachable; a VictoriaMetrics failure is reported per episode.
+async fn reconstructions(
+    State(s): State<AppState>,
+    Path(region_id): Path<String>,
+    Query(q): Query<ReconQ>,
+) -> Response {
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
     let max_bars = q.max_bars.unwrap_or(240).clamp(1, 1_440);
+    let max_outputs = q.max_outputs.unwrap_or(20).clamp(1, 100);
     let rows = match s.hub.region_episodes(&region_id, limit).await {
         Ok(r) => r,
         Err(e) => return hub_err(e),
     };
     let tsdb = fa_tsdb::Tsdb::new(s.cfg.victoriametrics.url.clone());
     let mut episodes = Vec::with_capacity(rows.len());
+    let mut keys: Vec<(usize, crate::decoder_store::EpisodeKey)> = Vec::new();
     for row in rows {
         let p = &row.properties;
         let inst = p.get("instrument_id").and_then(Value::as_str).unwrap_or_default().to_owned();
         let (t0, t1) = (episode_ms(p.get("t_enter")), episode_ms(p.get("t_exit")));
+        let space = p.get("expert_space_id").and_then(Value::as_str).unwrap_or_default();
+        let timescale = p.get("timescale").and_then(Value::as_str).unwrap_or_default();
+        if let (Some(t0), Some(t1), Some(snap)) = (t0, t1, crate::decoder_store::snapshot_of_space(space))
+            && !inst.is_empty()
+            && !timescale.is_empty()
+        {
+            keys.push((
+                episodes.len(),
+                crate::decoder_store::EpisodeKey {
+                    snapshot_id: snap.to_owned(),
+                    timescale: timescale.to_owned(),
+                    instrument_id: inst.clone(),
+                    t0_ms: t0,
+                    t1_ms: t1,
+                },
+            ));
+        }
         let mut ep = json!({ "episode": row, "instrument_id": inst, "t_enter_ms": t0, "t_exit_ms": t1,
-            "source": "none", "bars": [], "truncated": false });
+            "source": "none", "bars": [], "truncated": false, "decoder_outputs": [] });
         let (Some(t0), Some(t1)) = (t0, t1) else {
             ep["error"] = json!("episode without t_enter / t_exit");
             episodes.push(ep);
@@ -451,8 +479,14 @@ async fn reconstructions(State(s): State<AppState>, Path(region_id): Path<String
             Ok(series) => {
                 if let Some(sr) = series.into_iter().next() {
                     ep["source"] = json!("bars");
-                    bars = sr.points.iter().map(|b| json!({ "ts_ms": b.ts_ms, "open": b.open, "high": b.high,
-                        "low": b.low, "close": b.close, "volume": b.volume })).collect();
+                    bars = sr
+                        .points
+                        .iter()
+                        .map(|b| {
+                            json!({ "ts_ms": b.ts_ms, "open": b.open, "high": b.high,
+                        "low": b.low, "close": b.close, "volume": b.volume })
+                        })
+                        .collect();
                 }
             }
             Err(e) => ep["error"] = json!(format!("victoriametrics: {e}")),
@@ -461,8 +495,13 @@ async fn reconstructions(State(s): State<AppState>, Path(region_id): Path<String
             match tsdb.trade_prices_ms(&inst, t0, t1, fa_core::Timescale::Minute).await {
                 Ok(pts) if !pts.is_empty() => {
                     ep["source"] = json!("trades");
-                    bars = pts.iter().map(|(t, p)| json!({ "ts_ms": t, "open": p, "high": p, "low": p,
-                        "close": p, "volume": null })).collect();
+                    bars = pts
+                        .iter()
+                        .map(|(t, p)| {
+                            json!({ "ts_ms": t, "open": p, "high": p, "low": p,
+                        "close": p, "volume": null })
+                        })
+                        .collect();
                 }
                 Ok(_) => {}
                 Err(e) => ep["error"] = json!(format!("victoriametrics: {e}")),
@@ -475,13 +514,52 @@ async fn reconstructions(State(s): State<AppState>, Path(region_id): Path<String
         ep["bars"] = Value::Array(bars);
         episodes.push(ep);
     }
+    let outputs = episode_outputs(&s, &keys, max_outputs).await;
+    let mut matched = 0usize;
+    for ((i, _), outs) in keys.iter().zip(outputs.rows) {
+        matched += outs.len();
+        episodes[*i]["decoder_outputs"] = json!(outs);
+    }
+    let mut summary = json!({ "source": outputs.source, "matched": matched, "per_episode": max_outputs });
+    if let Some(e) = outputs.error {
+        summary["error"] = json!(e);
+    }
     Json(json!({
         "region_id": region_id,
         "episodes": episodes,
-        "decoder_outputs": null,
-        "note": "per-region decoder outputs are not recorded; episodes come from RegionEpisode rows (model-runtime), market paths from VictoriaMetrics 1m bars or trade prices",
+        "decoder_outputs": summary,
+        "note": "episodes come from RegionEpisode rows (model-runtime), market paths from VictoriaMetrics 1m bars or trade prices, decoder outputs from wh.decoder_output (control-api, 30 days) or its in-memory ring",
     }))
     .into_response()
+}
+
+struct EpisodeOutputs {
+    source: &'static str,
+    rows: Vec<Vec<crate::live::DecoderOutputView>>,
+    error: Option<String>,
+}
+
+/// Decoder outputs of each episode key: Postgres when the pool is up (falling back to memory
+/// on a query error), else the in-memory ring.
+async fn episode_outputs(
+    s: &AppState,
+    keys: &[(usize, crate::decoder_store::EpisodeKey)],
+    per: usize,
+) -> EpisodeOutputs {
+    let eps: Vec<_> = keys.iter().map(|(_, k)| k.clone()).collect();
+    let mut error = None;
+    if let Some(pool) = s.pg.get() {
+        match crate::decoder_store::for_episodes(pool, &eps, per).await {
+            Ok(rows) => return EpisodeOutputs { source: "postgres", rows, error },
+            Err(e) => error = Some(format!("postgres: {e}")),
+        }
+    }
+    let live = s.live();
+    let rows = eps
+        .iter()
+        .map(|k| live.decoder_outputs_in_episode(&k.snapshot_id, &k.timescale, &k.instrument_id, k.t0_ms, k.t1_ms, per))
+        .collect();
+    EpisodeOutputs { source: "memory", rows, error }
 }
 
 #[cfg(test)]
@@ -534,6 +612,67 @@ mod tests {
             assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {v}");
             assert_eq!(v["error"], "helix_unavailable");
         }
+    }
+
+    /// Episodes from a fake Helix joined to decoder outputs in the in-memory ring (no Postgres):
+    /// only outputs of the episode's instrument, snapshot and timescale inside its window.
+    #[tokio::test]
+    async fn reconstructions_join_decoder_outputs_to_episodes() {
+        use fa_proto::{Message, v1::DecoderOutput};
+        let fake = Router::new().route(
+            "/v2/query",
+            axum::routing::post(|| async {
+                Json(json!({ "rows": [
+                    { "$id": 1, "$label": "RegionEpisode", "region_id": "r1", "expert_space_id": "snap-1m-e0",
+                      "timescale": "1m", "instrument_id": "i1", "t_enter": 60_000, "t_exit": 180_000 },
+                    { "$id": 2, "$label": "RegionEpisode", "region_id": "r1", "expert_space_id": "snap-1m-e0",
+                      "timescale": "1m", "instrument_id": "i2", "t_enter": 60_000, "t_exit": 180_000 },
+                ] }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config");
+        let mut cfg = PlatformConfig::load(format!("{root}/platform.toml")).unwrap();
+        cfg.victoriametrics.url = "http://127.0.0.1:1".into();
+        let state = AppState::new(cfg, format!("{root}/sources.yaml").into(), None);
+        let state = AppState { hub: fa_hub::HubClient::new(format!("http://{addr}")), ..state };
+        let out = |inst: &str, snap: &str, ts: &str, at_s: i64, refs: Vec<String>| DecoderOutput {
+            decoder_id: "d".into(),
+            family: "retrieval".into(),
+            snapshot_id: snap.into(),
+            timescale: ts.into(),
+            as_of: Some(fa_proto::Timestamp { seconds: at_s, nanos: 0 }),
+            instrument_id: inst.into(),
+            output_refs: refs,
+            ..Default::default()
+        };
+        for m in [
+            out("i1", "snap-1m", "1m", 100, vec![]),
+            out("", "", "1m", 120, vec!["inst:i1".into()]), // older producer: instrument from the ref
+            out("i1", "snap-1m", "1m", 300, vec![]),        // after the episode
+            out("i1", "other", "1m", 100, vec![]),          // other snapshot
+            out("i1", "snap-1m", "1h", 100, vec![]),        // other timescale
+            out("i3", "snap-1m", "1m", 100, vec![]),        // other instrument
+        ] {
+            state.live_mut().ingest("decoder.output.retrieval", &m.encode_to_vec());
+        }
+        let app = router().with_state(state);
+        let res = app
+            .oneshot(Request::get("/api/latent/regions/r1/reconstructions?max_outputs=5").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v: Value = serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(v["decoder_outputs"]["source"], "memory", "{v}");
+        assert_eq!(v["decoder_outputs"]["matched"], 2, "{v}");
+        let first = v["episodes"][0]["decoder_outputs"].as_array().unwrap();
+        assert_eq!(first.len(), 2, "{v}");
+        assert!(first.iter().all(|o| o["instrument_id"] == "i1"), "{v}");
+        assert_eq!(v["episodes"][1]["decoder_outputs"], json!([]), "{v}");
+        assert!(v["episodes"][0]["error"].as_str().unwrap().starts_with("victoriametrics"), "{v}");
     }
 
     #[test]

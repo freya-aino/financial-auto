@@ -157,6 +157,7 @@ pub fn text_outputs(key: &str, ts: Timescale, snapshot_id: &str, now_ms: i64, s:
         output_refs: refs(topic),
         quantiles,
         analogs: vec![],
+        instrument_id: if key == "*" { String::new() } else { key.to_owned() },
     };
     [
         out("text.news", "news", vec![s.news]),
@@ -196,6 +197,7 @@ pub fn visual_outputs(
         output_refs: vec![format!("inst:{inst}"), format!("kind:{kind}"), format!("src:{source}"), format!("n:{n}")],
         quantiles,
         analogs: vec![],
+        instrument_id: inst.to_owned(),
     };
     Some([out("visual.chart", "chart", s.chart_quantiles()), out("visual.future", "future", s.future_quantiles())])
 }

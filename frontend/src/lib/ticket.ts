@@ -1,8 +1,8 @@
 // Manual order ticket with a pre-submit risk check (spec 51 §6.5, spec 40 §6.1 step 5). The
 // check is a dry run of `fa_risk::pretrade::check_order` against the risk-engine's book via
-// `POST /api/trading/pretrade` (control-api, pending: see `PENDING_ROUTES` in openapi.test.ts);
-// nothing is published. Submit is enabled only once the *current* ticket has a result: passed,
-// or the check route is unavailable (the risk-engine still runs the same check on the intent).
+// `POST /api/trading/pretrade` (control-api → risk-engine `ctl.risk.pretrade`); nothing is
+// published. Submit is enabled only once the *current* ticket has a result: passed, or the check
+// route is unavailable (the risk-engine still runs the same check on the intent).
 
 export interface TicketDraft {
 	instrument_id: string;

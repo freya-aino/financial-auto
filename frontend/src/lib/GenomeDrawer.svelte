@@ -7,14 +7,17 @@
 	import QuantileStrip from './QuantileStrip.svelte';
 	import { ago, live, short, type GenomeDetail, type GenomeOutputs } from './api';
 	import { plottableKeys } from './pareto';
+	import { PIPELINE_STAGES, stageClass, type StrategyWithPipeline } from './riskdesk';
 
 	interface Props {
 		genomeId: string | null;
 		onclose: () => void;
 		/** Open another genome (lineage tree click); the drawer shows it in place. */
 		onopen?: (id: string) => void;
+		/** The evolved strategy running this genome, if any (lifecycle stage badge, spec 35 AC 6). */
+		lifecycle?: StrategyWithPipeline | null;
 	}
-	let { genomeId, onclose, onopen }: Props = $props();
+	let { genomeId, onclose, onopen, lifecycle = null }: Props = $props();
 
 	let detail = $state<GenomeDetail | null>(null);
 	let outputs = $state<GenomeOutputs | null>(null);
@@ -57,6 +60,13 @@
 	{#if detail}
 		<div class="grid">
 			<section>
+				{#if lifecycle}
+					<p class="lifecycle">
+						<span class="badge {stageClass(lifecycle.status)}" title="strategy lifecycle stage (risk-engine pipeline, ledger.strategy_state)">{lifecycle.status}</span>
+						<span class="mono">{lifecycle.strategy_id}</span>
+						<span class="dim small">{PIPELINE_STAGES.join(' → ')}{lifecycle.last_reason ? ` · ${lifecycle.last_reason}` : ''}</span>
+					</p>
+				{/if}
 				<h3>Definition <span class="dim">{detail.genome ? `${detail.genome.kind} / ${detail.genome.family} · created ${ago(detail.genome.created_at, now)} ago` : 'not in Helix'}</span></h3>
 				{#if detail.helix?.error}<p class="badge warn">helix: {detail.helix.error}</p>{/if}
 				<pre class="mono def">{pretty || '—'}</pre>
@@ -145,6 +155,13 @@
 </Modal>
 
 <style>
+	.lifecycle {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		align-items: center;
+		margin: 0 0 6px;
+	}
 	.grid {
 		display: grid;
 		grid-template-columns: 1fr 1fr;

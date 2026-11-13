@@ -30,9 +30,10 @@ type DecoderOutput struct {
 	SnapshotId    string                 `protobuf:"bytes,4,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
 	Timescale     string                 `protobuf:"bytes,5,opt,name=timescale,proto3" json:"timescale,omitempty"`
 	AsOf          *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=as_of,json=asOf,proto3" json:"as_of,omitempty"`
-	OutputRefs    []string               `protobuf:"bytes,7,rep,name=output_refs,json=outputRefs,proto3" json:"output_refs,omitempty"` // Garage keys (images, text, trajectories)
-	Quantiles     []float64              `protobuf:"fixed64,8,rep,packed,name=quantiles,proto3" json:"quantiles,omitempty"`            // forecast quantiles where applicable
-	Analogs       []*Analog              `protobuf:"bytes,9,rep,name=analogs,proto3" json:"analogs,omitempty"`                         // retrieval decoders
+	OutputRefs    []string               `protobuf:"bytes,7,rep,name=output_refs,json=outputRefs,proto3" json:"output_refs,omitempty"`        // Garage keys (images, text, trajectories)
+	Quantiles     []float64              `protobuf:"fixed64,8,rep,packed,name=quantiles,proto3" json:"quantiles,omitempty"`                   // forecast quantiles where applicable
+	Analogs       []*Analog              `protobuf:"bytes,9,rep,name=analogs,proto3" json:"analogs,omitempty"`                                // retrieval decoders
+	InstrumentId  string                 `protobuf:"bytes,10,opt,name=instrument_id,json=instrumentId,proto3" json:"instrument_id,omitempty"` // instrument the output is about; empty for cross-asset / "*" outputs
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -130,6 +131,13 @@ func (x *DecoderOutput) GetAnalogs() []*Analog {
 	return nil
 }
 
+func (x *DecoderOutput) GetInstrumentId() string {
+	if x != nil {
+		return x.InstrumentId
+	}
+	return ""
+}
+
 type Analog struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	WindowId         string                 `protobuf:"bytes,1,opt,name=window_id,json=windowId,proto3" json:"window_id,omitempty"`
@@ -202,7 +210,7 @@ var File_fa_v1_decoder_proto protoreflect.FileDescriptor
 
 const file_fa_v1_decoder_proto_rawDesc = "" +
 	"\n" +
-	"\x13fa/v1/decoder.proto\x12\x05fa.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xbb\x02\n" +
+	"\x13fa/v1/decoder.proto\x12\x05fa.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe0\x02\n" +
 	"\rDecoderOutput\x12\x1d\n" +
 	"\n" +
 	"decoder_id\x18\x01 \x01(\tR\tdecoderId\x12\x1b\n" +
@@ -215,7 +223,9 @@ const file_fa_v1_decoder_proto_rawDesc = "" +
 	"\voutput_refs\x18\a \x03(\tR\n" +
 	"outputRefs\x12\x1c\n" +
 	"\tquantiles\x18\b \x03(\x01R\tquantiles\x12'\n" +
-	"\aanalogs\x18\t \x03(\v2\r.fa.v1.AnalogR\aanalogs\"\xae\x01\n" +
+	"\aanalogs\x18\t \x03(\v2\r.fa.v1.AnalogR\aanalogs\x12#\n" +
+	"\rinstrument_id\x18\n" +
+	" \x01(\tR\finstrumentId\"\xae\x01\n" +
 	"\x06Analog\x12\x1b\n" +
 	"\twindow_id\x18\x01 \x01(\tR\bwindowId\x129\n" +
 	"\n" +

@@ -417,6 +417,7 @@ pub(crate) mod tests {
     pub fn forecast(inst: Option<InstrumentId>, at_ms: i64, q: &[f64]) -> DecoderOutput {
         DecoderOutput {
             decoder_id: "baseline-forecast-1".into(),
+            instrument_id: String::new(),
             genome_id: "g1".into(),
             family: FAMILY_FORECAST.into(),
             snapshot_id: "snap".into(),
@@ -431,6 +432,7 @@ pub(crate) mod tests {
     pub fn retrieval(inst: InstrumentId, at_ms: i64, analogs: &[(i64, f64, f64)]) -> DecoderOutput {
         DecoderOutput {
             decoder_id: "baseline-retrieval-1".into(),
+            instrument_id: String::new(),
             genome_id: "g2".into(),
             family: FAMILY_RETRIEVAL.into(),
             snapshot_id: "snap".into(),
@@ -456,6 +458,7 @@ pub(crate) mod tests {
         let inst_ref = inst.map_or_else(|| MARKET_WIDE_REF.to_owned(), |i| format!("inst:{i}"));
         DecoderOutput {
             decoder_id: format!("baseline-{family}"),
+            instrument_id: String::new(),
             genome_id: format!("{family}-baseline"),
             family: family.into(),
             snapshot_id: "snap".into(),

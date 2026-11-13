@@ -254,6 +254,8 @@ export interface ExpertState {
 	dims: number;
 	norm: number;
 	uncertainty: number;
+	/** Raw latent mean; omitted when the producer sent none (project with `ProjectionView.pca`). */
+	mean?: number[];
 }
 
 export interface LatentStateView {
@@ -308,6 +310,8 @@ export interface DecoderOutputView {
 	snapshot_id: string;
 	timescale: string;
 	as_of: string | null;
+	/** Instrument the output is about ('' = market-wide). */
+	instrument_id: string;
 	output_refs: string[];
 	quantiles: number[];
 	analogs: Analog[];
@@ -694,6 +698,38 @@ export interface ProjectionView {
 	pca: { mean: number[]; components: number[][]; explained_variance_ratio: number[]; total_variance: number; method: string };
 }
 
+/** One 1 m bar of a region episode's market path (connector bars, or trade prices with OHLC equal). */
+export interface ReconBar {
+	ts_ms: number;
+	open: number;
+	high: number;
+	low: number;
+	close: number;
+	volume: number | null;
+}
+
+/** One `RegionEpisode` with its market path and the decoder outputs inside it. */
+export interface RegionEpisodeRecon {
+	episode: Record<string, unknown>;
+	instrument_id: string;
+	t_enter_ms: number | null;
+	t_exit_ms: number | null;
+	source: 'bars' | 'trades' | 'none';
+	bars: ReconBar[];
+	truncated: boolean;
+	/** Outputs of the episode's instrument, snapshot and timescale with `as_of` in the episode, newest first. */
+	decoder_outputs: DecoderOutputView[];
+	error?: string;
+}
+
+/** `GET /api/latent/regions/{region_id}/reconstructions` (spec 51 §6.3 region detail). */
+export interface RegionReconstructions {
+	region_id: string;
+	episodes: RegionEpisodeRecon[];
+	decoder_outputs: { source: 'postgres' | 'memory'; matched: number; per_episode: number; error?: string };
+	note: string;
+}
+
 export interface McmcRegion {
 	$id?: number;
 	region_id: string;
@@ -893,6 +929,10 @@ export const live = {
 	experts: (snapshot: string) => getJson<ExpertsView>(`/api/latent/${snapshot}/experts`),
 	projection: (snapshot: string, p: { expert: number | string; range?: string; n?: number; dims?: 2 | 3; kind?: string }) =>
 		getJson<ProjectionView>(`/api/latent/${snapshot}/projection${q({ expert: p.expert, range: p.range, n: p.n, dims: p.dims, kind: p.kind })}`),
+	regionReconstructions: (regionId: string, p: { limit?: number; max_bars?: number; max_outputs?: number } = {}) =>
+		getJson<RegionReconstructions>(
+			`/api/latent/regions/${encodeURIComponent(regionId)}/reconstructions${q({ limit: p.limit, max_bars: p.max_bars, max_outputs: p.max_outputs })}`
+		),
 	mcmcGraph: (snapshot: string, timescale: string) => getJson<McmcGraph>(`/api/mcmc/${snapshot}/graph${q({ timescale })}`),
 	snapshotAction: (id: string, action: 'promote' | 'rollback') => postJson<{ ok: boolean }>(`/api/latent/snapshots/${id}/${action}`),
 	neighborhood: (node: string, depth = 1) => getJson<Neighborhood>(`/api/graph/neighborhood${q({ node, depth })}`),

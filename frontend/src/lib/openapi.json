@@ -1618,7 +1618,7 @@
             "description": "error"
           }
         },
-        "summary": "the region's stored RegionEpisodes (latest exit first) each with the 1 m market path over [t_enter, t_exit] from VictoriaMetrics (connector bars, else last trade price per minute); per-region decoder outputs are not recorded",
+        "summary": "the region's stored RegionEpisodes (latest exit first) each with the 1 m market path over [t_enter, t_exit] from VictoriaMetrics (connector bars, else last trade price per minute) and the decoder outputs of that instrument, snapshot and timescale inside the episode (wh.decoder_output, else control-a",
         "tags": [
           "mcmc"
         ],

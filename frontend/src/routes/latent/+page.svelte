@@ -8,6 +8,7 @@
 	import GraphExplorer from '../../lib/GraphExplorer.svelte';
 	import Projection from '../../lib/Projection.svelte';
 	import QuantileStrip from '../../lib/QuantileStrip.svelte';
+	import RegionDetail from '../../lib/RegionDetail.svelte';
 	import RegionGraph from '../../lib/RegionGraph.svelte';
 	import ViewHeader from '../../lib/ViewHeader.svelte';
 	import {
@@ -284,6 +285,7 @@
 
 	<Experts view={experts} error={expertsError} {now} />
 	<Projection {snapshot} experts={expertIndices} {selected} {states} onselect={(id) => (selected = id)} />
+	{#if selected}<RegionDetail regionId={selected} />{/if}
 	<GraphExplorer node={selected ?? snapshot} />
 
 	<section class="panel">

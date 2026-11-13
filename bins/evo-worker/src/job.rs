@@ -646,6 +646,7 @@ impl Worker {
             // `h:<bars>` = forecast horizon in bars of the genome's timescale: strategy-runtime's
             // `fc_quantile(q, k)` / `fc_dist(k)` pick the output whose horizon is closest to `k`.
             output_refs: horizon_refs(&r.instrument_id, &job.job_id, genome.horizon),
+            instrument_id: r.instrument_id.clone(),
             quantiles: f.quantiles.clone(),
             analogs,
         }

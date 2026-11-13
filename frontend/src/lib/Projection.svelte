@@ -2,8 +2,9 @@
 	// PCA projection of one expert space (`GET /api/latent/{snapshot}/projection`, spec 51 §6.3):
 	// 2-D or 3-D canvas point cloud with pan / zoom / orbit (up to 50 000 points), coloured by
 	// region, instrument or time; live positions of selected instruments animated from the
-	// `/ws/latent` states (placed at the centroid of their current region — the state frames carry
-	// the region, not the latent vector); region occupancy over time from the fetched sample.
+	// `/ws/latent` states (the live latent mean projected with the response's PCA, falling back to
+	// the centroid of the current region when the mean is missing or its dimension does not
+	// match); region occupancy over time from the fetched sample.
 	import { onMount, untrack } from 'svelte';
 	import Empty from './Empty.svelte';
 	import PointCloud from './PointCloud.svelte';
@@ -11,6 +12,7 @@
 	import { live, short, type LatentStateView, type ProjectionView } from './api';
 	import { loadPref, savePref } from './prefs';
 	import { assignRegionColors, explainedLabel } from './projection';
+	import { livePosition } from './livepos';
 	import { getApi, errText } from './console';
 	import { q } from './api';
 	import { byTime, categorical, normaliser, normalise, occupancy, occupancyFromMatrix, regionCentroids, regionWeightQuery, tween, type Marker, type Occupancy, type VmMatrix } from './pointcloud';
@@ -120,13 +122,14 @@
 	const liveInstruments = $derived(states.filter((s) => s.experts.some((e) => e.expert_index === expert)).map((s) => s.instrument_id));
 	/** Region each tracked instrument is in now (for this expert). */
 	const targets = $derived.by(() => {
-		const out = new Map<string, { region: string; pos: [number, number, number] | null }>();
+		const out = new Map<string, { region: string; pos: [number, number, number] | null; exact: boolean }>();
 		for (const id of track) {
 			const s = states.find((x) => x.instrument_id === id);
-			const region = s?.experts.find((e) => e.expert_index === expert)?.region_id;
+			const e = s?.experts.find((x) => x.expert_index === expert);
+			const region = e?.region_id;
 			if (!region) continue;
-			const c = centroids.get(region);
-			out.set(id, { region, pos: c ? norm(c) : null });
+			const at = livePosition(e.mean, view?.pca, centroids.get(region));
+			out.set(id, { region, pos: at ? norm(at.coords) : null, exact: at?.exact ?? false });
 		}
 		return out;
 	});
@@ -270,12 +273,12 @@
 			</div>
 		{/if}
 
-		<h3 class="sub">Live positions <span class="dim">(state.{snapshot}.&lt;instrument&gt; on /ws/latent; marker sits at the centroid of the instrument's current E{expert} region, trail = previous regions)</span></h3>
+		<h3 class="sub">Live positions <span class="dim">(state.{snapshot}.&lt;instrument&gt; on /ws/latent; marker = the live latent mean projected with this PCA, or the centroid of the current E{expert} region (≈) when the mean is missing or its dimension differs; trail = previous regions)</span></h3>
 		{#if liveInstruments.length}
 			<div class="legend">
 				{#each liveInstruments as id (id)}
 					<button class="swatch" class:sel={track.includes(id)} style="--c: {instrumentColors.get(id)}" onclick={() => toggleTrack(id)} title={id}>
-						<i></i><span class="mono">{short(id, 8)}</span>{#if targets.get(id)}<span class="dim">{targets.get(id)?.region}{targets.get(id)?.pos ? '' : ' (not in sample)'}</span>{/if}
+						<i></i><span class="mono">{short(id, 8)}</span>{#if targets.get(id)}<span class="dim">{targets.get(id)?.region}{targets.get(id)?.pos ? (targets.get(id)?.exact ? '' : ' ≈') : ' (not in sample)'}</span>{/if}
 					</button>
 				{/each}
 			</div>

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { alertBanner, applyAlertEvent, severityRank, since, sortAlerts } from './alerts';
 import type { ActiveAlert, AlertEvent, AlertsView, DecoderSlot, SnapshotDetail } from './console';
 import { cardSummary, checklistRows, cumulative, expertHealth, genomeParams, isNeuralFamily, liveExpertHealth, missingNeuralChecks, parseList, shadowAge, slotVerdict, topMemberships } from './models';
-import { busRiskEvent, eventKinds, evidence, haltFamily, isRearmable, rankAllocators, rearmConfirmText, stageCounts, verdict } from './riskdesk';
+import { busRiskEvent, eventKinds, evidence, haltFamily, isRearmable, rankAllocators, rearmConfirmText, stageClass, stageCounts, strategiesByGenome, verdict, type StrategyWithPipeline } from './riskdesk';
 
 const ev = (p: Partial<AlertEvent>): AlertEvent => ({
 	status: 'firing', alertname: 'A', severity: 'warning', summary: 's', fingerprint: 'f', labels: {}, annotations: {},
@@ -188,6 +188,17 @@ describe('models', () => {
 		const news = cardSummary({ key: 'k.card.json', size: 1, last_modified: null, card: { meta: { family: 'nn_news', output_family: 'text.news', genome: 'nn_news:ts=1s', score: -0.18, objectives: { crps_skill: 0, recon_skill: 0 } } } });
 		expect(news).toMatchObject({ skill: -0.18, beats_baseline: false, key: 'k.safetensors' });
 		expect(genomeParams('nn_forecast:ts=1s;h=5')).toEqual(['nn_forecast', { ts: '1s', h: '5' }]);
+	});
+
+	it('keys evolved strategies by genome id, keeping the furthest stage', () => {
+		const row = (strategy_id: string, status: string, genome_id: string | null) => ({ strategy_id, status, pipeline: genome_id === undefined ? null : { genome_id } }) as unknown as StrategyWithPipeline;
+		const m = strategiesByGenome([row('a', 'retired', 'g1'), row('b', 'shadow', 'g1'), row('c', 'candidate', 'g2'), row('d', 'active', null), { strategy_id: 'e', status: 'active', pipeline: null } as unknown as StrategyWithPipeline]);
+		expect([...m.keys()].sort()).toEqual(['g1', 'g2']);
+		expect(m.get('g1')?.strategy_id).toBe('b');
+		expect(stageClass('active')).toBe('ok');
+		expect(stageClass('retired')).toBe('danger');
+		expect(stageClass('shadow')).toBe('warn');
+		expect(stageClass('paused')).toBe('');
 	});
 
 	it('MCMC helpers', () => {

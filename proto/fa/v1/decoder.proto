@@ -14,6 +14,7 @@ message DecoderOutput {
   repeated string output_refs = 7; // Garage keys (images, text, trajectories)
   repeated double quantiles = 8; // forecast quantiles where applicable
   repeated Analog analogs = 9; // retrieval decoders
+  string instrument_id = 10; // instrument the output is about; empty for cross-asset / "*" outputs
 }
 
 message Analog {

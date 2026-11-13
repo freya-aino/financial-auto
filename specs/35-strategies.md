@@ -242,15 +242,14 @@ Live strategies keep running on their snapshot until the replacement passes shad
 | Snapshot or region lineage breaks | Strategy suspended to shadow until revalidated |
 
 ## 9. Acceptance criteria
-**Remaining:**
-- **Evolution lab UI** (AC 6): lifecycle is shown on `/trading/pipeline`, not in the evolution lab (frontend; outside this round's code owners).
+**Remaining:** none — AC 6 met 2026-11-13 (D-098); the spec can be retired into the component READMEs (`specs/README.md`).
 
 1. GP DSL interpreter evaluates programs type-safely; random program generation and all variation operators produce valid typed programs (property tests). **Met for GP** (`programs_respect_limits_and_round_trip_through_sexpr`, `operators_are_type_safe_bounded_and_deterministic`).
 2. Neural policies and GP programs both implement `Strategy` and emit `ExposureIntent` with mean and std. **Met** (`GpStrategy`, `neural::NeuralStrategy` → `fa.v1.ExposureDistribution`; `neural_policies_and_asset_sets_replay_through_the_same_engine`, `neural_policies_run_live_on_their_asset_set`, `breeding_pools_keep_both_representations_alive`).
 3. Backtest of a strategy is deterministic and reproduces identical P&L given snapshot, window and seed. **Met** (`replay_is_deterministic_and_pays_costs`, recorded-latent fixture).
 4. Fitness computation includes costs, and the deflated Sharpe implementation matches reference values on known test vectors. **Met:** costs are in every replay (`cost_sensitivity` at 2×); `deflated_sharpe_matches_the_published_example` reproduces Bailey & López de Prado (2014)'s worked example (T = 1250, SR 2.5 annualised, skew −3, kurtosis 10, N = 100, V[SR] = ½: SR₀ ≈ 0.1132, DSR ≈ 0.9004).
 5. PBO computation runs per generation and blocks promotion when above `pbo_max`. **Met:** a generation with PBO > `pbo_max` (or unknown) yields no candidate, and PBO is a blocking gate item.
-6. The lifecycle states and transitions are persisted in Helix and visible in the evolution lab and trading desk UI. **Partly met:** persisted and audited in Postgres (`ledger.strategy_state`, `audit.log`), served by `GET /api/trading/strategies` and mirrored onto the Helix `Genome` nodes of evolved strategies every pipeline round (§5); the console's `/trading/pipeline` page shows the pipeline state per strategy (D-077); the evolution lab does not show the lifecycle.
+6. The lifecycle states and transitions are persisted in Helix and visible in the evolution lab and trading desk UI. **Met:** persisted and audited in Postgres (`ledger.strategy_state`, `audit.log`), served by `GET /api/trading/strategies` and mirrored onto the Helix `Genome` nodes of evolved strategies every pipeline round (§5); the console's `/trading/pipeline` page shows the pipeline state per strategy (D-077); the evolution lab has a strategy-lifecycle panel (stage counts, stage / evidence per evolved strategy) and the genome drawer shows the stage of the strategy running the genome, matched on the typed `pipeline.genome_id` control-api parses from the genome text (D-098).
 
 ## 10. Open questions
 1. GP program semantics: should programs be stateful (memory registers across steps) or purely functional on the current observation? *(Implemented answer: purely functional; the only state is the strategy's virtual book, read through the portfolio primitives.)*

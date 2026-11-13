@@ -293,9 +293,38 @@ pub struct DecoderOutputView {
     pub snapshot_id: String,
     pub timescale: String,
     pub as_of: Option<DateTime<Utc>>,
+    /// `DecoderOutput.instrument_id`, else the first `inst:<id>` output ref (older producers);
+    /// empty for market-wide outputs (`inst:*`).
+    pub instrument_id: String,
     pub output_refs: Vec<String>,
     pub quantiles: Vec<f64>,
     pub analogs: Vec<Value>,
+}
+
+impl DecoderOutputView {
+    /// Whether this output belongs to an episode of `instrument_id` in the expert spaces of
+    /// `snapshot_id` × `timescale` between `t0_ms` and `t1_ms` (inclusive). Outputs without a
+    /// snapshot (neural serving publishes none) match any snapshot of their timescale.
+    pub fn in_episode(&self, snapshot_id: &str, timescale: &str, instrument_id: &str, t0_ms: i64, t1_ms: i64) -> bool {
+        let at = self.as_of.unwrap_or(self.received_at).timestamp_millis();
+        !instrument_id.is_empty()
+            && self.instrument_id == instrument_id
+            && self.timescale == timescale
+            && (self.snapshot_id.is_empty() || self.snapshot_id == snapshot_id)
+            && (t0_ms..=t1_ms).contains(&at)
+    }
+}
+
+/// The instrument of a decoder output: the typed field, else the first `inst:<id>` ref.
+pub fn output_instrument(instrument_id: &str, refs: &[String]) -> String {
+    if !instrument_id.is_empty() {
+        return instrument_id.to_owned();
+    }
+    refs.iter()
+        .find_map(|r| r.strip_prefix("inst:"))
+        .filter(|i| !i.is_empty() && *i != "*")
+        .unwrap_or_default()
+        .to_owned()
 }
 
 // ------------------------------------------------------------- evolution
@@ -427,6 +456,9 @@ pub struct Live {
     regions: BTreeMap<String, BTreeMap<String, RegionView>>,
     transitions: BTreeMap<String, BTreeMap<String, TransitionRowView>>,
     decoder_outputs: VecDeque<DecoderOutputView>,
+    /// Bounded queue to the Postgres writer (`decoder_store`); full = the output is not stored.
+    decoder_sink: Option<tokio::sync::mpsc::Sender<DecoderOutputView>>,
+    decoder_sink_dropped: u64,
     /// Per-snapshot expert routing stats and norm covariance.
     snapshot_stats: BTreeMap<String, SnapshotStats>,
     /// Latest `latent.expert.health` per snapshot (spec 32 §4.3, model-runtime on closed bars).
@@ -459,6 +491,8 @@ impl Default for Live {
             regions: BTreeMap::new(),
             transitions: BTreeMap::new(),
             decoder_outputs: VecDeque::new(),
+            decoder_sink: None,
+            decoder_sink_dropped: 0,
             snapshot_stats: BTreeMap::new(),
             expert_health: BTreeMap::new(),
             jobs: HashMap::new(),
@@ -722,7 +756,7 @@ impl Live {
                 })
             })
             .collect();
-        self.decoder_outputs.push_front(DecoderOutputView {
+        let view = DecoderOutputView {
             received_at: Utc::now(),
             decoder_id: m.decoder_id,
             genome_id: m.genome_id,
@@ -730,11 +764,44 @@ impl Live {
             snapshot_id: m.snapshot_id,
             timescale: m.timescale,
             as_of: ts(m.as_of.as_ref()),
+            instrument_id: output_instrument(&m.instrument_id, &m.output_refs),
             output_refs: m.output_refs,
             quantiles: m.quantiles,
             analogs,
-        });
+        };
+        if let Some(tx) = &self.decoder_sink
+            && tx.try_send(view.clone()).is_err()
+        {
+            self.decoder_sink_dropped += 1;
+            if self.decoder_sink_dropped.is_power_of_two() {
+                tracing::warn!(dropped = self.decoder_sink_dropped, "decoder-output writer behind; outputs not stored");
+            }
+        }
+        self.decoder_outputs.push_front(view);
         self.decoder_outputs.truncate(self.runtime.live.max_decoder_outputs);
+    }
+
+    /// Sends every decoder output received from now on to `tx` as well (never blocks).
+    pub fn set_decoder_sink(&mut self, tx: tokio::sync::mpsc::Sender<DecoderOutputView>) {
+        self.decoder_sink = Some(tx);
+    }
+
+    /// Recent in-memory decoder outputs of one episode (newest first, at most `limit`).
+    pub fn decoder_outputs_in_episode(
+        &self,
+        snapshot_id: &str,
+        timescale: &str,
+        instrument_id: &str,
+        t0_ms: i64,
+        t1_ms: i64,
+        limit: usize,
+    ) -> Vec<DecoderOutputView> {
+        self.decoder_outputs
+            .iter()
+            .filter(|o| o.in_episode(snapshot_id, timescale, instrument_id, t0_ms, t1_ms))
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     /// Recent decoder outputs of one genome (newest first).

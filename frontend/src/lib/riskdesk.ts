@@ -73,6 +73,11 @@ export interface Selection {
 }
 
 interface PipelineRec {
+	/** Genome id parsed by control-api from the record's one-line TOML genome text (null when it has none). */
+	genome_id?: string | null;
+	genome?: string;
+	timescale?: string;
+	generation?: string;
 	selection?: { pbo?: number | null; deflated_sharpe?: number | null; sharpe?: number | null; n_obs?: number | null } | null;
 	holdout?: { deflated_sharpe?: number | null; sharpe?: number | null; n_obs?: number | null; holdout_id?: string } | null;
 	[k: string]: unknown;
@@ -107,6 +112,28 @@ export function evidence(s: StrategyWithPipeline, policy: PipelinePolicy = {}): 
 		selection: { pbo: n(sel?.pbo), dsr: n(sel?.deflated_sharpe), sharpe: n(sel?.sharpe), n_obs: n(sel?.n_obs) },
 		holdout: { pbo: null, dsr, sharpe, n_obs: obs, pass }
 	};
+}
+
+/**
+ * Evolved strategies keyed by the genome they run (`pipeline.genome_id`), so the evolution lab
+ * can show a genome's lifecycle stage. A genome bound to several strategies keeps the one
+ * furthest along (active > shadow > holdout_passed > candidate > paused > retired).
+ */
+export function strategiesByGenome(rows: StrategyWithPipeline[]): Map<string, StrategyWithPipeline> {
+	const rank = (s: string) => ['retired', 'other', 'paused', 'candidate', 'holdout_passed', 'shadow', 'active'].indexOf(stageOf(s));
+	const out = new Map<string, StrategyWithPipeline>();
+	for (const r of rows) {
+		const id = r.pipeline?.genome_id;
+		if (!id) continue;
+		const prev = out.get(id);
+		if (!prev || rank(r.status) > rank(prev.status)) out.set(id, r);
+	}
+	return out;
+}
+
+/** Badge class of a lifecycle stage (same colours as the pipeline page). */
+export function stageClass(s: string): string {
+	return s === 'active' ? 'ok' : s === 'retired' ? 'danger' : s === 'candidate' || s === 'holdout_passed' || s === 'shadow' ? 'warn' : '';
 }
 
 /** Pass/fail of a value against a threshold; null when the value is unknown. */

@@ -609,6 +609,7 @@ pub(crate) mod tests {
     pub fn forecast_msg(inst: InstrumentId, as_of_ms: i64, q: &[f64]) -> Vec<u8> {
         DecoderOutput {
             decoder_id: "d".into(),
+            instrument_id: String::new(),
             genome_id: "g".into(),
             family: "rnn_prior".into(),
             snapshot_id: "snap".into(),

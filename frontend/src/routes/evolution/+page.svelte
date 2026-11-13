@@ -1,7 +1,9 @@
 <script lang="ts">
 	// Evolution Lab (spec 51 §6.4, D-049/D-052): generations (REST + /ws/evolution), start form for
 	// decoder and strategy kinds, populations + Pareto fronts from the trial registry, genome
-	// drawer, validation card, GPU arbiter and recent jobs.
+	// drawer, validation card, GPU arbiter and recent jobs; lifecycle of the evolved strategies
+	// (spec 35 AC 6: candidate → holdout_passed → shadow → active → retired, from
+	// `GET /api/trading/strategies` + `GET /api/trading/pipeline`, as on /trading/pipeline).
 	import { onMount } from 'svelte';
 	import Empty from '../../lib/Empty.svelte';
 	import GenomeDrawer from '../../lib/GenomeDrawer.svelte';
@@ -21,8 +23,12 @@
 		type JobView,
 		type ParetoView,
 		type Population,
-		type StartGenerationBody
+		type StartGenerationBody,
+		type StrategiesView
 	} from '../../lib/api';
+	import { since } from '../../lib/alerts';
+	import { consoleApi, errText } from '../../lib/console';
+	import { PIPELINE_STAGES, evidence, stageClass, stageCounts, strategiesByGenome, verdict, type PipelinePolicy, type StrategyWithPipeline } from '../../lib/riskdesk';
 	import { candidateLabel, directionFor, MINIMISE, nonDominated, paretoPoints, plottableKeys } from '../../lib/pareto';
 	import { loadPref, savePref } from '../../lib/prefs';
 	import { runtime } from '../../lib/runtime.svelte';
@@ -47,6 +53,25 @@
 	let paretoError = $state('');
 	let genomeId = $state<string | null>(null);
 	let validationCandidate = $state('');
+
+	// strategy lifecycle (spec 35 AC 6)
+	let strategies = $state<StrategiesView | null>(null);
+	let lifecycleError = $state('');
+	let pipelineStatus = $state<Record<string, unknown> | null>(null);
+	const evolved = $derived(((strategies?.strategies ?? []) as StrategyWithPipeline[]).filter((s) => s.pipeline || s.evolved));
+	const stageTotals = $derived(stageCounts(evolved));
+	const lifecyclePolicy = $derived((pipelineStatus?.policy ?? {}) as PipelinePolicy);
+	const byGenome = $derived(strategiesByGenome(evolved));
+	const passBadge = (v: boolean | null) => (v === null ? '' : v ? 'ok' : 'danger');
+
+	async function refreshLifecycle() {
+		const [s, p] = await Promise.allSettled([live.strategies(), consoleApi.pipeline()]);
+		if (s.status === 'fulfilled') {
+			strategies = s.value;
+			lifecycleError = '';
+		} else lifecycleError = errText(s.reason);
+		if (p.status === 'fulfilled') pipelineStatus = p.value;
+	}
 
 	let xObj = $state(loadPref('evo.x', ''));
 	let yObj = $state(loadPref('evo.y', ''));
@@ -199,10 +224,12 @@
 		void refreshPopulations();
 		const stopPoll = poll(refreshJobs, () => (evolutionWs.live ? runtime.pollMs * 10 : runtime.pollMs));
 		const stopPops = poll(refreshPopulations, () => runtime.pollMs * 15);
+		const stopLifecycle = poll(refreshLifecycle, () => runtime.pollMs * 10);
 		const stopBus = onBus('jobs.>', refreshJobs);
 		return () => {
 			stopPoll();
 			stopPops();
+			stopLifecycle();
 			stopBus();
 			genTopics.close();
 			jobTopic.close();
@@ -394,7 +421,50 @@
 	<Validation candidate={validationCandidate} />
 </div>
 
-<GenomeDrawer {genomeId} onclose={() => (genomeId = null)} onopen={(id) => (genomeId = id)} />
+<section class="panel">
+	<div class="panel-head">
+		<h2>Strategy lifecycle <span class="dim">({evolved.length} evolved)</span></h2>
+		<a href="/trading/pipeline" class="dim">pipeline details, holdouts and round controls →</a>
+	</div>
+	<div class="stages">
+		{#each PIPELINE_STAGES as st, i}
+			<span class="badge {stageClass(st)}">{st} · <b class="mono">{stageTotals[st] ?? 0}</b></span>
+			{#if i < PIPELINE_STAGES.length - 1}<span class="dim">→</span>{/if}
+		{/each}
+		{#if stageTotals.paused}<span class="badge">paused · {stageTotals.paused}</span>{/if}
+		{#if pipelineStatus}<span class="dim mono">round {pipelineStatus.enabled === false ? 'DISABLED' : 'enabled'}</span>{/if}
+	</div>
+	{#if lifecycleError}<p class="badge warn" title="GET /api/trading/strategies">{lifecycleError}</p>{/if}
+	{#if evolved.length}
+		<div class="scroll">
+			<table>
+				<thead>
+					<tr><th>strategy</th><th>genome</th><th>stage</th><th>since</th><th title="selection PBO ≤ pbo_max">PBO</th><th title="selection deflated Sharpe ≥ dsr_min_candidate">DSR sel.</th><th>holdout</th><th>last reason</th></tr>
+				</thead>
+				<tbody>
+					{#each evolved as s (s.strategy_id)}
+						{@const e = evidence(s, lifecyclePolicy)}
+						{@const gid = s.pipeline?.genome_id ?? null}
+						<tr>
+							<td class="mono">{s.strategy_id}<div class="dim small">{s.pipeline?.timescale ?? ''}{s.pipeline?.generation ? ` · gen ${String(s.pipeline.generation).slice(-8)}` : ''}</div></td>
+							<td class="mono">{#if gid}<button class="link" onclick={() => ((genomeId = gid), (validationCandidate = gid))}>{candidateLabel(gid, 24)}</button>{:else}<span class="dim">—</span>{/if}</td>
+							<td><span class="badge {stageClass(s.status)}">{s.status}</span>{#if s.prev_status}<div class="dim small">from {s.prev_status}</div>{/if}</td>
+							<td class="mono dim">{since(s.since, now)}</td>
+							<td><span class="badge {passBadge(verdict(e.selection.pbo, lifecyclePolicy.pbo_max, 'max'))}">{e.selection.pbo?.toFixed(2) ?? '—'}</span></td>
+							<td><span class="badge {passBadge(verdict(e.selection.dsr, lifecyclePolicy.dsr_min_candidate, 'min'))}">{e.selection.dsr?.toFixed(2) ?? '—'}</span></td>
+							<td>{#if s.pipeline?.holdout}<span class="badge {passBadge(e.holdout.pass)}">DSR {e.holdout.dsr?.toFixed(2) ?? '—'} · n {e.holdout.n_obs ?? '—'}</span>{:else}<span class="dim">—</span>{/if}</td>
+							<td class="dim small">{s.last_reason || '—'}</td>
+						</tr>
+					{/each}
+				</tbody>
+			</table>
+		</div>
+	{:else if !lifecycleError}
+		<Empty producer="evolved strategies in ledger.strategy_state (risk-engine pipeline round, D-071)" />
+	{/if}
+</section>
+
+<GenomeDrawer {genomeId} lifecycle={genomeId ? (byGenome.get(genomeId) ?? null) : null} onclose={() => (genomeId = null)} onopen={(id) => (genomeId = id)} />
 
 <style>
 	.gens {
@@ -476,6 +546,13 @@
 	}
 	.pickers.row {
 		margin-bottom: 6px;
+	}
+	.stages {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		align-items: center;
+		margin-bottom: 8px;
 	}
 	.small {
 		font-size: 11px;

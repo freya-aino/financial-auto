@@ -689,6 +689,7 @@ fn output_of(
         timescale: ts.to_string(),
         as_of: Some(ms_to_ts(as_of_ms)),
         output_refs: refs,
+        instrument_id: inst.to_owned(),
         quantiles,
         analogs: s
             .analogs
