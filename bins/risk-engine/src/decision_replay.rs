@@ -304,4 +304,118 @@ mod tests {
         );
         assert!(same * 100 >= live.len() * 95, "the retained streams must reproduce the live decisions");
     }
+
+    /// The **deployed** service, from the streams alone (spec 41 §9, full-day replay): a cold
+    /// engine with the deployed `risk.toml` (account `FA_REPLAY_ACCOUNT`, default `paper`) is fed
+    /// every `signal.exposure.*` and `md.trade.*` retained since `FA_REPLAY_FROM_MS` (the deployed
+    /// process start on an empty ledger, e.g. a fresh ephemeral stack) plus the **gateway's real
+    /// order events** from `ORDERS` (their intent ids mapped onto the replay's own), ticking on the
+    /// 1 s wall-clock grid like the deployed engine. Its approved intents are compared tick by tick
+    /// with the `order.approved.<account>` the deployed engine published.
+    #[tokio::test]
+    #[ignore = "reads the live JetStream streams; FA_REPLAY_FROM_MS=<deployed start ms>"]
+    async fn deployed_decisions_from_retained_streams() {
+        use std::collections::{HashMap, VecDeque};
+        let Some(from) = std::env::var("FA_REPLAY_FROM_MS").ok().and_then(|s| s.parse::<i64>().ok()) else {
+            return;
+        };
+        let to = std::env::var("FA_REPLAY_TO_MS").ok().and_then(|s| s.parse().ok()).unwrap_or_else(now_ms);
+        let account = std::env::var("FA_REPLAY_ACCOUNT").unwrap_or_else(|_| "paper".into());
+        let url = std::env::var("FA_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
+        let js = fa_bus::async_nats::jetstream::new(fa_bus::async_nats::connect(&url).await.expect("nats"));
+        let opts = fa_bus::replay::ReadOptions { max_messages: 50_000_000, ..Default::default() };
+        let read = |stream: &'static str, filter: String| {
+            let js = js.clone();
+            async move { fa_bus::replay::read_range(&js, stream, &filter, from, to, &opts).await.expect(stream) }
+        };
+        let mut inputs = read("SIGNAL", "signal.exposure.>".into()).await;
+        inputs.extend(read("MD", "md.trade.>".into()).await);
+        let events = read("ORDERS", format!("order.event.{account}")).await;
+        let live: Vec<OrderIntent> = read("ORDERS", format!("order.approved.{account}"))
+            .await
+            .iter()
+            .filter_map(|r| OrderIntent::decode(r.payload.as_slice()).ok())
+            .collect();
+        let live_raw: Vec<OrderIntent> = read("ORDERS", format!("order.intent.{account}"))
+            .await
+            .iter()
+            .filter_map(|r| OrderIntent::decode(r.payload.as_slice()).ok())
+            .collect();
+        inputs.extend(events.iter().cloned());
+        inputs.sort_by_key(|r| (r.published_ms, r.stream_seq));
+        let created = |i: &OrderIntent| i.created_at.map_or(0, |t| t.seconds * 1000 + i64::from(t.nanos) / 1_000_000);
+        let tick_of = |ms: i64| ms - ms.rem_euclid(1000);
+        let fp = |t: i64, i: &OrderIntent| {
+            format!(
+                "{t} {} side={} qty={:.6} algo={} by={:?}",
+                i.instrument_id, i.side, i.quantity, i.exec_algo, i.strategy_ids
+            )
+        };
+        // deployed intent id per fingerprint (FIFO), so the gateway's events can be remapped
+        let mut deployed_ids: HashMap<String, VecDeque<String>> = HashMap::new();
+        for i in &live_raw {
+            deployed_ids.entry(fp(tick_of(created(i)), i)).or_default().push_back(i.intent_id.clone());
+        }
+        let mut s = settings();
+        s.account = account.clone();
+        let mut e = Engine::new(s);
+        e.set_costs(costs());
+        let mut id_map: HashMap<String, String> = HashMap::new(); // deployed → replay
+        let (mut replayed, mut unmapped_events) = (Vec::<String>::new(), 0usize);
+        let mut k = 0usize;
+        let mut t = tick_of(from) + 1000;
+        while t <= to {
+            while k < inputs.len() && inputs[k].published_ms <= t {
+                let r = &inputs[k];
+                k += 1;
+                if r.subject.starts_with("order.event.") {
+                    let Ok(mut ev) = OrderEvent::decode(r.payload.as_slice()) else { continue };
+                    match id_map.get(&ev.intent_id) {
+                        Some(id) => {
+                            ev.intent_id = id.clone();
+                            e.on_order_event(&ev, r.published_ms);
+                        }
+                        None => unmapped_events += 1,
+                    }
+                } else {
+                    apply(&mut e, r);
+                }
+            }
+            for o in e.tick(t) {
+                match o {
+                    Out::Intent(i) => {
+                        if let Some(dep) = deployed_ids.get_mut(&fp(t, &i)).and_then(VecDeque::pop_front) {
+                            id_map.insert(dep, i.intent_id.clone());
+                        }
+                    }
+                    Out::Approved(i) => replayed.push(fp(t, &i)),
+                    _ => {}
+                }
+            }
+            t += 1000;
+        }
+        let live: Vec<String> = live.iter().map(|i| fp(tick_of(created(i)), i)).collect();
+        fn count(v: &[String]) -> BTreeMap<&str, usize> {
+            let mut m: BTreeMap<&str, usize> = BTreeMap::new();
+            for x in v {
+                *m.entry(x.as_str()).or_default() += 1;
+            }
+            m
+        }
+        let (a, b) = (count(&live), count(&replayed));
+        let same: usize = a.iter().map(|(k, n)| (*n).min(b.get(k).copied().unwrap_or(0))).sum();
+        let first_diff = live.iter().zip(&replayed).position(|(x, y)| x != y);
+        eprintln!(
+            "deployed replay {from}..{to} ({:.1} h): {} inputs, {} order events ({unmapped_events} unmapped); live approved {}, replayed {}, identical {same} ({:.2} %); first divergence at {:?}",
+            (to - from) as f64 / 3.6e6,
+            inputs.len(),
+            events.len(),
+            live.len(),
+            replayed.len(),
+            100.0 * same as f64 / live.len().max(1) as f64,
+            first_diff.map(|p| (&live[p], &replayed[p]))
+        );
+        assert!(!live.is_empty(), "the deployed engine approved nothing in the window");
+        assert!(same * 100 >= live.len() * 95, "the deployed decisions must be reproduced from the streams");
+    }
 }

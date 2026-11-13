@@ -424,7 +424,7 @@ mod tests {
         assert!(t.streams.iter().all(|s| s.max_mib.is_some_and(|m| m >= 1024)), "every stream is capped");
         assert_eq!(by_name(&t, "LATENT").config().max_bytes, 24 * 1024 * 1024 * 1024);
         let by = |n: &str| t.streams.iter().find(|s| s.name == n).unwrap();
-        assert_eq!(by("MD").max_age_hours, 24);
+        assert_eq!(by("MD").max_age_hours, 48);
         assert_eq!(by("TEXT").subjects, ["news.>", "filing.>"]);
         assert_eq!(by("MACRO").max_age_hours, 30 * 24);
         assert_eq!(by("ORDERS").max_age_hours, 365 * 24);
@@ -432,7 +432,7 @@ mod tests {
         assert_eq!(by("JOB_RESULTS").subjects, ["jobs.result.>"]);
         assert_eq!(t.work_queue, WorkQueueSpec { ack_wait_secs: 60, max_deliver: 5, max_ack_pending: 64 });
         let cfg = by("MD").config();
-        assert_eq!(cfg.max_age, Duration::from_secs(86_400));
+        assert_eq!(cfg.max_age, Duration::from_secs(2 * 86_400));
         assert_eq!(cfg.retention, RetentionPolicy::Limits);
     }
 

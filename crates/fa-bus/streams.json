@@ -1,7 +1,7 @@
 {
   "_comment": "JetStream stream table from specs/21-bus-and-contracts.md §5. Single source of truth embedded by crates/fa-bus (streams.rs) and go/pkg/bus (streams.go); both sides test against it. JOBS_<kind> work queues are not listed: their owners create them (ensure_work_queue / EnsureWorkQueue) with the work_queue consumer tunables below. max_mib caps every stream (spec 21 §10.1 disk budget, sized from live `nats stream info` 2026-11-11 with >= 2x headroom); ensure never lowers a cap below a stream's current bytes.",
   "streams": [
-    { "name": "MD",          "subjects": ["md.>"],                "max_age_hours": 24, "max_mib": 4096,   "storage": "file", "description": "market data: live + short replay; long history in VictoriaMetrics/Garage" },
+    { "name": "MD",          "subjects": ["md.>"],                "max_age_hours": 48, "max_mib": 4096,   "storage": "file", "description": "market data: live + short replay (48 h: a full day stays replayable, D-100); long history in VictoriaMetrics/Garage" },
     { "name": "TEXT",        "subjects": ["news.>", "filing.>"],  "max_age_hours": 168, "max_mib": 2048,  "storage": "file", "description": "news and filing events" },
     { "name": "MEDIA",       "subjects": ["media.>"],             "max_age_hours": 168, "max_mib": 2048,  "storage": "file", "description": "media chunk refs; blobs live in Garage" },
     { "name": "MACRO",       "subjects": ["macro.>", "onchain.>"],"max_age_hours": 720, "max_mib": 2048,  "storage": "file", "description": "macro observations and on-chain events" },

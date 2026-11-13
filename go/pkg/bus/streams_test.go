@@ -25,7 +25,7 @@ func TestStreamTableMatchesSpec21(t *testing.T) {
 		}
 		by[s.Name] = s
 	}
-	if by["MD"].MaxAgeHours != 24 || by["ORDERS"].MaxAgeHours != 365*24 || by["MACRO"].MaxAgeHours != 30*24 {
+	if by["MD"].MaxAgeHours != 48 || by["ORDERS"].MaxAgeHours != 365*24 || by["MACRO"].MaxAgeHours != 30*24 {
 		t.Errorf("max ages: %+v", by)
 	}
 	if by["ORDERS"].Storage != "file" || by["ORDERS"].Config().Storage != jetstream.FileStorage {
@@ -45,7 +45,7 @@ func TestStreamTableMatchesSpec21(t *testing.T) {
 	if tb.WorkQueue != (WorkQueueSpec{AckWaitSecs: 60, MaxDeliver: 5, MaxAckPending: 64}) {
 		t.Errorf("work queue: %+v", tb.WorkQueue)
 	}
-	if c := by["MD"].Config(); c.MaxAge != 24*time.Hour || c.Retention != jetstream.LimitsPolicy {
+	if c := by["MD"].Config(); c.MaxAge != 48*time.Hour || c.Retention != jetstream.LimitsPolicy {
 		t.Errorf("MD config: %+v", c)
 	}
 	if WorkQueueName("evo") != "JOBS_EVO" || WorkQueueSubject("evo") != "jobs.evo.>" || WorkQueueName("media.asr") != "JOBS_MEDIA_ASR" {
@@ -104,7 +104,7 @@ func TestMergeStreamConfigHoldsPurgingLimits(t *testing.T) {
 	live = md
 	live.MaxAge = 12 * time.Hour
 	cfg, update, held = mergeStreamConfig(live, 0, md)
-	if !update || cfg.MaxAge != 24*time.Hour || len(held) != 0 {
+	if !update || cfg.MaxAge != md.MaxAge || len(held) != 0 {
 		t.Errorf("grow: update=%v age=%v held=%+v", update, cfg.MaxAge, held)
 	}
 

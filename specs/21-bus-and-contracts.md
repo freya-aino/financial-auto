@@ -123,7 +123,7 @@ message JobResult {
 ## 5. Data model — JetStream streams
 | Stream | Subjects | Retention | Max age | Notes |
 |---|---|---|---|---|
-| `MD` | `md.>` | limits | 24 h | live + short replay; long history in VM/Garage |
+| `MD` | `md.>` | limits | 48 h (D-100) | live + short replay, a full day replayable; long history in VM/Garage |
 | `TEXT` | `news.>`, `filing.>` | limits | 7 d | |
 | `MEDIA` | `media.>` | limits | 7 d | refs only, blobs in Garage |
 | `MACRO` | `macro.>`, `onchain.>` | limits | 30 d | |
@@ -169,7 +169,7 @@ The caps sum to 69 GiB against the server's 202 GB JetStream storage. `ensure_st
 ## 7. Tunables
 | Name | Default (placeholder) | Notes |
 |---|---|---|
-| `stream.MD.max_age` | 24 h | |
+| `stream.MD.max_age` | 48 h (D-100) | |
 | `consumer.max_ack_pending` | 10,000 (md, `LiveSpec::market_data`) / 64 per work-queue consumer (each worker holds ≤ 1 job: batch size 1) | `streams.json` `work_queue.max_ack_pending` |
 | `consumer.behind_threshold` | 1,000 | coalesce quotes/books above this backlog |
 | `jobs.ack_wait` | 60 s + in-progress heartbeats | |
