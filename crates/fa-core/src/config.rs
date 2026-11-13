@@ -51,6 +51,14 @@ pub struct GarageConfig {
     pub bucket_raw: String,
     pub bucket_media: String,
     pub bucket_models: String,
+    /// Days after which a media item's full video is dropped in favour of its sampled frames
+    /// (spec 20 §6.5, `garage.media_downsample_after_d`; run weekly by control-api).
+    #[serde(default = "default_media_downsample_after_d")]
+    pub media_downsample_after_d: u32,
+}
+
+fn default_media_downsample_after_d() -> u32 {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

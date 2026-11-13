@@ -13,6 +13,7 @@ mod latent_routes;
 mod ledger_routes;
 mod live;
 mod live_routes;
+mod maintenance;
 mod mcmc_routes;
 mod metrics_routes;
 mod openapi;
@@ -83,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
     ops_routes::spawn(&state); // JOB_RESULTS → ops.job_run, config → ops.config_snapshot (wait for Postgres)
     ref_mirror::spawn(&state); // Postgres ref → Helix Instrument/Entity/Venue mirror: full at start + periodic, incremental on ref.changed.* (spec 12 §5)
     refdata_maint::spawn(&state); // daily calendar refresh + adjusted daily bars (spec 12 §7)
+    maintenance::spawn(&state); // daily VictoriaMetrics retention + weekly genome GC (spec 20 §6.5)
     let app = app(state, Some(args.frontend)).await;
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     tracing::info!(%bind, "control-api listening");

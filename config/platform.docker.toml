@@ -22,6 +22,7 @@ region = "garage"
 bucket_raw = "fa-raw"
 bucket_media = "fa-media"
 bucket_models = "fa-models"
+media_downsample_after_d = 30 # spec 20 §6.5: full video → sampled frames after N days
 
 [control_api]
 bind = "0.0.0.0:7700"

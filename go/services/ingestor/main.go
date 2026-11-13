@@ -167,6 +167,11 @@ func main() {
 				counters.Set("tsdb.dropped", float64(st.Dropped))
 				counters.Set("tsdb.aggregated", float64(st.Aggregated))
 				counters.Set("tsdb.late", float64(st.Late))
+				// series budget (spec 20 §5.3) → fa_heartbeat_counter{service="ingestor",key="tsdb.…"}
+				counters.Set("tsdb.active_series", float64(st.ActiveSeries))
+				counters.Set("tsdb.demoted", float64(st.Demoted))
+				counters.Set("tsdb.over_budget", float64(st.OverBudget))
+				counters.Set("tsdb.rejected_bars", float64(st.RejectedBars))
 				select {
 				case <-ctx.Done():
 					return
