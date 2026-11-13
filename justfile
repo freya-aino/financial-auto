@@ -31,6 +31,22 @@ garage-init:
 migrate:
     sqlx migrate run --source {{root}}/migrations --database-url {{database_url}}
 
+# ── ephemeral test stacks (D-096) ──────────────────────────────────────
+# Every test run gets project fa-eph-<run> with fresh volumes and local connectors only;
+# eph-down deletes that project's containers, volumes and backups. One stack at a time (shared ports).
+
+# Start an ephemeral stack: just eph-up t1 [infra]
+eph-up run mode="app":
+    {{root}}/scripts/eph.sh up {{run}} {{mode}}
+
+# Remove an ephemeral stack with its volumes and backups
+eph-down run:
+    {{root}}/scripts/eph.sh down {{run}}
+
+# List leftover ephemeral projects, volumes and backups
+eph-ls:
+    {{root}}/scripts/eph.sh ls
+
 # ── app stack in Docker (D-026) ─────────────────────────────────────────
 
 # Build the Rust (incl. frontend) and Go service images
@@ -191,7 +207,7 @@ go *args:
     if command -v go >/dev/null; then
         go {{args}}
     else
-        docker run --rm -v "{{root}}/go":/src -w /src -v fa-gomod:/go/pkg/mod -v fa-gocache:/root/.cache/go-build {{go_image}} go {{args}}
+        docker run --rm -v "{{root}}":/repo -w /repo/go -v fa-gomod:/go/pkg/mod -v fa-gocache:/root/.cache/go-build {{go_image}} go {{args}}
     fi
 
 go-build: (go "build" "./...") (go "vet" "./...")

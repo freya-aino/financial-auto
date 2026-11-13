@@ -74,6 +74,7 @@ import (
 	_ "github.com/fey/financial-auto/go/connectors/oanda"
 	_ "github.com/fey/financial-auto/go/connectors/rss" // generic RSS/Atom adapter (spec 11 §6.3)
 	_ "github.com/fey/financial-auto/go/connectors/secedgar"
+	_ "github.com/fey/financial-auto/go/connectors/synthetic" // local factor-model generator for ephemeral stacks (D-096)
 	_ "github.com/fey/financial-auto/go/connectors/yahoo"
 )
 

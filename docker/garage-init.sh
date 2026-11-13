@@ -16,7 +16,17 @@ fi
 for b in fa-raw fa-media fa-models fa-ckpt fa-artifacts fa-backup; do
   G bucket create "$b" 2>/dev/null || echo "bucket $b exists"
 done
-G key info fa-local >/dev/null 2>&1 || G key create fa-local
+# A fresh Garage (ephemeral stack, D-096) imports the key already in config/secrets.toml, so the
+# services' credentials keep working; without one a new key is created and printed below.
+secret() { sed -n '/^\[garage\]/,/^\[/p' config/secrets.toml 2>/dev/null | sed -n "s/^$1 *= *\"\([^\"]*\)\".*/\1/p" | head -1; }
+AK=$(secret access_key_id); SK=$(secret secret_access_key)
+if ! G key info fa-local >/dev/null 2>&1; then
+  if [ -n "$AK" ] && [ -n "$SK" ]; then
+    G key import --yes -n fa-local "$AK" "$SK" >/dev/null && echo "imported key fa-local from config/secrets.toml"
+  else
+    G key create fa-local
+  fi
+fi
 for b in fa-raw fa-media fa-models fa-ckpt fa-artifacts fa-backup; do
   G bucket allow --read --write --owner "$b" --key fa-local >/dev/null
 done

@@ -15,6 +15,7 @@ import (
 	_ "github.com/fey/financial-auto/go/connectors/lemon"
 	_ "github.com/fey/financial-auto/go/connectors/oanda"
 	_ "github.com/fey/financial-auto/go/connectors/secedgar"
+	_ "github.com/fey/financial-auto/go/connectors/synthetic"
 	_ "github.com/fey/financial-auto/go/connectors/yahoo"
 )
 
@@ -22,7 +23,7 @@ import (
 // its catalog id, implements Normalizer and that the declared capabilities
 // match the implemented interfaces.
 func TestFirstWaveRegistered(t *testing.T) {
-	for _, id := range []string{"heartbeat", "yahoo", "lemon", "oanda", "hackernews", "google_news",
+	for _, id := range []string{"heartbeat", "synthetic", "yahoo", "lemon", "oanda", "hackernews", "google_news",
 		"frankfurter", "ecb", "gdelt", "sec_edgar", "kraken"} {
 		c, err := connector.New(id)
 		if err != nil {

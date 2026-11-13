@@ -39,11 +39,24 @@ If an existing `./target` is present, leave it alone — deleting it is the owne
 - Check `df -h /` before long builds or sweeps; stop and report when the disk is above 90 %.
 - Never delete anything outside your own scratch output without asking: no `rm -rf` of build
   directories, caches or other projects' data.
-- Never run `docker compose down -v`, `docker volume rm|prune`, `docker system prune`,
+- Never run `docker compose down -v` (except the scoped `just eph-down` below), `docker volume rm|prune`, `docker system prune`,
   `docker container prune` or `docker kill $(docker ps -q)`. Other projects share this Docker host.
 - Scratch containers get a unique `--name`, `--rm`, tmpfs storage and no named volumes; remove only
   the containers you started, by name.
 - Don't restart, wipe or re-seed the compose stack unless the task says so.
+
+## Ephemeral test stacks (owner rule, D-096)
+
+Test runs, including long ones, assume the platform is ephemeral: start from empty volumes and delete
+the run's data afterwards, so test data never piles up on the disk.
+
+- Start with `just eph-up <run>` (or `scripts/eph.sh up <run>`): compose project `fa-eph-<run>`,
+  fresh volumes, backups in `scratch/backups-<run>/`, local connectors only (`synthetic,heartbeat`).
+- Always finish with `just eph-down <run>`, which removes **only** that project's containers, volumes
+  and backups (`down -v` scoped to `fa-eph-<run>`; this is the one exception to the rule above).
+  Check `just eph-ls` is empty at the end of a task.
+- Develop and test against local and synthetic data. Real remote sources and APIs are added and
+  tested as the last step of a piece of work.
 
 ## Working conventions
 

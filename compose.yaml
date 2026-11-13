@@ -183,7 +183,7 @@ services:
       FA_BACKUP_OFFSITE_ENABLED: ${FA_BACKUP_OFFSITE_ENABLED:-0}
       FA_BACKUP_OFFSITE_REMOTE: ${FA_BACKUP_OFFSITE_REMOTE:-}
     volumes:
-      - ./backups:/backups
+      - ${FA_BACKUP_DIR:-./backups}:/backups # ephemeral stacks: scratch/backups-<run>, removed by eph-down (D-096)
       - pg-wal-archive:/wal-archive # read by the drill, pruned by prune.sh
       - helix-data:/helix:ro
       - ./config/secrets.toml:/run/fa/secrets.toml:ro
@@ -366,7 +366,8 @@ services:
     image: financial-auto/go:dev
     entrypoint: ["ingestor"]
     # Keyless live sources + the synthetic heartbeat (D-050); add lemon/oanda once keys are in config/secrets.toml.
-    command: ["-nats", "nats://nats:4222", "-catalog", "/app/config/sources.yaml", "-connectors", "heartbeat,yahoo,hackernews,google_news,frankfurter,ecb,gdelt,sec_edgar,kraken",
+    # FA_CONNECTORS overrides the list (ephemeral stacks: synthetic,heartbeat — no network, D-096).
+    command: ["-nats", "nats://nats:4222", "-catalog", "/app/config/sources.yaml", "-connectors", "${FA_CONNECTORS:-heartbeat,yahoo,hackernews,google_news,frankfurter,ecb,gdelt,sec_edgar,kraken}",
               "-tsdb-url", "http://victoriametrics:8428", "-postgres", "postgres://fa:fa@postgres:5432/fa", "-garage", "http://garage:3900"]
     volumes:
       - ./config/secrets.toml:/app/config/secrets.toml:ro # git-ignored; create with docker/garage-init.sh (D-045)
@@ -379,6 +380,12 @@ services:
       FA_LOG_FORMAT: ${FA_LOG_FORMAT:-text}
       FA_ARCHIVE_SPOOL: /tmp/fa-raw-spool # raw-archive spool while Garage is down (spec 10 §8)
       FA_NATS_SPOOL: /tmp/fa-nats-spool # envelope disk buffer while NATS is down (spec 10 §8)
+      # synthetic connector tunables (go/connectors/synthetic, D-096)
+      FA_SYNTHETIC_INSTRUMENTS: ${FA_SYNTHETIC_INSTRUMENTS:-8}
+      FA_SYNTHETIC_FACTORS: ${FA_SYNTHETIC_FACTORS:-3}
+      FA_SYNTHETIC_SEED: ${FA_SYNTHETIC_SEED:-1}
+      FA_SYNTHETIC_INTERVAL: ${FA_SYNTHETIC_INTERVAL:-1s}
+      FA_SYNTHETIC_NEWS_EVERY: ${FA_SYNTHETIC_NEWS_EVERY:-60}
     ports:
       - "127.0.0.1:9105:9100" # metrics
     depends_on:
