@@ -51,7 +51,8 @@ Test runs, including long ones, assume the platform is ephemeral: start from emp
 the run's data afterwards, so test data never piles up on the disk.
 
 - Start with `just eph-up <run>` (or `scripts/eph.sh up <run>`): compose project `fa-eph-<run>`,
-  fresh volumes, backups in `scratch/backups-<run>/`, local connectors only (`synthetic,heartbeat`).
+  fresh volumes, backups in `scratch/backups-<run>/`, local connectors only (`synthetic,heartbeat`), `FA_MARKET_DATA=synthetic` so the stack paper-trades
+  the synthetic market (the default everywhere else is `real`, D-103).
 - Always finish with `just eph-down <run>`, which removes **only** that project's containers, volumes
   and backups (`down -v` scoped to `fa-eph-<run>`; this is the one exception to the rule above).
   Check `just eph-ls` is empty at the end of a task.

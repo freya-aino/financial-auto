@@ -964,6 +964,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Durable MD consumers (spec 21 §5): a restart resumes where it stopped, so latents and
     // region statistics have no gaps; after more than MD_RESUME_WITHIN down the backlog is skipped.
+    let md_mode = fa_core::market_data::MarketDataMode::from_env().map_err(anyhow::Error::msg)?;
+    tracing::info!(market_data = %md_mode, "market data mode (D-103; FA_MARKET_DATA)");
     let md = |durable: &str, filter: &str| {
         fa_bus::consume::LiveSpec::market_data("MD", durable, &[filter]).with_resume_within(MD_RESUME_WITHIN)
     };
@@ -979,10 +981,15 @@ async fn main() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             msg = trades.next() => match msg {
-                Some((subject, env)) => rt.on_trade(&subject, &env).await,
+                Some((subject, env)) if md_mode.admits_subject(&subject) => rt.on_trade(&subject, &env).await,
+                Some(_) => {} // D-103: another market-data mode (default real drops synthetic venues)
                 None => break,
             },
-            Some((subject, env)) = bars_sub.next() => rt.on_bar(&subject, &env).await,
+            Some((subject, env)) = bars_sub.next() => {
+                if md_mode.admits_subject(&subject) {
+                    rt.on_bar(&subject, &env).await;
+                }
+            }
             Some((subject, env, publish)) = news_rx.recv() => {
                 rt.on_news(&subject, &env, publish).await;
                 if subject.is_empty() {

@@ -777,6 +777,7 @@ mod tests {
                 s
             })
             .collect();
+        let md_mode = fa_core::market_data::MarketDataMode::from_env().expect("FA_MARKET_DATA");
         let mut carry: Vec<RecordedMessage> = Vec::new();
         let mut transient_until = i64::MIN;
         let mut a = from;
@@ -785,7 +786,10 @@ mod tests {
             let b = (a + chunk).min(to);
             let mut inputs = std::mem::take(&mut carry);
             for (stream, filter) in INPUTS {
-                inputs.extend(read(stream, filter, a, b - 1).await);
+                // the deployed service's market-data mode (D-103; FA_MARKET_DATA, default real)
+                inputs.extend(
+                    read(stream, filter, a, b - 1).await.into_iter().filter(|r| md_mode.admits_subject(&r.subject)),
+                );
             }
             // signals stamped in [a, b) (published a few ms after their as_of)
             let live: Vec<RecordedMessage> = read(SIGNALS.0, SIGNALS.1, a, b + 5_000)

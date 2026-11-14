@@ -13,6 +13,9 @@ x-rust-defaults:
     FA_METRICS_BIND: 0.0.0.0:9100 # GET /metrics, scraped by victoriametrics; host ports 91xx below (D-056)
     RUST_LOG: info
     FA_LOG_FORMAT: ${FA_LOG_FORMAT:-text} # json → one JSON object per line (spec 60 §4); set in .env for the whole stack
+    # D-103: paper trading acts on real market data only (synthetic venues ignored); ephemeral
+    # stacks (scripts/eph.sh) set synthetic. real | synthetic | all.
+    FA_MARKET_DATA: ${FA_MARKET_DATA:-real}
   volumes: &secrets-volume
     - ./config/secrets.toml:/app/config/secrets.toml:ro # git-ignored; create with docker/garage-init.sh (D-045)
 
@@ -432,6 +435,7 @@ services:
       FA_METRICS_BIND: 0.0.0.0:9100
       FA_LOG_FORMAT: ${FA_LOG_FORMAT:-text}
       FA_COSTS: /app/config/costs.yaml # go/services/broker-gateway/costs.yaml, baked into the image
+      FA_MARKET_DATA: ${FA_MARKET_DATA:-real} # D-103: fills only against real market data by default
       FA_STATE_DIR: /var/lib/fa # → costs.calibrated.yaml (+ .report.json)
     ports:
       - "127.0.0.1:9106:9100" # metrics

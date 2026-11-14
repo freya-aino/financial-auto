@@ -329,7 +329,9 @@ mod tests {
             async move { fa_bus::replay::read_range(&js, stream, &filter, from, to, &opts).await.expect(stream) }
         };
         let mut inputs = read("SIGNAL", "signal.exposure.>".into()).await;
-        inputs.extend(read("MD", "md.trade.>".into()).await);
+        // the deployed service's market-data mode (D-103; FA_MARKET_DATA, default real)
+        let mode = fa_core::market_data::MarketDataMode::from_env().expect("FA_MARKET_DATA");
+        inputs.extend(read("MD", "md.trade.>".into()).await.into_iter().filter(|r| mode.admits_subject(&r.subject)));
         let events = read("ORDERS", format!("order.event.{account}")).await;
         let live: Vec<OrderIntent> = read("ORDERS", format!("order.approved.{account}"))
             .await

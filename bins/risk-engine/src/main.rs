@@ -444,6 +444,8 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     fa_bus::metrics::serve_from_env("risk-engine", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config).context("loading platform config")?;
+    let md_mode = fa_core::market_data::MarketDataMode::from_env().map_err(anyhow::Error::msg)?;
+    tracing::info!(market_data = %md_mode, "market data mode (D-103; FA_MARKET_DATA)");
     let vector_store = fa_hub::configure_vectors(&cfg); // ADR 0010: vectors in Qdrant, graph in Helix
     tracing::info!(qdrant = vector_store.as_deref().unwrap_or("off (helix vector indexes)"), "vector store");
     let settings = match std::fs::read_to_string(&args.risk) {
@@ -648,6 +650,10 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         tokio::spawn(async move {
             while let Some((subject, env)) = sub.next().await {
+                // D-103: marks only from the configured market data (default real)
+                if !md_mode.admits_subject(&subject) {
+                    continue;
+                }
                 if let Some(Payload::Trade(t)) = &env.payload
                     && let Ok(uuid) = Uuid::parse_str(&env.instrument_id)
                 {

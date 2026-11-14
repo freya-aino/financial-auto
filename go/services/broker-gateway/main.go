@@ -60,8 +60,14 @@ func main() {
 	statePath := flag.String("orders-state", envOr("FA_ORDERS_STATE", defaultStatePath()), "working/resting orders + positions persisted across restarts (empty: in memory only)")
 	riskTimeout := flag.Duration("risk-heartbeat-timeout", 15*time.Second, "fail-closed: reject risk-increasing intents while the risk-engine heartbeat is older than this (0 disables)")
 	carryPeriod := flag.Duration("carry-period", time.Hour, "funding / borrow charging period on open paper positions, published on exec.carry.<account> (0 disables)")
+	marketData := flag.String("market-data", envOr("FA_MARKET_DATA", "real"), "market data the paper engine fills against: real (default; synthetic venues ignored), synthetic (ephemeral stacks) or all (D-103)")
 	flag.Parse()
 	log := bus.NewLogger(service) // FA_LOG_FORMAT=json|text (spec 60 §4)
+	mdMode, err := bus.ParseMarketDataMode(*marketData)
+	if err != nil {
+		log.Error("market data mode", "err", err)
+		os.Exit(1)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -179,6 +185,10 @@ func main() {
 		return s
 	}
 	consume(md("broker-gateway-md-trade", bus.AllMdTrades), func(subject string, data []byte) {
+		if !mdMode.AdmitsSubject(subject) {
+			counters.Add("md_skipped", 1) // other market-data mode: never priced, never filled (D-103)
+			return
+		}
 		var e fav1.Envelope
 		if proto.Unmarshal(data, &e) != nil || e.GetTrade() == nil {
 			return
@@ -190,6 +200,10 @@ func main() {
 		publish(engine.ObserveTrade(subject, e.GetTrade().GetPrice(), e.GetTrade().GetSize(), at))
 	})
 	consume(md("broker-gateway-md-quote", allMdQuotes), func(subject string, data []byte) {
+		if !mdMode.AdmitsSubject(subject) {
+			counters.Add("md_skipped", 1)
+			return
+		}
 		var e fav1.Envelope
 		if proto.Unmarshal(data, &e) == nil && e.GetQuote() != nil {
 			engine.ObserveQuote(subject, e.GetQuote().GetBidPrice(), e.GetQuote().GetAskPrice())
@@ -304,7 +318,7 @@ func main() {
 			}
 		}()
 	}
-	log.Info("started", "mode", "paper", "costs", *costsPath, "calibrated", *calibPath, "orders_state", *statePath,
+	log.Info("started", "mode", "paper", "market_data", string(mdMode), "costs", *costsPath, "calibrated", *calibPath, "orders_state", *statePath,
 		"risk_heartbeat_timeout", *riskTimeout)
 	<-ctx.Done()
 	if store != nil {

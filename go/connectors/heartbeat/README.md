@@ -1,6 +1,6 @@
 # heartbeat
 
-Synthetic connector that proves the ingestion path end to end (D-018). It emits one random-walk `Trade` per second for the fixed simulated instrument `01900000-0000-7000-8000-000000000001` on venue `sim`, so events land on `md.trade.sim.01900000000070008000000000000001`.
+Synthetic connector that proves the ingestion path end to end (D-018). It emits one random-walk `Trade` per second for the fixed simulated instrument `01900000-0000-7000-8000-000000000001` on venue `sim`, so events land on `md.trade.sim.01900000000070008000000000000001`. With the default `FA_MARKET_DATA=real` (D-103) nothing trades on it: it only proves ingestion.
 
 **Status:** implemented. It isn't a catalog source, so the ingestor runs it as a built-in.
 

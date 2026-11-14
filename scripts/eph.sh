@@ -8,7 +8,7 @@
 #   scripts/eph.sh ls                 list leftover fa-eph-* projects and volumes
 #
 # Host ports are the normal ones (D-014), so only one stack — the main one or one ephemeral run —
-# can be up at a time. Env: FA_CONNECTORS (default synthetic,heartbeat), FA_EPH_DISK_MAX (85 %).
+# can be up at a time. Env: FA_CONNECTORS (default synthetic,heartbeat), FA_MARKET_DATA (default synthetic, D-103), FA_EPH_DISK_MAX (85 %).
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
@@ -35,8 +35,9 @@ up() {
     export COMPOSE_PROJECT_NAME="fa-eph-$run"
     export FA_BACKUP_DIR="$ROOT/scratch/backups-$run"
     export FA_CONNECTORS=${FA_CONNECTORS:-synthetic,heartbeat}
+    export FA_MARKET_DATA=${FA_MARKET_DATA:-synthetic} # D-103: the stack paper-trades the synthetic market
     mkdir -p "$FA_BACKUP_DIR"
-    log "up $COMPOSE_PROJECT_NAME (connectors $FA_CONNECTORS, backups $FA_BACKUP_DIR, disk ${pct} %)"
+    log "up $COMPOSE_PROJECT_NAME (connectors $FA_CONNECTORS, market data $FA_MARKET_DATA, backups $FA_BACKUP_DIR, disk ${pct} %)"
     compose up -d --wait garage
     "$ROOT/docker/garage-init.sh" >/dev/null
     if [ "$mode" = infra ]; then

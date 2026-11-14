@@ -30,7 +30,7 @@ use bytes::Bytes;
 use clap::Parser;
 use fa_blob::S3BlobStore;
 use fa_bus::{Bus, subjects};
-use fa_core::{InstrumentId, config::PlatformConfig, secrets::Secrets};
+use fa_core::{InstrumentId, config::PlatformConfig, market_data::MarketDataMode, secrets::Secrets};
 use fa_proto::{
     Message,
     v1::{
@@ -68,7 +68,14 @@ async fn durable<M: fa_proto::Message + Default + Send + 'static>(
     } else {
         LiveSpec::durable(&stream, &durable, &[filter])
     };
-    Ok(bus.subscribe_durable(spec.with_resume_within(RESUME_WITHIN)).await?)
+    let sub = bus.subscribe_durable(spec.with_resume_within(RESUME_WITHIN)).await?;
+    if stream != "MD" {
+        return Ok(sub);
+    }
+    // D-103: only the configured market data (default real: synthetic venues dropped) reaches
+    // the population; skipped messages are still acked by the durable consumer.
+    let mode = MarketDataMode::from_env().map_err(anyhow::Error::msg)?;
+    Ok(sub.filter(move |(subject, _)| std::future::ready(mode.admits_subject(subject))).boxed())
 }
 
 #[derive(Debug, Parser)]
@@ -216,6 +223,8 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     fa_bus::metrics::serve_from_env("strategy-runtime", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config).context("loading platform config")?;
+    let md_mode = MarketDataMode::from_env().map_err(anyhow::Error::msg)?;
+    tracing::info!(market_data = %md_mode, "market data mode (D-103; FA_MARKET_DATA)");
     let blob = Arc::new(blob_store(&cfg));
     let spec = PopulationSpec::parse(args.strategies.as_deref().unwrap_or("managed"));
     let (file, label, warning) = source::load_or_baselines(&spec, blob.as_ref().as_ref()).await;

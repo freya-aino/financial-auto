@@ -51,7 +51,7 @@ Every scheduler tick integrates each open `account|instrument` position at the t
 | Subject | Direction | Payload |
 |---|---|---|
 | `order.approved.>` | in | `OrderIntent`; non-paper → `REJECTED`, no price seen → `REJECTED`, unmarketable limit → `ACK` (resting) |
-| `md.trade.>` | in | `Envelope{Trade}`: mark, σ, volume; fills resting limits that became marketable |
+| `md.trade.>` | in | `Envelope{Trade}`: mark, σ, volume; fills resting limits that became marketable. Only venues admitted by `FA_MARKET_DATA` / `-market-data` (D-103: `real` default drops the synthetic venue `sim`; `synthetic` on ephemeral stacks; `all`); skipped messages count as `md_skipped` |
 | `md.quote.>` | in | `Envelope{Quote}`: spread for the next fills |
 | `order.cancel.<account>` | in | `OrderCancel{intent_id, account_id, reason, at, actor}` (a legacy `OrderIntent` payload still decodes: field 1 is the intent id in both); cancels a resting limit or a working algo order → `CANCELED`, ignored (`cancels.unknown`) when nothing is working |
 | `order.event.<account>` | out | `OrderEvent` (`ACK` / `PARTIAL_FILL` / `FILL` / `CANCELED` / `REJECTED`) |

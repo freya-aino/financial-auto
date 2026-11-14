@@ -3,6 +3,7 @@
 pub mod config;
 pub mod ids;
 pub mod logging;
+pub mod market_data;
 pub mod rng;
 pub mod secrets;
 pub mod time;
