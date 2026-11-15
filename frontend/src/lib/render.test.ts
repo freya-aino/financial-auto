@@ -26,6 +26,7 @@ const pages = {
 	risk: () => import('../routes/trading/risk/+page.svelte'),
 	ledger: () => import('../routes/trading/ledger/+page.svelte'),
 	history: () => import('../routes/history/+page.svelte'),
+	growth: () => import('../routes/growth/+page.svelte'),
 	validation: () => import('../routes/trading/validation/+page.svelte')
 };
 
