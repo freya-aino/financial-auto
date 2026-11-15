@@ -107,11 +107,12 @@
 {#if msg}<p class="badge" class:ok={msgOk} class:danger={!msgOk}>{msg}</p>{/if}
 
 <div class="grid cols">
-	<section class="panel">
+	<section class="panel wide">
 		<div class="panel-head"><h2>Locked holdouts <span class="dim">({holdouts.length})</span></h2><span class="dim">immutable once locked</span></div>
 		{#if holdoutError}<p class="badge danger">{holdoutError}</p>{/if}
 		{#if holdouts.length}
-			<table>
+			<div class="tablewrap">
+				<table>
 				<thead><tr><th>id</th><th>timescale</th><th>start</th><th>end</th><th>locked</th><th>note</th></tr></thead>
 				<tbody>
 					{#each holdouts as h (String(h.id))}
@@ -125,7 +126,8 @@
 						</tr>
 					{/each}
 				</tbody>
-			</table>
+				</table>
+			</div>
 		{:else if !holdoutError}
 			<Empty producer="validation.holdout (lock one below)" hint="" />
 		{/if}
@@ -198,6 +200,13 @@
 <style>
 	.cols {
 		grid-template-columns: repeat(auto-fill, minmax(460px, 1fr));
+	}
+	/* the holdouts table carries three 16-char timestamps: full row + scroll guard */
+	.tablewrap {
+		overflow-x: auto;
+	}
+	.tablewrap table {
+		width: 100%;
 	}
 	.wide {
 		grid-column: 1 / -1;
