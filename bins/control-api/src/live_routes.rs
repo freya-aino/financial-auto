@@ -145,7 +145,13 @@ pub async fn start_generation(State(s): State<AppState>, Json(body): Json<StartG
 /// Audits an operator command forwarded on `ctl.*` (spec 50 §3) with its outcome: `ok`, the
 /// service's refusal, or the transport error (no NATS / no reply) — so the attempt is on record
 /// even when the owning service is down.
-async fn audit_ctl(s: &AppState, action: &str, subject: &str, mut payload: serde_json::Value, r: &Result<CtlReply, ApiError>) {
+async fn audit_ctl(
+    s: &AppState,
+    action: &str,
+    subject: &str,
+    mut payload: serde_json::Value,
+    r: &Result<CtlReply, ApiError>,
+) {
     let outcome = match r {
         Ok(r) => json!({ "ok": r.ok, "message": r.message }),
         Err(ApiError(status, m)) => json!({ "ok": false, "status": status.as_u16(), "error": m }),
