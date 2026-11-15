@@ -14,7 +14,17 @@
 //! When `[postgres]` is reachable the paper book and the strategy lifecycle rows are loaded at
 //! startup and every intent, fill, halt/resume, lifecycle action, limit change (audit) and
 //! periodic position / strategy snapshot is persisted ([`persist`]); a reconciliation diff halts
-//! scope `broker`. Without Postgres the engine stays in memory and says so once.
+//! scope `broker`. With no `[postgres]` url the engine stays in memory and says so once; a
+//! configured but unreachable Postgres fails startup after 30 × 2 s unless
+//! `FA_LEDGER_ALLOW_MEMORY=1` (D-105).
+//!
+//! Determinism (spec 41 §9, D-105): decision inputs (signals, trades, order stages and events,
+//! halts, resumes, source health, kernel updates) are buffered with their receive time
+//! ([`inputs`]); a tick at grid time `t` applies exactly the inputs received ≤ `t`, in arrival
+//! order, before deciding — the same decode/apply path the replay uses — and missed grid slots
+//! are caught up one by one. The decision path publishes to NATS first and hands every Postgres
+//! write to the bounded background [`writer`], so a Postgres stall delays persistence, never a
+//! decision.
 //!
 //! Reference data and FX (D-061): the instrument table (`fa_warehouse::venues`) is loaded at
 //! start, every `refdata_refresh_secs` and (debounced) on `ref.changed.>` / `ingest.unresolved.>`;
@@ -34,11 +44,13 @@
 #[cfg(test)]
 mod decision_replay;
 mod engine;
+mod inputs;
 mod persist;
 mod pipeline;
 mod recon;
 mod risk_io;
 mod settings;
+mod writer;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -48,10 +60,7 @@ use fa_bus::{Bus, consume::LiveSpec, subjects};
 use fa_core::{InstrumentId, config::PlatformConfig};
 use fa_proto::{
     Message,
-    v1::{
-        CtlReply, CtlRequest, Envelope, ExposureDistribution, Halt, Heartbeat, OrderEvent, OrderIntent,
-        envelope::Payload,
-    },
+    v1::{CtlReply, CtlRequest, Envelope, ExposureDistribution, Halt, Heartbeat, OrderEvent, envelope::Payload},
 };
 use fa_risk::strategy::StrategyAction;
 use futures::StreamExt;
@@ -60,13 +69,15 @@ use uuid::Uuid;
 
 use crate::{
     engine::{Engine, Evidence, Out},
+    inputs::{Input, InputBuffer},
     persist::Persist,
     pipeline::Pipeline,
     settings::Settings,
+    writer::{WriteJob, Writer},
 };
 
-type Shared = Arc<Mutex<Engine>>;
-type Store = Option<Arc<Persist>>;
+pub(crate) type Shared = Arc<Mutex<Engine>>;
+pub(crate) type Store = Option<Arc<Persist>>;
 type Pipe = Option<Arc<Pipeline>>;
 
 const SERVICE: &str = "risk-engine";
@@ -101,7 +112,48 @@ fn ms(t: Option<&fa_proto::Timestamp>) -> Option<i64> {
     t.map(|t| t.seconds * 1000 + i64::from(t.nanos) / 1_000_000)
 }
 
-async fn publish_outs(bus: &Bus, store: &Store, engine: &Shared, outs: Vec<Out>) {
+/// The bus publish of one engine output (shared by the direct and the writer-backed path).
+async fn publish_one(bus: &Bus, o: &Out) -> Result<(), fa_bus::BusError> {
+    match o {
+        Out::Audit { action, subject, payload } => {
+            tracing::warn!(action, subject, %payload, "automatic lifecycle change");
+            Ok(())
+        }
+        Out::Intent(i) => bus.publish(subjects::order_intent(&i.account_id), i).await,
+        Out::Approved(i) => bus.publish(subjects::order_approved(&i.account_id), i).await,
+        Out::Rejected { account, event } => {
+            // typed decision on risk.event.<account>; the OrderEvent{REJECTED} stays for older consumers
+            let _ = bus.publish(subjects::risk_event(account), &rejection_event(account, event)).await;
+            bus.publish(subjects::order_event(account), event).await
+        }
+        Out::RiskEvent { kind, scope, detail } => {
+            tracing::info!(%kind, %scope, %detail, "risk event");
+            bus.publish(subjects::risk_event(RISK_EVENT_ACCOUNT), &breach_event(kind, scope, detail)).await
+        }
+        Out::Halt(h) => {
+            tracing::warn!(scope = %h.scope, reason = %h.reason, "raising halt");
+            let _ = bus.publish(subjects::risk_event(RISK_EVENT_ACCOUNT), &halt_event(h, true)).await;
+            bus.publish(subjects::risk_halt(&h.scope), h).await
+        }
+        Out::Resume(h) => {
+            tracing::info!(scope = %h.scope, reason = %h.reason, "clearing own halt");
+            let _ = bus.publish(subjects::risk_event(RISK_EVENT_ACCOUNT), &halt_event(h, false)).await;
+            // fa.v1 Resume is wire-compatible with Halt (D-030 consumers keep decoding Halt)
+            let resume = fa_proto::v1::Resume {
+                scope: h.scope.clone(),
+                reason: h.reason.clone(),
+                at: h.since.or_else(|| Some(fa_proto::now())),
+                manual: h.manual,
+                actor: format!("system:{SERVICE}"),
+            };
+            bus.publish(subjects::risk_resume(&h.scope), &resume).await
+        }
+    }
+}
+
+/// Publishes outs and persists them synchronously. Only for tasks off the decision path
+/// (reconciliation, retries, FX, the writer itself): awaiting Postgres here is fine.
+pub(crate) async fn publish_outs_direct(bus: &Bus, store: &Store, engine: &Shared, outs: Vec<Out>) {
     for o in outs {
         if let Some(p) = store {
             match &o {
@@ -129,43 +181,54 @@ async fn publish_outs(bus: &Bus, store: &Store, engine: &Shared, outs: Vec<Out>)
                 _ => {}
             }
         }
-        let r = match &o {
-            Out::Audit { action, subject, payload } => {
-                tracing::warn!(action, subject, %payload, "automatic lifecycle change");
-                Ok(())
-            }
-            Out::Intent(i) => bus.publish(subjects::order_intent(&i.account_id), i).await,
-            Out::Approved(i) => bus.publish(subjects::order_approved(&i.account_id), i).await,
-            Out::Rejected { account, event } => {
-                // typed decision on risk.event.<account>; the OrderEvent{REJECTED} stays for older consumers
-                let _ = bus.publish(subjects::risk_event(account), &rejection_event(account, event)).await;
-                bus.publish(subjects::order_event(account), event).await
-            }
-            Out::RiskEvent { kind, scope, detail } => {
-                tracing::info!(%kind, %scope, %detail, "risk event");
-                bus.publish(subjects::risk_event(RISK_EVENT_ACCOUNT), &breach_event(kind, scope, detail)).await
-            }
-            Out::Halt(h) => {
-                tracing::warn!(scope = %h.scope, reason = %h.reason, "raising halt");
-                let _ = bus.publish(subjects::risk_event(RISK_EVENT_ACCOUNT), &halt_event(h, true)).await;
-                bus.publish(subjects::risk_halt(&h.scope), h).await
-            }
-            Out::Resume(h) => {
-                tracing::info!(scope = %h.scope, reason = %h.reason, "clearing own halt");
-                let _ = bus.publish(subjects::risk_event(RISK_EVENT_ACCOUNT), &halt_event(h, false)).await;
-                // fa.v1 Resume is wire-compatible with Halt (D-030 consumers keep decoding Halt)
-                let resume = fa_proto::v1::Resume {
-                    scope: h.scope.clone(),
-                    reason: h.reason.clone(),
-                    at: h.since.or_else(|| Some(fa_proto::now())),
-                    manual: h.manual,
-                    actor: format!("system:{SERVICE}"),
-                };
-                bus.publish(subjects::risk_resume(&h.scope), &resume).await
-            }
-        };
-        if let Err(e) = r {
+        if let Err(e) = publish_one(bus, &o).await {
             tracing::warn!(error = %e, "publish failed");
+        }
+    }
+}
+
+/// The decision path's publisher (spec 41 §9, D-105): **bus first, Postgres second**. Every
+/// write goes to the bounded background [`Writer`], so a Postgres stall can no longer hold a
+/// tick past its grid slot. The enqueue awaits only when the queue is full (backpressure).
+async fn publish_outs(bus: &Bus, writer: &Option<Writer>, engine: &Shared, outs: Vec<Out>) {
+    let mut jobs: Vec<WriteJob> = Vec::new();
+    for o in outs {
+        if let Err(e) = publish_one(bus, &o).await {
+            tracing::warn!(error = %e, "publish failed");
+        }
+        if writer.is_none() {
+            continue;
+        }
+        match o {
+            Out::Intent(i) => jobs.push(WriteJob::Intent(i)),
+            Out::Halt(h) => {
+                jobs.push(WriteJob::Audit {
+                    action: "halt".into(),
+                    subject: Some(h.scope.clone()),
+                    payload: serde_json::json!({"reason": h.reason, "manual": h.manual, "raised_by": SERVICE}),
+                });
+                let ledger = engine.lock().await.ledger().clone();
+                jobs.push(WriteJob::Snapshot { ledger: Box::new(ledger), label: "halt" });
+            }
+            Out::Audit { action, subject, payload } => {
+                jobs.push(WriteJob::Audit { action, subject: Some(subject), payload });
+            }
+            Out::Resume(h) => jobs.push(WriteJob::Audit {
+                action: "resume".into(),
+                subject: Some(h.scope.clone()),
+                payload: serde_json::json!({"reason": h.reason, "raised_by": SERVICE}),
+            }),
+            Out::RiskEvent { kind, scope, detail } => jobs.push(WriteJob::Audit {
+                action: format!("risk.event.{kind}"),
+                subject: Some(scope),
+                payload: detail,
+            }),
+            Out::Approved(_) | Out::Rejected { .. } => {}
+        }
+    }
+    if let Some(w) = writer {
+        for j in jobs {
+            w.send(j).await;
         }
     }
 }
@@ -488,8 +551,36 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("no [postgres] url configured: paper book is in memory only (resets on restart)");
         None
     } else {
-        match Persist::open(&cfg.postgres.url, &settings.account, settings.starting_cash_eur).await {
-            Ok((p, ledger)) => {
+        // Fail closed (D-105): a configured but unreachable Postgres used to fall back silently
+        // to an in-memory book that resets on restart — after a host reboot (daemon ignores
+        // depends_on) that silently forgot trading state. Retry, then exit non-zero;
+        // FA_LEDGER_ALLOW_MEMORY=1 keeps the old fallback for tests and ephemeral stacks.
+        let mut opened = None;
+        for attempt in 1..=30u32 {
+            match Persist::open(&cfg.postgres.url, &settings.account, settings.starting_cash_eur).await {
+                Ok(x) => {
+                    opened = Some(x);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(attempt, error = %format!("{e:#}"), "postgres not reachable; retrying in 2 s");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+        let allow_memory = std::env::var("FA_LEDGER_ALLOW_MEMORY").is_ok_and(|v| v == "1");
+        match (opened, allow_memory) {
+            (None, false) => anyhow::bail!(
+                "postgres unreachable after 30 attempts: refusing to trade on an in-memory book \
+                 (set FA_LEDGER_ALLOW_MEMORY=1 to allow the volatile fallback)"
+            ),
+            (None, true) => {
+                tracing::warn!(
+                    "postgres unavailable: FA_LEDGER_ALLOW_MEMORY=1, paper book is in memory only (resets on restart)"
+                );
+                None
+            }
+            (Some((p, ledger)), _) => {
                 tracing::info!(
                     book = %p.book(),
                     cash_eur = ledger.cash_eur,
@@ -534,18 +625,19 @@ async fn main() -> anyhow::Result<()> {
                 p.audit("limits.loaded", Some(&settings.account), limits).await;
                 Some(Arc::new(p))
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "postgres unavailable: paper book is in memory only (resets on restart)");
-                None
-            }
         }
     };
     let bus = Bus::connect(&cfg.nats.url).await.context("connecting to NATS")?;
     let instance_id = ulid::Ulid::generate().to_string();
+    // D-105: decision inputs are buffered with their receive time and applied per grid slot;
+    // Postgres writes from the decision path go through the bounded background writer.
+    let buffer = InputBuffer::default();
+    let writer: Option<Writer> = store.clone().map(|p| Writer::spawn(bus.clone(), p, engine.clone()));
 
     // heartbeat
     {
         let (bus, engine, instance_id) = (bus.clone(), engine.clone(), instance_id.clone());
+        let (writer_hb, buffer_hb) = (writer.clone(), buffer.clone());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(args.heartbeat_secs));
             loop {
@@ -562,6 +654,8 @@ async fn main() -> anyhow::Result<()> {
                     );
                     c.insert("gross_exposure_eur".into(), e.gross_exposure_eur());
                     c.insert("halted".into(), if e.halted() { 1.0 } else { 0.0 });
+                    c.insert("persist.queue_depth".into(), writer_hb.as_ref().map_or(0.0, |w| w.depth() as f64));
+                    c.insert("inputs.buffered".into(), buffer_hb.len() as f64);
                     for (venue, eur) in e.exposure_by_venue() {
                         c.insert(format!("exposure_eur.venue.{venue}"), eur);
                     }
@@ -606,9 +700,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // signals
+    // signals: buffered to the next tick (D-105: a tick acts only on inputs received before it)
     {
-        let (bus, engine) = (bus.clone(), engine.clone());
+        let buffer = buffer.clone();
         let mut sub = bus
             .subscribe_durable::<ExposureDistribution>(
                 LiveSpec::durable("SIGNAL", "risk-engine-signal", &["signal.exposure.>"])
@@ -617,7 +711,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         tokio::spawn(async move {
             while let Some((_, m)) = sub.next().await {
-                engine.lock().await.on_signal(&m, now_ms());
+                buffer.push(now_ms(), Input::Signal(m));
             }
         });
     }
@@ -639,9 +733,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // trades: marks + volume (+ equity-driven halts)
+    // trades (marks + volume; equity-driven halts come out of the tick drain now)
     {
-        let (bus, engine, store) = (bus.clone(), engine.clone(), store.clone());
+        let buffer = buffer.clone();
         let mut sub = bus
             .subscribe_durable::<Envelope>(
                 LiveSpec::market_data("MD", "risk-engine-md-trade", &[subjects::ALL_MD_TRADES])
@@ -657,29 +751,31 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(Payload::Trade(t)) = &env.payload
                     && let Ok(uuid) = Uuid::parse_str(&env.instrument_id)
                 {
-                    let at = ms(env.event_time.as_ref()).unwrap_or_else(now_ms);
-                    let mut e = engine.lock().await;
                     // md.trade.<venue>.<token>: the venue the paper venue prices fees by
-                    if let Some(venue) = subject.strip_prefix("md.trade.").and_then(|r| r.split('.').next()) {
-                        e.note_md_venue(InstrumentId(uuid), venue);
-                    }
-                    let outs = e.on_trade(InstrumentId(uuid), at, t.price, t.size);
-                    drop(e);
-                    publish_outs(&bus, &store, &engine, outs).await;
+                    let venue = subject.strip_prefix("md.trade.").and_then(|r| r.split('.').next()).map(str::to_owned);
+                    let input = Input::Trade {
+                        inst: InstrumentId(uuid),
+                        venue,
+                        at_ms: ms(env.event_time.as_ref()),
+                        price: t.price,
+                        size: t.size,
+                    };
+                    buffer.push(now_ms(), input);
                 }
             }
         });
     }
 
-    // order.> : intents (foreign ones are gated), approvals (remembered), events (booked)
+    // order.> : intents (foreign ones are gated), approvals (remembered), events (booked) — all
+    // buffered to the tick drain; fill persistence runs in the writer (spec 42 semantics kept:
+    // record_fill_event + confirm/retry, unknown intents recovered or parked as orphans)
     {
-        let (bus, engine, store) = (bus.clone(), engine.clone(), store.clone());
+        let buffer = buffer.clone();
         let mut sub = // durable and never skipped (spec 21 §5): every intent, approval and fill is seen once a
         // restart resumes; fills are idempotent by fill id (`Ledger::apply_fill`)
         bus.subscribe_durable_raw(LiveSpec::durable("ORDERS", "risk-engine-order", &["order.>"])).await?;
         let account = settings.account.clone();
         tokio::spawn(async move {
-            use fa_proto::Message;
             while let Some(m) = sub.next().await {
                 let subject = m.subject.as_str();
                 // order.<stage>.<account>: only this engine's account is gated and booked. Other
@@ -688,49 +784,12 @@ async fn main() -> anyhow::Result<()> {
                 if !recon::own_account(subject, &account) {
                     continue;
                 }
-                let stage = if subject.starts_with("order.intent.") {
-                    Some(false)
-                } else if subject.starts_with("order.approved.") {
-                    Some(true)
-                } else {
-                    None
-                };
-                let outs = match stage {
-                    Some(approved) => match OrderIntent::decode(m.payload.as_ref()) {
-                        Ok(i) => {
-                            if let Some(p) = &store {
-                                p.intent(&i).await; // no-op for our own (already recorded) intents
-                            }
-                            engine.lock().await.on_intent_seen(&i, approved, now_ms())
-                        }
-                        Err(e) => {
-                            tracing::debug!(subject, error = %e, "undecodable intent");
-                            continue;
-                        }
-                    },
-                    None if subject.starts_with("order.event.") => match OrderEvent::decode(m.payload.as_ref()) {
-                        Ok(ev) => {
-                            let (mut outs, booked, unknown) = {
-                                let mut e = engine.lock().await;
-                                let outs = e.on_order_event(&ev, now_ms());
-                                (outs, e.take_booked_fills(), e.take_unknown_fills())
-                            };
-                            // spec 42: fills go through fa_ledger record_fill_event; fills for
-                            // unknown intents are recovered from Postgres or parked as orphans
-                            if let Some(p) = &store {
-                                outs.extend(recon::persist_fills(p, &engine, booked).await);
-                                outs.extend(recon::resolve_unknown(p, &engine, unknown).await);
-                            }
-                            outs
-                        }
-                        Err(e) => {
-                            tracing::debug!(subject, error = %e, "undecodable order event");
-                            continue;
-                        }
-                    },
-                    None => continue,
-                };
-                publish_outs(&bus, &store, &engine, outs).await;
+                match Input::parse(subject, m.payload.as_ref()) {
+                    Some(input) => buffer.push(now_ms(), input),
+                    None => {
+                        tracing::debug!(subject, "order message not buffered (undecodable or not a decision input)")
+                    }
+                }
             }
         });
     }
@@ -739,24 +798,14 @@ async fn main() -> anyhow::Result<()> {
     // (spec 40 §6.5: strategies depending on a drifted snapshot are paused, not everything)
     {
         let mut sub = bus.subscribe_raw("latent.mcmc.>".into()).await?;
-        let (bus_k, engine_k, store_k) = (bus.clone(), engine.clone(), store.clone());
+        let buffer = buffer.clone();
         tokio::spawn(async move {
             while let Some(m) = sub.next().await {
                 if !fa_bus::contract::accept(&m.subject, m.headers.as_ref()) {
                     continue;
                 }
-                let Ok(k) = fa_proto::v1::KernelUpdate::decode(m.payload.as_ref()) else { continue };
-                let Some(space) = k.space.as_ref() else { continue };
-                let Ok(ts) = space.timescale.parse::<fa_core::Timescale>() else { continue };
-                let outs = engine_k.lock().await.on_kernel_update(
-                    &space.snapshot_id,
-                    ts,
-                    space.expert_index,
-                    k.drift_kl,
-                    now_ms(),
-                );
-                if !outs.is_empty() {
-                    publish_outs(&bus_k, &store_k, &engine_k, outs).await;
+                if let Some(input) = Input::parse(&m.subject, m.payload.as_ref()) {
+                    buffer.push(now_ms(), input);
                 }
             }
         });
@@ -784,29 +833,17 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // halts and resumes (incl. the UI kill switch, D-030)
+    // halts and resumes (incl. the UI kill switch, D-030): buffered; the audit and the halt
+    // book snapshot are enqueued at the tick drain
     {
         let mut halts = bus.subscribe::<Halt>("risk.halt.>".into()).await?;
-        let (engine_h, store_h) = (engine.clone(), store.clone());
+        let buffer_h = buffer.clone();
         tokio::spawn(async move {
             while let Some((_, h)) = halts.next().await {
-                let ledger = {
-                    let mut e = engine_h.lock().await;
-                    e.on_halt(&h, now_ms());
-                    e.ledger().clone()
-                };
-                if let Some(p) = &store_h {
-                    p.audit(
-                        "halt",
-                        Some(&h.scope),
-                        serde_json::json!({"reason": h.reason, "manual": h.manual, "raised_by": "bus"}),
-                    )
-                    .await;
-                    p.snapshot(&ledger, "halt").await;
-                }
+                buffer_h.push(now_ms(), Input::Halt(h));
             }
         });
-        let (engine, store) = (engine.clone(), store.clone());
+        let buffer_r = buffer.clone();
         let mut resumes = bus.subscribe_raw("risk.resume.>".into()).await?;
         tokio::spawn(async move {
             while let Some(m) = resumes.next().await {
@@ -815,10 +852,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if let Some(scope) = m.subject.strip_prefix("risk.resume.") {
                     tracing::info!(scope, "resume received");
-                    engine.lock().await.on_resume(scope);
-                    if let Some(p) = &store {
-                        p.audit("resume", Some(scope), serde_json::json!({})).await;
-                    }
+                    buffer_r.push(now_ms(), Input::Resume { scope: scope.to_owned() });
                 }
             }
         });
@@ -826,28 +860,15 @@ async fn main() -> anyhow::Result<()> {
 
     // ingest.health.<source> (fa.v1 IngestHealth, or legacy D-054 JSON): `down` halts the source, `ok` clears it
     {
-        let (engine, store) = (engine.clone(), store.clone());
+        let buffer = buffer.clone();
         let mut sub = bus.subscribe_raw("ingest.health.>".into()).await?;
         tokio::spawn(async move {
             while let Some(m) = sub.next().await {
                 if !fa_bus::contract::accept(&m.subject, m.headers.as_ref()) {
                     continue;
                 }
-                let Some(source) = m.subject.strip_prefix("ingest.health.") else { continue };
-                let Some((status, reason)) = fa_bus::ingest::health_status(&m.payload) else { continue };
-                let (status, reason) = (status.as_str(), reason.as_str());
-                let changed = engine.lock().await.on_source_health(source, status, reason, now_ms());
-                if changed {
-                    tracing::warn!(source, status, reason, "source health changed the halt set");
-                    if let Some(p) = &store {
-                        let action = if status == "down" { "halt" } else { "resume" };
-                        p.audit(
-                            action,
-                            Some(&format!("source:{source}")),
-                            serde_json::json!({"reason": reason, "manual": false, "raised_by": "ingest.health"}),
-                        )
-                        .await;
-                    }
+                if let Some(input) = Input::parse(&m.subject, m.payload.as_ref()) {
+                    buffer.push(now_ms(), input);
                 }
             }
         });
@@ -1037,7 +1058,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if let Some(t) = p_x.load_fx(&fx_x.source, fx_x.history_days).await {
                     let outs = engine_x.lock().await.set_fx(t, now_ms());
-                    publish_outs(&bus_x, &Some(p_x.clone()), &engine_x, outs).await;
+                    publish_outs_direct(&bus_x, &Some(p_x.clone()), &engine_x, outs).await;
                 }
             }
         });
@@ -1087,40 +1108,98 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tick.tick().await;
                 let outs = recon::retry_unconfirmed(&p_u, &engine_u).await;
-                publish_outs(&bus_u, &Some(p_u.clone()), &engine_u, outs).await;
+                publish_outs_direct(&bus_u, &Some(p_u.clone()), &engine_u, outs).await;
             }
         });
         // open orphan fills halt the venue (at start and every pass); reconciliation at one cut
         let (engine_r, bus_r) = (engine.clone(), bus.clone());
         tokio::spawn(async move {
             let outs = recon::check_orphans(&p, &engine_r).await;
-            publish_outs(&bus_r, &Some(p.clone()), &engine_r, outs).await;
+            publish_outs_direct(&bus_r, &Some(p.clone()), &engine_r, outs).await;
             let mut tick = tokio::time::interval(Duration::from_secs(reconcile_secs.max(1)));
             tick.tick().await;
             loop {
                 tick.tick().await;
                 let mut outs = recon::check_orphans(&p, &engine_r).await;
                 outs.extend(recon::reconcile(&p, &engine_r).await);
-                publish_outs(&bus_r, &Some(p.clone()), &engine_r, outs).await;
+                publish_outs_direct(&bus_r, &Some(p.clone()), &engine_r, outs).await;
             }
         });
     }
 
     // decision loop; SIGTERM / SIGINT flush the book snapshot and every strategy row + sub-book
-    // before exiting, so a clean stop (docker compose stop) loses no sub-book change (D-061)
-    // ticks sit on the wall-clock grid (multiples of tick_ms since the epoch), so a replay of the
-    // recorded inputs knows when every decision was taken (spec 41 §9 decision-level replay)
+    // before exiting, so a clean stop (docker compose stop) loses no sub-book change (D-061).
+    // Ticks sit on the wall-clock grid (multiples of tick_ms since the epoch). D-105: each grid
+    // slot `t` first drains the inputs received at or before `t` (arrival order), then decides —
+    // the same rule the replay applies — and a late timer catches up slot by slot, so a delayed
+    // tick still acts only on what it would have seen on time. Only after a stall longer than
+    // MAX_CATCHUP_TICKS slots does the grid jump (a suspend/freeze is outside replay scope).
+    const MAX_CATCHUP_TICKS: i64 = 5;
     let period = args.tick_ms.max(100);
-    let phase = Duration::from_millis(period - (now_ms().rem_euclid(period as i64)) as u64);
+    let period_ms = period as i64;
+    let phase = Duration::from_millis(period - (now_ms().rem_euclid(period_ms)) as u64);
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + phase, Duration::from_millis(period));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next_grid = {
+        let t = now_ms();
+        t - t.rem_euclid(period_ms) + period_ms
+    };
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let t = now_ms();
-                let outs = engine.lock().await.tick(t - t.rem_euclid(period as i64));
-                publish_outs(&bus, &store, &engine, outs).await;
+                let now = now_ms();
+                if now - next_grid > period_ms * MAX_CATCHUP_TICKS {
+                    let skipped = (now - next_grid) / period_ms;
+                    tracing::warn!(skipped_ticks = skipped, "decision grid jumped after a stall (a replay diverges over the gap)");
+                    next_grid = now - now.rem_euclid(period_ms);
+                }
+                while next_grid <= now {
+                    let t = next_grid;
+                    next_grid += period_ms;
+                    let drained = buffer.drain_upto(t);
+                    let mut jobs: Vec<WriteJob> = Vec::new();
+                    let (outs, booked, unknown) = {
+                        let mut e = engine.lock().await;
+                        let mut outs = Vec::new();
+                        for (recv, input) in &drained {
+                            match input {
+                                // every seen intent is recorded (foreign ones too, as before)
+                                Input::OrderStage { intent, .. } => jobs.push(WriteJob::Intent(intent.clone())),
+                                Input::Halt(h) => jobs.push(WriteJob::Audit {
+                                    action: "halt".into(),
+                                    subject: Some(h.scope.clone()),
+                                    payload: serde_json::json!({"reason": h.reason, "manual": h.manual, "raised_by": "bus"}),
+                                }),
+                                Input::Resume { scope } => jobs.push(WriteJob::Audit {
+                                    action: "resume".into(),
+                                    subject: Some(scope.clone()),
+                                    payload: serde_json::json!({}),
+                                }),
+                                _ => {}
+                            }
+                            outs.extend(input.apply(&mut e, *recv));
+                            if matches!(input, Input::Halt(_)) {
+                                jobs.push(WriteJob::Snapshot { ledger: Box::new(e.ledger().clone()), label: "halt" });
+                            }
+                        }
+                        outs.extend(e.tick(t));
+                        (outs, e.take_booked_fills(), e.take_unknown_fills())
+                    };
+                    // bus first; every Postgres write goes to the bounded background writer
+                    publish_outs(&bus, &writer, &engine, outs).await;
+                    if let Some(w) = &writer {
+                        for j in jobs {
+                            w.send(j).await;
+                        }
+                        if !booked.is_empty() {
+                            w.send(WriteJob::Fills(booked)).await;
+                        }
+                        if !unknown.is_empty() {
+                            w.send(WriteJob::Unknown(unknown)).await;
+                        }
+                    }
+                }
             }
             _ = term.recv() => break,
             _ = tokio::signal::ctrl_c() => break,
