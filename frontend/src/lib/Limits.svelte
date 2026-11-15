@@ -120,18 +120,29 @@
 </section>
 
 <style>
+	/* The panel lives in a ~520px grid track, so the two tables have to stack on the
+	   column's width, not the viewport's: auto-fit drops to one column when it is narrow. */
 	.cols {
 		display: grid;
-		grid-template-columns: 1fr 1fr;
+		grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
 		gap: 12px;
 	}
-	@media (max-width: 800px) {
-		.cols {
-			grid-template-columns: 1fr;
-		}
+	.cols > table {
+		min-width: 0;
+		table-layout: fixed;
+	}
+	.cols th:nth-child(2) {
+		width: 92px;
+	}
+	.cols th:nth-child(3) {
+		width: 72px;
+	}
+	.cols td {
+		overflow-wrap: anywhere;
 	}
 	input {
-		width: 100px;
+		width: 100%;
+		min-width: 0;
 	}
 	tr.loosen td {
 		color: var(--danger);
