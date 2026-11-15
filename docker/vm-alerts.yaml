@@ -62,7 +62,7 @@ groups:
         labels: { severity: critical }
         annotations: { summary: "{{ $labels.dep }} unreachable from control-api for 1m" }
       - alert: InfraScrapeDown
-        expr: up{job=~"victoriametrics|garage|nats|postgres|vmalert"} == 0
+        expr: up{job=~"victoriametrics|garage|nats|postgres|vmalert|dgraph"} == 0
         for: 2m
         labels: { severity: warning }
         annotations: { summary: "{{ $labels.job }} metrics endpoint down" }
@@ -243,17 +243,17 @@ groups:
       - alert: HubWriteErrors
         expr: increase(fa_heartbeat_counter{service="model-runtime",key="hub.errors"}[15m]) > 0
         labels: { severity: warning }
-        annotations: { summary: "model-runtime HelixDB writes failing" }
+        annotations: { summary: "model-runtime graph writes failing (Dgraph)" }
       - alert: HubBacklogLost
         # observation log full / unwritable, or the sink queue overflowed: Helix writes are being lost (spec 30 §8, spec 33 §8)
         expr: increase(fa_heartbeat_counter{service="model-runtime",key=~"hub.(log_full|log_errors|dropped)"}[15m]) > 0
         labels: { severity: warning }
-        annotations: { summary: "model-runtime {{ $labels.key }} rising: Helix writes lost" }
+        annotations: { summary: "model-runtime {{ $labels.key }} rising: graph writes lost" }
       - alert: HubBacklog
         expr: fa_heartbeat_counter{service="model-runtime",key="hub.backlog"} > 0
         for: 30m
         labels: { severity: warning }
-        annotations: { summary: "model-runtime Helix writes deferred to the observation log for 30 min (Helix down or slow)" }
+        annotations: { summary: "model-runtime graph writes deferred to the observation log for 30 min (Dgraph down or slow)" }
       - alert: RegionSetInvalid
         # spec 30 §8: a region set collapsed into one region or hit max_regions_per_set
         expr: fa_heartbeat_counter{service="model-runtime",key=~"regions_invalid\\..*"} > 0

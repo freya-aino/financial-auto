@@ -22,7 +22,7 @@ set -euo pipefail
 
 [ $# -ge 1 ] || { sed -n '2,19p' "$0"; exit 2; }
 SRC=$(cd "$1" && pwd); shift
-YES=0; ONLY="postgres,helix,qdrant,garage"; PGDB="fa"; PITR=0; TARGET=""; PGVOL=""
+YES=0; ONLY="postgres,helix,dgraph,qdrant,garage"; PGDB="fa"; PITR=0; TARGET=""; PGVOL=""
 while [ $# -gt 0 ]; do
     case $1 in
         --yes|-y) YES=1; shift ;;
@@ -143,6 +143,27 @@ if want helix && [ -f "$SRC/helix/helix-data.tar.gz" ]; then
     compose start helix >/dev/null
 fi
 
+# 3a. Dgraph: load the export back with the live loader (ADR 0011). Additive by design — the
+# loader upserts by business key through the schema's @upsert predicates, so restoring onto a
+# non-empty store converges rather than duplicating. Wipe the volume first for a clean restore.
+if want dgraph && [ -f "$SRC/dgraph/export.tar.gz" ]; then
+    log "3/5 dgraph → live loader"
+    img=$(compose config --images | grep -m1 dgraph || echo "dgraph/dgraph:v25.5.1")
+    tmp=$(mktemp -d)
+    tar xzf "$SRC/dgraph/export.tar.gz" -C "$tmp"
+    rdf=$(find "$tmp" -name '*.rdf.gz' | head -1)
+    sch=$(find "$tmp" -name '*.schema.gz' | head -1)
+    if [ -n "$rdf" ]; then
+        docker run --rm --network "$(network_name)" -v "$tmp":/in:ro "$img" \
+            dgraph live -f "/in/${rdf#"$tmp/"}" ${sch:+-s "/in/${sch#"$tmp/"}"} \
+            --alpha dgraph-alpha:9080 --zero dgraph-zero:5080 >/dev/null \
+            || log "dgraph: live loader failed"
+    else
+        log "dgraph: no .rdf.gz in the export"
+    fi
+    rm -rf "$tmp"
+fi
+
 # 3b. Qdrant: upload each collection snapshot (replaces the collection; ADR 0010).
 if want qdrant && [ -d "$SRC/qdrant" ]; then
     Q=${FA_QDRANT_HOST_URL:-http://127.0.0.1:16333}
@@ -178,7 +199,7 @@ log "5/5 restore finished"
 if [ $SCRATCH = 0 ]; then
     cat <<MSG
 Recovery order (spec 60 §6.4) from here:
-  1. infra healthy (postgres, nats, garage, victoriametrics, helix)   — running
+  1. infra healthy (postgres, nats, garage, victoriametrics, dgraph)   — running
   2. migrations: control-api applies migrations/ on start
   3. ledger + broker-gateway → reconciliation before trading           — risk-engine reconciles on start
   4. risk state incl. kill switch                                      — risk-engine loads ledger.strategy_state

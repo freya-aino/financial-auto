@@ -44,7 +44,7 @@ Specs were the source of truth until code existed; now the code is, and the spec
 | ADR | Decision | Status |
 |---|---|---|
 | [0001](adr/0001-rust-go-split.md) | Rust core, Go for parallel services | accepted |
-| [0002](adr/0002-helixdb-hub.md) | HelixDB as graph/vector hub | accepted; superseded by 0010 (vectors D-101, graph D-108) except the remainder pending cutover |
+| [0002](adr/0002-helixdb-hub.md) | HelixDB as graph/vector hub | superseded: vectors by 0010 (D-101), graph by 0011 (D-110) |
 | [0003](adr/0003-pure-rust-ml.md) | Pure-Rust ML (burn + candle); implemented on candle only (D-070) | accepted |
 | [0004](adr/0004-nats-jetstream.md) | NATS JetStream bus + work queues | accepted (D-001) |
 | [0005](adr/0005-protobuf-contracts.md) | Protobuf contracts | accepted (D-001) |
@@ -52,7 +52,8 @@ Specs were the source of truth until code existed; now the code is, and the spec
 | [0007](adr/0007-victoriametrics.md) | VictoriaMetrics for time series | accepted |
 | [0008](adr/0008-postgres-warehouse.md) | PostgreSQL warehouse + ledger | accepted |
 | [0009](adr/0009-garage-s3.md) | Garage S3 for blobs | accepted |
-| [0010](adr/0010-vector-and-graph-store.md) | Qdrant for vectors, PostgreSQL for the model-state graph | accepted (D-101, D-108); supersedes 0002 except the not-yet-cut-over Helix remainder |
+| [0010](adr/0010-vector-and-graph-store.md) | Qdrant for vectors, PostgreSQL for the model-state graph | vectors accepted (D-101); graph half superseded by 0011 (D-110) |
+| [0011](adr/0011-dgraph-graph-store.md) | Dgraph as the single graph store | accepted (D-110); supersedes 0002, amends 0010's graph half |
 
 ## Decision traceability checklist
 Every design decision made so far, and the spec that records it.
@@ -78,7 +79,7 @@ Every design decision made so far, and the spec that records it.
 - [ ] Locked holdout, deflated Sharpe/PBO, shadow; no walk-forward in evolution → 41
 - [ ] Canonical proto events, three timestamps, raw archive → 10 (retired → ingestor README), 21
 - [ ] Internal UUID + FIGI/ISIN/LEI → 12 (retired → fa-warehouse README)
-- [ ] Helix / Qdrant / VictoriaMetrics / Postgres / Garage responsibilities → 20, ADR 0010
+- [ ] Dgraph / Qdrant / VictoriaMetrics / Postgres / Garage responsibilities → 20, ADR 0011, ADR 0010
 - [ ] NATS work queues for scaling; GPU priority queue → 21, 60
 - [ ] Backfill depth per timescale → 10
 - [ ] EUR base currency → 00, 42 (retired → fa-ledger README)

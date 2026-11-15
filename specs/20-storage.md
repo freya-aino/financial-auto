@@ -199,7 +199,7 @@ Original proposal: nightly Postgres dump + Helix snapshot + VM snapshot → Gara
 
 ## 9. Acceptance criteria
 **Remaining (2026-11-15):**
-- **Full Helix cutover** (D-108): genomes/fitness/pareto/evaluations, the graph explorer (`resolve_node`/`neighborhood`/`run_named`), experts, the meta marker and the retention aggregates are still Helix-resident, so the helix service stays in compose until they migrate; `graph_migrate` copies current values only (not event-time history or pre-migration genome links).
+- **Finish the Dgraph cutover** (ADR 0011, D-110): the graph store is Dgraph and every surface — the `GraphStore` trait, genomes/fitness/pareto/evaluations, experts, the graph explorer and the meta marker — routes to it, with `graph_migrate --from postgres --to dgraph` verified lossless across all 25 tables. Remaining: delete the dead Helix query layer (`ast`, `buffer`, `schema`, the `Batch` fallthroughs), the `helix` service and the Postgres `graph` schema; and re-run `examples/graph_bench.rs` on v25.5.1 to record the regression D-110 accepted with current numbers instead of the v24.1.4 ones in ADR 0010.
 - **k-NN at 10 M through fa-hub** (criterion 4): Qdrant meets it in the ADR bench (11 ms p95 filtered as-of at 10 M); the fa-hub path is measured to 200 k (10.9 ms p95). Re-run `knn_bench` against Qdrant at 1 M–10 M once spaces grow, and tune `indexing_threshold` / tenant HNSW (`payload_m`) then.
 - **Qdrant volume control:** the §6.4 retention fold runs on Qdrant; no per-collection size cap or alert on collection status ≠ green yet.
 

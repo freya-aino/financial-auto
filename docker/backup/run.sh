@@ -12,7 +12,7 @@
 #                                                               (fa-raw, mirrored incrementally, never pruned)
 #   manifest.json                                               kind "scheduled", sizes, sha256
 # Then: metrics → VictoriaMetrics, retention pruning (prune.sh), optional off-machine copy (disabled).
-# Env: FA_BACKUP_BUCKETS, FA_BACKUP_SKIP (postgres,helix,qdrant,garage), FA_QDRANT_URL, FA_BACKUP_KEEP (prune.sh),
+# Env: FA_BACKUP_BUCKETS, FA_BACKUP_SKIP (postgres,helix,dgraph,qdrant,garage), FA_QDRANT_URL, FA_BACKUP_KEEP (prune.sh),
 #      FA_BACKUP_OFFSITE_REMOTE + FA_BACKUP_OFFSITE_ENABLED=1 (rclone remote, e.g. "offsite:fa-backup").
 set -eu
 . /usr/local/lib/fa-backup/common.sh
@@ -67,6 +67,37 @@ if ! skip qdrant && [ -n "${FA_QDRANT_URL:-}" ]; then
         curl -fsS -o "$DEST/qdrant/$c.snapshot" "$FA_QDRANT_URL/collections/$c/snapshots/$name"
         curl -fsS -X DELETE "$FA_QDRANT_URL/collections/$c/snapshots/$name" >/dev/null || true
     done
+fi
+
+# Dgraph (graph store, ADR 0011): trigger a native export, then copy the files out.
+# The export is *queued* and written into the alpha's own volume (/dgraph/export/<run>/), so the
+# reply alone is not a backup — the files have to be collected, and the wait is why.
+if ! skip dgraph && [ -n "${FA_DGRAPH_URL:-}" ]; then
+    mkdir -p "$DEST/dgraph"
+    before=$(ls /dgraph-alpha/export 2>/dev/null | sort | tr '\n' ' ')
+    log "dgraph: export (rdf)"
+    resp=$(curl -fsS -X POST "$FA_DGRAPH_URL/admin" -H 'Content-Type: application/json' \
+        -d '{"query":"mutation { export(input: {format: \"rdf\"}) { response { code message } } }"}' 2>&1)
+    case "$resp" in
+        *Success*)
+            run=""
+            i=0
+            while [ $i -lt 60 ]; do
+                for d in $(ls /dgraph-alpha/export 2>/dev/null | sort); do
+                    case " $before " in *" $d "*) ;; *) run=$d ;; esac
+                done
+                [ -n "$run" ] && ls /dgraph-alpha/export/"$run"/*.gz >/dev/null 2>&1 && break
+                i=$((i + 1)); sleep 1
+            done
+            if [ -n "$run" ]; then
+                tar czf "$DEST/dgraph/export.tar.gz" -C /dgraph-alpha/export "$run"
+                du -h "$DEST/dgraph/export.tar.gz" | awk '{print "dgraph: export " $1}'
+            else
+                log "dgraph: export queued but no files appeared within 60 s"
+            fi
+            ;;
+        *) log "dgraph: export failed: $resp" ;;
+    esac
 fi
 
 if ! skip garage; then

@@ -228,6 +228,7 @@ services:
       FA_BACKUP_KEEP: ${FA_BACKUP_KEEP:-7}
       FA_BACKUP_BUCKETS: fa-models fa-ckpt fa-artifacts fa-backup
       FA_QDRANT_URL: http://qdrant:6333 # collection snapshots → /backups/<ts>/qdrant (ADR 0010)
+      FA_DGRAPH_URL: http://dgraph-alpha:8080 # graph export → /backups/<ts>/dgraph (ADR 0011)
       FA_SECRETS: /run/fa/secrets.toml
       PGHOST: postgres
       PGUSER: fa
@@ -241,6 +242,7 @@ services:
       - ${FA_BACKUP_DIR:-./backups}:/backups # ephemeral stacks: scratch/backups-<run>, removed by eph-down (D-096)
       - pg-wal-archive:/wal-archive # read by the drill, pruned by prune.sh
       - helix-data:/helix:ro
+      - dgraph-alpha-data:/dgraph-alpha:ro # graph exports land in the alpha's own volume (ADR 0011)
       - ./config/secrets.toml:/run/fa/secrets.toml:ro
     depends_on:
       postgres:

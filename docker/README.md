@@ -12,6 +12,8 @@ Everything runs through Docker Compose (D-034): `compose.yaml` at the repo root 
 | victoriametrics | `victoriametrics/victoria-metrics:v1.155.0` | 8428 | `curl localhost:8428/health` |
 | garage | `dxflrs/garage:v2.5.0` | S3 3900, admin 3903 | `docker compose exec garage /garage status` |
 | helix | `ghcr.io/helixdb/helixdb:v0.0.14` (data in `/var/lib/helix`) | 6969 → 8080 | `curl localhost:6969/healthz` |
+| `dgraph-zero` | `dgraph/dgraph:v25.5.1` | 6080 → 6080 | `curl localhost:6080/state` |
+| `dgraph-alpha` | `dgraph/dgraph:v25.5.1` | 8180 → 8080 | `curl localhost:8180/health` |
 | qdrant | `qdrant/qdrant:v1.20.0` (vectors, ADR 0010 / D-101; data in `qdrant-data`) | 16333 | `curl localhost:16333/readyz` |
 | vmalert | `victoriametrics/vmalert:v1.155.0` (rules `vm-alerts.yaml`) | 8880 | `curl localhost:8880/health` |
 | nats-exporter | `natsio/prometheus-nats-exporter:0.17.3` | — (7777 in compose) | scraped as job `nats` |

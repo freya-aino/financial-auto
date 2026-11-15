@@ -56,6 +56,40 @@ if ! skip helix; then
     FILES+=(helix/helix-data.tar.gz helix/files.txt)
 fi
 
+# 2a. Dgraph (graph store, ADR 0011): trigger a native export, then copy the files out of the
+# alpha's volume. The export is queued and lands in the alpha's own filesystem, so the admin
+# reply is not itself a backup; no service stop is needed, unlike the HelixDB tar above.
+if ! skip dgraph; then
+    D=${FA_DGRAPH_HOST_URL:-http://127.0.0.1:8180}
+    if curl -fsS -o /dev/null "$D/health" 2>/dev/null; then
+        mkdir -p "$DEST/dgraph"
+        vol=$(volume_name dgraph-alpha-data)
+        before=$(docker run --rm -v "$vol":/d:ro alpine:3.21 sh -c 'ls /d/export 2>/dev/null | sort' | tr '\n' ' ')
+        log "dgraph: export (rdf)"
+        if curl -fsS -X POST "$D/admin" -H 'Content-Type: application/json' \
+            -d '{"query":"mutation { export(input: {format: \"rdf\"}) { response { code message } } }"}' \
+            | grep -q Success; then
+            run=""
+            for _ in $(seq 1 60); do
+                for d in $(docker run --rm -v "$vol":/d:ro alpine:3.21 sh -c 'ls /d/export 2>/dev/null | sort'); do
+                    case " $before " in *" $d "*) ;; *) run=$d ;; esac
+                done
+                [ -n "$run" ] && break
+                sleep 1
+            done
+            if [ -n "$run" ]; then
+                docker run --rm -v "$vol":/d:ro -v "$DEST/dgraph":/out alpine:3.21 \
+                    tar czf /out/export.tar.gz -C /d/export "$run"
+                FILES+=(dgraph/export.tar.gz)
+            else
+                log "dgraph: export queued but no files appeared within 60 s"
+            fi
+        else
+            log "dgraph: export failed"
+        fi
+    fi
+fi
+
 # 2b. Qdrant (vectors, ADR 0010): one snapshot per collection through the REST API (no service stop).
 if ! skip qdrant && curl -fsS -o /dev/null "${FA_QDRANT_HOST_URL:-http://127.0.0.1:16333}/readyz" 2>/dev/null; then
     Q=${FA_QDRANT_HOST_URL:-http://127.0.0.1:16333}

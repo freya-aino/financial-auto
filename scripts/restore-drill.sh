@@ -19,7 +19,7 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
-SRC=""; ONLY="manifest,postgres,helix,garage"; TARGET=""; SWITCH=0
+SRC=""; ONLY="manifest,postgres,dgraph,garage"; TARGET=""; SWITCH=0
 while [ $# -gt 0 ]; do
     case $1 in
         --only) ONLY=$2; shift 2 ;;

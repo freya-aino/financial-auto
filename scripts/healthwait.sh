@@ -28,12 +28,13 @@ wait_for "garage    :3903/health"    curl -fsS http://127.0.0.1:3903/health
 wait_for "victoria  :8428/health"    curl -fsS http://127.0.0.1:8428/health
 wait_for "helix     :6969/healthz"   curl -fsS http://127.0.0.1:6969/healthz
 wait_for "qdrant    :16333/readyz"    curl -fsS http://127.0.0.1:16333/readyz
+wait_for "dgraph    :8180/health"     curl -fsS http://127.0.0.1:8180/health
 
 echo "step 2: migrations + control-api /api/health (nats connected, dependencies reachable)"
 health_ok() {
     local h; h=$(curl -fsS "$API/api/health") || return 1
     echo "$h" | grep -q '"connected":true' &&
-        for d in helix qdrant victoriametrics postgres garage; do echo "$h" | grep -q "\"$d\":true" || return 1; done
+        for d in dgraph qdrant victoriametrics postgres garage; do echo "$h" | grep -q "\"$d\":true" || return 1; done
 }
 wait_for "control-api $API/api/health all true" health_ok
 

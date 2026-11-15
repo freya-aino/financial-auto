@@ -224,6 +224,7 @@ pub fn build_response(
         ("garage", cfg.garage.endpoint.as_str()),
         ("qdrant", cfg.qdrant.url.as_str()),
         ("helix", cfg.helix.url.as_str()),
+        ("dgraph", cfg.dgraph.url.as_str()),
     ]
     .into_iter()
     .map(|(name, url)| json!({ "name": name, "url": redact_url(url) }))
@@ -356,7 +357,7 @@ api_key = "mystery-key-98765" # secret-scan: allow (test fixture, not a real key
         assert_eq!(sk["hint"], "…-key");
         assert_eq!(sk["secret_ref"], "[garage] secret_access_key");
         let names: Vec<&str> = v["endpoints"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["nats", "postgres", "victoriametrics", "garage", "qdrant", "helix"]);
+        assert_eq!(names, ["nats", "postgres", "victoriametrics", "garage", "qdrant", "helix", "dgraph"]);
         let pg = &v["endpoints"][1]["url"];
         assert_eq!(pg, &json!(format!("postgres://fa:{}@127.0.0.1:5432/fa", secrets::REDACTED)));
     }
@@ -388,7 +389,7 @@ api_key = "mystery-key-98765" # secret-scan: allow (test fixture, not a real key
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert!(v["connections"].as_array().is_some_and(|c| !c.is_empty()));
         assert!(v["garage"]["credentials"].as_array().is_some_and(|c| c.len() == 2));
-        assert_eq!(v["endpoints"].as_array().unwrap().len(), 6);
+        assert_eq!(v["endpoints"].as_array().unwrap().len(), 7, "dgraph joined the endpoint list (ADR 0011)");
         // every credential row is {set, hint?} — never a value field
         for c in v["connections"].as_array().unwrap() {
             for f in c["credentials"].as_array().unwrap() {
