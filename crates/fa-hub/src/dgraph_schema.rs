@@ -163,6 +163,7 @@ descends_from.kind: string .
 descends_from.overlap: float .
 descends_from.updated_at: datetime .
 
+region_match.key: string @index(exact) @upsert .
 region_match.prev_region_id: string @index(exact) .
 region_match.next_region_id: string @index(exact) .
 region_match.prev: uid .
@@ -404,6 +405,7 @@ type DescendsFrom {
     descends_from.updated_at
 }
 type RegionMatch {
+    region_match.key
     region_match.prev_region_id
     region_match.next_region_id
     region_match.prev

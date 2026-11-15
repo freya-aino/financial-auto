@@ -322,6 +322,13 @@ async fn conformance<G: GraphStore>(g: &G, run: &str) {
     // region match
     let m = g.match_regions(r0.id, r2.id, 0.9).await.unwrap();
     assert!(m > 0, "match_regions returns the edge id");
+    // the match must keep both business ids: `region_lineage` reads them for its carry edges
+    let carry = g.region_lineage(&rid(2), 2).await.unwrap().unwrap();
+    assert!(
+        carry.ancestors.iter().any(|a| a.kind == "carry"),
+        "match_regions must produce a carry ancestor for r2, got {:?}",
+        carry.ancestors.iter().map(|a| &a.kind).collect::<Vec<_>>()
+    );
 
     // kernels: `kernel_id` is the expert space id, so the upsert is idempotent per space
     let kernel = fa_hub::NewKernelModel {
@@ -494,5 +501,55 @@ async fn helix_backend_conforms() {
             .drop_nodes(label, Pred::starts_with(key, &format!("conf-{run}-")))
             .await
             .unwrap_or_else(|e| eprintln!("cleanup {label}: {e}"));
+    }
+}
+
+#[tokio::test]
+async fn dgraph_backend_conforms() {
+    let Ok(url) = std::env::var("FA_DGRAPH_URL") else {
+        eprintln!("skipped: FA_DGRAPH_URL not set");
+        return;
+    };
+    let dg = fa_hub::DgraphGraph::new(fa_hub::DgraphClient::new(&url));
+    dg.ensure_schema().await.unwrap();
+    let run = format!("dg{}", chrono::Utc::now().timestamp_millis());
+    conformance(&dg, &run).await;
+    // cleanup: `exact` is an ordered index, so a prefix is a range (dgraph_schema::prefix_filter)
+    let prefix = format!("conf-{run}-");
+    for (ty, pred) in [
+        ("TransitionVersion", "transition_version.from_region_id"),
+        ("RegionStatusVersion", "region_status_version.region_id"),
+        ("DescendsFrom", "descends_from.child_region_id"),
+        ("Hier", "hier.fine_region_id"),
+        ("Transition", "transition.from_region_id"),
+        ("RegionMatch", "region_match.prev_region_id"),
+        ("RegionEpisode", "region_episode.region_id"),
+        ("LatentRegion", "region.region_id"),
+        ("RegionSet", "region_set.region_set_id"),
+        ("KernelModel", "kernel_model.expert_space_id"),
+        ("CrossPrior", "cross_prior.source_instrument_id"),
+        ("AdapterState", "adapter_state.snapshot_id"),
+        ("ExpertSpace", "expert_space.expert_space_id"),
+        ("TrainedOn", "trained_on.snapshot_id"),
+        ("FeedbackFrom", "feedback_from.snapshot_id"),
+        ("SnapshotParent", "snapshot_parent.key"),
+        ("Snapshot", "snapshot.snapshot_id"),
+        ("RefListedOn", "ref_listed_on.instrument_id"),
+        ("RefIssuedBy", "ref_issued_by.instrument_id"),
+        ("RefSameExposure", "ref_same_exposure.instrument_id"),
+        ("RefInstrument", "ref_instrument.instrument_id"),
+        ("RefInSector", "ref_in_sector.entity_id"),
+        ("RefEntity", "ref_entity.entity_id"),
+        ("RefSector", "ref_sector.sector_id"),
+        ("RefVenue", "ref_venue.venue_id"),
+    ] {
+        let f = fa_hub::dgraph_schema::prefix_filter(pred, &prefix);
+        let q = format!("{{ q(func: type({ty})) @filter({f}) {{ uid }} }}");
+        let data = dg.client().query(&q).await.unwrap();
+        let del: Vec<serde_json::Value> = data["q"]
+            .as_array()
+            .map(|a| a.iter().map(|r| serde_json::json!({"uid": r["uid"]})).collect())
+            .unwrap_or_default();
+        dg.client().delete(del).await.unwrap();
     }
 }
