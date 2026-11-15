@@ -366,6 +366,9 @@ impl HubClient {
     /// `Sector` nodes of their sectors and each entity's `InSector` edge (made equal to its
     /// current sector).
     pub async fn upsert_ref_entities(&self, rows: &[RefEntity]) -> Result<usize> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::upsert_ref_entities(pg, rows).await;
+        }
         for c in rows.chunks(CHUNK) {
             self.batch(&entity_batch(c).returning(Vec::<String>::new())).await?;
         }
@@ -380,6 +383,9 @@ impl HubClient {
 
     /// `upsertRefVenues`: `Venue` nodes by `venue_id`.
     pub async fn upsert_ref_venues(&self, rows: &[RefVenue]) -> Result<usize> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::upsert_ref_venues(pg, rows).await;
+        }
         for c in rows.chunks(CHUNK) {
             self.batch(&venue_batch(c).returning(Vec::<String>::new())).await?;
         }
@@ -389,6 +395,9 @@ impl HubClient {
     /// `upsertRefInstruments`: `Instrument` nodes, then (after every node batch) their
     /// `IssuedBy` / `ListedOn` / `SameExposure` out-edges made equal to the given sets.
     pub async fn upsert_ref_instruments(&self, rows: &[RefInstrument]) -> Result<RefSyncReport> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::upsert_ref_instruments(pg, rows).await;
+        }
         let mut rep = RefSyncReport::default();
         for c in rows.chunks(CHUNK) {
             self.batch(&instrument_batch(c).returning(Vec::<String>::new())).await?;
@@ -407,6 +416,9 @@ impl HubClient {
 
     /// `retireRefInstruments`: `status = inactive`, reference out-edges dropped.
     pub async fn retire_ref_instruments(&self, instrument_ids: &[String]) -> Result<usize> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::retire_ref_instruments(pg, instrument_ids).await;
+        }
         for c in instrument_ids.chunks(CHUNK) {
             self.batch(&retire_batch(c)).await?;
         }
@@ -415,6 +427,9 @@ impl HubClient {
 
     /// `refInstrumentIds`: `instrument_id` of every mirrored `Instrument` with its `status`.
     pub async fn ref_instrument_ids(&self) -> Result<Vec<(String, String)>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::ref_instrument_ids(pg).await;
+        }
         #[derive(Deserialize)]
         struct Row {
             instrument_id: String,
@@ -463,6 +478,9 @@ impl HubClient {
 
     /// `instrumentReference`: an instrument with its issuer, listings (+ venues) and exposures.
     pub async fn instrument_reference(&self, instrument_id: &str) -> Result<Option<InstrumentReference>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::instrument_reference(pg, instrument_id).await;
+        }
         let b = Batch::read()
             .named("instrument_reference")
             .var("i", by_key(node::INSTRUMENT, "instrument_id", instrument_id))

@@ -24,6 +24,9 @@ pub fn created_before(as_of_ms: i64) -> Pred {
 impl HubClient {
     /// `listSnapshotsAsOf`: snapshots created at or before `as_of_ms`, by `snapshot_id`.
     pub async fn list_snapshots_as_of(&self, as_of_ms: i64) -> Result<Vec<Snapshot>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::list_snapshots_as_of(pg, as_of_ms).await;
+        }
         let op = Op::nodes_with_label_where(node::SNAPSHOT, created_before(as_of_ms))
             .order_by("snapshot_id", false)
             .value_map(None);
@@ -33,6 +36,10 @@ impl HubClient {
 
     /// `spaceRegionsAsOf`: regions of an expert space (`$id`) created at or before `as_of_ms`.
     pub async fn space_regions_as_of(&self, space: u64, as_of_ms: i64) -> Result<Vec<LatentRegion>> {
+        if let Some(pg) = self.graph() {
+            let rows = crate::graph::GraphStore::space_regions_as_of(pg, space, as_of_ms).await?;
+            return self.regions_as_of(rows, as_of_ms).await;
+        }
         let op = Op::nodes(space).r#in(Some(edge::IN_SPACE)).where_(created_before(as_of_ms)).value_map(None);
         let mut resp = self.batch(&Batch::read().named("space_regions_as_of").ret("rows", op)).await?;
         self.regions_as_of(resp.take("rows")?, as_of_ms).await
@@ -43,6 +50,14 @@ impl HubClient {
     /// transitions whose both endpoints are visible, with the posterior and region status in force
     /// at `t` (see module docs).
     pub async fn snapshot_graph_as_of(&self, snapshot_id: &str, as_of_ms: i64) -> Result<Option<SnapshotGraph>> {
+        if let Some(pg) = self.graph() {
+            let Some(g) = crate::graph::GraphStore::snapshot_graph_as_of(pg, snapshot_id, as_of_ms).await? else {
+                return Ok(None);
+            };
+            let transitions = self.transitions_as_of(g.transitions, as_of_ms).await?;
+            let regions = self.regions_as_of(g.regions, as_of_ms).await?;
+            return Ok(Some(SnapshotGraph { snapshot: g.snapshot, spaces: g.spaces, regions, transitions }));
+        }
         let batch = Batch::read()
             .named("snapshot_graph_as_of")
             .var(

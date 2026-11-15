@@ -1237,6 +1237,7 @@ dependencies = [
 name = "fa-hub"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "fa-core",
  "instant-distance",
  "rayon",

@@ -186,7 +186,11 @@ async fn main() {
     let mut rng = Rng(args.seed.max(1));
     let mix = Mixture::new(&mut rng, args.clusters, args.dim);
     let mut stored: Vec<Vec<f32>> = Vec::with_capacity(*args.sizes.last().unwrap_or(&0));
-    let filter = if args.filtered { KnnFilter { kind: Some("observation".into()), ..Default::default() } } else { KnnFilter::default() };
+    let filter = if args.filtered {
+        KnnFilter { kind: Some("observation".into()), ..Default::default() }
+    } else {
+        KnnFilter::default()
+    };
 
     println!(
         "dim={} k={} queries={} batch={} concurrency={} clusters={} filtered={}",
@@ -339,7 +343,8 @@ async fn query_only(hub: &HubClient, args: &Args, space: &str) {
 /// background index work. `None` when it did not drain within `max_secs`.
 async fn drain(hub: &HubClient, step: usize, max_secs: u64) -> Option<f64> {
     let t = Instant::now();
-    let receipts = hub.ensure_indexes(vec![IndexSpec::node_equality("BenchProbe", &format!("p{step}"), false)]).await.ok()?;
+    let receipts =
+        hub.ensure_indexes(vec![IndexSpec::node_equality("BenchProbe", &format!("p{step}"), false)]).await.ok()?;
     hub.wait_for_receipts(&receipts, Duration::from_secs(max_secs)).await.ok()?;
     Some(t.elapsed().as_secs_f64())
 }

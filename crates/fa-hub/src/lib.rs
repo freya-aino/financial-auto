@@ -38,6 +38,7 @@ pub mod buffer;
 pub mod catalog;
 pub mod evolution;
 pub mod experts;
+pub mod graph;
 pub mod meta;
 pub mod qdrant;
 pub mod queries;
@@ -59,13 +60,14 @@ pub use asof::*;
 pub use ast::{Batch, Cond, EdgeRef, IndexSpec, Input, Metric, NodeRef, Op, ParamType, Pred, Val, param};
 pub use buffer::{BufferStats, FlushReport, WriteBuffer};
 pub use experts::{AlignmentRow, ExpertRow, NewAlignment, NewExpert, expert_uid};
+pub use graph::{GraphStore, HelixGraph, PgGraph, configure_graph};
 pub use meta::{SCHEMA_VERSION, SchemaMarker};
 pub use qdrant::{QdrantVectors, configure_vectors};
 pub use queries::*;
 pub use reference::{InstrumentReference, RefEntity, RefExposure, RefInstrument, RefListing, RefSyncReport, RefVenue};
 pub use regions::{
-    LineageLink, NewCrossPrior, NewDescent, NewHierEdge, NewKernelModel, NewRegionEpisode, NewRegionSet, RegionLineage, RegionSetRow,
-    RegionStatsUpdate,
+    LineageLink, NewCrossPrior, NewDescent, NewHierEdge, NewKernelModel, NewRegionEpisode, NewRegionSet, RegionLineage,
+    RegionSetRow, RegionStatsUpdate,
 };
 pub use retention::{PruneReport, RetentionPolicy};
 pub use vectors::{EmbeddingHit, KnnFilter, NewEmbedding};
@@ -123,6 +125,9 @@ pub enum HubError {
     /// A non-2xx response of the Qdrant vector store.
     #[error("qdrant {status}: {msg}")]
     Qdrant { status: u16, msg: String },
+    /// A Postgres error of the graph store (ADR 0010, D-108).
+    #[error("graph pg: {0}")]
+    Graph(String),
 }
 
 impl HubError {
@@ -261,6 +266,8 @@ pub struct HubClient {
     pub(crate) cache: Arc<ClientCache>,
     /// Vector store; `None` = the Helix vector indexes.
     pub(crate) vectors: Option<Arc<QdrantVectors>>,
+    /// Graph store; `None` = the Helix graph (D-108; see [`graph::configure_graph`]).
+    pub(crate) graph: Option<Arc<PgGraph>>,
 }
 
 impl HubClient {
@@ -270,6 +277,7 @@ impl HubClient {
             http: reqwest::Client::new(),
             cache: Arc::default(),
             vectors: qdrant::default_url().map(|u| Arc::new(QdrantVectors::new(u, None))),
+            graph: graph::default_graph(),
         }
     }
 
@@ -286,6 +294,7 @@ impl HubClient {
             http,
             cache: Arc::default(),
             vectors: qdrant::default_url().map(|u| Arc::new(QdrantVectors::new(u, Some(timeout)))),
+            graph: graph::default_graph(),
         }
     }
 
@@ -298,6 +307,22 @@ impl HubClient {
     /// The attached Qdrant store, if vectors are not in Helix.
     pub fn vectors(&self) -> Option<&QdrantVectors> {
         self.vectors.as_deref()
+    }
+
+    /// Replace the graph store (`None` = the Helix graph), e.g. in tests or [`HelixGraph`].
+    pub fn with_graph(mut self, graph: Option<PgGraph>) -> Self {
+        self.graph = graph.map(Arc::new);
+        self
+    }
+
+    /// The attached Postgres graph, if the graph is not in Helix.
+    pub fn graph(&self) -> Option<&PgGraph> {
+        self.graph.as_deref()
+    }
+
+    /// `"postgres"` or `"helix"`.
+    pub fn graph_backend(&self) -> &'static str {
+        if self.graph.is_some() { "postgres" } else { "helix" }
     }
 
     /// `"qdrant"` or `"helix"`.

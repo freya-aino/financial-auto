@@ -271,6 +271,9 @@ impl HubClient {
     /// Region statistics (`mass`, `occupancy`, `spread`, `age`, `updated_at`) by `region_id`, one
     /// write batch. Unknown ids are skipped.
     pub async fn update_region_stats(&self, rows: &[RegionStatsUpdate]) -> Result<()> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::update_region_stats(pg, rows).await;
+        }
         if rows.is_empty() {
             return Ok(());
         }
@@ -293,6 +296,9 @@ impl HubClient {
     /// unmatched`), `related_region_id` (the survivor of a merge, else empty); versioned as a
     /// `RegionStatusVersion` in the same batch ([`crate::versions`]).
     pub async fn mark_region_died(&self, region_id: &str, reason: &str, related_region_id: &str) -> Result<()> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::mark_region_died(pg, region_id, reason, related_region_id).await;
+        }
         let op = Op::nodes(NodeRef::var("region"))
             .set_property("status", "retired")
             .set_property("retire_reason", reason)
@@ -351,6 +357,9 @@ impl HubClient {
     /// `DescendsFrom` edges child → parent, upserted by `(child, parent, kind)`; one batch.
     /// Pairs whose regions do not exist (yet) are skipped by the server-side probe.
     pub async fn upsert_descents(&self, rows: &[NewDescent]) -> Result<()> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::upsert_descents(pg, rows).await;
+        }
         if rows.is_empty() {
             return Ok(());
         }
@@ -379,6 +388,9 @@ impl HubClient {
 
     /// `Hier` edges fine → coarse, upserted by the pair; one batch.
     pub async fn upsert_hier_edges(&self, rows: &[NewHierEdge]) -> Result<()> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::upsert_hier_edges(pg, rows).await;
+        }
         if rows.is_empty() {
             return Ok(());
         }
@@ -408,6 +420,9 @@ impl HubClient {
 
     /// `RegionSet` upsert by `region_set_id = expert_space_id` (linked from its `ExpertSpace`).
     pub async fn upsert_region_set(&self, r: &NewRegionSet) -> Result<()> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::upsert_region_set(pg, r).await;
+        }
         let props = vec![
             ("snapshot_id", s(&r.snapshot_id)),
             ("timescale", s(&r.timescale)),
@@ -434,6 +449,9 @@ impl HubClient {
 
     /// The stored `RegionSet` of an expert space.
     pub async fn region_set(&self, expert_space_id: &str) -> Result<Option<RegionSetRow>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::region_set(pg, expert_space_id).await;
+        }
         let op = by_key(labels::REGION_SET, "region_set_id", expert_space_id).value_map(None);
         let mut resp = self.batch(&Batch::read().named("region_set").ret("row", op)).await?;
         resp.take_opt("row")
@@ -441,6 +459,9 @@ impl HubClient {
 
     /// `KernelModel` upsert by `kernel_id = expert_space_id` (linked from its `ExpertSpace`).
     pub async fn upsert_kernel_model(&self, k: &NewKernelModel) -> Result<()> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::upsert_kernel_model(pg, k).await;
+        }
         let props = vec![
             ("expert_space_id", s(&k.expert_space_id)),
             ("snapshot_id", s(&k.snapshot_id)),
@@ -470,6 +491,9 @@ impl HubClient {
 
     /// Every `KernelModel` of a snapshot.
     pub async fn snapshot_kernels(&self, snapshot_id: &str) -> Result<Vec<NodeRow>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::snapshot_kernels(pg, snapshot_id).await;
+        }
         let op = by_key(labels::KERNEL_MODEL, "snapshot_id", snapshot_id).value_map(None);
         let mut resp = self.batch(&Batch::read().named("snapshot_kernels").ret("rows", op)).await?;
         resp.take("rows")
@@ -477,6 +501,9 @@ impl HubClient {
 
     /// `CrossPrior` upserts by `pair_id = <ts>:<source>:<target>`; one batch per row.
     pub async fn upsert_cross_priors(&self, rows: &[NewCrossPrior]) -> Result<()> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::upsert_cross_priors(pg, rows).await;
+        }
         for c in rows {
             let props = vec![
                 ("timescale", s(&c.timescale)),
@@ -508,6 +535,9 @@ impl HubClient {
 
     /// `CrossPrior` rows of a timescale, best score first.
     pub async fn cross_priors(&self, timescale: &str, limit: usize) -> Result<Vec<NodeRow>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::cross_priors(pg, timescale, limit).await;
+        }
         let op = by_key(labels::CROSS_PRIOR, "timescale", timescale)
             .order_by("score", true)
             .limit(limit.max(1))
@@ -518,6 +548,9 @@ impl HubClient {
 
     /// `RegionEpisode` upserts by `episode_id`; one batch per row.
     pub async fn upsert_region_episodes(&self, rows: &[NewRegionEpisode]) -> Result<()> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::upsert_region_episodes(pg, rows).await;
+        }
         for e in rows {
             let props = vec![
                 ("region_id", s(&e.region_id)),
@@ -545,6 +578,9 @@ impl HubClient {
 
     /// Episodes of a region, latest exit first (retrieval decoders, spec 34).
     pub async fn region_episodes(&self, region_id: &str, limit: usize) -> Result<Vec<NodeRow>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::region_episodes(pg, region_id, limit).await;
+        }
         let op = by_key(labels::REGION_EPISODE, "region_id", region_id)
             .order_by("t_exit", true)
             .limit(limit.max(1))
@@ -556,6 +592,9 @@ impl HubClient {
     /// Drops the episodes of `timescale` that ended before `cutoff_ms` (spec 30 §10 q6: same
     /// horizon as the observation latents); returns how many were dropped.
     pub async fn prune_region_episodes(&self, timescale: &str, cutoff_ms: i64) -> Result<u64> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::prune_region_episodes(pg, timescale, cutoff_ms).await;
+        }
         #[derive(Deserialize)]
         struct Id {
             #[serde(rename = "$id")]
@@ -586,6 +625,9 @@ impl HubClient {
 
     /// `Hier` edges out of every region of a snapshot.
     pub async fn snapshot_hierarchy(&self, snapshot_id: &str) -> Result<Vec<EdgeRow>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::snapshot_hierarchy(pg, snapshot_id).await;
+        }
         let b = Batch::read()
             .named("snapshot_hierarchy")
             .var("snap", by_key(node::SNAPSHOT, "snapshot_id", snapshot_id))
@@ -598,6 +640,9 @@ impl HubClient {
 
     /// Every region carrying `lineage_id`, across snapshots.
     pub async fn lineage_members(&self, lineage_id: &str) -> Result<Vec<NodeRow>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::lineage_members(pg, lineage_id).await;
+        }
         let op = by_key(node::LATENT_REGION, "lineage_id", lineage_id).value_map(None);
         let mut resp = self.batch(&Batch::read().named("lineage_members").ret("rows", op)).await?;
         resp.take("rows")
@@ -629,6 +674,9 @@ impl HubClient {
     /// Ancestors (`DescendsFrom` out, `RegionMatch` in) and descendants of a region up to
     /// `depth` levels, plus every region of its lineage. `None` when the region is unknown.
     pub async fn region_lineage(&self, region_id: &str, depth: usize) -> Result<Option<RegionLineage>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::region_lineage(pg, region_id, depth).await;
+        }
         let mut resp = self
             .batch(
                 &Batch::read()

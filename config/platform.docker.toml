@@ -13,6 +13,11 @@ url = "http://helix:8080"
 url = "http://qdrant:6333"
 vector_backend = "qdrant" # or "helix" (pre-ADR-0010 HelixDB vector indexes)
 
+# Graph store (ADR 0010, D-108): the model-state graph (snapshots, regions, transitions,
+# lineage, ref mirror) in the platform Postgres, schema `graph`. `helix` keeps the old backend.
+[graph]
+backend = "postgres"
+
 [victoriametrics]
 url = "http://victoriametrics:8428"
 

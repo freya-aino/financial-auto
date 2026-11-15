@@ -160,6 +160,17 @@ impl HubClient {
         as_of_ms: Option<i64>,
         limit: usize,
     ) -> Result<Vec<TransitionVersion>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::transition_versions(
+                pg,
+                from_region_id,
+                to_region_id,
+                sampler_id,
+                as_of_ms,
+                limit,
+            )
+            .await;
+        }
         let mut pred = vec![Pred::eq("edge_key", edge_key(from_region_id, to_region_id, sampler_id).as_str())];
         pred.extend(as_of_ms.map(at_or_before));
         let op = Op::nodes_with_label_where(labels::TRANSITION_VERSION, Pred::and(pred))
@@ -178,6 +189,9 @@ impl HubClient {
         as_of_ms: Option<i64>,
         limit: usize,
     ) -> Result<Vec<RegionStatusVersion>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::region_status_versions(pg, region_id, as_of_ms, limit).await;
+        }
         let mut pred = vec![Pred::eq("region_id", region_id)];
         pred.extend(as_of_ms.map(at_or_before));
         let op = Op::nodes_with_label_where(labels::REGION_STATUS_VERSION, Pred::and(pred))
@@ -217,6 +231,24 @@ impl HubClient {
         Ok(out)
     }
 
+    /// [`Self::latest_versions`] for `TransitionVersion` on the Helix backend ([`crate::graph::HelixGraph`]).
+    pub async fn latest_transition_versions_helix(
+        &self,
+        keys: &[String],
+        t_ms: i64,
+    ) -> Result<Vec<Option<TransitionVersion>>> {
+        self.latest_versions(labels::TRANSITION_VERSION, "edge_key", keys, t_ms).await
+    }
+
+    /// [`Self::latest_versions`] for `RegionStatusVersion` on the Helix backend.
+    pub async fn latest_region_status_versions_helix(
+        &self,
+        keys: &[String],
+        t_ms: i64,
+    ) -> Result<Vec<Option<RegionStatusVersion>>> {
+        self.latest_versions(labels::REGION_STATUS_VERSION, "region_id", keys, t_ms).await
+    }
+
     /// Edges as they were at `t_ms` (module docs): unchanged ones as read, the others from their
     /// latest version `≤ t`, dropped when they had none.
     pub async fn transitions_as_of(&self, edges: Vec<Transition>, t_ms: i64) -> Result<Vec<Transition>> {
@@ -234,8 +266,10 @@ impl HubClient {
                 )
             })
             .collect();
-        let versions: Vec<Option<TransitionVersion>> =
-            self.latest_versions(labels::TRANSITION_VERSION, "edge_key", &keys, t_ms).await?;
+        let versions: Vec<Option<TransitionVersion>> = match self.graph() {
+            Some(pg) => crate::graph::GraphStore::latest_transition_versions(pg, &keys, t_ms).await?,
+            None => self.latest_versions(labels::TRANSITION_VERSION, "edge_key", &keys, t_ms).await?,
+        };
         for (mut e, v) in keyed.into_iter().zip(versions) {
             if let Some(v) = v {
                 apply_transition_version(&mut e, &v);
@@ -252,8 +286,10 @@ impl HubClient {
         let (mut out, stale): (Vec<LatentRegion>, Vec<LatentRegion>) =
             regions.into_iter().partition(|r| unchanged_since(r.updated_at.as_deref(), t_ms));
         let keys: Vec<String> = stale.iter().map(|r| r.region_id.clone()).collect();
-        let versions: Vec<Option<RegionStatusVersion>> =
-            self.latest_versions(labels::REGION_STATUS_VERSION, "region_id", &keys, t_ms).await?;
+        let versions: Vec<Option<RegionStatusVersion>> = match self.graph() {
+            Some(pg) => crate::graph::GraphStore::latest_region_status_versions(pg, &keys, t_ms).await?,
+            None => self.latest_versions(labels::REGION_STATUS_VERSION, "region_id", &keys, t_ms).await?,
+        };
         for (mut r, v) in stale.into_iter().zip(versions) {
             match v {
                 Some(v) => {
@@ -276,6 +312,9 @@ impl HubClient {
     /// (node id), drop the versions with `ts < cutoff_ms` except the newest of them (the value in
     /// force at the cut-off). Returns the number of version rows dropped.
     pub async fn prune_space_versions(&self, space: u64, cutoff_ms: i64) -> Result<u64> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::prune_space_versions(pg, space, cutoff_ms).await;
+        }
         let graph = self.region_graph(space).await?;
         let edge_keys: BTreeSet<String> = graph
             .transitions

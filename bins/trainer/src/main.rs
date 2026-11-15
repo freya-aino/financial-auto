@@ -358,7 +358,8 @@ async fn main() -> anyhow::Result<()> {
     fa_core::logging::init("trainer"); // FA_LOG_FORMAT=json|text (spec 60 §4)
     let args = Args::parse();
     let cfg = PlatformConfig::load(&args.config)?;
-    let vector_store = fa_hub::configure_vectors(&cfg); // ADR 0010: vectors in Qdrant, graph in Helix
+    let vector_store = fa_hub::configure_vectors(&cfg); // ADR 0010: vectors in Qdrant (D-101)
+    tracing::info!(graph = fa_hub::configure_graph(&cfg), "graph store"); // ADR 0010 / D-108
     tracing::info!(qdrant = vector_store.as_deref().unwrap_or("off (helix vector indexes)"), "vector store");
     let vm_url = args
         .vm_url

@@ -449,6 +449,9 @@ impl HubClient {
 
     /// `upsertInstrument`: a real upsert (lookup → update properties, else insert).
     pub async fn upsert_instrument(&self, inst: &NewInstrument) -> Result<Instrument> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::upsert_instrument(pg, inst).await;
+        }
         let existing =
             Op::nodes_with_label_where(node::INSTRUMENT, Pred::eq("instrument_id", inst.instrument_id.as_str()));
         let updated = Op::nodes(NodeRef::var("existing"))
@@ -485,6 +488,9 @@ impl HubClient {
 
     /// `getInstrument`
     pub async fn get_instrument(&self, instrument_id: &str) -> Result<Option<Instrument>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::get_instrument(pg, instrument_id).await;
+        }
         let mut resp =
             self.batch(&Batch::read().ret("row", by_key(node::INSTRUMENT, "instrument_id", instrument_id))).await?;
         resp.take_opt("row")
@@ -494,6 +500,9 @@ impl HubClient {
 
     /// `addSnapshot` (fails with a unique violation if `snapshot_id` exists).
     pub async fn add_snapshot(&self, snap: &NewSnapshot) -> Result<Snapshot> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::add_snapshot(pg, snap).await;
+        }
         let props = vec![
             ("snapshot_id", s(&snap.snapshot_id)),
             ("timescale", s(&snap.timescale)),
@@ -509,6 +518,9 @@ impl HubClient {
 
     /// `addExpertSpace`: inserts the space and the `HasSpace` edge from `snapshot`.
     pub async fn add_expert_space(&self, snapshot: u64, space: &NewExpertSpace) -> Result<ExpertSpace> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::add_expert_space(pg, snapshot, space).await;
+        }
         let props = vec![
             ("expert_space_id", s(&space.expert_space_id)),
             ("snapshot_id", s(&space.snapshot_id)),
@@ -524,6 +536,9 @@ impl HubClient {
     /// `ensureSnapshot`: get-or-create by `snapshot_id` (idempotent across service restarts;
     /// an existing row is returned unchanged so operator status changes survive).
     pub async fn ensure_snapshot(&self, snap: &NewSnapshot) -> Result<Snapshot> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::ensure_snapshot(pg, snap).await;
+        }
         let props = vec![
             ("snapshot_id", s(&snap.snapshot_id)),
             ("timescale", s(&snap.timescale)),
@@ -545,6 +560,9 @@ impl HubClient {
 
     /// `ensureExpertSpace`: get-or-create by `expert_space_id`; a new space gets its `HasSpace` edge.
     pub async fn ensure_expert_space(&self, snapshot: u64, space: &NewExpertSpace) -> Result<ExpertSpace> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::ensure_expert_space(pg, snapshot, space).await;
+        }
         let props = vec![
             ("expert_space_id", s(&space.expert_space_id)),
             ("snapshot_id", s(&space.snapshot_id)),
@@ -568,6 +586,9 @@ impl HubClient {
 
     /// `listSnapshots`
     pub async fn list_snapshots(&self) -> Result<Vec<Snapshot>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::list_snapshots(pg).await;
+        }
         let op = Op::nodes_with_label(node::SNAPSHOT).order_by("snapshot_id", false).value_map(None);
         let mut resp = self.batch(&Batch::read().named("list_snapshots").ret("rows", op)).await?;
         resp.take("rows")
@@ -575,6 +596,9 @@ impl HubClient {
 
     /// Lookup by business id (what control-api routes receive).
     pub async fn snapshot_by_id(&self, snapshot_id: &str) -> Result<Option<Snapshot>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::snapshot_by_id(pg, snapshot_id).await;
+        }
         let mut resp =
             self.batch(&Batch::read().ret("row", by_key(node::SNAPSHOT, "snapshot_id", snapshot_id))).await?;
         resp.take_opt("row")
@@ -582,6 +606,9 @@ impl HubClient {
 
     /// Lookup an expert space by business id.
     pub async fn space_by_id(&self, expert_space_id: &str) -> Result<Option<ExpertSpace>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::space_by_id(pg, expert_space_id).await;
+        }
         let mut resp = self
             .batch(&Batch::read().ret("row", by_key(node::EXPERT_SPACE, "expert_space_id", expert_space_id)))
             .await?;
@@ -590,6 +617,9 @@ impl HubClient {
 
     /// `snapshotSpaces`: `N<Snapshot>(snapshot)::Out<HasSpace>`
     pub async fn snapshot_spaces(&self, snapshot: u64) -> Result<Vec<ExpertSpace>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::snapshot_spaces(pg, snapshot).await;
+        }
         let op = Op::nodes(snapshot).out(Some(edge::HAS_SPACE)).value_map(None);
         let mut resp = self.batch(&Batch::read().named("snapshot_spaces").ret("rows", op)).await?;
         resp.take("rows")
@@ -598,6 +628,9 @@ impl HubClient {
     /// Snapshots of one timescale and encoder family with `status` (`candidate | active | retired`),
     /// newest `created_at` first. The trainer and model-runtime resolve the active snapshot with it.
     pub async fn snapshots_by_status(&self, timescale: &str, family: &str, status: &str) -> Result<Vec<Snapshot>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::snapshots_by_status(pg, timescale, family, status).await;
+        }
         let pred = Pred::and([
             Pred::eq("timescale", timescale),
             Pred::eq("encoder_family", family),
@@ -617,6 +650,9 @@ impl HubClient {
 
     /// `SnapshotParent{op}` edge parent → child (spec 36 lineage). Returns the edge id.
     pub async fn link_snapshot_parent(&self, parent: u64, child: u64, op: &str) -> Result<u64> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::link_snapshot_parent(pg, parent, child, op).await;
+        }
         let edge_op = Op::nodes(parent).add_e(edge::SNAPSHOT_PARENT, child, vec![("op", s(op))]);
         let mut resp = self.batch(&Batch::write().named("link_snapshot_parent").ret("e", edge_op)).await?;
         Ok(resp.take_one::<IdRow>("e")?.id)
@@ -624,6 +660,9 @@ impl HubClient {
 
     /// Parent snapshot of `child` (`In<SnapshotParent>`), if linked.
     pub async fn snapshot_parent(&self, child: u64) -> Result<Option<Snapshot>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::snapshot_parent(pg, child).await;
+        }
         let op = Op::nodes(child).r#in(Some(edge::SNAPSHOT_PARENT)).value_map(None);
         let mut resp = self.batch(&Batch::read().named("snapshot_parent").ret("rows", op)).await?;
         let mut rows: Vec<Snapshot> = resp.take("rows")?;
@@ -633,6 +672,9 @@ impl HubClient {
 
     /// Snapshots derived from `parent` (`Out<SnapshotParent>`).
     pub async fn snapshot_children(&self, parent: u64) -> Result<Vec<Snapshot>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::snapshot_children(pg, parent).await;
+        }
         let op = Op::nodes(parent).out(Some(edge::SNAPSHOT_PARENT)).value_map(None);
         let mut resp = self.batch(&Batch::read().named("snapshot_children").ret("rows", op)).await?;
         resp.take("rows")
@@ -640,6 +682,9 @@ impl HubClient {
 
     /// Set `status` on a snapshot (`promote`/`rollback` routes). Returns the updated row.
     pub async fn set_snapshot_status(&self, snapshot: u64, status: &str) -> Result<Snapshot> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::set_snapshot_status(pg, snapshot, status).await;
+        }
         let op = Op::nodes(snapshot).set_property("status", status).value_map(None);
         let mut resp = self.batch(&Batch::write().named("set_snapshot_status").ret("row", op)).await?;
         resp.take_one("row")
@@ -648,6 +693,9 @@ impl HubClient {
     /// Record which snapshot `snapshot` replaced on promotion, so `rollback` can restore exactly
     /// that one instead of guessing from creation times. Returns the updated row.
     pub async fn set_snapshot_previous_active(&self, snapshot: u64, previous: &str) -> Result<Snapshot> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::set_snapshot_previous_active(pg, snapshot, previous).await;
+        }
         let op = Op::nodes(snapshot).set_property("previous_active", previous).value_map(None);
         let mut resp = self.batch(&Batch::write().named("set_snapshot_previous_active").ret("row", op)).await?;
         resp.take_one("row")
@@ -661,6 +709,9 @@ impl HubClient {
         manifest_json: &str,
         carried_mass: f64,
     ) -> Result<Snapshot> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::set_snapshot_manifest(pg, snapshot, manifest_json, carried_mass).await;
+        }
         let op = Op::nodes(snapshot)
             .set_property("manifest", manifest_json)
             .set_property("carried_mass", carried_mass)
@@ -675,6 +726,9 @@ impl HubClient {
     /// (the Helix id of the `Snapshot` row). Fails with a unique violation when
     /// `<snapshot_id>@<version>` exists.
     pub async fn add_adapter_state(&self, snapshot: u64, a: &NewAdapterState) -> Result<AdapterState> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::add_adapter_state(pg, snapshot, a).await;
+        }
         let mut props = vec![
             ("adapter_id", s(&a.adapter_id())),
             ("snapshot_id", s(&a.snapshot_id)),
@@ -699,6 +753,9 @@ impl HubClient {
 
     /// Adapter versions of a snapshot by business id, newest `version` first, at most `limit`.
     pub async fn snapshot_adapters(&self, snapshot_id: &str, limit: usize) -> Result<Vec<AdapterState>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::snapshot_adapters(pg, snapshot_id, limit).await;
+        }
         let op = Op::nodes_with_label_where(node::ADAPTER_STATE, Pred::eq("snapshot_id", snapshot_id))
             .order_by("version", true)
             .limit(limit.max(1))
@@ -718,6 +775,9 @@ impl HubClient {
 
     /// `addRegion`: inserts the region and its `InSpace` edge to `space`.
     pub async fn add_region(&self, space: u64, region: &NewRegion) -> Result<LatentRegion> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::add_region(pg, space, region).await;
+        }
         let props = vec![
             ("region_id", s(&region.region_id)),
             ("lineage_id", s(&region.lineage_id)),
@@ -737,6 +797,9 @@ impl HubClient {
     /// D-039 ids are process-local) is revived: `status = live`, radius/density refreshed.
     /// A new row is inserted with its `InSpace` edge to `space`.
     pub async fn upsert_region(&self, space: u64, region: &NewRegion) -> Result<LatentRegion> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::upsert_region(pg, space, region).await;
+        }
         let existing = by_key_nodes(node::LATENT_REGION, "region_id", &region.region_id);
         let updated = Op::nodes(NodeRef::var("existing"))
             .set_property("status", "live")
@@ -802,6 +865,9 @@ impl HubClient {
 
     /// `getRegion`: lookup by business id.
     pub async fn region_by_id(&self, region_id: &str) -> Result<Option<LatentRegion>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::region_by_id(pg, region_id).await;
+        }
         let mut resp =
             self.batch(&Batch::read().ret("row", by_key(node::LATENT_REGION, "region_id", region_id))).await?;
         resp.take_opt("row")
@@ -816,6 +882,9 @@ impl HubClient {
         status: &str,
         related_region_id: &str,
     ) -> Result<LatentRegion> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::mark_region_status(pg, region_id, status, related_region_id).await;
+        }
         let op = Op::nodes(NodeRef::var("region"))
             .set_property("status", status)
             .set_property("related_region_id", related_region_id)
@@ -837,6 +906,9 @@ impl HubClient {
 
     /// `spaceRegions`: `N<ExpertSpace>(space)::In<InSpace>`
     pub async fn space_regions(&self, space: u64) -> Result<Vec<LatentRegion>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::space_regions(pg, space).await;
+        }
         let op = Op::nodes(space).r#in(Some(edge::IN_SPACE)).value_map(None);
         let mut resp = self.batch(&Batch::read().named("space_regions").ret("rows", op)).await?;
         resp.take("rows")
@@ -844,6 +916,9 @@ impl HubClient {
 
     /// `addTransition`: `AddE<Transition>::From(from)::To(to)`, returned as an edge row.
     pub async fn add_transition(&self, from: u64, to: u64, t: &NewTransition) -> Result<Transition> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::add_transition(pg, from, to, t).await;
+        }
         let props = vec![
             ("sampler_id", s(&t.sampler_id)),
             ("count", t.count.into()),
@@ -874,6 +949,9 @@ impl HubClient {
     /// Fails with [`HubError::NotFound`] when either region is unknown; the whole batch is then
     /// rolled back by the server (one transaction).
     pub async fn upsert_transitions(&self, rows: &[TransitionUpsert]) -> Result<Vec<Transition>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::upsert_transitions(pg, rows).await;
+        }
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -956,6 +1034,9 @@ impl HubClient {
 
     /// `regionTransitions`: outgoing `Transition` edges of a region.
     pub async fn region_transitions(&self, region: u64) -> Result<Vec<Transition>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::region_transitions(pg, region).await;
+        }
         let op = Op::nodes(region).out_e(Some(edge::TRANSITION)).edge_properties();
         let mut resp = self.batch(&Batch::read().named("region_transitions").ret("rows", op)).await?;
         resp.take("rows")
@@ -963,6 +1044,9 @@ impl HubClient {
 
     /// `regionNeighbors`: regions reachable over one `Transition`.
     pub async fn region_neighbors(&self, region: u64) -> Result<Vec<LatentRegion>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::region_neighbors(pg, region).await;
+        }
         let op = Op::nodes(region).out(Some(edge::TRANSITION)).dedup().value_map(None);
         let mut resp = self.batch(&Batch::read().named("region_neighbors").ret("rows", op)).await?;
         resp.take("rows")
@@ -970,6 +1054,9 @@ impl HubClient {
 
     /// `matchRegions`: `RegionMatch{score}` edge prev → next; returns the edge id.
     pub async fn match_regions(&self, prev: u64, next: u64, score: f64) -> Result<u64> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::match_regions(pg, prev, next, score).await;
+        }
         let op = Op::nodes(prev).add_e(edge::REGION_MATCH, next, vec![("score", score.into())]);
         let mut resp = self.batch(&Batch::write().named("match_regions").ret("e", op)).await?;
         Ok(resp.take_one::<IdRow>("e")?.id)
@@ -977,6 +1064,9 @@ impl HubClient {
 
     /// Regions of an expert space with all transitions among them (one round trip).
     pub async fn region_graph(&self, space: u64) -> Result<RegionGraph> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::region_graph(pg, space).await;
+        }
         let batch = Batch::read()
             .named("region_graph")
             .var("regions", Op::nodes(space).r#in(Some(edge::IN_SPACE)))
@@ -989,6 +1079,9 @@ impl HubClient {
     /// `snapshotGraph`: the snapshot, its spaces, their regions and all transitions among them,
     /// by business id, in one round trip. `None` when the snapshot does not exist.
     pub async fn snapshot_graph(&self, snapshot_id: &str) -> Result<Option<SnapshotGraph>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::snapshot_graph(pg, snapshot_id).await;
+        }
         let batch = Batch::read()
             .named("snapshot_graph")
             .var("snap", by_key_nodes(node::SNAPSHOT, "snapshot_id", snapshot_id))
@@ -1208,6 +1301,9 @@ impl HubClient {
     /// `generation` and `updated_at` refreshed; one write batch. Pairs whose genome or snapshot
     /// does not exist are skipped by the server-side probe (no error).
     pub async fn link_trained_on(&self, links: &[TrainedOnLink]) -> Result<()> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::link_trained_on(pg, links).await;
+        }
         if links.is_empty() {
             return Ok(());
         }
@@ -1231,6 +1327,9 @@ impl HubClient {
     /// into the snapshot's fit (D-009), upserted by `(snapshot_id, genome_id)`; one write batch.
     /// Missing genomes / snapshots are skipped by the probe.
     pub async fn link_feedback_from(&self, links: &[FeedbackLink]) -> Result<()> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::link_feedback_from(pg, links).await;
+        }
         if links.is_empty() {
             return Ok(());
         }
@@ -1257,6 +1356,19 @@ impl HubClient {
 
     /// `snapshotFeedback`: the `FeedbackFrom` edges of a snapshot (weights) and the elite genomes.
     pub async fn snapshot_feedback(&self, snapshot_id: &str) -> Result<(Vec<EdgeRow>, Vec<Genome>)> {
+        if let Some(pg) = self.graph() {
+            // edges live in Postgres; the genome nodes still live in Helix (D-108)
+            let edges = crate::graph::GraphStore::feedback_edges(pg, snapshot_id).await?;
+            let mut genomes = Vec::with_capacity(edges.len());
+            for e in &edges {
+                if let Some(gid) = e.properties.get("genome_id").and_then(Json::as_str)
+                    && let Some(g) = self.genome_by_id(gid).await?
+                {
+                    genomes.push(g);
+                }
+            }
+            return Ok((edges, genomes));
+        }
         let b = Batch::read()
             .named("snapshot_feedback")
             .var("s", by_key_nodes(node::SNAPSHOT, "snapshot_id", snapshot_id))
@@ -1268,6 +1380,9 @@ impl HubClient {
 
     /// `genomeTrainedOn`: the snapshots a genome was trained on (`TrainedOn` targets).
     pub async fn genome_trained_on(&self, genome_id: &str) -> Result<Vec<Snapshot>> {
+        if let Some(pg) = self.graph() {
+            return crate::graph::GraphStore::trained_on_snapshots(pg, genome_id).await;
+        }
         let op = by_key_nodes(node::GENOME, "genome_id", genome_id).out(Some(edge::TRAINED_ON)).value_map(None);
         let mut resp = self.batch(&Batch::read().named("genome_trained_on").ret("rows", op)).await?;
         resp.take("rows")

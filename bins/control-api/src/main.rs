@@ -64,7 +64,8 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     fa_bus::metrics::serve_from_env("control-api", env!("CARGO_PKG_VERSION")); // GET /metrics on FA_METRICS_BIND (spec 60 §4, D-056)
     let cfg = PlatformConfig::load(&args.config).context("loading platform config")?;
-    let vector_store = fa_hub::configure_vectors(&cfg); // ADR 0010: vectors in Qdrant, graph in Helix
+    let vector_store = fa_hub::configure_vectors(&cfg); // ADR 0010: vectors in Qdrant (D-101)
+    tracing::info!(graph = fa_hub::configure_graph(&cfg), "graph store"); // ADR 0010 / D-108
     tracing::info!(qdrant = vector_store.as_deref().unwrap_or("off (helix vector indexes)"), "vector store");
     let bind: SocketAddr = cfg.control_api.bind.parse().context("parsing control_api.bind")?;
 

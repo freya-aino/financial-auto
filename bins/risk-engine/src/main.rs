@@ -509,7 +509,8 @@ async fn main() -> anyhow::Result<()> {
     let cfg = PlatformConfig::load(&args.config).context("loading platform config")?;
     let md_mode = fa_core::market_data::MarketDataMode::from_env().map_err(anyhow::Error::msg)?;
     tracing::info!(market_data = %md_mode, "market data mode (D-103; FA_MARKET_DATA)");
-    let vector_store = fa_hub::configure_vectors(&cfg); // ADR 0010: vectors in Qdrant, graph in Helix
+    let vector_store = fa_hub::configure_vectors(&cfg); // ADR 0010: vectors in Qdrant (D-101)
+    tracing::info!(graph = fa_hub::configure_graph(&cfg), "graph store"); // ADR 0010 / D-108
     tracing::info!(qdrant = vector_store.as_deref().unwrap_or("off (helix vector indexes)"), "vector store");
     let settings = match std::fs::read_to_string(&args.risk) {
         Ok(src) => Settings::parse(&src).with_context(|| format!("parsing {}", args.risk.display()))?,

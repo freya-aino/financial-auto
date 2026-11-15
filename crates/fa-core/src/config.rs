@@ -18,6 +18,9 @@ pub struct PlatformConfig {
     /// Vector store (ADR 0010, D-101); absent = defaults.
     #[serde(default)]
     pub qdrant: QdrantConfig,
+    /// Graph store (ADR 0010, D-108); absent = defaults (Postgres).
+    #[serde(default)]
+    pub graph: GraphConfig,
     pub victoriametrics: Endpoint,
     pub postgres: PostgresConfig,
     pub garage: GarageConfig,
@@ -67,6 +70,25 @@ pub struct QdrantConfig {
     /// `FA_VECTOR_BACKEND`; `FA_QDRANT_URL` overrides `url`.
     #[serde(default = "default_vector_backend")]
     pub vector_backend: String,
+}
+
+/// `[graph]`: where the model-state graph lives (ADR 0010, D-108).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GraphConfig {
+    /// `postgres` (default; schema `graph` on the platform Postgres) or `helix` (the pre-D-108
+    /// HelixDB graph). Overridden by `FA_GRAPH_BACKEND`.
+    #[serde(default = "default_graph_backend")]
+    pub backend: String,
+}
+
+impl Default for GraphConfig {
+    fn default() -> Self {
+        Self { backend: default_graph_backend() }
+    }
+}
+
+fn default_graph_backend() -> String {
+    "postgres".into()
 }
 
 fn default_qdrant_url() -> String {
@@ -307,6 +329,10 @@ impl PlatformConfig {
         if cfg.garage.public_endpoint.is_empty() {
             cfg.garage.public_endpoint = cfg.garage.endpoint.clone();
         }
+        if !matches!(cfg.graph.backend.as_str(), "postgres" | "helix") {
+            let msg = format!("graph.backend must be `postgres` or `helix`, not `{}`", cfg.graph.backend);
+            return Err(ConfigError::Invalid { path: p, msg });
+        }
         if !matches!(cfg.qdrant.vector_backend.as_str(), "qdrant" | "helix") {
             let msg = format!("qdrant.vector_backend must be `qdrant` or `helix`, not `{}`", cfg.qdrant.vector_backend);
             return Err(ConfigError::Invalid { path: p, msg });
@@ -325,6 +351,7 @@ impl PlatformConfig {
             "nats",
             "helix",
             "qdrant",
+            "graph",
             "victoriametrics",
             "postgres",
             "garage",

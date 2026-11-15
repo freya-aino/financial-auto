@@ -131,7 +131,9 @@ impl HubClient {
         let experts: Vec<(u32, Op)> = match &e.experts {
             Some(ids) => ids
                 .iter()
-                .map(|i| (*i, by_key(crate::experts::labels::EXPERT, "expert_uid", &crate::expert_uid(&e.snapshot_id, *i))))
+                .map(|i| {
+                    (*i, by_key(crate::experts::labels::EXPERT, "expert_uid", &crate::expert_uid(&e.snapshot_id, *i)))
+                })
                 .collect(),
             None => Vec::new(),
         };
@@ -244,7 +246,12 @@ mod tests {
     fn front_id_and_batches_build() {
         let f = NewParetoFront { generation_id: "01G".into(), gen_index: 2, ..Default::default() };
         assert_eq!(f.front_id(), "01G/2");
-        let e = Evaluation { genome_id: "g".into(), snapshot_id: "s".into(), experts: Some(vec![0, 2]), ..Default::default() };
+        let e = Evaluation {
+            genome_id: "g".into(),
+            snapshot_id: "s".into(),
+            experts: Some(vec![0, 2]),
+            ..Default::default()
+        };
         assert_eq!(e.experts.as_ref().map(Vec::len), Some(2));
     }
 }
