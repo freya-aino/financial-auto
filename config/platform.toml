@@ -8,6 +8,9 @@ url = "nats://127.0.0.1:4222"
 [helix]
 url = "http://127.0.0.1:6969"
 
+[dgraph] # graph store (ADR 0011, D-110): replaces HelixDB and the Postgres `graph` schema
+url = "http://127.0.0.1:8180"
+
 [qdrant] # vector store, ADR 0010 / D-101 (the graph stays in [helix])
 url = "http://127.0.0.1:16333"
 vector_backend = "qdrant" # or "helix" (pre-ADR-0010 HelixDB vector indexes)

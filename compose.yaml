@@ -88,6 +88,44 @@ services:
     # from the host: curl -fsS http://127.0.0.1:16333/readyz
     restart: unless-stopped
 
+  # Graph store (ADR 0011, D-110): Dgraph replaces HelixDB and the Postgres `graph` schema.
+  # Zero manages the cluster layout and uid leases; alpha serves DQL over HTTP (8080) and gRPC (9080).
+  # Single-node (one group, replicas 1) — this is a one-workstation stack.
+  dgraph-zero:
+    image: dgraph/dgraph:v25.5.1
+    command: ["dgraph", "zero", "--my=dgraph-zero:5080", "--replicas=1"]
+    ports:
+      - "127.0.0.1:6080:6080" # admin/state HTTP
+    volumes:
+      - dgraph-zero-data:/dgraph
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:6080/state"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  dgraph-alpha:
+    image: dgraph/dgraph:v25.5.1
+    command: ["dgraph", "alpha", "--my=dgraph-alpha:7080", "--zero=dgraph-zero:5080",
+              "--security", "whitelist=0.0.0.0/0"]
+    ports:
+      - "127.0.0.1:8180:8080" # DQL/HTTP; host 8080 is free but 8180 keeps the 81xx block with the other UIs
+    volumes:
+      - dgraph-alpha-data:/dgraph
+    depends_on:
+      dgraph-zero:
+        condition: service_healthy
+    # unlike helix the image ships a shell and curl, so the graph store finally has a real healthcheck
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
   victoriametrics:
     image: victoriametrics/victoria-metrics:v1.155.0
     command:
@@ -500,6 +538,8 @@ volumes:
   nats-data:
   helix-data:
   qdrant-data: # Qdrant collections (ADR 0010)
+  dgraph-zero-data: # Dgraph cluster layout / uid leases (ADR 0011)
+  dgraph-alpha-data: # Dgraph posting lists and indexes (ADR 0011)
   postgres-data:
   vm-data:
   garage-meta:

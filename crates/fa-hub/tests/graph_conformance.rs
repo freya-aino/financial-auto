@@ -239,6 +239,177 @@ async fn conformance<G: GraphStore>(g: &G, run: &str) {
     let r = g.instrument_reference(&iid).await.unwrap().unwrap();
     assert!(r.listings.is_empty(), "retired instruments lose their out-edges");
 
+    // ── groups below were uncovered before D-110; Postgres is the oracle for the Dgraph
+    // ── backend, so they are pinned here while both implementations still exist.
+
+    // the `add_*` constructors (the suite previously only exercised `ensure_`/`upsert_`)
+    let sid2 = format!("conf-{run}-snap2");
+    let snap2 = g
+        .add_snapshot(&NewSnapshot {
+            snapshot_id: sid2.clone(),
+            timescale: "1m".into(),
+            encoder_family: "stat".into(),
+            generation: 2,
+            garage_key: "k2".into(),
+            status: "candidate".into(),
+        })
+        .await
+        .unwrap();
+    assert_ne!(snap2.id, snap.id);
+    let dup = g
+        .add_snapshot(&NewSnapshot {
+            snapshot_id: sid2.clone(),
+            timescale: "1m".into(),
+            encoder_family: "stat".into(),
+            generation: 2,
+            garage_key: "k2".into(),
+            status: "candidate".into(),
+        })
+        .await;
+    assert!(dup.is_err(), "add_snapshot must reject a duplicate business id");
+
+    // snapshot parent / children
+    let link = g.link_snapshot_parent(snap.id, snap2.id, "retrain").await.unwrap();
+    assert!(link > 0);
+    assert_eq!(g.snapshot_parent(snap2.id).await.unwrap().map(|s| s.id), Some(snap.id));
+    let kids = g.snapshot_children(snap.id).await.unwrap();
+    assert!(kids.iter().any(|s| s.id == snap2.id), "child not listed");
+    assert!(g.snapshot_parent(snap.id).await.unwrap().is_none(), "root has no parent");
+
+    // add_region / add_transition, region stats, death
+    // `add_region` is a raw insert: unlike `upsert_region` it leaves `status` unset and appends no
+    // status version. Previously untested, and a difference the Dgraph backend must reproduce.
+    let r2 = g.add_region(space.id, &mk(2)).await.unwrap();
+    assert_eq!(r2.status, None, "add_region does not set a lifecycle status");
+    assert!(g.region_status_versions(&rid(2), None, 10).await.unwrap().is_empty(), "and writes no version");
+    let t = g
+        .add_transition(r0.id, r2.id, &fa_hub::NewTransition {
+            sampler_id: "added".into(),
+            count: 5,
+            mean: 0.5,
+            lower: 0.4,
+            upper: 0.6,
+            kernel_params: "{}".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(t.count, 5);
+    g.update_region_stats(&[fa_hub::RegionStatsUpdate {
+        region_id: rid(2),
+        mass: 2.5,
+        occupancy: 0.4,
+        spread: 1.5,
+        age: 11,
+    }])
+    .await
+    .unwrap();
+    // `LatentRegion` does not carry the stats, but `NodeRow` reflects every column, so the
+    // round trip is checked through the lineage read (r2 shares the run's lineage id).
+    let rows = g.lineage_members(&format!("conf-{run}-lin")).await.unwrap();
+    let r2row = rows.iter().find(|n| n.properties.get("region_id").and_then(|v| v.as_str()) == Some(&rid(2)));
+    let props = &r2row.expect("r2 in lineage").properties;
+    assert_eq!(props.get("mass").and_then(serde_json::Value::as_f64), Some(2.5));
+    assert_eq!(props.get("occupancy").and_then(serde_json::Value::as_f64), Some(0.4));
+    assert_eq!(props.get("age").and_then(serde_json::Value::as_i64), Some(11));
+    g.mark_region_died(&rid(2), "pruned", "").await.unwrap();
+    let dead = g.region_by_id(&rid(2)).await.unwrap().unwrap();
+    assert_eq!(dead.status.as_deref(), Some("retired"), "death marks `retired`, not `dead`");
+    let dv = g.region_status_versions(&rid(2), None, 10).await.unwrap();
+    assert_eq!(dv.len(), 1, "death appends exactly one status version");
+    assert_eq!(dv[0].status, "retired");
+    assert!(g.mark_region_died(&format!("conf-{run}-missing"), "x", "").await.is_err(), "unknown region errors");
+
+    // region match
+    let m = g.match_regions(r0.id, r2.id, 0.9).await.unwrap();
+    assert!(m > 0, "match_regions returns the edge id");
+
+    // kernels: `kernel_id` is the expert space id, so the upsert is idempotent per space
+    let kernel = fa_hub::NewKernelModel {
+        expert_space_id: esid.clone(),
+        snapshot_id: sid.clone(),
+        timescale: "1m".into(),
+        expert_index: 0,
+        kernel_type: "dirichlet".into(),
+        serving_sampler: "dirichlet".into(),
+        scores: "[]".into(),
+        stationary: "[]".into(),
+        relaxation_steps: 3.0,
+        drift_kl: 0.01,
+        n_rows: 2,
+        observation_mass: 10.0,
+        live_regions: 2,
+    };
+    g.upsert_kernel_model(&kernel).await.unwrap();
+    g.upsert_kernel_model(&fa_hub::NewKernelModel { live_regions: 3, ..kernel.clone() }).await.unwrap();
+    let kernels = g.snapshot_kernels(&sid).await.unwrap();
+    assert_eq!(kernels.len(), 1, "upsert by expert space, not insert");
+
+    // cross priors: ordered by score, limited
+    let prior = |target: &str, score: f64| fa_hub::NewCrossPrior {
+        timescale: format!("conf-{run}-ts"),
+        source_instrument_id: format!("conf-{run}-src"),
+        target_instrument_id: target.to_owned(),
+        n: 30,
+        correlation: 0.5,
+        shrinkage: 0.1,
+        lead_lag: 1,
+        lead_corr: 0.4,
+        predictive_gain: 0.2,
+        uncertainty: 0.3,
+        score,
+        rank: 1,
+    };
+    g.upsert_cross_priors(&[prior("a", 0.1), prior("b", 0.9)]).await.unwrap();
+    let priors = g.cross_priors(&format!("conf-{run}-ts"), 10).await.unwrap();
+    assert_eq!(priors.len(), 2);
+    g.upsert_cross_priors(&[prior("a", 0.2)]).await.unwrap();
+    assert_eq!(g.cross_priors(&format!("conf-{run}-ts"), 10).await.unwrap().len(), 2, "upsert by pair_id");
+    assert_eq!(g.cross_priors(&format!("conf-{run}-ts"), 1).await.unwrap().len(), 1, "limit honoured");
+
+    // episodes: upsert by (region, instrument, t_enter), read newest first, prune by cutoff
+    let ep = |t_enter: i64, bars: u32| fa_hub::NewRegionEpisode {
+        region_id: rid(0),
+        expert_space_id: esid.clone(),
+        timescale: format!("conf-{run}-ts"),
+        instrument_id: format!("conf-{run}-inst-ep"),
+        t_enter_ms: t_enter,
+        t_exit_ms: t_enter + 60_000,
+        bars,
+        max_weight: 0.9,
+        mean_weight: 0.5,
+    };
+    let old_enter = now_ms() - 7_200_000;
+    g.upsert_region_episodes(&[ep(old_enter, 1), ep(now_ms() - 60_000, 2)]).await.unwrap();
+    assert_eq!(g.region_episodes(&rid(0), 10).await.unwrap().len(), 2);
+    g.upsert_region_episodes(&[ep(old_enter, 7)]).await.unwrap();
+    let eps = g.region_episodes(&rid(0), 10).await.unwrap();
+    assert_eq!(eps.len(), 2, "upsert by episode_id, not insert");
+    let pruned = g.prune_region_episodes(&format!("conf-{run}-ts"), now_ms() - 3_600_000).await.unwrap();
+    assert_eq!(pruned, 1, "only the two-hour-old episode is past the cutoff");
+    assert_eq!(g.region_episodes(&rid(0), 10).await.unwrap().len(), 1);
+
+    // version pruning keeps the newest version per key below the cutoff
+    let before_prune = g.transition_versions(&rid(0), &rid(1), "dirichlet", None, 10).await.unwrap().len();
+    assert_eq!(before_prune, 2);
+    let dropped = g.prune_space_versions(space.id, now_ms() + 1_000).await.unwrap();
+    assert!(dropped >= 1, "expected to drop superseded versions, dropped {dropped}");
+    let kept = g.transition_versions(&rid(0), &rid(1), "dirichlet", None, 10).await.unwrap();
+    assert_eq!(kept.len(), 1, "the newest version per key survives pruning");
+    assert_eq!(kept[0].count, 2, "and it is the newest one");
+
+    // feedback links (the trained_on counterpart)
+    g.link_feedback_from(&[fa_hub::FeedbackLink {
+        snapshot_id: sid.clone(),
+        genome_id: format!("conf-{run}-genome"),
+        weight: 0.5,
+        output_family: "analog".into(),
+        score: 0.7,
+    }])
+    .await
+    .unwrap();
+    let fb = g.feedback_edges(&sid).await.unwrap();
+    assert!(fb.len() <= 1, "at most one feedback edge per (snapshot, genome)");
+
     // genome links by business id
     g.link_trained_on(&[fa_hub::TrainedOnLink {
         genome_id: format!("conf-{run}-genome"),
@@ -266,6 +437,13 @@ async fn postgres_backend_conforms() {
     // cleanup: every table keys its conformance rows by the run prefix
     let like = format!("conf-{run}-%");
     for sql in [
+        "DELETE FROM graph.region_episode WHERE region_id LIKE $1",
+        "DELETE FROM graph.cross_prior WHERE source_instrument_id LIKE $1",
+        "DELETE FROM graph.kernel_model WHERE expert_space_id LIKE $1",
+        "DELETE FROM graph.region_match WHERE prev_region_id LIKE $1",
+        "DELETE FROM graph.feedback_from WHERE snapshot_id LIKE $1",
+        "DELETE FROM graph.snapshot_parent WHERE parent_id IN (SELECT id FROM graph.snapshot WHERE snapshot_id LIKE $1)",
+        "DELETE FROM graph.transition WHERE from_region_id LIKE $1",
         "DELETE FROM graph.transition_version WHERE from_region_id LIKE $1",
         "DELETE FROM graph.region_status_version WHERE region_id LIKE $1",
         "DELETE FROM graph.descends_from WHERE child_region_id LIKE $1",
