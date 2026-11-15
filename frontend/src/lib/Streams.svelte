@@ -2,6 +2,7 @@
 	// JetStream streams and consumer lag (spec 51 §6.2 "JetStream consumer lag", D-046).
 	import { onMount } from 'svelte';
 	import Empty from './Empty.svelte';
+	import Info from './Info.svelte';
 	import { api, bytes, poll, type BusStream } from './api';
 	import { runtime } from './runtime.svelte';
 
@@ -30,13 +31,13 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Streams</h2>
+		<h2>Streams <Info k="ops.streams" /></h2>
 		<span class="dim">GET /api/bus/streams · {streams.length} streams · {totalMsgs.toLocaleString()} msgs · {bytes(totalBytes)}{lagging ? ` · ${lagging} consumer${lagging === 1 ? '' : 's'} with pending` : ''}</span>
 	</div>
 	{#if error}<p class="badge danger">{error}</p>{/if}
 	{#if streams.length}
 		<table>
-			<thead><tr><th>stream</th><th>subjects</th><th>retention</th><th>messages</th><th>bytes / cap</th><th>seq</th><th>consumers</th></tr></thead>
+			<thead><tr><th>stream</th><th>subjects</th><th>retention</th><th>messages</th><th>bytes / cap <Info k="ops.streams.cap" /></th><th>seq</th><th>consumers <Info k="ops.streams.consumers" /></th></tr></thead>
 			<tbody>
 				{#each streams as s (s.name)}
 					<tr class:open={open === s.name} onclick={() => (open = open === s.name ? null : s.name)}>

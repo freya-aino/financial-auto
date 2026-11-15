@@ -5,6 +5,7 @@
 	// confirmed, audited by control-api (actor ui) and announced on ref.changed.<entity>.
 	import { onMount } from 'svelte';
 	import Empty from '../../lib/Empty.svelte';
+	import Info from '../../lib/Info.svelte';
 	import ViewHeader from '../../lib/ViewHeader.svelte';
 	import { api, num, short, type Instrument } from '../../lib/api';
 	import { consoleApi, errText, type CorporateAction, type SessionRow, type Venue } from '../../lib/console';
@@ -249,11 +250,12 @@
 	<label title="knowledge instant (record time); empty = now">known at <input type="datetime-local" bind:value={rKnown} /></label>
 	<button onclick={() => (resolve(), loadFx(), loadInstrument(), loadActions())}>re-evaluate as of</button>
 	<span class="dim">Empty = now. Every query below uses these instants.</span>
+	<Info k="ops.refdata.bitemporal" />
 </div>
 
 <div class="grid cols">
 	<section class="panel">
-		<div class="panel-head"><h2>Resolve symbol</h2><span class="dim">none · one · ambiguous</span></div>
+		<div class="panel-head"><h2>Resolve symbol <Info k="ops.refdata.resolve" /></h2><span class="dim">none · one · ambiguous</span></div>
 		<form class="row" onsubmit={(e) => (e.preventDefault(), resolve())}>
 			<label>venue <input bind:value={rVenue} size="6" placeholder="xetr" /></label>
 			<label>or source <input bind:value={rSource} size="7" disabled={!!rVenue} /></label>
@@ -279,7 +281,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Instrument as of</h2></div>
+		<div class="panel-head"><h2>Instrument as of <Info k="ops.refdata.asof" /></h2></div>
 		<form class="row" onsubmit={(e) => (e.preventDefault(), find())}>
 			<input bind:value={search} placeholder="search name / symbol" />
 			<button type="submit">search</button>
@@ -307,7 +309,7 @@
 
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Calendar</h2>
+			<h2>Calendar <Info k="ops.refdata.calendar" /></h2>
 			<span class="dim">{calRule ? `rule ${calRule}` : 'no built-in rule'}{calTz ? ` · ${calTz}` : ''}</span>
 		</div>
 		{#if venuesErr}<p class="badge danger">{venuesErr}</p>{/if}
@@ -348,7 +350,7 @@
 
 	<section class="panel wide">
 		<div class="panel-head">
-			<h2>Corporate actions <span class="dim">({actions.length}{pit ? `, as known ${rKnown || 'now'} for ${short(instId)}` : ', newest recorded'})</span></h2>
+			<h2>Corporate actions <Info k="ops.refdata.actions" /> <span class="dim">({actions.length}{pit ? `, as known ${rKnown || 'now'} for ${short(instId)}` : ', newest recorded'})</span></h2>
 			<button onclick={() => ((instId = ''), loadActions())} disabled={!instId}>all instruments</button>
 		</div>
 		{#if actionsErr}<p class="badge danger">{actionsErr}</p>{/if}
@@ -399,7 +401,7 @@
 	</section>
 
 	<section class="panel wide">
-		<div class="panel-head"><h2>Overrides <span class="dim">{instId ? `for ${short(instId, 12)}` : '(load an instrument above first)'}</span></h2><span class="dim">POST /api/refdata/identifiers · /api/refdata/contract-specs</span></div>
+		<div class="panel-head"><h2>Overrides <Info k="ops.refdata.overrides" /> <span class="dim">{instId ? `for ${short(instId, 12)}` : '(load an instrument above first)'}</span></h2><span class="dim">POST /api/refdata/identifiers · /api/refdata/contract-specs</span></div>
 		{#if ovMsg}<p class="badge" class:ok={ovOk} class:danger={!ovOk}>{ovMsg}</p>{/if}
 		<h3 class="sub">Identifier</h3>
 		<form class="row" onsubmit={(e) => (e.preventDefault(), addIdentifier())}>

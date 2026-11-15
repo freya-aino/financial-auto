@@ -4,6 +4,7 @@
 	// (`ops.config_snapshot`, one row per changed digest of a config section).
 	import { onMount } from 'svelte';
 	import Empty from '../../lib/Empty.svelte';
+	import Info from '../../lib/Info.svelte';
 	import ViewHeader from '../../lib/ViewHeader.svelte';
 	import { ago, short } from '../../lib/api';
 	import { errText } from '../../lib/console';
@@ -86,7 +87,7 @@
 <div class="grid cols">
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Job summary</h2>
+			<h2>Job summary <Info k="ops.history.summary" /></h2>
 			<label class="dim">last
 				<select bind:value={hours}>{#each [1, 6, 24, 72, 168, 720] as h}<option value={h}>{h < 48 ? `${h} h` : `${h / 24} d`}</option>{/each}</select>
 			</label>
@@ -115,7 +116,7 @@
 
 	<section class="panel wide">
 		<div class="panel-head">
-			<h2>Job runs <span class="dim">({runs.length})</span></h2>
+			<h2>Job runs <Info k="ops.history.runs" /> <span class="dim">({runs.length})</span></h2>
 			<div class="controls">
 				<input class="mono" bind:value={kind} placeholder="kind (all)" size="22" aria-label="kind filter" />
 				<select bind:value={limit} aria-label="limit">{#each [50, 100, 500, 2000] as l}<option value={l}>{l}</option>{/each}</select>
@@ -153,7 +154,7 @@
 
 	<section class="panel wide">
 		<div class="panel-head">
-			<h2>Config snapshots <span class="dim">({snaps.length})</span></h2>
+			<h2>Config snapshots <Info k="ops.history.snapshots" /> <span class="dim">({snaps.length})</span></h2>
 			<div class="controls">
 				<select bind:value={service} aria-label="service">
 					<option value="">all services</option>

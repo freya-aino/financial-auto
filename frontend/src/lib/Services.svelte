@@ -2,6 +2,7 @@
 	// Services table (spec 51 §6.2): heartbeats with the gauge groups of D-053/D-055
 	// (strategy-runtime `primitives.*`, orchestrator `validation.*` / `pareto.*`, model-runtime `hub.*`).
 	import { onMount } from 'svelte';
+	import Info from './Info.svelte';
 	import { ApiError, api, poll, type ServiceStatus } from './api';
 	import { runtime } from './runtime.svelte';
 	import { SERVICE_ACTIONS, actionBody, actionGate, confirmText, describeResult, fmtCounter, groupCounters, primitiveShares, type ServiceAction, type Supervisor } from './services';
@@ -94,7 +95,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Services</h2>
+		<h2>Services <Info k="ops.services" /></h2>
 		<span class="dim">from svc.heartbeat.&gt; · click a row for every counter</span>
 		<span class="badge" class:ok={supervisor?.available} class:warn={!supervisor?.available} title={supervisor?.available ? `compose project ${supervisor.project} via ${supervisor.socket}` : (supervisor?.detail ?? 'GET /api/services did not report a supervisor')}>
 			docker {supervisor?.available ? 'control on' : 'control off'}

@@ -4,6 +4,7 @@
 	// purge ask confirm() and show the API's answer (never optimistic).
 	import { onMount } from 'svelte';
 	import Empty from '../../lib/Empty.svelte';
+	import Info from '../../lib/Info.svelte';
 	import ViewHeader from '../../lib/ViewHeader.svelte';
 	import { ago, bytes, num, poll } from '../../lib/api';
 	import { errText } from '../../lib/console';
@@ -137,7 +138,7 @@
 <div class="grid cols">
 	<section class="panel wide">
 		<div class="panel-head">
-			<h2>External connections</h2>
+			<h2>External connections <Info k="ops.infra.connections" /></h2>
 			{#if connSummary}
 				<span class="badge {connSummary.missing ? 'danger' : 'ok'}">{connSummary.text}</span>
 			{/if}
@@ -195,7 +196,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Postgres</h2>{#if storeErr(stores?.stores.postgres)}<span class="badge danger">down</span>{/if}</div>
+		<div class="panel-head"><h2>Postgres <Info k="ops.infra.postgres" /></h2>{#if storeErr(stores?.stores.postgres)}<span class="badge danger">down</span>{/if}</div>
 		{#if storesError}<p class="badge danger">{storesError}</p>
 		{:else if !stores}<p class="dim">loading…</p>
 		{:else if stores.stores.postgres.error}<p class="err">{stores.stores.postgres.error}</p>
@@ -206,7 +207,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>VictoriaMetrics</h2>{#if storeErr(stores?.stores.victoriametrics)}<span class="badge danger">down</span>{/if}</div>
+		<div class="panel-head"><h2>VictoriaMetrics <Info k="ops.infra.vm" /></h2>{#if storeErr(stores?.stores.victoriametrics)}<span class="badge danger">down</span>{/if}</div>
 		{#if storesError}<p class="badge danger">{storesError}</p>
 		{:else if !stores}<p class="dim">loading…</p>
 		{:else if stores.stores.victoriametrics.error}<p class="err">{stores.stores.victoriametrics.error}</p>
@@ -218,7 +219,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Garage</h2>{#if storeErr(stores?.stores.garage)}<span class="badge danger">down</span>{/if}</div>
+		<div class="panel-head"><h2>Garage <Info k="ops.infra.garage" /></h2>{#if storeErr(stores?.stores.garage)}<span class="badge danger">down</span>{/if}</div>
 		{#if storesError}<p class="badge danger">{storesError}</p>
 		{:else if !stores}<p class="dim">loading…</p>
 		{:else if stores.stores.garage.error}<p class="err">{stores.stores.garage.error}</p>
@@ -239,7 +240,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Qdrant</h2>{#if storeErr(stores?.stores.qdrant)}<span class="badge danger">down</span>{/if}</div>
+		<div class="panel-head"><h2>Qdrant <Info k="ops.infra.qdrant" /></h2>{#if storeErr(stores?.stores.qdrant)}<span class="badge danger">down</span>{/if}</div>
 		{#if storesError}<p class="badge danger">{storesError}</p>
 		{:else if !stores}<p class="dim">loading…</p>
 		{:else if stores.stores.qdrant.error}<p class="err">{stores.stores.qdrant.error}</p>
@@ -261,7 +262,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Helix</h2>{#if storeErr(stores?.stores.helix)}<span class="badge danger">down</span>{/if}</div>
+		<div class="panel-head"><h2>Helix <Info k="ops.infra.helix" /></h2>{#if storeErr(stores?.stores.helix)}<span class="badge danger">down</span>{/if}</div>
 		{#if storesError}<p class="badge danger">{storesError}</p>
 		{:else if !stores}<p class="dim">loading…</p>
 		{:else if stores.stores.helix.error}<p class="err">{stores.stores.helix.error}</p>
@@ -271,7 +272,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Backup & drills</h2></div>
+		<div class="panel-head"><h2>Backup & drills <Info k="ops.infra.backup" /></h2></div>
 		{#if backupError}<p class="badge danger">{backupError}</p>
 		{:else if !backup}<p class="dim">loading…</p>
 		{:else}
@@ -291,7 +292,7 @@
 	</section>
 
 	<section class="panel wide">
-		<div class="panel-head"><h2>Maintenance</h2><span class="dim">VM retention · genome GC · media downsample · accounting close (audit.log)</span></div>
+		<div class="panel-head"><h2>Maintenance <Info k="ops.infra.maintenance" /></h2><span class="dim">VM retention · genome GC · media downsample · accounting close (audit.log)</span></div>
 		{#if jobsError}<p class="badge danger">{jobsError}</p>
 		{:else if !jobs.length}<p class="dim">loading…</p>
 		{:else}
@@ -320,7 +321,7 @@
 
 	<section class="panel wide">
 		<div class="panel-head">
-			<h2>Dead letters <span class="dim">{dlq ? `(${dlq.stream.messages} in DLQ · ${bytes(dlq.stream.bytes)})` : ''}</span></h2>
+			<h2>Dead letters <Info k="ops.infra.dlq" /> <span class="dim">{dlq ? `(${dlq.stream.messages} in DLQ · ${bytes(dlq.stream.bytes)})` : ''}</span></h2>
 			<div class="controls">
 				<select bind:value={dlqLimit} aria-label="limit">{#each [20, 50, 200, 500] as l}<option value={l}>{l}</option>{/each}</select>
 				<button onclick={loadDlq}>refresh</button>
@@ -328,6 +329,7 @@
 					disabled={busy || !dlq || dlq.stream.messages === 0}
 					onclick={() => act(purgeConfirmText(dlq?.stream.messages ?? 0), 'purge', () => infraApi.dlqPurge())}
 				>purge all…</button>
+				<Info k="ops.infra.dlq-actions" />
 			</div>
 		</div>
 		{#if actionMsg}<p class="badge {actionOk ? 'ok' : 'danger'}">{actionMsg}</p>{/if}

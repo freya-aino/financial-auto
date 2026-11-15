@@ -6,6 +6,7 @@
 	// chart; a chart whose query matches nothing names the series it would read.
 	import { onMount } from 'svelte';
 	import GrowthChart from '../../lib/GrowthChart.svelte';
+	import Info from '../../lib/Info.svelte';
 	import ViewHeader from '../../lib/ViewHeader.svelte';
 	import { api, bytes, eur, poll, q, type BusStream } from '../../lib/api';
 	import { errText, getApi } from '../../lib/console';
@@ -132,11 +133,12 @@
 		<button class:sel={range === r.key} onclick={() => (range = r.key)}>{r.key}</button>
 	{/each}
 	<span class="dim mono">step {params.step}s · via /api/metrics/query_range</span>
+	<Info k="ops.growth.range" />
 </div>
 
 <div class="grid cols">
 	<section class="panel">
-		<div class="panel-head"><h2>Data</h2><span class="dim">ingest → bus → stores</span></div>
+		<div class="panel-head"><h2>Data <Info k="ops.growth.data" /></h2><span class="dim">ingest → bus → stores</span></div>
 		<div class="charts">
 			{#each section('data') as spec (spec.id)}
 				<GrowthChart
@@ -155,7 +157,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Learning</h2><span class="dim">regions, snapshots, strategies, evolution</span></div>
+		<div class="panel-head"><h2>Learning <Info k="ops.growth.learning" /></h2><span class="dim">regions, snapshots, strategies, evolution</span></div>
 		<div class="charts">
 			{#each section('learning') as spec (spec.id)}
 				<GrowthChart
@@ -174,7 +176,7 @@
 
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Money</h2>
+			<h2>Money <Info k="ops.growth.money" /></h2>
 			<span class="dim">segment funds &amp; cumulative opex (D-104)</span>
 		</div>
 		{#if balancesError}<p class="badge danger">{balancesError}</p>{/if}
@@ -190,7 +192,7 @@
 			{#if money.allRetained}
 				<p class="dim">all retained — no split configured</p>
 			{/if}
-			<h3>Cumulative opex</h3>
+			<h3>Cumulative opex <Info k="ops.growth.opex" /></h3>
 			{#if money.expenses.length}
 				<table>
 					<thead><tr><th>expense account</th><th>ref</th><th>EUR</th></tr></thead>

@@ -3,6 +3,7 @@
 	// cursors, enable/disable, ingest start/stop and the Backfill dialog whose job lands in
 	// Jobs & GPU (`kind=ingest.backfill`).
 	import { onMount } from 'svelte';
+	import Info from './Info.svelte';
 	import Modal from './Modal.svelte';
 	import { ago, api, poll, short, type Source, type SourceDetail } from './api';
 	import { loadPref, savePref } from './prefs';
@@ -156,7 +157,7 @@
 <section class="panel sources">
 	<div class="panel-head">
 		<h2>
-			Sources <span class="dim">({filtered.length}/{sources.length})</span>
+			Sources <Info k="ops.sources" /> <span class="dim">({filtered.length}/{sources.length})</span>
 			<span class="badge ok">{healthCounts.ok} ok</span>
 			{#if healthCounts.degraded}<span class="badge warn">{healthCounts.degraded} degraded</span>{/if}
 			{#if healthCounts.down}<span class="badge danger">{healthCounts.down} down</span>{/if}
@@ -183,7 +184,7 @@
 	<div class="scroll catalog">
 		<table>
 			<thead>
-				<tr><th>id</th><th>name</th><th>category</th><th>status</th><th>health</th><th>last event</th><th>limiter</th><th>errors</th><th>capabilities</th><th>control</th><th>notes</th></tr>
+				<tr><th>id</th><th>name</th><th>category</th><th>status</th><th>health</th><th>last event</th><th>limiter <Info k="ops.sources.limiter" /></th><th>errors</th><th>capabilities</th><th>control</th><th>notes</th></tr>
 			</thead>
 			<tbody>
 				{#each filtered as s (s.id)}

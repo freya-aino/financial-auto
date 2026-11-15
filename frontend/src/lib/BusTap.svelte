@@ -2,6 +2,7 @@
 	// Live NATS tap over the shared /ws/bus connection (spec 50 §4.3, 51 §6.2). Rows are
 	// appended once per animation frame; the socket itself is owned by `bus` (ws.svelte.ts).
 	import { onDestroy } from 'svelte';
+	import Info from './Info.svelte';
 	import type { BusFrame } from './api';
 	import { SubjectRates, sparkPoints, type SubjectRate } from './busrates';
 	import { loadPref, savePref } from './prefs';
@@ -67,7 +68,7 @@
 
 <section class="panel tap">
 	<div class="panel-head">
-		<h2>Bus tap</h2>
+		<h2>Bus tap <Info k="ops.bustap" /></h2>
 		<form
 			onsubmit={(e) => {
 				e.preventDefault();

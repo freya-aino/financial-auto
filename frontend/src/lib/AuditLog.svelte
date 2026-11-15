@@ -1,6 +1,7 @@
 <script lang="ts">
 	// Audit log (`GET /api/audit?since=`): every operator and system mutation (D-047/D-051/D-054/D-055).
 	import { onMount } from 'svelte';
+	import Info from './Info.svelte';
 	import { ago, api, poll, type AuditEntry } from './api';
 	import { loadPref, savePref } from './prefs';
 	import { runtime } from './runtime.svelte';
@@ -37,7 +38,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Audit log <span class="dim">({shown.length}/{entries.length})</span></h2>
+		<h2>Audit log <Info k="ops.audit" /> <span class="dim">({shown.length}/{entries.length})</span></h2>
 		<div class="filters">
 			<select bind:value={since} onchange={refresh}>
 				{#each ['1h', '6h', '24h', '7d', '30d'] as s}<option value={s}>last {s}</option>{/each}

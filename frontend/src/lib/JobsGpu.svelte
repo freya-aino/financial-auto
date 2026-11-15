@@ -3,6 +3,7 @@
 	// Job.priority indexes the arbiter's class list (spec 60, D-006).
 	import { onMount } from 'svelte';
 	import Empty from './Empty.svelte';
+	import Info from './Info.svelte';
 	import { ago, api, live, poll, short, type GpuStatus, type JobView } from './api';
 	import { runtime } from './runtime.svelte';
 	import { evolutionWs, onBus } from './ws.svelte';
@@ -72,7 +73,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Jobs &amp; GPU</h2>
+		<h2>Jobs &amp; GPU <Info k="ops.jobs" /></h2>
 		{#if gpu?.available}
 			<span class="badge ok">arbiter · {ago(gpu.last_seen, now)} ago</span>
 		{:else}

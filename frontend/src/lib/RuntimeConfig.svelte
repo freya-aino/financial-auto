@@ -2,6 +2,7 @@
 	// Runtime-tunable config editor (`GET/PUT /api/config/runtime`, D-055): bounded inputs
 	// from the server's `bounds`, shows `changed`, `persisted` and `audited` from the reply.
 	import { onMount } from 'svelte';
+	import Info from './Info.svelte';
 	import { api, type ConfigPutResult, type ConfigSection } from './api';
 	import { runtime } from './runtime.svelte';
 
@@ -76,7 +77,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Runtime config</h2>
+		<h2>Runtime config <Info k="ops.runtime-config" /></h2>
 		<span class="dim">GET/PUT /api/config/runtime · applied in-process, persisted to config/runtime.toml, audited</span>
 	</div>
 	{#if error}<p class="badge danger">{error}</p>{/if}

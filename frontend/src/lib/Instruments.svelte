@@ -2,6 +2,7 @@
 	// Reference-data search (`GET /api/instruments?q=`) and the quarantine review loop
 	// (`GET /api/instruments/quarantine`, `POST …/{provisional}/resolve`; D-054).
 	import { onMount } from 'svelte';
+	import Info from './Info.svelte';
 	import Modal from './Modal.svelte';
 	import { ago, api, poll, short, type Instrument, type QuarantineRow } from './api';
 	import { loadPref, savePref } from './prefs';
@@ -101,7 +102,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Instruments</h2>
+		<h2>Instruments <Info k="ops.instruments" /></h2>
 		<form class="search" onsubmit={(e) => (e.preventDefault(), search())}>
 			<input bind:value={query} oninput={search} placeholder="search names, identifiers, venue symbols" size="36" />
 			{#if searching}<span class="dim">…</span>{/if}
@@ -131,7 +132,7 @@
 	{/if}
 
 	<div class="panel-head qhead">
-		<h3 class="sub">Quarantine <span class="dim">({rows.length})</span></h3>
+		<h3 class="sub">Quarantine <Info k="ops.quarantine" /> <span class="dim">({rows.length})</span></h3>
 		<select bind:value={qStatus} onchange={refreshQuarantine}>
 			<option value="open">open</option>
 			<option value="resolved">resolved</option>

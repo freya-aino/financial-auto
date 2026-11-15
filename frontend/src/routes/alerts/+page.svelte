@@ -3,6 +3,7 @@
 	// transitions, the alert pipeline's own health (Watchdog) and the live `ops.alert` tail.
 	import { onMount } from 'svelte';
 	import Empty from '../../lib/Empty.svelte';
+	import Info from '../../lib/Info.svelte';
 	import ViewHeader from '../../lib/ViewHeader.svelte';
 	import { poll } from '../../lib/api';
 	import { applyAlertEvent, labelText, severityClass, since, sortAlerts } from '../../lib/alerts';
@@ -73,7 +74,7 @@
 <div class="grid cols">
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Alert pipeline</h2>
+			<h2>Alert pipeline <Info k="ops.alerts.pipeline" /></h2>
 			{#if view}
 				<span class="badge" class:ok={view.pipeline.ok} class:danger={!view.pipeline.ok}>{view.pipeline.ok ? 'Watchdog fresh' : 'PIPELINE DOWN'}</span>
 			{/if}
@@ -97,7 +98,7 @@
 
 	<section class="panel wide">
 		<div class="panel-head">
-			<h2>Active <span class="dim">({active.length})</span></h2>
+			<h2>Active <Info k="ops.alerts.active" /> <span class="dim">({active.length})</span></h2>
 			<span class="dim">critical first · click a row for labels</span>
 		</div>
 		{#if active.length}
@@ -127,7 +128,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Recent transitions <span class="dim">({view?.recent.length ?? 0})</span></h2></div>
+		<div class="panel-head"><h2>Recent transitions <Info k="ops.alerts.recent" /> <span class="dim">({view?.recent.length ?? 0})</span></h2></div>
 		{#if view?.recent.length}
 			<div class="scroll tall">
 				<table>
@@ -151,7 +152,7 @@
 
 	<section class="panel wide">
 		<div class="panel-head">
-			<h2>History <span class="dim">({history.length} transitions, {firingCount} firing · ops.alert_event)</span></h2>
+			<h2>History <Info k="ops.alerts.history" /> <span class="dim">({history.length} transitions, {firingCount} firing · ops.alert_event)</span></h2>
 			<form
 				class="controls"
 				onsubmit={(e) => {
@@ -190,7 +191,7 @@
 
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Live <code>ops.alert</code></h2>
+			<h2>Live <code>ops.alert</code> <Info k="ops.alerts.live" /></h2>
 			<span class="badge" class:ok={bus.status === 'open'} class:warn={bus.status !== 'open'}>/ws/bus {bus.status}</span>
 		</div>
 		{#if tail.length}
