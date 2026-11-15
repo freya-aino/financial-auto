@@ -1606,3 +1606,180 @@ mod tests {
         assert_eq!((t.id, t.from, t.to), (5, 1, 2));
     }
 }
+
+/// Rows per import mutation. Large enough that 62 k versions are ~63 requests rather than 62 k,
+/// small enough to stay well inside Dgraph's request limits.
+///
+/// Note the blank-node labels must differ *within* a chunk: `_:v` repeated across objects of one
+/// mutation names a single node, so a shared label silently collapses the whole chunk into one
+/// row instead of erroring. Caught by the migration's row-count verification (62 594 → 1 858).
+const IMPORT_CHUNK: usize = 1_000;
+
+/// One `TransitionVersion` as read from the source, for [`DgraphGraph::dg_import_transition_versions`].
+#[derive(Debug, Clone)]
+pub struct TransitionVersionImport {
+    pub edge_key: String,
+    pub from_region_id: String,
+    pub to_region_id: String,
+    pub sampler_id: String,
+    pub count: i64,
+    pub mean: f64,
+    pub lower: f64,
+    pub upper: f64,
+    pub kernel_params: String,
+    pub ts: String,
+}
+
+/// One `RegionStatusVersion` as read from the source.
+#[derive(Debug, Clone)]
+pub struct RegionStatusVersionImport {
+    pub region_id: String,
+    pub status: String,
+    pub related_region_id: String,
+    pub reason: String,
+    pub ts: String,
+}
+
+/// Bulk import used only by the D-110 migration (`examples/graph_migrate.rs`).
+///
+/// `GraphStore` can *read* event-time history but has no way to write it: versions are appended as
+/// a side effect of `upsert_transitions` / `mark_region_status`, which would stamp `now()` and lose
+/// the original `ts`. A faithful copy therefore needs these, and they exist for the migration
+/// rather than for the running platform — nothing else should append history directly.
+impl DgraphGraph {
+    /// Append `TransitionVersion` rows with their original timestamps, batched.
+    ///
+    /// Batching is not an optimisation here: a real book carried 62 594 version rows, and one
+    /// HTTP mutation each would make the cutover a multi-minute wall of round trips. Each chunk is
+    /// one atomic mutation, and the rows are append-only, so a re-run after a failure duplicates
+    /// only the chunk boundary rather than corrupting anything.
+    pub async fn dg_import_transition_versions(&self, rows: &[TransitionVersionImport]) -> Result<usize> {
+        let mut n = 0;
+        for chunk in rows.chunks(IMPORT_CHUNK) {
+            let set: Vec<Json> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    json!({
+                        "uid": format!("_:v{i}"), "dgraph.type": "TransitionVersion",
+                        "transition_version.edge_key": v.edge_key,
+                        "transition_version.from_region_id": v.from_region_id,
+                        "transition_version.to_region_id": v.to_region_id,
+                        "transition_version.sampler_id": v.sampler_id,
+                        "transition_version.count": v.count,
+                        "transition_version.mean": v.mean,
+                        "transition_version.lower": v.lower,
+                        "transition_version.upper": v.upper,
+                        "transition_version.kernel_params": v.kernel_params,
+                        "transition_version.ts": v.ts,
+                    })
+                })
+                .collect();
+            self.dg.mutate(set).await?;
+            n += chunk.len();
+        }
+        Ok(n)
+    }
+
+    /// Append `RegionStatusVersion` rows with their original timestamps, batched.
+    pub async fn dg_import_region_status_versions(&self, rows: &[RegionStatusVersionImport]) -> Result<usize> {
+        let mut n = 0;
+        for chunk in rows.chunks(IMPORT_CHUNK) {
+            let set: Vec<Json> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    json!({
+                        "uid": format!("_:v{i}"), "dgraph.type": "RegionStatusVersion",
+                        "region_status_version.region_id": v.region_id,
+                        "region_status_version.status": v.status,
+                        "region_status_version.related_region_id": v.related_region_id,
+                        "region_status_version.reason": v.reason,
+                        "region_status_version.ts": v.ts,
+                    })
+                })
+                .collect();
+            self.dg.mutate(set).await?;
+            n += chunk.len();
+        }
+        Ok(n)
+    }
+
+    /// A `RegionMatch` addressed by business ids. The trait's `match_regions` takes node ids,
+    /// which do not survive a backend change (D-108: ids never cross backends).
+    pub async fn dg_import_region_match(&self, prev_region_id: &str, next_region_id: &str, score: f64) -> Result<()> {
+        let key = format!("{prev_region_id}|{next_region_id}");
+        self.upsert_keyed(
+            "RegionMatch",
+            "region_match.key",
+            &key,
+            obj(json!({
+                "region_match.prev_region_id": prev_region_id,
+                "region_match.next_region_id": next_region_id,
+                "region_match.score": score,
+            })),
+        )
+        .await
+        .map(drop)
+    }
+
+    /// A `SnapshotParent` addressed by business ids, keeping `op` — which the trait's
+    /// `snapshot_parent` read drops, because it returns the parent snapshot and not the edge.
+    pub async fn dg_import_snapshot_parent(&self, parent_id: &str, child_id: &str, op: &str) -> Result<()> {
+        let key = format!("{parent_id}|{child_id}");
+        let (p, c) = (
+            self.by_key("Snapshot", "snapshot.snapshot_id", parent_id).await?,
+            self.by_key("Snapshot", "snapshot.snapshot_id", child_id).await?,
+        );
+        let (Some(p), Some(c)) = (p, c) else { return Ok(()) };
+        self.upsert_keyed(
+            "SnapshotParent",
+            "snapshot_parent.key",
+            &key,
+            obj(json!({
+                "snapshot_parent.parent": {"uid": u64_to_uid(uid_of(&p))},
+                "snapshot_parent.child": {"uid": u64_to_uid(uid_of(&c))},
+                "snapshot_parent.op": op,
+            })),
+        )
+        .await
+        .map(drop)
+    }
+
+    /// Drop event-time versions — all of them, or only those stamped at or after `since`.
+    ///
+    /// Two separate problems make this necessary for the migration, and both showed up only in the
+    /// row-count verification:
+    ///
+    /// 1. Copying *current values* through the runtime API manufactures history, by design:
+    ///    `upsert_transitions` and `upsert_region` each append a version stamped `now()`, because
+    ///    that is what a live write must do. Importing the real history on top left both
+    ///    (62 594 real + 1 795 manufactured).
+    /// 2. The history import is append-only, so running the migration twice doubled it
+    ///    (125 188 rows).
+    ///
+    /// Passing `None` makes the import *authoritative*: the source's history replaces whatever the
+    /// destination has, so the migration converges on a re-run instead of accumulating. That is
+    /// the right semantic for a cutover — the destination is not yet taking live writes — and it
+    /// is why the migration must finish before the platform starts writing to Dgraph.
+    pub async fn dg_drop_versions(&self, since: Option<&str>) -> Result<u64> {
+        let mut n = 0;
+        for (ty, prefix) in
+            [("TransitionVersion", "transition_version"), ("RegionStatusVersion", "region_status_version")]
+        {
+            let filter = since
+                .map(|t| format!(" @filter(ge({prefix}.ts, \"{}\"))", esc(t)))
+                .unwrap_or_default();
+            let dql = format!("{{ q(func: type({ty})){filter} {{ uid }} }}");
+            let uids: Vec<u64> = self.rows(&dql).await?.iter().map(uid_of).collect();
+            n += self.delete_uids(&uids).await?;
+        }
+        Ok(n)
+    }
+
+    /// Count the nodes of one type — the migration's row-count verification.
+    pub async fn dg_count(&self, ty: &str) -> Result<u64> {
+        let d = self.dg.query(&format!("{{ q(func: type({ty})) {{ count(uid) }} }}")).await?;
+        Ok(d.pointer("/q/0/count").and_then(Json::as_u64).unwrap_or(0))
+    }
+}
