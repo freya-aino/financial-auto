@@ -4,6 +4,7 @@
 	import { page } from '$app/state';
 	import { onMount } from 'svelte';
 	import AlertBanner from '../lib/AlertBanner.svelte';
+	import Info from '../lib/Info.svelte';
 	import KillSwitch from '../lib/KillSwitch.svelte';
 	import { api, eur, live, poll, type Health, type RiskView } from '../lib/api';
 	import { runtime } from '../lib/runtime.svelte';
@@ -93,7 +94,7 @@
 		<div class="brand">
 			<img src="/favicon.svg" alt="" width="18" height="18" />
 			<h1>financial-auto</h1>
-			<span class="badge ok mode" title="Live trading is impossible from this UI (D-029)">PAPER</span>
+			<span class="badge ok mode" title="Live trading is impossible from this UI (D-029)">PAPER</span><Info k="chrome.mode" />
 		</div>
 		<nav>
 			{#each nav as item}
@@ -107,7 +108,7 @@
 					<span class="dim">P&amp;L</span>
 					<b class="mono" class:pos={(pnl ?? 0) > 0} class:neg={(pnl ?? 0) < 0}>{eur(pnl)}</b>
 				</span>
-				{#if risk?.halts.length}<a href="/trading/" class="badge danger">{risk.halts.length} halt{risk.halts.length === 1 ? '' : 's'}</a>{/if}
+				{#if risk?.halts.length}<a href="/trading/" class="badge danger">{risk.halts.length} halt{risk.halts.length === 1 ? '' : 's'}</a><Info k="chrome.halts" />{/if}
 			{/if}
 		</div>
 		<div class="status">
@@ -120,9 +121,10 @@
 				{#each Object.entries(health.dependencies) as [name, up]}
 					<span class="dot" class:ok={up} class:warn={!up} title="{name}: {up ? 'reachable' : 'unreachable'}">{name}</span>
 				{/each}
+				<Info k="chrome.deps" />
 			{/if}
 			<span class="dot sock" class:ok={tradingWs.live} class:warn={!tradingWs.live} title="/ws/trading {tradingWs.status}{tradingWs.flushMs ? ` · flush ${tradingWs.flushMs} ms` : ''}{lagged ? ` · ${lagged} frames superseded/dropped across sockets` : ''}">ws</span>
-			<KillSwitch {risk} compact onchanged={pollRisk} />
+			<KillSwitch {risk} compact onchanged={pollRisk} /><Info k="chrome.kill" />
 		</div>
 	</header>
 	{#if section.sub}
