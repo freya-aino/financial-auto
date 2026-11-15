@@ -102,7 +102,7 @@ Strategy sub-positions are derived from `fill_attribution`.
 - The audit log contains an entry for every manual API action: ledger-side manual actions (orphan resolution, payouts, restatements) are audited; whole-API coverage is spec 50's.
 - The sum of strategy-attributed P&L equals portfolio P&L (minus unattributed manual trades): `strategy_pnls` incl. `unattributed` sums to `book_pnl` (unit test over FIFO/average and several ranges).
 
-**Operator action, not implementation:** on the live `paper` book the last criterion (and `verify_existing_book_read_only`) holds only after the planned FX restatement of instrument `9daa8cea…` is applied. Its 1 080 fills from 2026-11-10 19:48:59 to 2026-11-11 01:48:18 were booked as `EUR` at 1.0 before the instrument's USD quote currency was known. The dry run moves them EUR → USD at 0.891742464776173 (`ecb_daily`, valid 2026-11-10): cash and equity +8.054251 EUR, and the 24 h strategy − book gap goes from −214.373064 to 0.000000. To apply: `POST /api/trading/restatements/fx` with `apply` + `confirm` + a reason (or the `restate_fx` example with `--apply`), then restart the risk-engine and re-run the verification.
+**Resolved 2026-11-15 (D-107):** the planned FX restatement of instrument `9daa8cea…` (1 080 fills booked EUR at 1.0 on 2026-11-10/11) became moot when the owner chose the fresh book after the 2026-11-11 volume loss; that ledger was not restored. On the current book every criterion above holds. The restatement machinery stays for future mis-booked FX.
 
 ## 10. Open questions and user decisions
 1. Payout quota rule: **decided** (`payout`, default `fixed_eur` 0). The real amounts are the user's call.
