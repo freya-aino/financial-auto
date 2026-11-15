@@ -300,7 +300,8 @@
 		</div>
 		<h3 class="sub">Jobs by kind <span class="dim">since control-api start</span></h3>
 		{#if kinds.length}
-			<table>
+			<div class="tablewrap">
+				<table>
 				<thead>
 					<tr><th>kind</th>{#each STATUSES as s}<th>{s}</th>{/each}</tr>
 				</thead>
@@ -314,7 +315,8 @@
 						</tr>
 					{/each}
 				</tbody>
-			</table>
+				</table>
+			</div>
 		{:else}
 			<Empty producer="jobs.* (evo-orchestrator / trainer)" />
 		{/if}
@@ -520,6 +522,24 @@
 		flex-direction: column;
 		gap: 2px;
 		color: var(--text-dim);
+		/* grid items default to min-width auto: a long select/placeholder would widen the
+		   column past the panel */
+		min-width: 0;
+	}
+	.form input,
+	.form select,
+	.form textarea {
+		width: 100%;
+		min-width: 0;
+	}
+	.top > .panel {
+		min-width: 0;
+	}
+	.tablewrap {
+		overflow-x: auto;
+	}
+	.tablewrap table {
+		width: 100%;
 	}
 	.wide {
 		grid-column: 1 / -1;
@@ -537,6 +557,11 @@
 		display: flex;
 		gap: 8px;
 		align-items: center;
+		flex-wrap: wrap;
+	}
+	.actions :global(.badge) {
+		max-width: 100%;
+		overflow-wrap: anywhere;
 	}
 	.pickers {
 		display: flex;
