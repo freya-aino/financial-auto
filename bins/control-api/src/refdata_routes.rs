@@ -97,7 +97,10 @@ fn parse_ts(v: &Option<String>, name: &str) -> Result<Option<DateTime<Utc>>, Box
         None => Ok(None),
         Some(x) => DateTime::parse_from_rfc3339(x)
             .map(|t| Some(t.with_timezone(&Utc)))
-            .or_else(|_| NaiveDate::parse_from_str(x, "%Y-%m-%d").map(|d| Some(d.and_hms_opt(0, 0, 0).expect("midnight").and_utc())))
+            .or_else(|_| {
+                NaiveDate::parse_from_str(x, "%Y-%m-%d")
+                    .map(|d| Some(d.and_hms_opt(0, 0, 0).expect("midnight").and_utc()))
+            })
             .map_err(|_| Box::new(err(StatusCode::BAD_REQUEST, format!("{name} must be RFC 3339 or YYYY-MM-DD")))),
     }
 }
@@ -113,7 +116,10 @@ macro_rules! ts_or_return {
 
 /// Audit + `ref.changed.<entity>` notice; failures are logged, never fatal.
 async fn announce(s: &AppState, pool: &PgPool, entity: &str, ids: Vec<String>, change: &str, payload: Value) {
-    if let Err(e) = crate::audit::append(pool, ACTOR, &format!("ref.{entity}.{change}"), ids.first().map(String::as_str), payload).await {
+    if let Err(e) =
+        crate::audit::append(pool, ACTOR, &format!("ref.{entity}.{change}"), ids.first().map(String::as_str), payload)
+            .await
+    {
         tracing::warn!(error = %e, "audit append failed");
     }
     if let Some(nats) = &s.nats {
@@ -184,7 +190,9 @@ async fn fx(State(s): State<AppState>, Query(q): Query<AsOfQuery>) -> Response {
     let pool = pool_or_return!(s);
     let at = ts_or_return!(q.at, "at").unwrap_or_else(Utc::now);
     let known_at = ts_or_return!(q.known_at, "known_at");
-    let Some(ccy) = q.ccy.as_deref().filter(|x| !x.is_empty()) else { return err(StatusCode::BAD_REQUEST, "ccy is required") };
+    let Some(ccy) = q.ccy.as_deref().filter(|x| !x.is_empty()) else {
+        return err(StatusCode::BAD_REQUEST, "ccy is required");
+    };
     match asof::fx_to_eur(&pool, ccy, at, known_at).await {
         Ok(Some((rate, ts, source))) => {
             Json(json!({ "ccy": ccy.to_uppercase(), "at": at, "rate_to_eur": rate, "rate_time": ts, "source": source }))
@@ -203,8 +211,15 @@ async fn add_action(State(s): State<AppState>, Json(a): Json<NewCorporateAction>
     match corpactions::record(&pool, &a).await {
         Ok((id, created)) => {
             if created {
-                announce(&s, &pool, "corporate_action", vec![a.instrument_id.to_string(), id.to_string()], "created", json!(a))
-                    .await;
+                announce(
+                    &s,
+                    &pool,
+                    "corporate_action",
+                    vec![a.instrument_id.to_string(), id.to_string()],
+                    "created",
+                    json!(a),
+                )
+                .await;
             }
             Json(json!({ "ok": true, "id": id, "created": created })).into_response()
         }
@@ -305,8 +320,15 @@ async fn materialize(State(s): State<AppState>, Path(venue): Path<String>, Json(
     };
     match calendar::materialize(&pool, &venue, rule, b.from, b.to).await {
         Ok(n) => {
-            announce(&s, &pool, "calendar", vec![venue.clone()], "materialized", json!({ "from": b.from, "to": b.to, "rows": n }))
-                .await;
+            announce(
+                &s,
+                &pool,
+                "calendar",
+                vec![venue.clone()],
+                "materialized",
+                json!({ "from": b.from, "to": b.to, "rows": n }),
+            )
+            .await;
             Json(json!({ "ok": true, "venue": venue, "rule": rule, "rows": n })).into_response()
         }
         Err(e) => db_err(e),
@@ -405,6 +427,7 @@ async fn payout(State(s): State<AppState>, Json(b): Json<PayoutBody>) -> Respons
             Json(json!({ "ok": true, "created": created })).into_response()
         }
         Err(fa_ledger::pg::PgError::Invalid(m)) => err(StatusCode::BAD_REQUEST, m),
+        Err(fa_ledger::pg::PgError::QuotaExceeded(m)) => err(StatusCode::CONFLICT, m),
         Err(e) => db_err(e),
     }
 }

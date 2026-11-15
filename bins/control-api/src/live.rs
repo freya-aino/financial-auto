@@ -47,6 +47,22 @@ pub fn ts(t: Option<&Timestamp>) -> Option<DateTime<Utc>> {
     t.and_then(|t| DateTime::from_timestamp(t.seconds, u32::try_from(t.nanos).unwrap_or(0)))
 }
 
+/// EUR conversion rate for an amount in `ccy` against a ccy → `rate_to_eur` map (upper-cased
+/// keys). `None`, empty or `EUR` convert at 1.0; a known finite positive rate is used as is;
+/// anything else falls back to 1.0 with `fallback = true` so the caller can warn and count it
+/// (review 2026-11-15 §3.2 item 3 — the fallback is never silent).
+pub fn fx_to_eur(ccy: Option<&str>, rates: &BTreeMap<String, f64>) -> (f64, bool) {
+    let Some(c) = ccy.map(str::trim).filter(|c| !c.is_empty()) else { return (1.0, false) };
+    let c = c.to_uppercase();
+    if c == fa_core::BASE_CURRENCY {
+        return (1.0, false);
+    }
+    match rates.get(&c) {
+        Some(r) if r.is_finite() && *r > 0.0 => (*r, false),
+        _ => (1.0, true),
+    }
+}
+
 // ---------------------------------------------------------------- latent
 
 #[derive(Debug, Clone, Serialize)]
@@ -478,6 +494,16 @@ pub struct Live {
     halts: BTreeMap<String, HaltView>,
     /// Peak paper equity, for drawdown of the paper book.
     peak_equity: f64,
+    /// Latest EUR rate per upper-cased currency (`ref.fx_rate`, newest `ts` across sources),
+    /// refreshed by [`crate::state::AppState::spawn_live_fx_refresher`]; EUR itself is implicit.
+    fx_rates: BTreeMap<String, f64>,
+    /// Quote currency per instrument UUID string (`ref.instrument.quote_ccy`, upper-cased);
+    /// missing = EUR (the paper default).
+    instrument_ccy: HashMap<String, String>,
+    /// Fills applied at the 1.0 fallback because their currency had no usable rate (review
+    /// 2026-11-15 §3.2 item 3: never silent — each is also warned, and the count is served in
+    /// `positions_view`).
+    fx_fallback_fills: u64,
     /// Operator-tunable bounds (`[runtime]`, `PUT /api/config/runtime`).
     runtime: RuntimeConfig,
     /// Change events for the WebSocket streams; nobody listening = nothing built.
@@ -506,6 +532,9 @@ impl Default for Live {
             risk: None,
             halts: BTreeMap::new(),
             peak_equity: PAPER_CASH_EUR,
+            fx_rates: BTreeMap::new(),
+            instrument_ccy: HashMap::new(),
+            fx_fallback_fills: 0,
             runtime: RuntimeConfig::default(),
             events: broadcast::channel(EVENT_CAPACITY).0,
         }
@@ -561,6 +590,27 @@ impl Live {
     pub fn seed_ledger(&mut self, ledger: Ledger) {
         self.ledger = ledger;
         self.update_peak();
+    }
+
+    /// Replaces the FX view used to convert non-EUR fills and marks: `rates` maps upper-cased
+    /// currencies to their latest `rate_to_eur`, `instrument_ccy` maps instrument UUID strings
+    /// to their quote currency. Fed periodically from Postgres (`ref.fx_rate`,
+    /// `ref.instrument`) by [`crate::state::AppState::spawn_live_fx_refresher`].
+    pub fn set_fx(&mut self, rates: BTreeMap<String, f64>, instrument_ccy: HashMap<String, String>) {
+        self.fx_rates = rates;
+        self.instrument_ccy = instrument_ccy;
+    }
+
+    /// Fills applied at the 1.0 fallback because their currency had no rate.
+    #[cfg(test)]
+    pub fn fx_fallback_fills(&self) -> u64 {
+        self.fx_fallback_fills
+    }
+
+    /// EUR rate for amounts quoted in `instrument_id`'s currency (1.0 for EUR or unknown
+    /// instruments, and as the counted fallback when the rate is missing).
+    fn instrument_fx(&self, instrument_id: &str) -> (f64, bool) {
+        fx_to_eur(self.instrument_ccy.get(instrument_id).map(String::as_str), &self.fx_rates)
     }
 
     /// Routes one bus message by subject. Undecodable payloads are logged and ignored.
@@ -1338,15 +1388,33 @@ impl Live {
         let Some((fill_id, uuid, signed, instrument_id)) = fill else {
             return;
         };
-        // Paper instruments are treated as EUR-priced until FX conversion lands (D-028).
+        // Convert the fill (and its fee) from the instrument's quote currency to EUR with the
+        // latest known rate (review 2026-11-15 §3.2 item 3). A missing rate falls back to 1.0,
+        // warned and counted — never silently.
+        let (fx, fill_fb) = self.instrument_fx(&instrument_id);
+        let fee_ccy = if m.fee_currency.trim().is_empty() { None } else { Some(m.fee_currency.trim().to_uppercase()) };
+        let (fee_fx, fee_fb) = match &fee_ccy {
+            Some(c) => fx_to_eur(Some(c), &self.fx_rates),
+            None => (fx, fill_fb), // fee currency unreported: assume the fill's
+        };
+        if fill_fb || fee_fb {
+            self.fx_fallback_fills += 1;
+            tracing::warn!(
+                intent = %m.intent_id,
+                instrument = %instrument_id,
+                ccy = self.instrument_ccy.get(&instrument_id).map(String::as_str).unwrap_or("?"),
+                fee_ccy = fee_ccy.as_deref().unwrap_or(""),
+                "no FX rate for fill currency; applied at 1.0"
+            );
+        }
         self.ledger.apply_fill(&Fill {
             fill_id,
             intent_id: m.intent_id.clone(),
             instrument: InstrumentId(uuid),
             quantity: signed,
             price: m.fill_price,
-            fx_to_eur: 1.0,
-            fee_eur: m.fee,
+            fx_to_eur: fx,
+            fee_eur: m.fee * fee_fx,
         });
         self.marks.entry(instrument_id).or_insert(m.fill_price);
         self.update_peak();
@@ -1405,7 +1473,10 @@ impl Live {
     }
 
     fn marks_eur(&self) -> BTreeMap<InstrumentId, f64> {
-        self.marks.iter().filter_map(|(k, v)| Uuid::parse_str(k).ok().map(|u| (InstrumentId(u), *v))).collect()
+        self.marks
+            .iter()
+            .filter_map(|(k, v)| Uuid::parse_str(k).ok().map(|u| (InstrumentId(u), *v * self.instrument_fx(k).0)))
+            .collect()
     }
 
     fn paper_equity(&self) -> f64 {
@@ -1427,7 +1498,7 @@ impl Live {
             .filter(|(_, p)| p.quantity != 0.0 || p.realised_eur != 0.0)
             .map(|(id, p)| {
                 let key = id.to_string();
-                let mark = self.marks.get(&key).copied();
+                let mark = self.marks.get(&key).map(|px| px * self.instrument_fx(&key).0);
                 let value = mark.map(|m| m * p.quantity);
                 json!({
                     "instrument_id": key,
@@ -1446,6 +1517,7 @@ impl Live {
             "cash_eur": self.ledger.cash_eur,
             "fees_eur": self.ledger.fees_eur,
             "equity_eur": self.paper_equity(),
+            "fx_fallback_fills": self.fx_fallback_fills,
             "positions": positions,
         })
     }
@@ -1825,6 +1897,93 @@ mod tests {
         // replaying the intent must not reset the status
         feed(&mut l, "order.intent.paper", &intent);
         assert_eq!(l.orders_view(false, 10)["orders"][0]["status"], "filled");
+    }
+
+    #[test]
+    fn fx_to_eur_picks_rate_or_counted_fallback() {
+        let rates = BTreeMap::from([("USD".to_owned(), 0.9), ("BAD".to_owned(), 0.0)]);
+        assert_eq!(fx_to_eur(None, &rates), (1.0, false));
+        assert_eq!(fx_to_eur(Some(""), &rates), (1.0, false));
+        assert_eq!(fx_to_eur(Some("EUR"), &rates), (1.0, false));
+        assert_eq!(fx_to_eur(Some("usd"), &rates), (0.9, false), "case-insensitive");
+        assert_eq!(fx_to_eur(Some(" USD "), &rates), (0.9, false), "trimmed");
+        assert_eq!(fx_to_eur(Some("GBP"), &rates), (1.0, true), "missing rate falls back, flagged");
+        assert_eq!(fx_to_eur(Some("BAD"), &rates), (1.0, true), "non-positive rate is unusable");
+    }
+
+    #[test]
+    fn non_eur_fills_convert_and_missing_rates_are_counted() {
+        let mut l = Live::default();
+        let usd = Uuid::now_v7().to_string();
+        let gbp = Uuid::now_v7().to_string();
+        l.set_fx(
+            BTreeMap::from([("USD".to_owned(), 0.9)]),
+            HashMap::from([(usd.clone(), "USD".to_owned()), (gbp.clone(), "GBP".to_owned())]),
+        );
+        let intent = |id: &str, inst: &str, qty: f64| OrderIntent {
+            intent_id: id.into(),
+            account_id: "paper".into(),
+            instrument_id: inst.into(),
+            side: Side::Buy as i32,
+            quantity: qty,
+            exec_algo: "market".into(),
+            mode: TradingMode::Paper as i32,
+            ..Default::default()
+        };
+        feed(&mut l, "order.approved.paper", &intent("i1", &usd, 10.0));
+        feed(
+            &mut l,
+            "order.event.paper",
+            &OrderEvent {
+                intent_id: "i1".into(),
+                kind: order_event::Kind::Fill as i32,
+                fill_price: 100.0,
+                fill_quantity: 10.0,
+                fee: 2.0,
+                fee_currency: "USD".into(),
+                event_time: Some(now()),
+                ..Default::default()
+            },
+        );
+        // 10 × 100 USD × 0.9 = 900 EUR + 2 USD × 0.9 fee
+        let p = l.positions_view();
+        assert_eq!(p["positions"][0]["avg_cost_eur"], 90.0);
+        assert_eq!(p["cash_eur"], PAPER_CASH_EUR - 900.0 - 1.8);
+        assert_eq!(p["fx_fallback_fills"], 0);
+        assert_eq!(l.fx_fallback_fills(), 0);
+
+        // the mark from a native-USD trade is converted the same way: 110 USD → 99 EUR
+        feed(
+            &mut l,
+            "md.trade.sim.x",
+            &Envelope {
+                instrument_id: usd.clone(),
+                payload: Some(Payload::Trade(Trade { price: 110.0, size: 1.0, ..Default::default() })),
+                ..Default::default()
+            },
+        );
+        let p = l.positions_view();
+        assert_eq!(p["positions"][0]["mark_eur"], 99.0);
+        assert_eq!(p["positions"][0]["unrealised_eur"], (99.0 - 90.0) * 10.0);
+
+        // GBP has no rate: the fill books at 1.0, warned and counted, never silently
+        feed(&mut l, "order.approved.paper", &intent("i2", &gbp, 1.0));
+        feed(
+            &mut l,
+            "order.event.paper",
+            &OrderEvent {
+                intent_id: "i2".into(),
+                kind: order_event::Kind::Fill as i32,
+                fill_price: 50.0,
+                fill_quantity: 1.0,
+                event_time: Some(now()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(l.fx_fallback_fills(), 1);
+        let p = l.positions_view();
+        assert_eq!(p["fx_fallback_fills"], 1);
+        assert_eq!(p["cash_eur"], PAPER_CASH_EUR - 901.8 - 50.0);
     }
 
     #[test]

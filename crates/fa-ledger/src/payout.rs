@@ -94,6 +94,27 @@ impl PayoutRule {
     }
 }
 
+/// Remaining payable amount of a `(book, day)` quota row: `quota − paid`, floored at 0.
+/// Rollover is already inside the stored quota — [`PayoutRule::quota`] carries yesterday's
+/// unpaid quota into today's `quota(D)` when `rollover` is set — so nothing is added here.
+pub fn remaining_eur(quota_eur: Decimal, paid_eur: Decimal) -> Decimal {
+    (quota_eur - paid_eur).max(Decimal::ZERO)
+}
+
+/// Enforces a booked payout against the day's quota (review 2026-11-15 §3.2 item 6): the
+/// amount must not exceed [`remaining_eur`]. No quota row means nothing is payable. `Err`
+/// carries the operator-readable reason.
+pub fn check_amount(amount_eur: Decimal, quota_eur: Decimal, paid_eur: Decimal) -> Result<(), String> {
+    let remaining = remaining_eur(quota_eur, paid_eur);
+    if amount_eur > remaining {
+        return Err(format!(
+            "payout of {amount_eur} EUR exceeds the remaining quota of {remaining} EUR \
+             (quota {quota_eur} EUR, already paid {paid_eur} EUR)"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +146,32 @@ mod tests {
         assert_eq!(capped.quota(&inputs(100_000.0, 0.0, 0.0, 0.0)), dec(1_000.0));
         assert!(PayoutRule { pct: 2.0, ..PayoutRule::default() }.validate().is_err());
         assert!(PayoutRule::default().validate().is_ok());
+    }
+
+    #[test]
+    fn enforcement_respects_remaining_quota() {
+        // no quota row (0/0): nothing is payable
+        assert_eq!(remaining_eur(Decimal::ZERO, Decimal::ZERO), Decimal::ZERO);
+        assert!(check_amount(dec(0.01), Decimal::ZERO, Decimal::ZERO).is_err());
+        // up to the remainder is fine, a cent over is not
+        assert_eq!(remaining_eur(dec(50.0), dec(20.0)), dec(30.0));
+        assert!(check_amount(dec(30.0), dec(50.0), dec(20.0)).is_ok());
+        assert!(check_amount(dec(30.01), dec(50.0), dec(20.0)).is_err());
+        // overpaid (operator booked before the quota existed): remainder floors at 0
+        assert_eq!(remaining_eur(dec(10.0), dec(25.0)), Decimal::ZERO);
+        assert!(check_amount(dec(0.01), dec(10.0), dec(25.0)).is_err());
+        // the error names the numbers
+        let e = check_amount(dec(40.0), dec(50.0), dec(20.0)).unwrap_err();
+        assert!(e.contains("40") && e.contains("30") && e.contains("50"), "{e}");
+    }
+
+    #[test]
+    fn rollover_is_carried_by_the_rule_not_the_check() {
+        // quota(D) already contains yesterday's unpaid carry, so the check sees it via quota_eur
+        let rule = PayoutRule { amount_eur: 50.0, rollover: true, ..PayoutRule::default() };
+        let today = rule.quota(&inputs(100_000.0, 0.0, 50.0, 20.0));
+        assert_eq!(today, dec(80.0), "50 base + 30 carried");
+        assert!(check_amount(dec(80.0), today, Decimal::ZERO).is_ok());
+        assert!(check_amount(dec(80.01), today, Decimal::ZERO).is_err());
     }
 }

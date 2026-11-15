@@ -252,10 +252,10 @@ impl Persist {
         Ok((daily.date, rates.len(), n))
     }
 
-    /// Today's reserved payout from `ledger.payout_quota` (spec 42 §6): the larger of
-    /// `quota − paid` and `reserved`, 0 without a row.
+    /// Today's reserved payout for this book from `ledger.payout_quota` (spec 42 §6): the
+    /// larger of `quota − paid` and `reserved`, 0 without a row.
     pub async fn payout_reserve_today(&self) -> f64 {
-        match self.pg.payout_quota(Utc::now().date_naive()).await {
+        match self.pg.payout_quota(&self.book, Utc::now().date_naive()).await {
             Ok(Some(q)) => (q.quota_eur - q.paid_eur).max(q.reserved_eur).max(0.0),
             Ok(None) => 0.0,
             Err(e) => {
@@ -265,11 +265,13 @@ impl Persist {
         }
     }
 
-    /// Raises today's quota to `quota_eur` (never lowers it: tighten-only, spec 40 §6.5).
+    /// Raises today's quota for this book to `quota_eur` (never lowers it: tighten-only,
+    /// spec 40 §6.5).
     pub async fn raise_payout_quota(&self, quota_eur: f64) -> anyhow::Result<f64> {
         let day = Utc::now().date_naive();
-        let cur = self.pg.payout_quota(day).await?;
+        let cur = self.pg.payout_quota(&self.book, day).await?;
         let q = fa_ledger::pg::PayoutQuota {
+            book: self.book.clone(),
             day,
             quota_eur: cur.as_ref().map_or(quota_eur, |c| c.quota_eur.max(quota_eur)),
             reserved_eur: cur.as_ref().map_or(0.0, |c| c.reserved_eur),

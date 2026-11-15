@@ -86,6 +86,37 @@ impl AppState {
         });
     }
 
+    /// Keeps the live book's FX view fresh (review 2026-11-15 §3.2 item 3): every
+    /// `FA_LIVE_FX_REFRESH_SECS` (default 300; `0` disables), once Postgres is attached, the
+    /// latest `ref.fx_rate` rate per currency (newest `ts` across sources, so Yahoo intraday
+    /// beats the ECB daily when fresher) and every instrument's `quote_ccy` are loaded and
+    /// handed to [`Live::set_fx`]. Fills seen before the first load convert at the counted
+    /// 1.0 fallback.
+    pub fn spawn_live_fx_refresher(&self) {
+        let every = std::env::var("FA_LIVE_FX_REFRESH_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(300);
+        if every == 0 {
+            tracing::info!("live FX refresh disabled (FA_LIVE_FX_REFRESH_SECS=0)");
+            return;
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let Some(pool) = state.pg.get().cloned() else {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    continue;
+                };
+                match load_fx_view(&pool).await {
+                    Ok((rates, ccys)) => {
+                        tracing::debug!(rates = rates.len(), instruments = ccys.len(), "live FX view refreshed");
+                        state.live_mut().set_fx(rates, ccys);
+                    }
+                    Err(e) => tracing::warn!(error = %e, "live FX view not refreshed"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(every)).await;
+            }
+        });
+    }
+
     pub fn record_heartbeat(&self, hb: Heartbeat) {
         let status = ServiceStatus {
             service: hb.service.clone(),
@@ -119,4 +150,23 @@ impl AppState {
             }
         });
     }
+}
+
+/// The two maps [`Live::set_fx`] takes: ccy → latest `rate_to_eur`, instrument UUID → quote ccy.
+async fn load_fx_view(
+    pool: &sqlx::PgPool,
+) -> Result<(BTreeMap<String, f64>, std::collections::HashMap<String, String>), sqlx::Error> {
+    let rates: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT DISTINCT ON (upper(ccy)) upper(ccy), rate_to_eur::float8 \
+         FROM ref.fx_rate ORDER BY upper(ccy), ts DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    let ccys: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id::text, upper(trim(quote_ccy)) FROM ref.instrument \
+         WHERE quote_ccy IS NOT NULL AND trim(quote_ccy) <> ''",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok((rates.into_iter().collect(), ccys.into_iter().collect()))
 }

@@ -1063,7 +1063,7 @@ impl PgLedger {
         let prev_start = prev.and_time(NaiveTime::MIN).and_utc();
         let equity = self.equity_eur(book, Some(start - Duration::microseconds(1)), None).await?;
         let pnl = self.book_pnl(book, Some(prev_start), Some(start), None).await?;
-        let prev_q = self.payout_quota(prev).await?;
+        let prev_q = self.payout_quota(book, prev).await?;
         let inputs = crate::payout::PayoutInputs {
             prev_equity_eur: equity,
             prev_net_pnl_eur: pnl.net_eur,
@@ -1072,13 +1072,15 @@ impl PgLedger {
         };
         let quota = rule.quota(&inputs);
         let (q,): (rust_decimal::Decimal,) = sqlx::query_as(
-            "INSERT INTO ledger.payout_quota (day, quota_eur, reserved_eur, paid_eur, rule) VALUES ($1, $2, 0, 0, $3) \
-             ON CONFLICT (day) DO UPDATE SET \
+            "INSERT INTO ledger.payout_quota (book, day, quota_eur, reserved_eur, paid_eur, rule) \
+             VALUES ($1, $2, $3, 0, 0, $4) \
+             ON CONFLICT (book, day) DO UPDATE SET \
                rule = CASE WHEN excluded.quota_eur > ledger.payout_quota.quota_eur THEN excluded.rule \
                            ELSE coalesce(ledger.payout_quota.rule, excluded.rule) END, \
                quota_eur = greatest(ledger.payout_quota.quota_eur, excluded.quota_eur) \
              RETURNING quota_eur",
         )
+        .bind(book)
         .bind(day)
         .bind(quota)
         .bind(json!({"rule": rule, "inputs": inputs, "book": book, "quota_eur": quota}))
@@ -1088,9 +1090,13 @@ impl PgLedger {
     }
 
     /// Books a payout of `amount_eur` (> 0) for `day` as `cash_movement(kind = 'payout', ref = day)`
-    /// and sets `ledger.payout_quota.paid_eur` of that day to the sum of all books' payouts with
-    /// that reference (row created with quota 0 when missing). One payout per book and day:
-    /// a repeat is a no-op returning `false`. Audited. The quota rule itself is spec 42 Q1.
+    /// and sets `ledger.payout_quota.paid_eur` of that `(book, day)` to the sum of the book's
+    /// payouts with that reference. The amount is enforced against the day's remaining quota
+    /// (`quota_eur − paid_eur`; rollover is already inside `quota_eur`, [`crate::payout`]) inside
+    /// the same transaction — no quota row means nothing is payable, and an over-quota amount is
+    /// rejected with [`PgError::QuotaExceeded`] (review 2026-11-15 §3.2 item 6). One payout per
+    /// book and day: a repeat is a no-op returning `false`. Audited. The quota rule itself is
+    /// spec 42 Q1.
     pub async fn record_payout(&self, book: &str, day: NaiveDate, amount_eur: f64) -> Result<bool, PgError> {
         if !(amount_eur.is_finite() && amount_eur > 0.0) {
             return Err(PgError::Invalid(format!("payout amount must be positive, got {amount_eur}")));
@@ -1115,12 +1121,26 @@ impl PgLedger {
         .await?
         .rows_affected();
         if n > 0 {
-            sqlx::query(
-                "INSERT INTO ledger.payout_quota (day, quota_eur, reserved_eur, paid_eur) \
-                 SELECT $1, 0, 0, coalesce(-sum(amount * fx_rate_eur), 0) FROM ledger.cash_movement \
-                 WHERE kind = 'payout' AND ref = $2 \
-                 ON CONFLICT (day) DO UPDATE SET paid_eur = excluded.paid_eur",
+            // Enforce the (book, day) quota inside the booking transaction: the row is locked
+            // so concurrent raises / payouts serialise with this one, and a rejection rolls the
+            // cash movement back.
+            let row: Option<(rust_decimal::Decimal, rust_decimal::Decimal)> = sqlx::query_as(
+                "SELECT quota_eur, paid_eur FROM ledger.payout_quota WHERE book = $1 AND day = $2 FOR UPDATE",
             )
+            .bind(book)
+            .bind(day)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let (quota, paid) = row.unwrap_or_default();
+            crate::payout::check_amount(dec(amount_eur), quota, paid)
+                .map_err(|m| PgError::QuotaExceeded(format!("book {book}, day {day}: {m}")))?;
+            sqlx::query(
+                "INSERT INTO ledger.payout_quota (book, day, quota_eur, reserved_eur, paid_eur) \
+                 SELECT $1, $2, 0, 0, coalesce(-sum(amount * fx_rate_eur), 0) FROM ledger.cash_movement \
+                 WHERE book = $1 AND kind = 'payout' AND ref = $3 \
+                 ON CONFLICT (book, day) DO UPDATE SET paid_eur = excluded.paid_eur",
+            )
+            .bind(book)
             .bind(day)
             .bind(&reference)
             .execute(&mut *tx)
@@ -1277,20 +1297,38 @@ mod tests {
         let d = pg.resolve_orphan(sid, &OrphanAction::Dismiss { reason: "test".into() }, "ui").await.unwrap();
         assert_eq!(d.status, "dismissed");
 
-        // payout booking
+        // payout booking — enforced against the (book, day) quota (review 2026-11-15 §3.2 item 6)
         let day = chrono::NaiveDate::from_ymd_opt(2099, 2, 3).unwrap();
-        assert!(pg.record_payout(&book, day, 25.0).await.unwrap());
+        assert!(
+            matches!(pg.record_payout(&book, day, 25.0).await, Err(PgError::QuotaExceeded(_))),
+            "no quota row: nothing payable"
+        );
+        pg.upsert_payout_quota(&crate::pg::PayoutQuota {
+            book: book.clone(),
+            day,
+            quota_eur: 30.0,
+            reserved_eur: 0.0,
+            paid_eur: 0.0,
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(pg.record_payout(&book, day, 30.01).await, Err(PgError::QuotaExceeded(_))),
+            "amount above the quota is rejected"
+        );
+        assert!(pg.record_payout(&book, day, 25.0).await.unwrap(), "rejections rolled back: same id books fine");
         assert!(!pg.record_payout(&book, day, 25.0).await.unwrap(), "one payout per book and day");
         assert!(pg.record_payout(&book, day, -1.0).await.is_err());
         let (paid,): (f64,) = sqlx::query_as(
-            "SELECT (-sum(amount))::float8 FROM ledger.cash_movement WHERE kind = 'payout' AND ref = $1",
+            "SELECT (-sum(amount))::float8 FROM ledger.cash_movement WHERE book = $1 AND kind = 'payout' AND ref = $2",
         )
+        .bind(&book)
         .bind(day.to_string())
         .fetch_one(pg.pool())
         .await
         .unwrap();
-        assert!(paid >= 25.0);
-        assert!((pg.payout_quota(day).await.unwrap().unwrap().paid_eur - paid).abs() < 1e-9);
+        assert!((paid - 25.0).abs() < 1e-9, "only the in-quota payout was booked");
+        assert!((pg.payout_quota(&book, day).await.unwrap().unwrap().paid_eur - paid).abs() < 1e-9);
 
         // replaying twice yields the same state; it equals the in-memory ledger
         let st = pg.book_state(&book, None).await.unwrap();
@@ -1391,15 +1429,7 @@ mod tests {
         pg.delete_book(&book).await.unwrap();
         assert!(pg.orphan_fills(None, 10_000).await.unwrap().iter().all(|o| o.id != oid && o.id != sid));
         assert!(pg.cached_lots(&book).await.unwrap().is_empty());
-        sqlx::query(
-            "DELETE FROM ledger.payout_quota WHERE day = $1 AND NOT EXISTS (SELECT 1 FROM ledger.cash_movement \
-                     WHERE kind = 'payout' AND ref = $2)",
-        )
-        .bind(day)
-        .bind(day.to_string())
-        .execute(pg.pool())
-        .await
-        .unwrap();
+        sqlx::query("DELETE FROM ledger.payout_quota WHERE book = $1").bind(&book).execute(pg.pool()).await.unwrap();
         sqlx::query(
             "DELETE FROM audit.log WHERE actor IN ('ui', $2) AND (subject LIKE $1 || '%' OR payload->>'book' = $1)",
         )

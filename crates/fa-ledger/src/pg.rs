@@ -53,6 +53,10 @@ pub enum PgError {
     NotFound(String),
     #[error("invalid: {0}")]
     Invalid(String),
+    /// A payout was rejected because it exceeds the day's remaining quota for the book
+    /// (`ledger.payout_quota`, review 2026-11-15 §3.2 item 6). Maps to a 4xx in control-api.
+    #[error("payout quota exceeded: {0}")]
+    QuotaExceeded(String),
 }
 
 /// An order intent as persisted to `ledger.order_intent` (+ its paper `venue_order`).
@@ -167,6 +171,8 @@ pub struct ReconciliationRun {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PayoutQuota {
+    /// The ledger book the quota applies to (`(book, day)` key, migration `20261115110000`).
+    pub book: String,
     pub day: chrono::NaiveDate,
     pub quota_eur: f64,
     pub reserved_eur: f64,
@@ -381,7 +387,9 @@ impl PgLedger {
         .await?
         .rows_affected();
         if inserted > 0 && !strategy_ids.is_empty() {
-            for (s, (qty, fee)) in strategy_ids.iter().zip(attribution_split(x.qty.abs(), x.fee_eur, strategy_ids.len(), weights)) {
+            for (s, (qty, fee)) in
+                strategy_ids.iter().zip(attribution_split(x.qty.abs(), x.fee_eur, strategy_ids.len(), weights))
+            {
                 sqlx::query(
                     "INSERT INTO ledger.fill_attribution (fill_id, strategy_id, qty, fee_share) \
                      VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
@@ -782,15 +790,17 @@ impl PgLedger {
             .collect())
     }
 
-    pub async fn payout_quota(&self, day: chrono::NaiveDate) -> Result<Option<PayoutQuota>, PgError> {
+    pub async fn payout_quota(&self, book: &str, day: chrono::NaiveDate) -> Result<Option<PayoutQuota>, PgError> {
         let row = sqlx::query(
-            "SELECT day, quota_eur::float8 AS q, reserved_eur::float8 AS r, paid_eur::float8 AS p \
-             FROM ledger.payout_quota WHERE day = $1",
+            "SELECT book, day, quota_eur::float8 AS q, reserved_eur::float8 AS r, paid_eur::float8 AS p \
+             FROM ledger.payout_quota WHERE book = $1 AND day = $2",
         )
+        .bind(book)
         .bind(day)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| PayoutQuota {
+            book: r.get("book"),
             day: r.get("day"),
             quota_eur: r.get("q"),
             reserved_eur: r.get("r"),
@@ -800,11 +810,12 @@ impl PgLedger {
 
     pub async fn upsert_payout_quota(&self, q: &PayoutQuota) -> Result<(), PgError> {
         sqlx::query(
-            "INSERT INTO ledger.payout_quota (day, quota_eur, reserved_eur, paid_eur) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (day) DO UPDATE SET quota_eur = excluded.quota_eur, \
+            "INSERT INTO ledger.payout_quota (book, day, quota_eur, reserved_eur, paid_eur) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (book, day) DO UPDATE SET quota_eur = excluded.quota_eur, \
              reserved_eur = excluded.reserved_eur, paid_eur = excluded.paid_eur",
         )
+        .bind(&q.book)
         .bind(q.day)
         .bind(dec(q.quota_eur))
         .bind(dec(q.reserved_eur))
@@ -816,7 +827,8 @@ impl PgLedger {
 
     /// Deletes everything belonging to a book (tests / paper resets), including its orphan fills
     /// and cached lots (tables of migration `20261111000030`, which must be applied). Reconciliation
-    /// runs and the payout quota are not per book and are left alone.
+    /// runs are not per book; they and the payout quota rows (per book since `20261115110000`,
+    /// but tighten-only operator state) are left alone.
     pub async fn delete_book(&self, book: &str) -> Result<(), PgError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -1073,10 +1085,19 @@ mod tests {
         assert_eq!(r.diff.positions.len(), 1);
         assert!(r.diff.cash_ours != r.diff.cash_theirs);
 
-        // cash written by another writer (a payout from control-api) is returned to apply
-        crate::pg::PgLedger::record_payout(&pg, &book, chrono::NaiveDate::from_ymd_opt(2099, 1, 2).unwrap(), 12.5)
-            .await
-            .unwrap();
+        // cash written by another writer (a payout from control-api) is returned to apply;
+        // the payout needs a quota for its (book, day) first (review 2026-11-15 §3.2 item 6)
+        let payout_day = chrono::NaiveDate::from_ymd_opt(2099, 1, 2).unwrap();
+        pg.upsert_payout_quota(&PayoutQuota {
+            book: book.clone(),
+            day: payout_day,
+            quota_eur: 12.5,
+            reserved_eur: 0.0,
+            paid_eur: 0.0,
+        })
+        .await
+        .unwrap();
+        crate::pg::PgLedger::record_payout(&pg, &book, payout_day, 12.5).await.unwrap();
         pg.record_fill(&late, t0, &[]).await.unwrap();
         let r = pg.reconcile_cut(&book, &mem, &[], 0.0, 0.0).await.unwrap();
         assert!(r.diff.is_empty(), "{:?}", r.diff);
@@ -1084,20 +1105,23 @@ mod tests {
         let c = &r.cash_only_theirs[0];
         assert!(mem.apply_cash(&c.key, &c.kind, c.amount_eur));
         assert_eq!(Totals::of(&pg.load_book(&book).await.unwrap()), Totals::of(&mem));
-        sqlx::query("DELETE FROM ledger.payout_quota WHERE day = '2099-01-02'").execute(pg.pool()).await.unwrap();
+        sqlx::query("DELETE FROM ledger.payout_quota WHERE book = $1").bind(&book).execute(pg.pool()).await.unwrap();
         pg.delete_book(&book).await.unwrap();
     }
 
     #[tokio::test]
     async fn payout_quota_upserts() {
         let Some(pg) = ledger().await else { return };
+        let book = format!("test-{}", Uuid::now_v7());
         let day = chrono::NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
-        let q = PayoutQuota { day, quota_eur: 10.0, reserved_eur: 1.0, paid_eur: 0.5 };
+        let q = PayoutQuota { book: book.clone(), day, quota_eur: 10.0, reserved_eur: 1.0, paid_eur: 0.5 };
         pg.upsert_payout_quota(&q).await.unwrap();
         pg.upsert_payout_quota(&PayoutQuota { paid_eur: 2.0, ..q.clone() }).await.unwrap();
-        let got = pg.payout_quota(day).await.unwrap().unwrap();
+        let got = pg.payout_quota(&book, day).await.unwrap().unwrap();
         assert_eq!((got.quota_eur, got.reserved_eur, got.paid_eur), (10.0, 1.0, 2.0));
-        sqlx::query("DELETE FROM ledger.payout_quota WHERE day = $1").bind(day).execute(pg.pool()).await.unwrap();
+        // the quota is per book: another book's day is untouched
+        assert!(pg.payout_quota("paper-nosuch", day).await.unwrap().is_none());
+        sqlx::query("DELETE FROM ledger.payout_quota WHERE book = $1").bind(&book).execute(pg.pool()).await.unwrap();
     }
 
     #[test]

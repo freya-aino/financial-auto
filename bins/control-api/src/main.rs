@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
     config_routes::set_runtime_path(&args.config); // `PUT /api/config/runtime` persists next to it
     state.spawn_heartbeat_collector();
     state.spawn_live_collector();
+    state.spawn_live_fx_refresher(); // ref.fx_rate + quote ccys → live book fill conversion (review 2026-11-15 §3.2 item 3)
     streams_routes::spawn_ensure_streams(&state);
     sources::spawn_health_collector(&state); // ingest.health|gap|unresolved.* mirror (D-054)
 
