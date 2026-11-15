@@ -24,11 +24,12 @@ Build a locally operated, largely autonomous trading platform. It learns a share
 - Sub-second / HFT latency targets.
 
 ## 3. Decisions
-- **Assets:** everything reachable via API; the **asset universe is selected by the model** ([31, retired → fa-encoders](../crates/fa-encoders/README.md#encoder-model-lasting-content-of-the-retired-spec-31), [33, retired → fa-mcmc](../crates/fa-mcmc/README.md#graph-model-lasting-content-of-the-retired-spec-33), [35](35-strategies.md)).
+- **Assets:** everything reachable via API; the **asset universe is selected by the model** ([31, retired → fa-encoders](../crates/fa-encoders/README.md#encoder-model-lasting-content-of-the-retired-spec-31), [33, retired → fa-mcmc](../crates/fa-mcmc/README.md#graph-model-lasting-content-of-the-retired-spec-33), [35, retired → fa-strategies](../crates/fa-strategies/README.md#strategy-model-lasting-content-of-the-retired-spec-35)).
 - **Horizons:** multiple; each strategy has its own, with **matched scope**: lookback scale ≈ forecast scale (1h → 2h, 1d → 2d).
 - **Timescales:** one custom-sized model per timescale (seconds, minutes, hours, days, weeks…).
 - **Base currency:** EUR for P&L, risk and fitness.
-- **Path to money:** paper first; promotion requires minimum shadow calendar time plus statistical criteria ([40](../bins/risk-engine/README.md#execution-and-risk-lasting-content-of-the-retired-spec-40), [41](41-backtest-and-validation.md)).
+- **Path to money:** paper first; promotion requires minimum shadow calendar time plus statistical criteria ([40](../bins/risk-engine/README.md#execution-and-risk-lasting-content-of-the-retired-spec-40), [41](41-backtest-and-validation.md)). Paper trading acts on **real collected market data by default** (`FA_MARKET_DATA = real`; synthetic venues are dropped by the decision path, D-103); ephemeral test stacks run the synthetic market (D-096).
+- **Organisational accounting:** a double-entry ledger above the trading book (`fa-accounting`, D-104) with segments trading / infrastructure / operations / owner / treasury; a closed day's positive net income splits 20 % owner / 30 % infrastructure / 0 % reserves, opex accrued at notional cloud-equivalent prices (D-106, owner-confirmed). control-api closes the previous UTC day daily.
 - **Languages:** Rust for most of the system including ML; Go for parallel/scalable services ([ADR 0001](adr/0001-rust-go-split.md)).
 - **Compute:** one GPU workstation as the target. The current development host has no GPU: the neural families train and serve on CPU through candle, with an opt-in `cuda` feature (D-068, D-070). Everything must scale horizontally later without redesign ([60, retired](../docker/README.md#reference-spec-60-ops-retired-2026-11-11)).
 
@@ -63,7 +64,7 @@ System-level halts are owned by [40](../bins/risk-engine/README.md#execution-and
 - The system can run end to end in paper mode on a single GPU workstation. *Met in paper mode on a CPU-only host: every service runs in compose on live keyless feeds with statistical baselines behind every stage and the neural families on CPU; no live trading.*
 
 ## 10. Open questions
-1. **Success metrics:** target return, max acceptable drawdown, starting capital. Blocks the tunables in 40.
+1. **Success metrics:** target return, max acceptable drawdown, starting capital. Blocks the tunables in 40. *Partially answered:* the revenue split (20/30/0) and notional opex prices are owner-confirmed (D-106) and booked by the organisational accounting (D-104); the paper book of record bootstrapped 2026-11-15 with a 100 000 EUR opening deposit (D-107). Target return, max drawdown and live starting capital remain open.
 2. **Latency budget per timescale.** No longer blocks the process split in 01 (one `model-runtime` for all timescales, D-005); measured so far: the MCMC 1m step at p99 1.3–3.6 ms against a 5 ms budget (D-075).
 
 ## 11. Deferred

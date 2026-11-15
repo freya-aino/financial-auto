@@ -1,7 +1,7 @@
 # fa-accounting — organisational books above the trading ledger
 
-The double-entry ledger of the organisation around the trading system (D-104;
-[code_review_15_11_26.md](../../code_review_15_11_26.md) §4). [`fa-ledger`](../fa-ledger) stays
+The double-entry ledger of the organisation around the trading system (D-104; design from the
+2026-11-15 code review §4.2, since retired). [`fa-ledger`](../fa-ledger) stays
 the book of record for trading events; this crate records where the money *goes*: revenue
 recognition, the system's own operating costs, the revenue split, and the segmentation and
 allocation of funds. All amounts are EUR at the ledger scale (`fa_ledger::money`, 18 dp).
@@ -35,13 +35,34 @@ Schema `acct` (`migrations/20261115100000_accounting.sql`): `acct.account`, `acc
 migrations apply it. An account's `kind` is immutable in `sync_chart` — changing it would flip
 the orientation of its history.
 
+## Wiring (control-api)
+
+- **Daily close** (`bins/control-api/src/accounting.rs`): every `FA_ACCT_CLOSE_SECS` (default
+  86 400; `0` disables) control-api closes the previous UTC day of the `paper` book — net P&L
+  from `PgLedger::book_pnl` as revenue, the day's metered costs priced by `[accounting]`
+  (`fa_core::config::AccountingConfig`, all zero by default): flat `base_eur_per_day`
+  (operations), GPU ms summed from `ops.job_run` (`SUM(bigint)` is `NUMERIC` — cast back to
+  `bigint`) at `gpu_eur_per_hour`, VictoriaMetrics + Postgres bytes at 1/30 of
+  `storage_eur_per_gib_month` per day (both to `expenses:infrastructure`); zero-priced or
+  zero-usage meters produce no item. The first ever run seeds `equity:contributed` with the
+  book's external capital (deposits − withdrawals), so the trading-book mirror tracks equity,
+  not just P&L since the job existed. Each run is audited `ops.accounting_close`; a failed
+  close is retried next interval.
+- **Routes**: `GET /api/accounting/balances` (accounts, segment funds, trial balance),
+  `GET /api/accounting/entries`, `POST /api/accounting/close` (the scheduled job's code path,
+  so closing an already-closed day posts nothing twice). The frontend Infra page shows the
+  Accounting panel.
+- **Live numbers** (D-106, owner-confirmed): `[accounting]` in both platform tomls —
+  `owner_frac 0.2`, `infra_frac 0.3`, `reserve_frac 0.0` (50 % retained); notional opex prices
+  `base_eur_per_day 1.0`, `gpu_eur_per_hour 0.5`, `storage_eur_per_gib_month 0.02`
+  (cloud-equivalent estimates, to be replaced by real invoices when they exist).
+
 ## Not here (by design)
 
 - **Pricing the meters**: opex items arrive priced (`close::OpexItem`); the price table and the
-  accrual job (reading `used_gpu_ms`, `vm_data_size_bytes`, stream bytes, …) belong to the
-  caller (control-api), per §4.2 step 1 of the review.
-- **Wiring**: no service calls this crate yet; the close job, config (`[accounting]` split
-  fractions) and API/dashboard views are the follow-up step.
+  accrual queries live in the caller (control-api, above), per §4.2 step 1 of the review.
+- `close::payout_paid` is not yet called by any service: an operator payout
+  (`POST /api/trading/payouts`) is not mirrored into these books automatically yet.
 - Jurisdiction, external tax, multi-currency books (EUR only, like the trading ledger's base).
 
 ## Tests

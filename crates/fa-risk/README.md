@@ -19,4 +19,4 @@ Non-evolvable hard risk limits, kill switch, health halts, strategy lifecycle an
 Hard limits and pre-trade checks, halt state machine, daily-loss day, feed guard, lifecycle rules and promotion gate, pipeline decisions, execution-algorithm choice, cost-aware rebalancing, limit calibration.
 
 ## Governing specs
-- Retired spec 40 → [risk-engine README](../../bins/risk-engine/README.md#execution-and-risk-lasting-content-of-the-retired-spec-40), [35-strategies](../../specs/35-strategies.md) §6.4, [41-backtest-and-validation](../../specs/41-backtest-and-validation.md) §6.6
+- Retired spec 40 → [risk-engine README](../../bins/risk-engine/README.md#execution-and-risk-lasting-content-of-the-retired-spec-40), [Strategy model (ex spec 35)](../fa-strategies/README.md#strategy-model-lasting-content-of-the-retired-spec-35) §6.4, [41-backtest-and-validation](../../specs/41-backtest-and-validation.md) §6.6

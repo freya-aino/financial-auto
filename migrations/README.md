@@ -2,7 +2,7 @@
 
 PostgreSQL warehouse + ledger schema, in sqlx format (`<timestamp>_<name>.sql`, D-013).
 
-**Status:** 30 migrations (schemas `catalog`, `ref`, `ingest`, `wh`, `ledger`, `audit`, `validation`, `ops`). control-api applies them at startup (`sqlx::migrate!`); later files are idempotent (`if not exists`) so a manually applied copy does not break that run. The initial six were verified 2026-11-06 on a scratch `postgres:17-alpine` (23 tables).
+**Status:** 33 migrations (schemas `catalog`, `ref`, `ingest`, `wh`, `ledger`, `audit`, `validation`, `ops`, `acct`, `graph`). control-api applies them at startup (`sqlx::migrate!`); later files are idempotent (`if not exists`) so a manually applied copy does not break that run. The initial six were verified 2026-11-06 on a scratch `postgres:17-alpine` (23 tables).
 
 | File | Schema | Spec |
 |---|---|---|
@@ -32,6 +32,11 @@ PostgreSQL warehouse + ledger schema, in sqlx format (`<timestamp>_<name>.sql`, 
 | `20261113000020_refdata_kraken_class.sql` | corrects Kraken instruments provisioned as `unknown` to `crypto`/`crypto_spot` (or `fx_pair` for two fiat legs) with base/quote currencies (XBT→BTC, XDG→DOGE), in place with one `audit.log` row each; only provisional `unknown/unknown` rows of `source_id = 'kraken'`; idempotent | 12 §6 |
 | `20261113000040_holdout_embargo.sql` | `validation.holdout.embargo_ms` (embargo the holdout was locked with; NULL = timescale default); idempotent | 41 §6.4 |
 | `20261114030000_ingest_runtime_catalog_adjusted.sql` | `catalog.source.rate_limit` / `config` (JSONB runtime overrides, `ctl.ingest.configure` / `PATCH /api/sources/{id}`), `status_note` / `status_changed_at` (auto-disable reason); `wh.adjusted_bar_1d` (materialised adjusted daily bars, both modes, action-set digest; `fa_warehouse::adjusted`); idempotent; verified on a scratch `postgres:17-alpine` with every migration applied | 11 §4/§7, 12 §7 (retired → catalog / fa-warehouse READMEs) |
+| `20261114050000_encoder_generation.sql` | `validation.encoder_generation` (one row per trainer generation run: `GenPhase`, status, selected snapshot, full `record` JSONB) and `validation.data_window` (train / validation boundaries and excluded locked holdouts per generation); written by the trainer, read by control-api `/api/generations`; idempotent | 36 §4.1/§5, D-091 |
+| `20261114070000_risk_history.sql` | `ledger.allocation_snapshot` (active allocator weights / sleeves per book), `ledger.portfolio_target` (netted targets raw → capped → gated per decision tick), `ledger.promotion_review` (promotion-gate decisions, kept as audit trail); written by the risk-engine (`history.rs`), snapshots pruned after `[history] retention_days`; idempotent | 40 §5, D-094 |
 | `20261114090000_decoder_output.sql` | `wh.decoder_output` (every `DecoderOutput` control-api receives: decoder, genome, family, snapshot, timescale, nullable `instrument_id`, `as_of`, `output` JSONB with refs / quantiles / analogs; index on snapshot × timescale × instrument × `as_of`; 30-day retention by control-api); idempotent | 51 §6.3, D-098 |
+| `20261115100000_accounting.sql` | schema `acct` (fa-accounting, D-104): `account` (chart of accounts with organisational segments and external refs), `entry` (append-only journal, unique `entry_ref`), `posting` (`NUMERIC(38,18)` amounts); balance checks live in the crate | 00, D-104 |
+| `20261115110000_payout_quota_book.sql` | `ledger.payout_quota.book` (quota per book, not global; existing rows become `paper`), primary key → (book, day); idempotent | 42 §10 (review 2026-11-15 §3.2) |
+| `20261115120000_graph.sql` | schema `graph` (ADR 0010 second half, D-108): 25 typed tables replacing the Helix model-state graph — reference mirror, snapshots/spaces/adapters, regions/transitions + `TransitionVersion`/`RegionStatusVersion`, lineage/hierarchy, region sets/kernels/cross priors/episodes, string-keyed `TrainedOn`/`FeedbackFrom` links; ids from the shared `graph.node_id` sequence; written through `fa_hub::graph::PgGraph` | 20, ADR 0010, D-108 |
 
 Apply with `just migrate`, which needs `sqlx-cli`: `cargo install sqlx-cli --no-default-features --features rustls,postgres`.

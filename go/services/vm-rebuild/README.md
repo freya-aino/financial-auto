@@ -6,7 +6,7 @@ Rebuilds VictoriaMetrics market series (`fa_trade_*`, `fa_quote_*`, `fa_bar_*`, 
 
 **Read-only against live:** nothing is published on NATS (unlike `ctl.ingest.replay mode=publish`), nothing is written to Garage; symbols resolve through `refdata.Resolver.Lookup` only (never provisioning) on a Postgres session with `default_transaction_read_only=on`; the live VM is only exported. The tool refuses a `-target` that equals `-compare` or is port 8428 on localhost / `victoriametrics`.
 
-Linked connectors: `kraken`, `yahoo` (the sources that write market series today; add a blank import for others).
+Linked connectors: `kraken`, `yahoo` (the real sources that write market series today; the synthetic `sim` connectors `heartbeat` and `synthetic` are not linked — add a blank import for others).
 
 | Flag | Default | |
 |---|---|---|

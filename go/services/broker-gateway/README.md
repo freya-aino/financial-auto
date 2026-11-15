@@ -58,7 +58,9 @@ Every scheduler tick integrates each open `account|instrument` position at the t
 | `exec.carry.<account>` | out | JSON carry charge per (instrument, kind, period), see paper carry |
 | `exec.costs.calibrated` | out | JSON calibration report `{at, applied, path, error?, entries[{venue, class, fills, informative, echo, k_prior, k_fit, weight, k_new, clamped, realised_bps_ewma, model_bps_ewma, status}]}` |
 
-Heartbeat counters (also `fa_heartbeat_counter{service="broker-gateway",key=…}` on `/metrics`, spec 60 §6.5): `events.<KIND>`, `resting`, `working`, `quotes`, `intents.duplicate`, `cancels.unknown`, `errors.decode`, `algo.<name>.working|done|cancelled`, `algo.auto.<chosen>`, `slippage.<venue>.<class>.bps_mean` (realised vs arrival, EWMA α 0.05), `slippage.<venue>.<class>.model_bps_mean` (modelled half spread + impact), `slippage.<venue>.<class>.n`, `exec_slippage_bps.<algo>` (EWMA), `costs.k.<venue>.<class>` (impact coefficient in use), `calibrations`, `risk_heartbeat_age_s`, `risk_heartbeat_alive`, `failclosed.rejected`, `state.saves`, `state.save_errors`, `state.restored_working`.
+All four inputs are durable JetStream consumers (D-097; `bus.EnsureLive` / `LiveConsumer.Run` ack a message when its handler returns, so a crash redelivers — execution is idempotent through the restored intent-id set; the gateway calls `bus.EnsureStreams` at start and exits if it fails): `order.approved.>` / `order.cancel.>` on ORDERS always resume after an outage, the MD consumers resume within 2 min (`ResumeWithin` — an older backlog is skipped, not replayed) and quotes coalesce to latest-only when behind (spec 21 Q2). Messages with an unknown `Fa-Schema` major are dropped and counted.
+
+Heartbeat counters (also `fa_heartbeat_counter{service="broker-gateway",key=…}` on `/metrics`, spec 60 §6.5): `events.<KIND>`, `resting`, `working`, `quotes`, `intents.duplicate`, `cancels.unknown`, `errors.decode`, `algo.<name>.working|done|cancelled`, `algo.auto.<chosen>`, `slippage.<venue>.<class>.bps_mean` (realised vs arrival, EWMA α 0.05), `slippage.<venue>.<class>.model_bps_mean` (modelled half spread + impact), `slippage.<venue>.<class>.n`, `exec_slippage_bps.<algo>` (EWMA), `costs.k.<venue>.<class>` (impact coefficient in use), `calibrations`, `risk_heartbeat_age_s`, `risk_heartbeat_alive`, `failclosed.rejected`, `state.saves`, `state.save_errors`, `state.restored_working`, `md_skipped` (market data of a venue the mode drops, D-103), `consumer.<durable>.coalesced|rejected_schema` (D-097).
 
 In compose the gateway loads the repo `costs.yaml` baked into the image (`FA_COSTS=/app/config/costs.yaml`; before this it ran on the built-in default model), keeps `FA_STATE_DIR=/var/lib/fa` on the `broker-gateway-state` volume (calibrated costs + report, `orders.json`), serves `/metrics` on `0.0.0.0:9100` (published as `127.0.0.1:9106`) and is health-checked by `healthprobe` (`go/services/healthprobe`).
 
@@ -76,6 +78,7 @@ go test ./services/broker-gateway        # cost model, fixture, limit/cancel pat
 | `-recalibrate-every` / `-recalibrate-apply` / `-recalibrate-min-samples` | | `15m` / `true` / `30` |
 | `-algo-tick` | | `1s` |
 | `-risk-heartbeat-timeout` | | `15s` (0 disables fail-closed) |
+| `-market-data` | `FA_MARKET_DATA` | `real` — the paper engine ignores the synthetic venue `sim`; `synthetic` (ephemeral stacks) \| `all`; unknown value exits (D-103) |
 | `-carry-period` | | `1h` (0 disables funding / borrow charges) |
 | `-metrics` | `FA_METRICS_BIND` | host port of `docker/README.md` (compose `0.0.0.0:9100`; `off` disables) |
 

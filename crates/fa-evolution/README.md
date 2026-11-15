@@ -20,4 +20,4 @@ Rust-side evolution logic used by `evo-worker` (`evo.vary.decoder`, `evo.vary.st
 
 ## Governing specs
 - Spec 34 (retired): [fa-decoders README](../fa-decoders/README.md#decoder-population-lasting-content-of-the-retired-spec-34) (§6.2 variation and selection, §6.3 objectives, Q6 normalisation, §6.4 budget, §6.5 orchestration)
-- [35-strategies](../../specs/35-strategies.md), [Execution & risk (ex spec 40)](../../bins/risk-engine/README.md#execution-and-risk-lasting-content-of-the-retired-spec-40) §6.2 (allocator tournament)
+- [Strategy model (ex spec 35)](../fa-strategies/README.md#strategy-model-lasting-content-of-the-retired-spec-35), [Execution & risk (ex spec 40)](../../bins/risk-engine/README.md#execution-and-risk-lasting-content-of-the-retired-spec-40) §6.2 (allocator tournament)

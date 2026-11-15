@@ -75,5 +75,5 @@ Generation scheduler (`scheduler.go`), ranking and halving (`halving.go`, `nsga.
 
 ## Governing specs
 - Spec 34 (retired): [fa-decoders README](../../../crates/fa-decoders/README.md#decoder-population-lasting-content-of-the-retired-spec-34) (§6.2–6.5 here)
-- [35-strategies](../../../specs/35-strategies.md) §6.3–6.4, [Execution & risk (ex spec 40)](../../../bins/risk-engine/README.md#execution-and-risk-lasting-content-of-the-retired-spec-40) §6.2, [41-backtest-and-validation](../../../specs/41-backtest-and-validation.md) §6.5
+- [Strategy model (ex spec 35)](../../../crates/fa-strategies/README.md#strategy-model-lasting-content-of-the-retired-spec-35) §6.3–6.4, [Execution & risk (ex spec 40)](../../../bins/risk-engine/README.md#execution-and-risk-lasting-content-of-the-retired-spec-40) §6.2, [41-backtest-and-validation](../../../specs/41-backtest-and-validation.md) §6.5
 - [Ops reference (ex spec 60)](../../../docker/README.md#reference-spec-60-ops-retired-2026-11-11); decisions D-006, D-025, D-037, D-044, D-049, D-052

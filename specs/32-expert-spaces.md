@@ -3,14 +3,14 @@
 | | |
 |---|---|
 | **Status** | draft |
-| **Maturity** | Low (objective, health, identity and `ExpertView` implemented; the health targets are not met on live data, §6.3.1) |
+| **Maturity** | Medium (D-099 objective, health, identity and `ExpertView` implemented; item 2 passes 12/12 on synthetic factor data at the tightened D-102 thresholds; live-data evaluation deferred to the final live round, §6.3.1) |
 | **Owners (code)** | `crates/fa-expert-space`, `crates/fa-encoders`, `bins/trainer`, `bins/model-runtime` |
 | **Depends on** | 31 Expert encoders, 30 Latent regions, 33 MCMC graph, 34 Decoder population, 36 Training lifecycle |
 
 ## 1. Purpose
-Expert spaces are the low-dimensional manifolds the encoders produce through a **learned mixture-of-experts router**. Each expert specialises in a part of the predictive structure. The system optimises for two things at once:
-- **independence:** the experts' next-step prediction errors are ~uncorrelated;
-- **generality:** each expert's latent stays reconstructable by many decoder families (past events, future trajectories, text, images).
+Expert spaces are the low-dimensional manifolds the encoders produce through a **learned mixture-of-experts router**. Each expert specialises in a part of the predictive structure. The system optimises for two things at once (since D-099):
+- **diversity:** the experts are distinct representations, not copies (pairwise latent CKA driven down);
+- **generality:** the spaces are trained end to end on the family's reconstruction/SSL target plus next step, so each expert's latent stays reconstructable by many decoder families (past events, future trajectories, text, images).
 
 This spec defines the router, the objective and the **decoder-facing contract** that everything downstream reads.
 
@@ -18,7 +18,7 @@ This spec defines the router, the objective and the **decoder-facing contract** 
 **In scope:**
 - MoE router design and how the expert count emerges.
 - Per-expert manifold projection (dimensionality reduction).
-- The residual-decorrelation objective and its balance against generalisation.
+- The end-to-end objective (reconstruction/SSL + next step + expert diversity, D-099) and its balance against generalisation.
 - Expert identity across generations.
 - The `ExpertView` contract consumed by decoders, MCMC and strategies.
 
@@ -29,7 +29,7 @@ This spec defines the router, the objective and the **decoder-facing contract** 
 
 ## 3. Decisions
 - Expert partitioning comes from a **learned MoE router**. The number and content of experts **emerge from training**. Decorrelation pressure forces specialisation.
-- The decorrelation target is the **cross-expert covariance of next-step prediction errors (residuals)**, driven to ≈ 0 (ensemble diversity). The latent codes themselves are **not** required to be decorrelated.
+- The objective is **end-to-end reconstruction/SSL + next step** with an **expert-diversity** term (pairwise latent CKA of the experts' latents, D-099). ~~The decorrelation target is the **cross-expert covariance of next-step prediction errors (residuals)**, driven to ≈ 0.~~ Residual decorrelation is an optional regulariser (`λ_dec` 0 by default) and an informational diagnostic, no longer a requirement or promotion gate (D-099; the pre-D-099 form is kept in §6.3 for the record).
 - This is balanced against **generalisation**: each expert must stay reconstructable by the decoder population (spec 34). From gen 1, this pressure comes from elite-decoder feedback.
 - Expert spaces exist **per timescale** (one model per timescale, spec 31) and per encoder snapshot.
 - Asset selection may be expressed through the router (experts specialising on asset subsets). Otherwise it comes from MCMC priors or evolution.
@@ -168,6 +168,8 @@ The pattern of rounds 3–4 is consistent: every method that reaches correlation
 
 Ablations (seed 1): **without the diversity term** (`λ_div` 0) every family fails on diversity — latent CKA 0.995 (fsq), 0.999 (jepa, hvf), 1.000 (ldm): end-to-end reconstruction alone makes the experts copies. `λ_div` as a *mean* over pairs at 0.3 (fsq: CKA 0.99) and at 1 (8-expert ldm: 0.999) is too weak; as a sum at 1 the 8-expert ldm router collapses to 2 experts (usage `K_eff` 1.95), at 3–10 with `λ_bal` 0.01 fsq's router collapses (usage `K_eff` 1.0–1.5). `λ_bal` 0.1 / 0.3 / 1 all pass with diversity on; bias balancing (`bias_rate` 0.01) does not (usage `K_eff` 1.03). Router entropy (normalised, seed 1): fsq 0.94 (near-uniform soft routing), hvf 0.64, jepa 0.63, ldm 0.68 — routing is input-dependent for three families; in-sample CKA equals validation CKA within 0.03 (the diversity is structural and generalises, unlike the residual decorrelation of rounds 1–4). As expected under D-099 the experts' next-step residuals stay almost identical (correlation 0.99–1.00, residual `K_eff` ≈ 1), which no longer gates. Every default genome passes the new item 2 on this data; **real-data evaluation is left for the final live round.**
 
+**Round 6 — tightened thresholds, item-2 drift trigger (2026-11-14, D-102).** Checklist defaults tightened: `latent_cka_max` ≤ **0.7** (was 0.9), `ssl_skill` ≥ **0.1** (was 0.05); usage `K_eff` ≥ 2 and min skill ≥ 0.02 unchanged (trainer `ExpertTargets`, control-api `manifest_health_checks`). The trainer drift trigger (`FA_TRAIN_DRIFT_TRIGGERS=1`, `watch.rs`) no longer reads `resid_corr_max` (≈ 0.99 by design since D-099; `FA_TRIGGER_RESID_CORR` removed): it fires when a live `latent.expert.health` report fails the same `ExpertTargets` on 3 consecutive reports (fields a live report leaves unset are skipped). Re-run of the round-5 sweep (`--synthetic 6:3 --synthetic-bars 3000`, 4 families × seeds 1–3): **12/12 pass at the new limits** (usage `K_eff` 3.5–7.7, latent CKA max 0.06–0.46, SSL skill 0.39–0.69, min skill 0.14–0.21), so the tighter limits cost nothing on planted factors. Still provisional until checked on real bars.
+
 ### 6.4 Measured quantities (health)
 **Since D-099** the checklist (spec 36 §6.4 item 2) reads, on the validation windows of each fit:
 - **Usage `K_eff`** `k_eff_usage = (Σu)² / Σu²` over the experts' usage `u` (mean router probability): how many experts the router actually uses.
@@ -217,7 +219,7 @@ Manifests carry `k_eff_usage`, `latent_cka_max`, `ssl_skill`, `recon_skill`, `ro
 | Failure | Response |
 |---|---|
 | Router collapse (one expert takes everything) | Balancing kicks in; if usage `K_eff < 2` after training → snapshot not promotable (spec 36) |
-| Experts are copies (same representation) | Diversity term `λ_div`; `latent_cka_max > 0.9` → not promotable (D-099) |
+| Experts are copies (same representation) | Diversity term `λ_div`; `latent_cka_max > 0.7` → not promotable (D-099, tightened D-102) |
 | Degenerate experts (no skill) | `min_skill` constraint fails → expert pruned or snapshot rejected |
 | Residual correlation spikes live (regime change) | Health signal on bus; strategies/allocator can widen uncertainty; can trigger refresh (spec 36). Since D-099 end-to-end trained experts share their next-step residuals (validation correlation ≈ 0.99 on synthetic data), so residual correlation no longer triggers a refresh: the trainer's drift trigger (off by default) fires when live expert health fails the item-2 targets (usage K_eff, latent CKA, SSL skill, min skill) on 3 consecutive reports (D-102) |
 | Expert count changes between generations | Lifecycle events. Decoders/strategies remap or re-evaluate (spec 34/35) |
@@ -226,15 +228,15 @@ Manifests carry `k_eff_usage`, `latent_cka_max`, `ssl_skill`, `recon_skill`, `ro
 
 ## 9. Acceptance criteria
 **Remaining (why this spec stays):**
-- The D-099 item 2 (usage `K_eff` ≥ 2, latent CKA ≤ 0.9, SSL skill ≥ 0.05, min skill ≥ 0.02, no collapse) is met by every default family on synthetic 3-factor data (§6.3.1 round 5) but has **not been evaluated on live market data** — that is the final live round.
-- The item 2 thresholds are **provisional** until the owner confirms them (D-099).
+- The item 2 checklist (usage `K_eff` ≥ 2, latent CKA ≤ 0.7, SSL skill ≥ 0.1, min skill ≥ 0.02, no collapse; D-099, tightened D-102) is met by every default family on synthetic 3-factor data at the tightened limits (§6.3.1 rounds 5–6, 12/12) but has **not been evaluated on live market data** — that is the final live round.
+- The item 2 thresholds are **provisional** until confirmed on real bars (D-099, D-102).
 
 *Superseded (owner decision 2026-11-13, D-099):* rounds 1–4 (§6.3.1) showed that `K_eff ≥ 2`, residual correlation ≤ 0.1 and min skill ≥ 0.02 are not met together on validation; residual decorrelation is no longer a criterion.
 
 *Done in round 4 (2026-11-11):* bias-adjustment balancing and expert split (§6.1), `cov_ema` (§6.3), PIT/CRPS calibration and per-expert decodability (§6.4), the `fa_expert_resid_corr` / `fa_expert_usage` series and per-eval matrices (§5), questions 1, 3, 5 (§10). *Round 5 (2026-11-13):* end-to-end objective with the diversity term (§6.3), usage `K_eff` / latent CKA / SSL skill (§6.4), `trainer sweep --synthetic N:K`.
 
-*Status:* 1 holds on synthetic data for all four families, three seeds each (round 5); 2 measured per snapshot (`skill_e<k>`), enforced by the checklist, met on synthetic data; 3 holds (`ExpertView` with every §4.2 field, Rust → Go fixture round trip); 4 implemented with threshold 0.5 (CKA placeholder 0.7 not used), `AlignedTo` edges in Helix; 5 emitted per generation in the manifest and `Expert` nodes, live on `latent.expert.health` for learned active snapshots (live: usage `K_eff` gauge; latent CKA and SSL skill only from fits), kept per snapshot by control-api and shown on the console's Encoder snapshots page (the console does not show the D-099 metrics yet).
-1. On a synthetic dataset built from K independent latent factors, the default genome of each family passes item 2 on validation: usage `K_eff` ≥ 2 (≥ K−1), `latent_cka_max` ≤ 0.9, SSL skill ≥ 0.05, every expert's skill ≥ `min_skill`, no collapse. (Residual correlation is reported, not required.)
+*Status:* 1 holds on synthetic data for all four families, three seeds each, at the tightened D-102 limits (rounds 5–6); 2 measured per snapshot (`skill_e<k>`), enforced by the checklist, met on synthetic data; 3 holds (`ExpertView` with every §4.2 field, Rust → Go fixture round trip); 4 implemented with threshold 0.5 (CKA placeholder 0.7 not used), `AlignedTo` edges in Helix; 5 emitted per generation in the manifest and `Expert` nodes, live on `latent.expert.health` for learned active snapshots (live: usage `K_eff` gauge; latent CKA and SSL skill only from fits), kept per snapshot by control-api and shown on the console's Encoder snapshots page (its promotion checklist includes the D-099/D-102 items `expert_k_eff`, `expert_diversity`, `ssl_skill`, `expert_min_skill` — `models.ts NEURAL_CHECKS` — with missing ones flagged).
+1. On a synthetic dataset built from K independent latent factors, the default genome of each family passes item 2 on validation: usage `K_eff` ≥ 2 (≥ K−1), `latent_cka_max` ≤ 0.7, SSL skill ≥ 0.1 (D-102), every expert's skill ≥ `min_skill`, no collapse. (Residual correlation is reported, not required.)
 2. Every active expert beats the naive baseline by ≥ `min_skill` on the validation window.
 3. The `ExpertView` proto round-trips between Rust and Go and contains every field listed in §4.2.
 4. Expert identity alignment keeps ids for experts with CKA ≥ 0.7 (placeholder) across two consecutive generations.

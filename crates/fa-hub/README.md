@@ -1,12 +1,17 @@
 # fa-hub
 
-Typed Rust client for HelixDB's standalone server (`ghcr.io/helixdb/helixdb:v0.0.14`, compose
-service `helix`, `http://127.0.0.1:6969`). It speaks `POST /v2/query`, the operation-tree
+Typed Rust client for the model-state hub. One `HubClient` routes three kinds of state:
+the **graph** behind the `GraphStore` trait, served by Postgres (schema `graph`, default) or
+Helix (`graph` module, D-108); **vectors** in Qdrant (`qdrant` module, D-101); and the still
+Helix-resident rows (genomes/fitness/evolution, graph explorer, experts, meta, retention
+aggregates) on HelixDB's standalone server (`ghcr.io/helixdb/helixdb:v0.0.14`, compose service
+`helix`, `http://127.0.0.1:6969`). The Helix side speaks `POST /v2/query`, the operation-tree
 contract shared by the official Helix SDKs, and wraps every query of `helix/queries.hx` as a
 typed function with the same name.
 
 **Status:** implemented and verified against the live v0.0.14 image (unit tests + gated
-integration tests, see below). Supersedes the D-012 assumption of CLI-compiled
+integration tests, see below); the graph conformance suite is green on both backends
+(2026-11-15, D-108). Supersedes the D-012 assumption of CLI-compiled
 `POST /<query_name>` endpoints (D-033).
 
 ## Owns
@@ -45,10 +50,25 @@ integration tests, see below). Supersedes the D-012 assumption of CLI-compiled
   media embeddings in per-dimension collections (`latent_d<dim>` with tenant index
   `expert_space_id`, `news_d<dim>`, `media_d<dim>`; `ts` range index; point id = FNV-1a 64 of the
   business key; payload `norm` restores raw vectors). A `HubClient` with one attached routes every
-  vector call below — and the retention fold — to it; the graph stays in Helix.
+  vector call below — and the retention fold — to it.
   `configure_vectors(&cfg)` picks the process default from `[qdrant]` (`vector_backend = "qdrant"
   | "helix"`, `FA_QDRANT_URL`, `FA_VECTOR_BACKEND`); `HubClient::with_vectors` overrides it per
   client. Live tests: the same suite runs on both backends (`FA_QDRANT_URL` set or not).
+- `graph` (ADR 0010 second half, D-108) – the model-state graph behind the 59-method `GraphStore`
+  trait: ref mirror, snapshots/spaces/adapters, regions/transitions with their event-time
+  versions, lineage/hierarchy, region sets/kernels/cross priors/episodes, as-of reads and the
+  string-keyed genome links (`TrainedOn`/`FeedbackFrom`). Implemented by `PgGraph` (schema
+  `graph`, migration `20261115120000`, 25 typed tables, ids from one shared sequence so `u64`
+  node ids stay globally unique, recursive-walk lineage, version overlays in SQL;
+  `connect_lazy`) and `HelixGraph` (the original query layer, graph detached so calls cannot
+  route back). Routing lives inside `HubClient` — no call-site changes: `configure_graph(&cfg)`
+  applies `[graph] backend = "postgres" (default) | "helix"` (`FA_GRAPH_BACKEND`; Postgres url
+  from `postgres.url` / `FA_POSTGRES_URL`) in control-api, model-runtime, trainer, evo-worker
+  and risk-engine; `HubClient::with_graph` overrides per client, `graph_backend()` reports.
+  Still Helix-resident: genomes/fitness/pareto/evaluations, the graph explorer
+  (`resolve_node` / `neighborhood` / `run_named`), experts, the meta marker and the retention
+  aggregates. `examples/graph_migrate.rs` copies a live graph between backends idempotently
+  (current values; not event-time history or pre-migration genome links).
 - `vectors` – vector validation (`InvalidVector`: empty / zero-norm / non-finite), registered-dim
   checks (`space_dim`, `check_space_dim`, `DimMismatch`), `add_latents_checked` (validate + ensure
   index + write), `knn(space, v, k, &KnnFilter)` (kind / instrument / as-of / since / exclude /
@@ -69,7 +89,8 @@ integration tests, see below). Supersedes the D-012 assumption of CLI-compiled
   (`LatentVec kind=centroid`), `upsert_descents` (`DescendsFrom{carry|split|merge|partial}`),
   `upsert_hier_edges` (`Hier`), `upsert_region_set` / `region_set` (serialised online region set +
   kernel, restored on restart), `upsert_kernel_model` / `snapshot_kernels`, `upsert_cross_priors` /
-  `cross_priors`, `snapshot_hierarchy`, `lineage_members`, `region_lineage`.
+  `cross_priors`, `snapshot_hierarchy`, `lineage_members`, `region_lineage`,
+  `upsert_region_episodes` / `region_episodes` / `prune_region_episodes` (`RegionEpisode`, D-089).
 - `experts` (D-073) – `Expert` nodes (`expert_uid = <snapshot>/e<id>`), `ExpertOf`,
   `AlignedTo{cka}`: `upsert_expert`, `align_expert`, `retire_expert` (`died_gen`),
   `snapshot_experts`, `expert_parents`, `expert_alignments`.
@@ -212,9 +233,10 @@ Also available but unused: `GET /healthz`, `GET /readyz` (503 while indexes catc
 `GET /v2/diagnostics`, and `POST /v2/cypher` / `/v2/sql` text endpoints.
 
 ## Who writes what (D-048)
+Rows land in the configured graph backend (Postgres by default, D-108), except `LatentVec` rows (vectors: Qdrant, D-101) and the evolution rows (`Genome`, `ParentOf`, `FitnessRecord`, `EvaluatedOn`, `ParetoFront`) and `Expert` nodes, which stay in Helix.
 | Writer | Rows |
 |---|---|
-| `bins/model-runtime` (`hub_sink`, `hub_retention`) | `Snapshot stat-v1-<ts>`, `ExpertSpace <snapshot>-e<k>`, `LatentRegion` (+ `status`, statistics, death marks), `Transition` (coalesced) + `TransitionVersion`, `RegionStatusVersion`, `LatentVec kind=observation` for 1m and slower and `kind=centroid`, `DescendsFrom`, `Hier`, `RegionSet`, `KernelModel`, `CrossPrior`; prunes observations and versions every 6 h |
+| `bins/model-runtime` (`hub_sink`, `hub_retention`) | `Snapshot stat-v1-<ts>`, `ExpertSpace <snapshot>-e<k>`, `LatentRegion` (+ `status`, statistics, death marks), `Transition` (coalesced) + `TransitionVersion`, `RegionStatusVersion`, `LatentVec kind=observation` for 1m and slower and `kind=centroid`, `DescendsFrom`, `Hier`, `RegionSet`, `KernelModel`, `CrossPrior`, `RegionEpisode`; prunes observations, versions and episodes every 6 h |
 | `bins/evo-worker` (`vary`, `vary_strategy`, `allocator`) | `Genome` via `upsert_genome`, `ParentOf` via `link_parent`, `FitnessRecord`+`Scored` via `add_fitness_record` |
 | `bins/risk-engine` (`pipeline`) | `Genome` lifecycle status via `set_genome_status` (mirrors `ledger.strategy_state`) |
 | `bins/trainer` | `Snapshot` candidates (+ `manifest`, `carried_mass`), `ExpertSpace`, `LatentRegion`, `SnapshotParent`, `RegionMatch`, `AdapterState` + `HasAdapter`, `Expert` + `ExpertOf`/`AlignedTo` for neural snapshots |
@@ -227,6 +249,7 @@ FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test live            #
 FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test regions_live    # region lifecycle, lineage, kernels
 FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test versions_live   # event-time versions and as-of overlay
 FA_HELIX_URL=… FA_QDRANT_URL=http://127.0.0.1:6333 cargo test -p fa-hub --tests # same suites, vectors on Qdrant
+DATABASE_URL=… FA_HELIX_URL=… cargo test -p fa-hub --test graph_conformance    # one GraphStore suite on both backends (D-108; Postgres needs migrations applied)
 ```
 Concurrent writers: `HubClient::batch` retries `409 transaction_conflict` (an aborted, uncommitted transaction) up to six times with a short backoff, so parallel writers and the parallel live suite do not fail spuriously.
 The live tests create `test-<nanos>-…` rows and drop them afterwards; the indexes created by
@@ -235,8 +258,8 @@ idempotent `ensure_*`/`upsert_*` writers, lifecycle marks, `snapshot_graph`, `re
 named-query catalog, the evo-worker business-id writers and the `AdapterState` round trip
 (`adapter_state_round_trip_and_snapshot_manifest`).
 
-**k-NN benchmark** (spec 20 §6.4, criterion 4): `cargo build --release -p fa-hub --example knn_bench`, then run it against a **scratch** HelixDB (`--url`, refuses port 6969; `--n 10000,25000,50000 --queries 200 --drain-secs 900`; `--query-space <id>` re-measures an existing space). 2026-11-11, v0.0.14, dim 32, k = 10: idle p95 93 ms at 50 k vectors, 213–300 ms at 250 k (latency follows the whole `vec<d>` index, not the queried space), recall@10 ≥ 0.997, ≈ 21 KB per vector, 429 `index_backpressure` at 250 k pending.
+**k-NN benchmark** (spec 20 §6.4, criterion 4): `cargo build --release -p fa-hub --example knn_bench`, then run it against a **scratch** HelixDB (`--url`, refuses port 6969; `--n 10000,25000,50000 --queries 200 --drain-secs 900`; `--query-space <id>` re-measures an existing space). 2026-11-11, v0.0.14, dim 32, k = 10: idle p95 93 ms at 50 k vectors, 213–300 ms at 250 k (latency follows the whole `vec<d>` index, not the queried space), recall@10 ≥ 0.997, ≈ 21 KB per vector, 429 `index_backpressure` at 250 k pending. The same workload on Qdrant (`qdrant_bench` example): 10.9 ms p95 at 200 k vectors (D-101). `graph_bench` replays the heaviest graph shapes on Postgres and Dgraph at ~10× live size (the ADR 0010 measurement behind D-108).
 
 ## Governing specs
-- [20-storage](../../specs/20-storage.md) §5.2, [ADR 0002](../../specs/adr/0002-helixdb-hub.md), D-012, D-033, D-043, D-048, D-067, D-069, D-073, D-078, D-084
+- [20-storage](../../specs/20-storage.md) §5.2, [ADR 0002](../../specs/adr/0002-helixdb-hub.md), [ADR 0010](../../specs/adr/0010-vector-and-graph-store.md), D-012, D-033, D-043, D-048, D-067, D-069, D-073, D-078, D-084, D-101, D-108
 - [helix/](../../helix/README.md) – the readable catalog this crate mirrors

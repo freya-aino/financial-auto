@@ -1,14 +1,28 @@
 # helix
 
 The HelixDB data model: `schema.hx` (nodes, edges, vector types) and `queries.hx` (query
-catalog). Governed by [spec 20 §5.2](../specs/20-storage.md), ADR 0002, D-012 and D-033.
+catalog). Governed by [spec 20 §5.2](../specs/20-storage.md), ADR 0002, ADR 0010, D-012, D-033,
+D-101 and D-108.
+
+**Helix's role is reduced** (ADR 0010): vectors live in Qdrant (D-101) and the model-state
+graph — reference mirror, snapshots/spaces/adapters, regions/transitions with event-time
+versions, lineage/hierarchy, region sets/kernels/cross priors/episodes, `TrainedOn`/`FeedbackFrom`
+links — lives in Postgres schema `graph` by default (`[graph] backend = postgres`,
+`fa_hub::graph::GraphStore`, D-108); Helix serves those rows only with `backend = helix`.
+What Helix still holds in every configuration: the evolution rows (`Genome`, `FitnessRecord`,
+`ParentOf`, `Scored`, `EvaluatedOn`, `Reads`, `ParetoFront`/`InFront`), `Expert` nodes with
+`ExpertOf`/`AlignedTo`, the graph-explorer queries (`resolve_node`, `neighborhood`, the
+`run_named` whitelist), the `SchemaMeta` marker and the retention aggregates — so the `helix`
+compose service stays until those migrate (full cutover pending, D-108).
+`fa-hub/examples/graph_migrate.rs` copies a live graph between backends.
 
 **Status:** the `.hx` files are the **readable catalog** of the model, not something the server
-loads. HelixDB now runs from the official standalone image (D-033), which exposes the
+loads. HelixDB runs from the official standalone image (D-033), which exposes the
 operation-tree API at `POST /v2/query` and does not compile HelixQL projects into named
 endpoints (HelixQL is "legacy" in the upstream docs; the SDKs and `helix query` build the same
 JSON operation tree). The executable counterpart of these files is
-[`crates/fa-hub`](../crates/fa-hub/README.md):
+[`crates/fa-hub`](../crates/fa-hub/README.md) (for the graph constructs, its `HelixGraph`
+backend); the table maps the Helix form:
 
 | `.hx` construct | fa-hub |
 |---|---|
@@ -19,9 +33,14 @@ JSON operation tree). The executable counterpart of these files is
 | `QUERY name(args) => … RETURN x` | `HubClient::name(args)` in `queries.rs` (snake_case, same semantics), one `/v2/query` batch each |
 
 When changing the model, edit the `.hx` file first (it is the review surface), then mirror the
-change in `fa-hub::schema` / `fa-hub::queries` and run the live tests.
+change in `fa-hub::schema` / `fa-hub::queries` — and, for graph constructs, in `fa_hub::graph`
+(both backends plus a `graph` migration) — and run the live tests and the conformance suite.
 
-**Who writes (D-048, D-069, D-073, D-076, D-078):** `bins/model-runtime` (`hub_sink.rs`) persists its snapshot
+**Who writes (D-048, D-069, D-073, D-076, D-078):** every writer goes through `HubClient`, which
+routes graph rows to the configured backend — with the default `[graph] backend = postgres`
+they land in the `graph` schema and reach Helix only on `backend = helix`; `LatentVec`
+observations go to Qdrant (D-101); the evolution and `Expert` rows always land here.
+`bins/model-runtime` (`hub_sink.rs`) persists its snapshot
 (`stat-v1-<ts>`), expert spaces (`<snapshot>-e<k>`), regions with lifecycle `status`,
 statistics, centroids and `DescendsFrom` lineage, coalesced `Transition` posteriors with their
 `TransitionVersion`/`RegionStatusVersion` history, `Hier` edges, `RegionSet`/`KernelModel`
@@ -40,18 +59,22 @@ serves spec 50 §4.4/§4.5 from these rows, including the named-query whitelist 
 `fa-hub::catalog` behind `POST /api/graph/query`.
 
 ## Contents
-| Area | Nodes / vectors | Edges |
-|---|---|---|
-| Reference (mirror of Postgres `ref`) | Instrument, Entity, Venue, Sector | IssuedBy, ListedOn, SameExposure, InSector (Entity → Sector) |
-| Snapshots / experts | Snapshot, ExpertSpace, Expert, AdapterState | HasSpace, SnapshotParent, HasAdapter, ExpertOf, AlignedTo |
-| Regions / Markov graph | LatentRegion, Window, `V::LatentVec`, RegionSet, KernelModel, CrossPrior | InSpace, Transition, Hier, RegionMatch, DescendsFrom, HasRegionSet, HasKernel, Contains |
-| Versions (as-of overlay) | TransitionVersion, RegionStatusVersion | – |
-| Evolution | Genome, FitnessRecord | ParentOf, Scored, TrainedOn, FeedbackFrom |
-| Text / media | `V::NewsDoc`, `V::MediaSegment` | Mentions |
-| Meta | SchemaMeta | – |
+| Area | Nodes / vectors | Edges | Default home |
+|---|---|---|---|
+| Reference (mirror of Postgres `ref`) | Instrument, Entity, Venue, Sector | IssuedBy, ListedOn, SameExposure, InSector (Entity → Sector) | Postgres `graph` (D-108) |
+| Snapshots / adapters | Snapshot, ExpertSpace, AdapterState | HasSpace, SnapshotParent, HasAdapter | Postgres `graph` |
+| Experts | Expert | ExpertOf, AlignedTo | Helix |
+| Regions / Markov graph | LatentRegion, Window, RegionSet, KernelModel, CrossPrior, RegionEpisode | InSpace, Transition, Hier, RegionMatch, DescendsFrom, HasRegionSet, HasKernel, Contains | Postgres `graph` |
+| Versions (as-of overlay) | TransitionVersion, RegionStatusVersion | – | Postgres `graph` |
+| Latents | `V::LatentVec` | – | Qdrant (D-101) |
+| Evolution | Genome, FitnessRecord, ParetoFront | ParentOf, Scored, EvaluatedOn, Reads, InFront | Helix |
+| Genome ↔ snapshot links | – | TrainedOn, FeedbackFrom | Postgres `graph` (string-keyed, D-108) |
+| Text / media | `V::NewsDoc`, `V::MediaSegment` | Mentions | Qdrant |
+| Meta | SchemaMeta | – | Helix |
 
 ## Design notes
-- **Mixed-dimension latents** (previously an open gap): a vector index is keyed by
+- **Mixed-dimension latents** (Helix vector backend only since D-101; Qdrant uses per-dimension
+  collections instead): a vector index is keyed by
   `(label, property)` with a fixed dimension, so `LatentVec` stores a `d`-dimensional vector in
   `vec<d>` and gets one index per `d`, each partitioned per expert space via `tenant_property =
   expert_space_id`. Searches are therefore always scoped to one expert space (what spec 34 wants).
@@ -67,9 +90,10 @@ serves spec 50 §4.4/§4.5 from these rows, including the named-query whitelist 
   the unique indexes and fail with 409 `unique_constraint_violation` on duplicates.
 - **Index DDL is asynchronous** and cannot share a batch with data writes; `fa-hub` waits for
   builds (`wait_for_index`) in its `*_ready` helpers.
-- `NewsDoc` / `MediaSegment` embeddings use the same `vec<d>` convention, one un-partitioned
-  cosine index per `(label, d)` created on first write (`add_news_docs` / `add_media_segments`,
-  `search_news_docs` / `search_media_segments`); no ingestor writes them yet.
+- `NewsDoc` / `MediaSegment` embeddings use the same `vec<d>` convention on the Helix backend,
+  one un-partitioned cosine index per `(label, d)` created on first write (`add_news_docs` /
+  `add_media_segments`, `search_news_docs` / `search_media_segments`; `news_d<dim>` /
+  `media_d<dim>` collections on Qdrant); no ingestor writes them yet.
 - **Dimensions:** `ExpertSpace.dim` is authoritative; `add_latents_checked` / `knn` reject other
   vector lengths. Index ensures are cached per client.
 - **Event-time versions:** `Transition` posteriors and region `status` are updated in place, so

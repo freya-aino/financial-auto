@@ -18,12 +18,17 @@ Collects the weights of non-elite decoder genomes once they are N generations ol
 - A bundle without a card is unloadable (bundles are discovered through cards) and is collected like any non-elite.
 - `gc::plan(listing, policy, protection, elites, now)` is pure; `gc::execute(store, plan, dry_run)` deletes (or counts) the planned bundles and reports failures without stopping.
 
+control-api runs the GC weekly (`maintenance.rs`, `FA_GENOME_GC_SECS`, default 604 800; `0` disables; audited as `ops.*`, D-097); the example below remains the manual path.
+
 ```sh
 cargo run -p fa-blob --example genome_gc                   # dry run against the compose Garage (default)
 cargo run -p fa-blob --example genome_gc -- --list         # + one line per decision
 cargo run -p fa-blob --example genome_gc -- --apply        # delete; refused if GET /api/decoders/serving fails
 # --keep-generations N --elite-per-family K --min-age-days D --control-api URL|none --keep-file PATH --no-serving-check
 ```
+
+## Media downsampling (`media` module, spec 20 §6.5, D-097)
+Media lives at `fa-media/<source>/<media_id>/{video,audio,frames,transcript}/…` (spec 20 §5.5). The downsampled form of a video is its sampled `frames/`: once a media item has frames, its full `video/` objects older than `garage.media_downsample_after_d` (default 30 d, `media::DEFAULT_AFTER_DAYS`) are deleted; items without frames keep their video, as does any object of unknown age. Audio and transcripts are kept forever. `media::plan(listing, now, after)` is pure; `media::downsample(store, now, after, dry_run)` lists `fa-media`, deletes and reports (`DownsampleReport`). control-api runs it on the genome-GC cadence (`maintenance.rs`, weekly).
 
 ## Owns
 Content-addressed blob keys and snapshot layout.
