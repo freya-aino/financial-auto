@@ -24,7 +24,7 @@ use crate::state::AppState;
 
 /// Route modules in install order (later modules win on a duplicate method + path, like the
 /// `install`ed routers that layer in front of `routes.rs`).
-pub const SOURCES: [(&str, &str); 21] = [
+pub const SOURCES: [(&str, &str); 23] = [
     ("routes", include_str!("routes.rs")),
     ("graph", include_str!("graph_routes.rs")),
     ("mcmc", include_str!("mcmc_routes.rs")),
@@ -41,6 +41,8 @@ pub const SOURCES: [(&str, &str); 21] = [
     ("ops", include_str!("ops_routes.rs")),
     ("metrics", include_str!("metrics_routes.rs")),
     ("accounting", include_str!("accounting_routes.rs")),
+    ("infra", include_str!("infra_routes.rs")),
+    ("dlq", include_str!("dlq_routes.rs")),
     ("openapi", include_str!("openapi.rs")),
     ("ledger", include_str!("ledger_routes.rs")),
     ("services", include_str!("services_routes.rs")),

@@ -9,9 +9,11 @@ mod bus_tap;
 mod config_routes;
 mod console_routes;
 mod decoder_store;
+mod dlq_routes;
 mod docker;
 mod evolution_routes;
 mod graph_routes;
+mod infra_routes;
 mod latent_routes;
 mod ledger_routes;
 mod live;
@@ -118,7 +120,9 @@ async fn app(state: state::AppState, frontend: Option<PathBuf>) -> axum::Router 
         .merge(console_routes::router().with_state(state.clone())) // decoders, pipeline, halts/re-arm, risk events, refdata reads
         .merge(ops_routes::router().with_state(state.clone())) // ops schema: job history, config snapshots (spec 20 §5.4)
         .merge(metrics_routes::router().with_state(state.clone())) // VictoriaMetrics query passthrough with limits (spec 50 §5)
-        .merge(accounting_routes::router().with_state(state.clone())); // organisational books (D-104)
+        .merge(accounting_routes::router().with_state(state.clone())) // organisational books (D-104)
+        .merge(infra_routes::router().with_state(state.clone())) // store usage, maintenance runs, backup status (spec 51 round 9)
+        .merge(dlq_routes::router().with_state(state.clone())); // DLQ browser over JetStream (spec 51 round 9)
     let app = ledger_routes::install(state.clone(), app).await; // Postgres pool + paper-book seed + ledger routes (D-047)
     let app = services_routes::install(state.clone(), app); // start/stop/restart via the Docker socket (D-060)
     let app = trading_routes::install(state.clone(), app); // strategy lifecycle + limits via ctl.risk.* (D-051)

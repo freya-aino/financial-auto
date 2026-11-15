@@ -615,6 +615,122 @@
         "x-handler": "bins/control-api/src/console_routes.rs::decoder_action"
       }
     },
+    "/api/dlq": {
+      "get": {
+        "operationId": "dlq_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "recent dead letters, newest first: stream seq, original stream/subject, reason, age, size, payload preview (first 256 bytes, lossy flag)",
+        "tags": [
+          "dlq"
+        ],
+        "x-handler": "bins/control-api/src/dlq_routes.rs::list"
+      }
+    },
+    "/api/dlq/purge": {
+      "post": {
+        "operationId": "dlq_purge",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "{\"confirm\": true, \"subject\"?} → purge the DLQ stream (optionally filtered); 428 without confirm; audited dlq.purge",
+        "tags": [
+          "dlq"
+        ],
+        "x-handler": "bins/control-api/src/dlq_routes.rs::purge"
+      }
+    },
+    "/api/dlq/replay": {
+      "post": {
+        "operationId": "dlq_replay",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "{\"seq\": n} → republish that payload to its original subject and delete it from the DLQ stream; audited dlq.replay",
+        "tags": [
+          "dlq"
+        ],
+        "x-handler": "bins/control-api/src/dlq_routes.rs::replay"
+      }
+    },
     "/api/evolution/generations": {
       "get": {
         "operationId": "routes_generations",
@@ -1385,6 +1501,102 @@
           "routes"
         ],
         "x-handler": "bins/control-api/src/routes.rs::health"
+      }
+    },
+    "/api/infra/backup": {
+      "get": {
+        "operationId": "infra_backup",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "current fa_backup_* / fa_wal_archive_* / fa_restore_drill_* values from VictoriaMetrics, shaped as backup / WAL / drill cards with ages",
+        "tags": [
+          "infra"
+        ],
+        "x-handler": "bins/control-api/src/infra_routes.rs::backup"
+      }
+    },
+    "/api/infra/maintenance": {
+      "get": {
+        "operationId": "infra_maintenance",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "latest audit.log row per maintenance action (ops.vm_retention, ops.genome_gc, ops.media_downsample, ops.accounting_close)",
+        "tags": [
+          "infra"
+        ],
+        "x-handler": "bins/control-api/src/infra_routes.rs::maintenance"
+      }
+    },
+    "/api/infra/stores": {
+      "get": {
+        "operationId": "infra_stores",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "per-store usage (postgres size + connections, VictoriaMetrics bytes/series vs FA_VM_DISK_BUDGET_GIB, Garage buckets, Qdrant collections, Helix node/edge counts), each probed concurrently with a 5 s timeout; a down store reports {\"error\": …}",
+        "tags": [
+          "infra"
+        ],
+        "x-handler": "bins/control-api/src/infra_routes.rs::stores"
       }
     },
     "/api/ingest/{source}/{action}": {
