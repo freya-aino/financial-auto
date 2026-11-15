@@ -1,6 +1,7 @@
 <script lang="ts">
 	// Realised P&L from persisted fills (`GET /api/trading/pnl?range=&strategy=`, D-047).
 	import { onMount } from 'svelte';
+	import Info from './Info.svelte';
 	import { eur, live, short, type PnlView } from './api';
 	import { loadPref, savePref } from './prefs';
 	import { runtime } from './runtime.svelte';
@@ -45,7 +46,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>P&amp;L</h2>
+		<h2>P&amp;L<Info k="trading.pnlRange" /></h2>
 		<div class="pickers">
 			<select bind:value={range}>{#each ['1h', '6h', '1d', '7d', '30d', 'all'] as r}<option value={r}>{r}</option>{/each}</select>
 			<select bind:value={strategy}>

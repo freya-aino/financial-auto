@@ -5,6 +5,7 @@
 	import { onMount } from 'svelte';
 	import { accountingApi, closeConfirmText, closeDayBody, groupByKind, segmentFunds, trialBalanceOk, yesterdayUtc, type BalancesView, type CloseReport, type JournalEntry } from '../../../lib/accounting';
 	import Empty from '../../../lib/Empty.svelte';
+	import Info from '../../../lib/Info.svelte';
 	import ViewHeader from '../../../lib/ViewHeader.svelte';
 	import { eur, num, poll, short } from '../../../lib/api';
 	import { consoleApi, errText, type PnlBreakdown, type PnlParts } from '../../../lib/console';
@@ -224,7 +225,7 @@
 
 <div class="grid cols">
 	<section class="panel">
-		<div class="panel-head"><h2>P&amp;L breakdown <span class="dim">({book})</span></h2><span class="dim">EUR · FX split into realised / unrealised / cash</span></div>
+		<div class="panel-head"><h2>P&amp;L breakdown <span class="dim">({book})</span><Info k="trading.pnlBreakdown" /></h2><span class="dim">EUR · FX split into realised / unrealised / cash</span></div>
 		{#if pnlError}<p class="badge danger">{pnlError}</p>{/if}
 		{#if pnl}
 			<table class="parts">
@@ -245,7 +246,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Per strategy <span class="dim">({strategies.length})</span></h2></div>
+		<div class="panel-head"><h2>Per strategy <span class="dim">({strategies.length})</span><Info k="trading.pnlPerStrategy" /></h2></div>
 		{#if strategies.length}
 			<div class="scroll tall">
 				<table>
@@ -270,7 +271,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Tax lots <span class="dim">({lots.length})</span></h2><span class="dim">FIFO, open lots now</span></div>
+		<div class="panel-head"><h2>Tax lots <span class="dim">({lots.length})</span><Info k="trading.lots" /></h2><span class="dim">FIFO, open lots now</span></div>
 		{#if lotsError}<p class="badge danger">{lotsError}</p>{/if}
 		{#if lots.length}
 			<div class="scroll tall">
@@ -299,7 +300,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Statement</h2><span class="dim">{String(statement?.method ?? '')}</span></div>
+		<div class="panel-head"><h2>Statement<Info k="trading.statement" /></h2><span class="dim">{String(statement?.method ?? '')}</span></div>
 		{#if statementError}<p class="badge danger">{statementError}</p>{/if}
 		{#if statement}
 			<table>
@@ -317,7 +318,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Orphan fills <span class="dim">({orphans.length} open)</span></h2></div>
+		<div class="panel-head"><h2>Orphan fills <span class="dim">({orphans.length} open)</span><Info k="trading.orphans" /></h2></div>
 		{#if orphansError}<p class="badge danger">{orphansError}</p>{/if}
 		{#if actionMsg}<p class="badge" class:ok={actionOk} class:danger={!actionOk}>{actionMsg}</p>{/if}
 		{#if orphanRows.length}
@@ -347,7 +348,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Book a payout <span class="dim">(book {book})</span></h2></div>
+		<div class="panel-head"><h2>Book a payout <span class="dim">(book {book})</span><Info k="trading.payout" /></h2></div>
 		<div class="toolbar">
 			<label>day <input type="date" bind:value={payoutDay} /></label>
 			<label>amount EUR <input inputmode="decimal" placeholder="0.00" bind:value={payoutAmount} /></label>
@@ -357,7 +358,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Organisational books <span class="dim">(D-104)</span></h2><span class="dim">double-entry above the trading book · EUR</span></div>
+		<div class="panel-head"><h2>Organisational books <span class="dim">(D-104)</span><Info k="trading.orgBooks" /></h2><span class="dim">double-entry above the trading book · EUR</span></div>
 		{#if acctError}<p class="badge danger">{acctError}</p>{/if}
 		{#if acct}
 			<table class="funds">
@@ -390,7 +391,7 @@
 
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Journal <span class="dim">({journal.length} of {journalCount})</span></h2>
+			<h2>Journal <span class="dim">({journal.length} of {journalCount})</span><Info k="trading.journal" /></h2>
 			<label class="dim">limit <select bind:value={journalLimit} onchange={() => void loadJournal()}>{#each [20, 100, 500] as n (n)}<option value={n}>{n}</option>{/each}</select></label>
 		</div>
 		{#if journalError}<p class="badge danger">{journalError}</p>{/if}
@@ -419,7 +420,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Close day <span class="dim">(accounting)</span></h2><span class="dim">POST /api/accounting/close · idempotent</span></div>
+		<div class="panel-head"><h2>Close day <span class="dim">(accounting)</span><Info k="trading.closeDay" /></h2><span class="dim">POST /api/accounting/close · idempotent</span></div>
 		<div class="toolbar">
 			<label>day (UTC) <input type="date" bind:value={closeDay} /></label>
 			<button disabled={closeBusy || !closeDay} onclick={closeTheDay}>close day…</button>
@@ -440,7 +441,7 @@
 	</section>
 
 	<section class="panel wide">
-		<div class="panel-head"><h2>FX restatement <span class="dim">(book {book})</span></h2><span class="dim">POST /api/trading/restatements/fx · dry run first</span></div>
+		<div class="panel-head"><h2>FX restatement <span class="dim">(book {book})</span><Info k="trading.fxRestatement" /></h2><span class="dim">POST /api/trading/restatements/fx · dry run first</span></div>
 		<form class="toolbar" onsubmit={(e) => (e.preventDefault(), restateDryRun())}>
 			<label>instrument <input class="mono" bind:value={rs.instrument} placeholder="UUID" size="36" /></label>
 			<label title="target currency; default the instrument's quote_ccy">to ccy <input bind:value={rs.ccy} placeholder="quote" size="4" /></label>

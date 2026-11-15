@@ -5,6 +5,7 @@
 	// actions, rejections, managed live set); locked holdouts; the paper allocator tournament.
 	import { onMount } from 'svelte';
 	import Empty from '../../../lib/Empty.svelte';
+	import Info from '../../../lib/Info.svelte';
 	import Validation from '../../../lib/Validation.svelte';
 	import ViewHeader from '../../../lib/ViewHeader.svelte';
 	import { live, num, pct, poll, type StrategiesView } from '../../../lib/api';
@@ -97,6 +98,7 @@
 		{#if i < PIPELINE_STAGES.length - 1}<span class="dim arrow">→</span>{/if}
 	{/each}
 	{#if counts.paused}<span class="badge">paused · {counts.paused}</span>{/if}
+	<Info k="trading.lifecycle" />
 	<span class="spacer"></span>
 	{#if status}
 		<span class="dim mono" title="last round">round {since(ms(status.at_ms), now)} ago · {status.took_ms ?? '—'} ms · {status.enabled ? 'enabled' : 'DISABLED'}</span>
@@ -108,7 +110,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Evolved strategies <span class="dim">({evolved.length}{showAll ? ` of ${rows.length}` : ''})</span></h2>
+		<h2>Evolved strategies <span class="dim">({evolved.length}{showAll ? ` of ${rows.length}` : ''})</span><Info k="trading.pipelineStrategies" /></h2>
 		<label class="dim"><input type="checkbox" bind:checked={showAll} /> include hand-written baselines</label>
 	</div>
 	{#if strategiesError}<p class="badge danger">{strategiesError}</p>{/if}
@@ -163,9 +165,9 @@
 
 <div class="grid cols">
 	<section class="panel">
-		<div class="panel-head"><h2>Last round</h2></div>
+		<div class="panel-head"><h2>Last round<Info k="trading.pipelineRound" /></h2></div>
 		{#if status}
-			<h3 class="sub">Holdouts per timescale</h3>
+			<h3 class="sub">Holdouts per timescale<Info k="trading.holdouts" /></h3>
 			<table>
 				<thead><tr><th>timescale</th><th>state</th><th>window</th></tr></thead>
 				<tbody>
@@ -192,7 +194,7 @@
 				<h3 class="sub">Managed live set</h3>
 				<p class="mono small">{liveSet.key} · {liveSet.evolved ?? 0} evolved · {liveSet.written ? 'written' : liveSet.unchanged ? 'unchanged' : (liveSet.reason ?? 'not written')} · strategy-runtime {status.runtime_reachable ? 'reachable' : 'unreachable'}</p>
 			{/if}
-			<h3 class="sub">Policy</h3>
+			<h3 class="sub">Policy<Info k="trading.dsrPbo" /></h3>
 			<div class="policy">
 				{#each Object.entries(policy) as [k, v]}<span class="badge mono">{k} = {String(v)}</span>{/each}
 			</div>
@@ -202,7 +204,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Rejected candidates <span class="dim">({rejected.length}, newest first)</span></h2></div>
+		<div class="panel-head"><h2>Rejected candidates <span class="dim">({rejected.length}, newest first)</span><Info k="trading.rejected" /></h2></div>
 		{#if rejected.length}
 			<div class="scroll tall">
 				<table>
@@ -225,7 +227,7 @@
 
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Allocator tournament</h2>
+			<h2>Allocator tournament<Info k="trading.tournament" /></h2>
 			{#if tournament}<span class="dim">serving <b class="mono">{tournament.active ?? '—'}</b> · cost {tournament.cost_bps} bps</span>{/if}
 		</div>
 		{#if tournamentError}<p class="badge danger">{tournamentError}</p>{/if}

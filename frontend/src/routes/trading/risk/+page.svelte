@@ -5,6 +5,7 @@
 	// RiskEvent feed: audit.log history plus the live risk.event / risk.halt / risk.resume tail.
 	import { onMount } from 'svelte';
 	import Empty from '../../../lib/Empty.svelte';
+	import Info from '../../../lib/Info.svelte';
 	import KillSwitch from '../../../lib/KillSwitch.svelte';
 	import ViewHeader from '../../../lib/ViewHeader.svelte';
 	import { live, poll, type RiskView } from '../../../lib/api';
@@ -94,21 +95,21 @@
 
 <div class="killbar panel">
 	<KillSwitch {risk} onchanged={refreshHalts} />
-	<span class="dim">The kill switch halts the portfolio. Every other scope is raised by risk-engine itself (daily loss, feeds, model health, broker reconciliation, stale FX) and is re-armed here.</span>
+	<span class="dim">The kill switch halts the portfolio. Every other scope is raised by risk-engine itself (daily loss, feeds, model health, broker reconciliation, stale FX) and is re-armed here.</span><Info k="trading.killVsHalts" />
 	{#if msg}<span class="badge" class:ok class:danger={!ok}>{msg}</span>{/if}
 </div>
 
 <div class="grid cols">
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Halts <span class="dim">({halts?.halts.length ?? 0})</span></h2>
+			<h2>Halts <span class="dim">({halts?.halts.length ?? 0})</span><Info k="trading.haltsPanel" /></h2>
 			{#if halts?.persisted}<span class="dim mono" title="ledger.risk_state ({halts.persisted.book})">persisted {since(halts.persisted.updated_at, now)} ago</span>{/if}
 		</div>
 		{#if haltsError}<p class="badge danger">{haltsError}</p>{/if}
 		{#if halts && !halts.postgres}<p class="badge warn">Postgres unavailable: only halts seen on the bus since control-api start are listed.</p>{/if}
 		{#if halts?.halts.length}
 			<table>
-				<thead><tr><th>scope</th><th>reason</th><th>since</th><th>source</th><th></th></tr></thead>
+				<thead><tr><th>scope</th><th>reason</th><th>since</th><th>source</th><th><Info k="trading.rearm" /></th></tr></thead>
 				<tbody>
 					{#each halts.halts as h (h.scope)}
 						<tr>
@@ -140,7 +141,7 @@
 
 	<section class="panel wide">
 		<div class="panel-head">
-			<h2>Risk events <span class="dim">({shownEvents.length})</span></h2>
+			<h2>Risk events <span class="dim">({shownEvents.length})</span><Info k="trading.riskEvents" /></h2>
 			<div class="ctl">
 				<select bind:value={windowSpec} onchange={refreshEvents} aria-label="window">
 					{#each ['1h', '6h', '24h', '7d'] as w}<option value={w}>{w}</option>{/each}

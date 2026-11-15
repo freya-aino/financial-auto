@@ -1,6 +1,7 @@
 <script lang="ts">
 	// Strategies table (spec 51 §6.5, D-051): lifecycle status, sleeve, weight, drawdown, shadow
 	// progress, gate checklist with missing items, latest signal; pause/resume/flatten/promote/shadow.
+	import Info from './Info.svelte';
 	import { ago, eur, live, pct, short, type StrategiesView, type StrategyAction, type StrategyView } from './api';
 
 	interface Props {
@@ -64,7 +65,7 @@
 
 <section class="panel strategies">
 	<div class="panel-head">
-		<h2>Strategies <span class="dim">({view?.count ?? 0})</span></h2>
+		<h2>Strategies <span class="dim">({view?.count ?? 0})</span><Info k="trading.strategies" /></h2>
 		<span class="dim">
 			GET /api/trading/strategies · source {view?.source ?? '—'}
 			{#if view}· {Object.entries(view.status_counts).map(([k, v]) => `${v} ${k}`).join(', ')}{/if}
@@ -76,7 +77,7 @@
 		<div class="scroll tall">
 			<table>
 				<thead>
-					<tr><th>strategy</th><th>status</th><th>sleeve</th><th>weight</th><th>P&amp;L</th><th>drawdown</th><th>shadow</th><th>gate</th><th>last signal</th><th>mean |exposure|</th><th>actions</th></tr>
+					<tr><th>strategy</th><th>status<Info k="trading.lifecycle" /></th><th>sleeve<Info k="trading.sleeve" /></th><th>weight</th><th>P&amp;L</th><th>drawdown<Info k="trading.strategyDrawdown" /></th><th>shadow</th><th>gate</th><th>last signal</th><th>mean |exposure|</th><th>actions</th></tr>
 				</thead>
 				<tbody>
 					{#each view.strategies as s (s.strategy_id)}

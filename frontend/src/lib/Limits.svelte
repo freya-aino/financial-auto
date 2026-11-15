@@ -2,6 +2,7 @@
 	// Risk limits (spec 40 §6.5, D-051): GET/PUT /api/trading/limits, tighten-only. Loosening
 	// fields are flagged before sending; a 422 `loosen:` reply is shown inline.
 	import { onMount } from 'svelte';
+	import Info from './Info.svelte';
 	import { live, type Limits } from './api';
 	import { diffLimits, limitsBody, loosening, parseLoosenError } from './limits';
 	import { runtime } from './runtime.svelte';
@@ -71,7 +72,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Risk limits</h2>
+		<h2>Risk limits<Info k="trading.limits" /></h2>
 		<span class="dim">{note || 'PUT /api/trading/limits may only tighten'}</span>
 	</div>
 	{#if error}<p class="badge danger">{error}</p>{/if}

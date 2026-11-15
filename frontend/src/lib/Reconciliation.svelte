@@ -1,6 +1,7 @@
 <script lang="ts">
 	// Reconciliation runs (`GET /api/trading/reconciliation`, D-047/D-051): memory book vs Postgres.
 	import { onMount } from 'svelte';
+	import Info from './Info.svelte';
 	import { ago, eur, live, short, type ReconciliationRun } from './api';
 	import { runtime } from './runtime.svelte';
 
@@ -36,7 +37,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Reconciliation</h2>
+		<h2>Reconciliation<Info k="trading.reconciliation" /></h2>
 		{#if latest}<span class="badge" class:ok={latest === 'ok'} class:danger={latest === 'diff'}>latest {latest}</span>{:else}<span class="dim">no runs</span>{/if}
 	</div>
 	{#if error}<p class="badge danger">{error}</p>{/if}

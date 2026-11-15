@@ -4,6 +4,7 @@
 	// Sharpe with its backtest. Each mutation: validate → confirm → show the API's answer.
 	import { onMount } from 'svelte';
 	import Empty from '../../../lib/Empty.svelte';
+	import Info from '../../../lib/Info.svelte';
 	import Validation from '../../../lib/Validation.svelte';
 	import ViewHeader from '../../../lib/ViewHeader.svelte';
 	import { live, num, short, type Holdout, type StrategyView } from '../../../lib/api';
@@ -108,7 +109,7 @@
 
 <div class="grid cols">
 	<section class="panel wide">
-		<div class="panel-head"><h2>Locked holdouts <span class="dim">({holdouts.length})</span></h2><span class="dim">immutable once locked</span></div>
+		<div class="panel-head"><h2>Locked holdouts <span class="dim">({holdouts.length})</span><Info k="trading.holdouts" /></h2><span class="dim">immutable once locked</span></div>
 		{#if holdoutError}<p class="badge danger">{holdoutError}</p>{/if}
 		{#if holdouts.length}
 			<div class="tablewrap">
@@ -143,7 +144,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Evaluate on a holdout</h2><span class="dim">one evo.eval.strategy.holdout job</span></div>
+		<div class="panel-head"><h2>Evaluate on a holdout<Info k="trading.holdoutEvaluate" /></h2><span class="dim">one evo.eval.strategy.holdout job</span></div>
 		<form class="form" onsubmit={evaluate}>
 			<label class="wide">holdout
 				<select bind:value={eHoldout}>
@@ -163,7 +164,7 @@
 	</section>
 
 	<section class="panel wide">
-		<div class="panel-head"><h2>Shadow vs backtest</h2><span class="dim">realised shadow Sharpe (fill-marked) ÷ latest backtest Sharpe</span></div>
+		<div class="panel-head"><h2>Shadow vs backtest<Info k="trading.shadowConsistency" /></h2><span class="dim">realised shadow Sharpe (fill-marked) ÷ latest backtest Sharpe</span></div>
 		<form class="controls" onsubmit={loadShadow}>
 			<input class="mono" list="shadow-strategies" bind:value={sStrategy} placeholder="strategy id" size="36" aria-label="strategy" />
 			<datalist id="shadow-strategies">{#each shadowStrategies as s}<option value={s.strategy_id}>{s.status}</option>{/each}</datalist>

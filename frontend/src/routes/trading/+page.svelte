@@ -4,6 +4,7 @@
 	import { onMount, untrack } from 'svelte';
 	import Empty from '../../lib/Empty.svelte';
 	import Gauge from '../../lib/Gauge.svelte';
+	import Info from '../../lib/Info.svelte';
 	import KillSwitch from '../../lib/KillSwitch.svelte';
 	import Limits from '../../lib/Limits.svelte';
 	import Pnl from '../../lib/Pnl.svelte';
@@ -283,8 +284,8 @@
 </div>
 
 <div class="tiles">
-	<div class="panel"><span class="dim">equity · {figuresSource}</span><b class="mono">{eur(figures?.equity_eur)}</b></div>
-	<div class="panel"><span class="dim">deployable (net of payout quota)</span><b class="mono">{eur(figures?.deployable_eur)}</b></div>
+	<div class="panel"><span class="dim">equity · {figuresSource}<Info k="trading.equity" /></span><b class="mono">{eur(figures?.equity_eur)}</b></div>
+	<div class="panel"><span class="dim">deployable (net of payout quota)<Info k="trading.deployable" /></span><b class="mono">{eur(figures?.deployable_eur)}</b></div>
 	<div class="panel"><span class="dim">gross exposure</span><b class="mono">{eur(figures?.gross_exposure_eur)}</b></div>
 	<div class="panel"><span class="dim">drawdown{limits ? ` · cap ${pct(limits.max_drawdown, 0)}` : ''}</span><b class="mono" class:neg={(figures?.drawdown ?? 0) > (limits?.max_drawdown ?? 0.1) * 0.5}>{pct(figures?.drawdown)}</b></div>
 	<div class="panel">
@@ -296,17 +297,17 @@
 
 <div class="grid charts">
 	<section class="panel">
-		<div class="panel-head"><h2>Equity & P&L</h2><span class="dim">{figuresSource}, {tradingWs.live ? 'from risk frames' : 'sampled by polling'} · {samples.length} pts</span></div>
+		<div class="panel-head"><h2>Equity & P&L<Info k="trading.equityChart" /></h2><span class="dim">{figuresSource}, {tradingWs.live ? 'from risk frames' : 'sampled by polling'} · {samples.length} pts</span></div>
 		<Sparkline {times} values={samples.map((s) => s.equity)} format={eur} label="equity" fill />
 		<Sparkline {times} values={samples.map((s) => s.pnl)} format={eur} baseline={0} tone="signed" label={risk?.reported ? 'daily P&L' : 'P&L since start'} />
 	</section>
 	<section class="panel">
-		<div class="panel-head"><h2>Drawdown</h2><span class="dim">reported · peak-to-trough from sampled equity</span></div>
+		<div class="panel-head"><h2>Drawdown<Info k="trading.drawdown" /></h2><span class="dim">reported · peak-to-trough from sampled equity</span></div>
 		<Sparkline {times} values={samples.map((s) => s.drawdown)} format={fmtPct} tone="danger" label="drawdown (reported)" fill />
 		<Sparkline {times} values={drawdowns} format={fmtPct} tone="danger" label="drawdown (client, from equity samples)" />
 	</section>
 	<section class="panel">
-		<div class="panel-head"><h2>Exposure vs caps</h2><span class="dim">{limits ? 'caps from GET /api/trading/limits' : 'caps not loaded'}</span></div>
+		<div class="panel-head"><h2>Exposure vs caps<Info k="trading.exposureCaps" /></h2><span class="dim">{limits ? 'caps from GET /api/trading/limits' : 'caps not loaded'}</span></div>
 		{#if figures}
 			<div class="gauges">
 				<Gauge label="gross exposure" value={figures.gross_exposure_eur} cap={limits?.portfolio_gross_cap ? limits.portfolio_gross_cap * figures.equity_eur : null} reference={figures.equity_eur} format={eur} />
@@ -354,7 +355,7 @@
 	<Reconciliation {now} version={fillVersion} />
 
 	<section class="panel">
-		<div class="panel-head"><h2>Positions</h2><span class="dim">paper book, EUR{tradingWs.live ? ' · positions frames' : ' · polled'}</span></div>
+		<div class="panel-head"><h2>Positions<Info k="trading.positions" /></h2><span class="dim">paper book, EUR{tradingWs.live ? ' · positions frames' : ' · polled'}</span></div>
 		{#if positions.length}
 			<table>
 				<thead><tr><th>instrument</th><th>qty</th><th>avg cost</th><th>mark</th><th>value</th><th>unrealised</th><th>realised</th></tr></thead>
@@ -378,7 +379,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Manual paper order</h2><span class="dim">order.intent.paper → risk-engine → broker-gateway (D-051)</span></div>
+		<div class="panel-head"><h2>Manual paper order<Info k="trading.ticket" /></h2><span class="dim">order.intent.paper → risk-engine → broker-gateway (D-051)</span></div>
 		<form class="ticket" onsubmit={submitOrder}>
 			<label class="wide">instrument
 				<input list="instruments" bind:value={oInst} placeholder="instrument UUID" />
@@ -413,7 +414,7 @@
 				{/if}
 			</div>
 		</form>
-		<h3 class="sub">Active halts <span class="dim">({risk?.halts.length ?? 0}; scopes portfolio · daily_loss · strategy:&lt;id&gt; · source:&lt;id&gt; · broker)</span></h3>
+		<h3 class="sub">Active halts<Info k="trading.haltScopes" /> <span class="dim">({risk?.halts.length ?? 0}; scopes portfolio · daily_loss · strategy:&lt;id&gt; · source:&lt;id&gt; · broker)</span></h3>
 		{#if risk?.halts.length}
 			<table>
 				<thead><tr><th>scope</th><th>reason</th><th>since</th><th>manual</th></tr></thead>
@@ -435,7 +436,7 @@
 
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Orders & fills</h2>
+			<h2>Orders & fills<Info k="trading.orders" /></h2>
 			<span class="dim">{tradingWs.live ? 'order.<intent> frames' : 'polled'}{resting.length ? ` · ${resting.length} resting/open` : ''}</span>
 		</div>
 		{#if orders.length}
@@ -473,7 +474,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Strategy signals</h2><span class="dim">target exposure, mean ± σ in [−1, 1]</span></div>
+		<div class="panel-head"><h2>Strategy signals<Info k="trading.signals" /></h2><span class="dim">target exposure, mean ± σ in [−1, 1]</span></div>
 		{#if signals.length}
 			<div class="scroll tall">
 				{#each signals as s (s.strategy_id)}
