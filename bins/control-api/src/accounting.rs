@@ -85,7 +85,8 @@ async fn opex_items(
     }
     if cfg.gpu_eur_per_hour > 0.0 {
         let ms: i64 = sqlx::query(
-            "SELECT COALESCE(SUM(used_gpu_ms), 0) FROM ops.job_run WHERE finished_at >= $1 AND finished_at < $2",
+            // SUM(bigint) is NUMERIC in Postgres: cast back so it decodes as i64
+            "SELECT COALESCE(SUM(used_gpu_ms), 0)::bigint FROM ops.job_run WHERE finished_at >= $1 AND finished_at < $2",
         )
         .bind(from)
         .bind(to)
