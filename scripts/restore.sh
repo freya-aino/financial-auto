@@ -145,7 +145,7 @@ fi
 
 # 3b. Qdrant: upload each collection snapshot (replaces the collection; ADR 0010).
 if want qdrant && [ -d "$SRC/qdrant" ]; then
-    Q=${FA_QDRANT_HOST_URL:-http://127.0.0.1:6333}
+    Q=${FA_QDRANT_HOST_URL:-http://127.0.0.1:16333}
     for f in "$SRC"/qdrant/*.snapshot; do
         [ -e "$f" ] || continue
         c=$(basename "$f" .snapshot)

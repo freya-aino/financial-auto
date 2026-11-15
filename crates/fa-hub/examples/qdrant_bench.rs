@@ -109,7 +109,11 @@ async fn main() {
         }
     }
     assert!(!url.is_empty(), "--url required (scratch qdrant)");
-    assert!(!url.contains(":6333") || url.contains("fa-bench"), "only a fa-bench-* scratch qdrant");
+    // :6333 is the container port, :16333 the main stack's host port (D-109)
+    assert!(
+        !(url.contains(":6333") || url.contains(":16333")) || url.contains("fa-bench"),
+        "only a fa-bench-* scratch qdrant"
+    );
     sizes.sort_unstable();
     let per_space = layout == "per-space";
     let q = Q { http: reqwest::Client::builder().timeout(Duration::from_secs(600)).build().expect("client"), url };

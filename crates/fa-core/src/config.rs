@@ -92,7 +92,7 @@ fn default_graph_backend() -> String {
 }
 
 fn default_qdrant_url() -> String {
-    "http://127.0.0.1:6333".into()
+    "http://127.0.0.1:16333".into()
 }
 
 fn default_vector_backend() -> String {

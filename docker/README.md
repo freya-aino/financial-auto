@@ -12,7 +12,7 @@ Everything runs through Docker Compose (D-034): `compose.yaml` at the repo root 
 | victoriametrics | `victoriametrics/victoria-metrics:v1.155.0` | 8428 | `curl localhost:8428/health` |
 | garage | `dxflrs/garage:v2.5.0` | S3 3900, admin 3903 | `docker compose exec garage /garage status` |
 | helix | `ghcr.io/helixdb/helixdb:v0.0.14` (data in `/var/lib/helix`) | 6969 → 8080 | `curl localhost:6969/healthz` |
-| qdrant | `qdrant/qdrant:v1.20.0` (vectors, ADR 0010 / D-101; data in `qdrant-data`) | 6333 | `curl localhost:6333/readyz` |
+| qdrant | `qdrant/qdrant:v1.20.0` (vectors, ADR 0010 / D-101; data in `qdrant-data`) | 16333 | `curl localhost:16333/readyz` |
 | vmalert | `victoriametrics/vmalert:v1.155.0` (rules `vm-alerts.yaml`) | 8880 | `curl localhost:8880/health` |
 | nats-exporter | `natsio/prometheus-nats-exporter:0.17.3` | — (7777 in compose) | scraped as job `nats` |
 | postgres-exporter | `quay.io/prometheuscommunity/postgres-exporter:v0.17.1` | — (9187 in compose) | scraped as job `postgres` |
@@ -53,7 +53,7 @@ just app-down                  # stops everything, keeps volumes
 - **Scaling workers:** `just app-scale-workers 4`, or `docker compose --profile app up -d --scale evo-worker=4`. Workers are stateless and pull jobs from a NATS work queue. For more machines later, point more `evo-worker` containers at the same NATS.
 - **Trainer:** a one-off CLI in the `tools` profile, not started by default. Run it with `just trainer pretrain --help` or `docker compose --profile tools run --rm trainer …`.
 - **GPU:** install `nvidia-container-toolkit`, then uncomment the `deploy.resources.reservations.devices` blocks on `model-runtime`, `evo-worker` and `trainer`. GPU time is still arbitrated by `evo-orchestrator` (D-006). The Rust image is CPU-only today: the ML crates run on candle's CPU backend and the `cuda` cargo feature is off (D-070); enabling CUDA needs `--features cuda` and a CUDA base / builder image. Untested: this machine has no GPU. Device selection: `FA_ML_DEVICE` (spec 60 §6.2).
-- **Qdrant:** the `qdrant` service holds latents, news and media embeddings (D-101; `[qdrant] vector_backend` in the platform tomls switches back to Helix), `http://qdrant:6333` inside compose and `127.0.0.1:6333` from the host; no shell tools in the image, so like helix no in-container healthcheck (`fa_dependency_up{dep="qdrant"}`, VictoriaMetrics scrapes its `/metrics`).
+- **Qdrant:** the `qdrant` service holds latents, news and media embeddings (D-101; `[qdrant] vector_backend` in the platform tomls switches back to Helix), `http://qdrant:6333` inside compose and `127.0.0.1:16333` from the host; no shell tools in the image, so like helix no in-container healthcheck (`fa_dependency_up{dep="qdrant"}`, VictoriaMetrics scrapes its `/metrics`).
 - **HelixDB:** the `helix` service, reached at `http://helix:8080` inside compose and `127.0.0.1:6969` from the host. The image is distroless, so it has no in-container healthcheck; `control-api` only waits for it to start and probes it every 15 s (`fa_dependency_up`).
 - **UI:** the `ui` service is the only thing serving the frontend in compose; the control-api container has no `frontend/build`, so `:7700` is API only. Run outside compose (`just cargo run -p control-api`), control-api still serves `frontend/build` when it exists.
 - **No parallel control-api:** don't run `just cargo run -p control-api` at the same time, because it also binds port 7700.

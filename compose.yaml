@@ -81,11 +81,11 @@ services:
     environment:
       QDRANT__TELEMETRY_DISABLED: "true"
     ports:
-      - "127.0.0.1:6333:6333" # REST (D-101); gRPC 6334 is not used
+      - "127.0.0.1:16333:6333" # REST; host 6333 belongs to another project on this machine (D-109). gRPC 6334 is not used
     volumes:
       - qdrant-data:/qdrant/storage
     # no shell tools in the image, so no in-container healthcheck (like helix);
-    # from the host: curl -fsS http://127.0.0.1:6333/readyz
+    # from the host: curl -fsS http://127.0.0.1:16333/readyz
     restart: unless-stopped
 
   victoriametrics:

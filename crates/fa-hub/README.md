@@ -248,7 +248,7 @@ cargo test -p fa-hub                                   # unit tests + tests/cove
 FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test live            # against `just up`'s helix
 FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test regions_live    # region lifecycle, lineage, kernels
 FA_HELIX_URL=http://127.0.0.1:6969 cargo test -p fa-hub --test versions_live   # event-time versions and as-of overlay
-FA_HELIX_URL=… FA_QDRANT_URL=http://127.0.0.1:6333 cargo test -p fa-hub --tests # same suites, vectors on Qdrant
+FA_HELIX_URL=… FA_QDRANT_URL=http://127.0.0.1:16333 cargo test -p fa-hub --tests # same suites, vectors on Qdrant
 DATABASE_URL=… FA_HELIX_URL=… cargo test -p fa-hub --test graph_conformance    # one GraphStore suite on both backends (D-108; Postgres needs migrations applied)
 ```
 Concurrent writers: `HubClient::batch` retries `409 transaction_conflict` (an aborted, uncommitted transaction) up to six times with a short backoff, so parallel writers and the parallel live suite do not fail spuriously.

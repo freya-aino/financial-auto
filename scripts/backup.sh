@@ -3,7 +3,7 @@
 #   postgres/fa.dump        pg_dump -Fc of database `fa` (ledger, warehouse, validation registry)
 #   postgres/globals.sql    roles (pg_dumpall --globals-only)
 #   helix/helix-data.tar.gz HelixDB data volume, taken while the helix service is stopped (~seconds)
-#   qdrant/<c>.snapshot     Qdrant collection snapshots via REST (FA_QDRANT_HOST_URL, default 127.0.0.1:6333)
+#   qdrant/<c>.snapshot     Qdrant collection snapshots via REST (FA_QDRANT_HOST_URL, default 127.0.0.1:16333)
 #   garage/<bucket>/        rclone copy of the critical buckets (fa-models fa-ckpt fa-artifacts fa-backup)
 #   nats/<stream>/          optional `nats stream backup` per JetStream stream (FA_BACKUP_NATS=1)
 #   manifest.json           versions, sizes, sha256 of every file
@@ -57,8 +57,8 @@ if ! skip helix; then
 fi
 
 # 2b. Qdrant (vectors, ADR 0010): one snapshot per collection through the REST API (no service stop).
-if ! skip qdrant && curl -fsS -o /dev/null "${FA_QDRANT_HOST_URL:-http://127.0.0.1:6333}/readyz" 2>/dev/null; then
-    Q=${FA_QDRANT_HOST_URL:-http://127.0.0.1:6333}
+if ! skip qdrant && curl -fsS -o /dev/null "${FA_QDRANT_HOST_URL:-http://127.0.0.1:16333}/readyz" 2>/dev/null; then
+    Q=${FA_QDRANT_HOST_URL:-http://127.0.0.1:16333}
     mkdir -p "$DEST/qdrant"
     for c in $(curl -fsS "$Q/collections" | tr '{},' '\n\n\n' | sed -n 's/.*"name":"\([^"]*\)".*/\1/p'); do
         log "qdrant: snapshot of collection $c"

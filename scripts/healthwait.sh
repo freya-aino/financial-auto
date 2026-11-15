@@ -27,7 +27,7 @@ wait_for "nats      :8222/healthz"   curl -fsS http://127.0.0.1:8222/healthz
 wait_for "garage    :3903/health"    curl -fsS http://127.0.0.1:3903/health
 wait_for "victoria  :8428/health"    curl -fsS http://127.0.0.1:8428/health
 wait_for "helix     :6969/healthz"   curl -fsS http://127.0.0.1:6969/healthz
-wait_for "qdrant    :6333/readyz"    curl -fsS http://127.0.0.1:6333/readyz
+wait_for "qdrant    :16333/readyz"    curl -fsS http://127.0.0.1:16333/readyz
 
 echo "step 2: migrations + control-api /api/health (nats connected, dependencies reachable)"
 health_ok() {

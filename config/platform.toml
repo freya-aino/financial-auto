@@ -9,7 +9,7 @@ url = "nats://127.0.0.1:4222"
 url = "http://127.0.0.1:6969"
 
 [qdrant] # vector store, ADR 0010 / D-101 (the graph stays in [helix])
-url = "http://127.0.0.1:6333"
+url = "http://127.0.0.1:16333"
 vector_backend = "qdrant" # or "helix" (pre-ADR-0010 HelixDB vector indexes)
 
 # Graph store (ADR 0010, D-108): the model-state graph (snapshots, regions, transitions,
