@@ -9,6 +9,7 @@
 	import GenomeDrawer from '../../lib/GenomeDrawer.svelte';
 	import Generations from '../../lib/Generations.svelte';
 	import Histogram from '../../lib/Histogram.svelte';
+	import Info from '../../lib/Info.svelte';
 	import Scatter from '../../lib/Scatter.svelte';
 	import Validation from '../../lib/Validation.svelte';
 	import ViewHeader from '../../lib/ViewHeader.svelte';
@@ -242,7 +243,7 @@
 
 <section class="panel gens">
 	<div class="panel-head">
-		<h2>Generations <span class="dim">({generations.length})</span></h2>
+		<h2>Generations <span class="dim">({generations.length})</span><Info k="evolution.generations" /></h2>
 		<span class="badge" class:ok={evolutionWs.live} class:warn={!evolutionWs.live} title="/ws/evolution · {evolutionWs.frames} frames · {evolutionWs.lagged} superseded">ws {evolutionWs.status}</span>
 	</div>
 	<Generations rows={generations} {frames} {populations} {now} onchanged={refreshJobs} onpick={(g) => (popId = populations.some((p) => p.id === g.id) ? g.id : popId)} />
@@ -251,7 +252,7 @@
 
 <div class="grid top">
 	<section class="panel">
-		<div class="panel-head"><h2>Start generation</h2><span class="dim">POST /api/evolution/generations → ctl.evo.start · successive halving (NSGA-II ranks)</span></div>
+		<div class="panel-head"><h2>Start generation<Info k="evolution.start" /></h2><span class="dim">POST /api/evolution/generations → ctl.evo.start · successive halving (NSGA-II ranks)</span></div>
 		<form onsubmit={startGeneration} class="form">
 			<label>kind
 				<select bind:value={gKind}>
@@ -265,7 +266,7 @@
 				{isStrategy ? 'strategies (one inline-TOML table per line)' : 'genomes (comma / whitespace separated)'} <span class="dim">{genomeList.length} parsed</span>
 				<textarea bind:value={gGenomes} rows="4" class="mono" placeholder={isStrategy ? '{ id = "gp-…", timescale = "1s", steps = 5, lookback_bars = 32, signal = "(neg (mul 400 analog_forecast))", uncertainty = "region_entropy" }' : 'retrieval:ts=1s;h=3;lb=8;levels=0.05/0.25/0.5/0.75/0.95;kernel=16;scale=1;shrink=0.5;k=10;tau=30;gap=5;metric=cos;lat=0.5'}></textarea>
 			</label>
-			<label>eta <input type="number" min="2" max="10" bind:value={gEta} /></label>
+			<label><span>eta<Info k="evolution.eta" /></span> <input type="number" min="2" max="10" bind:value={gEta} /></label>
 			<label>max generations <input type="number" min="1" max="100" bind:value={gMaxGenerations} /></label>
 			<label>min budget (ms) <input type="number" min="1000" step="1000" bind:value={gMinBudget} /></label>
 			<label>max budget (ms) <input type="number" min="1000" step="1000" bind:value={gMaxBudget} placeholder="orchestrator default" /></label>
@@ -281,7 +282,7 @@
 
 	<section class="panel">
 		<div class="panel-head">
-			<h2>GPU arbiter</h2>
+			<h2>GPU arbiter<Info k="evolution.gpu" /></h2>
 			{#if gpu?.available}<span class="badge ok">evo-orchestrator · {ago(gpu.last_seen, now)} ago</span>{:else}<span class="badge warn">unavailable</span>{/if}
 		</div>
 		{#if gpu?.available}
@@ -326,7 +327,7 @@
 <div class="grid two">
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Populations &amp; Pareto front</h2>
+			<h2>Populations &amp; Pareto front<Info k="evolution.pareto" /></h2>
 			<div class="pickers">
 				<select bind:value={popId} title="GET /api/evolution/populations (validation.trial per generation)">
 					<option value="">in-memory jobs ({scored.length} scored)</option>
@@ -389,7 +390,7 @@
 
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Recent jobs</h2>
+			<h2>Recent jobs<Info k="evolution.jobs" /></h2>
 			<select bind:value={kindFilter} onchange={refreshJobs}>
 				<option value="">all kinds</option>
 				{#each kinds as k}<option value={k}>{k}</option>{/each}
@@ -425,7 +426,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Strategy lifecycle <span class="dim">({evolved.length} evolved)</span></h2>
+		<h2>Strategy lifecycle <span class="dim">({evolved.length} evolved)</span><Info k="evolution.lifecycle" /></h2>
 		<a href="/trading/pipeline" class="dim">pipeline details, holdouts and round controls →</a>
 	</div>
 	<div class="stages">

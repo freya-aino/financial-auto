@@ -2,6 +2,7 @@
 	// Genome inspector (spec 51 §6.4): `GET /api/evolution/genomes/{id}` + `/outputs`
 	// (presigned eval reports open in a new tab; decoder outputs via QuantileStrip / Histogram).
 	import Histogram from './Histogram.svelte';
+	import Info from './Info.svelte';
 	import LineageTree from './LineageTree.svelte';
 	import Modal from './Modal.svelte';
 	import QuantileStrip from './QuantileStrip.svelte';
@@ -75,7 +76,7 @@
 				{/if}
 			</section>
 			<section>
-				<h3>Fitness <span class="dim">({detail.fitness.length} records{detail.latest_objectives ? ' · latest job objectives below' : ''})</span></h3>
+				<h3>Fitness<Info k="evolution.fitness" /> <span class="dim">({detail.fitness.length} records{detail.latest_objectives ? ' · latest job objectives below' : ''})</span></h3>
 				{#if fitnessByGen.length}
 					<div class="scroll fit">
 						<table>

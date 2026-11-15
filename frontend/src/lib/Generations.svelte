@@ -1,6 +1,7 @@
 <script lang="ts">
 	// Generations table (spec 51 §6.4, D-049/D-052): REST list + `/ws/evolution` generation frames
 	// + registry statistics, with pause / resume / stop actions.
+	import Info from './Info.svelte';
 	import { ago, live, short, type GenerationFrame, type GenerationRow, type Population } from './api';
 	import { mergeGenerations, runActions, type GenerationTableRow } from './generations';
 
@@ -41,7 +42,7 @@
 <div class="scroll tall">
 	<table>
 		<thead>
-			<tr><th>generation</th><th>kind</th><th>status</th><th>loop</th><th>rung</th><th>candidates</th><th>front sizes</th><th>survivors / rung</th><th>deflated Sharpe</th><th>PBO</th><th>artifact</th><th>updated</th><th>actions</th></tr>
+			<tr><th>generation</th><th>kind</th><th>status</th><th>loop</th><th>rung<Info k="evolution.rung" /></th><th>candidates</th><th>front sizes</th><th>survivors / rung</th><th>deflated Sharpe<Info k="evolution.dsr" /></th><th>PBO<Info k="evolution.pbo" /></th><th>artifact</th><th>updated</th><th>actions</th></tr>
 		</thead>
 		<tbody>
 			{#each table as g (g.id)}

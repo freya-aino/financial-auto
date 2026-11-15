@@ -1,6 +1,7 @@
 <script lang="ts">
 	// Genome lineage tree (spec 51 §6.4): `GET /api/graph/lineage/{genome_id}` for the ancestry
 	// levels, parents of each ancestor from `GET /api/evolution/genomes/{id}` for the edges.
+	import Info from './Info.svelte';
 	import { getApi, errText } from './console';
 	import { live } from './api';
 	import { COL_W, layoutLineage, needParents, nodeLabel, parentIds, type LineageView } from './lineage';
@@ -57,7 +58,7 @@
 </script>
 
 <section class="lineage">
-	<h3>Lineage <span class="dim">GET /api/graph/lineage/{nodeLabel(genomeId)}{layout ? ` · ${layout.nodes.length - 1} ancestors over ${Math.max(0, ...layout.nodes.map((n) => n.depth))} generations` : ''}{pending ? ` · fetching parents (${pending} left)` : ''}</span></h3>
+	<h3>Lineage<Info k="evolution.genomeLineage" /> <span class="dim">GET /api/graph/lineage/{nodeLabel(genomeId)}{layout ? ` · ${layout.nodes.length - 1} ancestors over ${Math.max(0, ...layout.nodes.map((n) => n.depth))} generations` : ''}{pending ? ` · fetching parents (${pending} left)` : ''}</span></h3>
 	{#if error}<p class="badge warn">{error}</p>{/if}
 	{#if busy && !view}<p class="dim">loading…</p>{/if}
 	{#if layout && layout.nodes.length > 1}

@@ -2,6 +2,7 @@
 	// Graph Explorer (spec 50 §4.4, D-048): HelixDB neighbourhood around any business id and
 	// the whitelisted named-query catalog with a parameter form.
 	import { onMount } from 'svelte';
+	import Info from './Info.svelte';
 	import { ApiError, live, type GraphQueryDef, type Neighborhood } from './api';
 	import { loadPref, savePref } from './prefs';
 
@@ -107,7 +108,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Graph explorer</h2>
+		<h2>Graph explorer<Info k="latent.graphExplorer" /></h2>
 		<span class="dim">HelixDB · GET /api/graph/neighborhood · POST /api/graph/query (named catalog only)</span>
 	</div>
 	<form class="row" onsubmit={explore}>

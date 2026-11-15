@@ -4,6 +4,7 @@
 	// in the region and the decoder outputs (forecast quantiles, retrieved analogs, refs) of that
 	// instrument, snapshot and timescale inside the episode window.
 	import Empty from './Empty.svelte';
+	import Info from './Info.svelte';
 	import QuantileStrip from './QuantileStrip.svelte';
 	import Sparkline from './Sparkline.svelte';
 	import { live, short, type RegionReconstructions } from './api';
@@ -51,7 +52,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Region detail <code>{regionId}</code></h2>
+		<h2>Region detail <code>{regionId}</code><Info k="latent.regionDetail" /></h2>
 		<div class="controls">
 			<label>episodes
 				<select bind:value={limit}>{#each LIMITS as k}<option value={k}>{k}</option>{/each}</select>

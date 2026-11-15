@@ -7,6 +7,7 @@
 	// match); region occupancy over time from the fetched sample.
 	import { onMount, untrack } from 'svelte';
 	import Empty from './Empty.svelte';
+	import Info from './Info.svelte';
 	import PointCloud from './PointCloud.svelte';
 	import Sparkline from './Sparkline.svelte';
 	import { live, short, type LatentStateView, type ProjectionView } from './api';
@@ -220,7 +221,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Projection</h2>
+		<h2>Projection<Info k="latent.projection" /></h2>
 		<div class="controls">
 			<label>expert
 				<select bind:value={expert}>{#each experts as e}<option value={e}>E{e}</option>{/each}</select>

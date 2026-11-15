@@ -5,6 +5,7 @@
 	// Operator control goes through control-api → ctl.decoders.* (confirmed, audited).
 	import { onMount } from 'svelte';
 	import Empty from '../../../lib/Empty.svelte';
+	import Info from '../../../lib/Info.svelte';
 	import ViewHeader from '../../../lib/ViewHeader.svelte';
 	import { num, poll } from '../../../lib/api';
 	import { since } from '../../../lib/alerts';
@@ -114,13 +115,13 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Slots <span class="dim">({serving?.slots.length ?? 0})</span></h2>
-		<span class="dim">online loss: CRPS of forecasts at horizon close, 1 − cos for news, raster CE for charts · lower is better · bus counts since page load</span>
+		<h2>Slots <span class="dim">({serving?.slots.length ?? 0})</span><Info k="evolution.slots" /></h2>
+		<span class="dim">online loss: CRPS of forecasts at horizon close, 1 − cos for news, raster CE for charts · lower is better · bus counts since page load<Info k="evolution.crps" /></span>
 	</div>
 	{#if serving?.slots.length}
 		<div class="scroll">
 			<table>
-				<thead><tr><th>family</th><th>ts</th><th>serving</th><th>shadow</th><th>promotion</th><th>bus</th><th></th></tr></thead>
+				<thead><tr><th>family</th><th>ts</th><th>serving</th><th>shadow</th><th>promotion<Info k="evolution.promotionRule" /></th><th>bus</th><th></th></tr></thead>
 				<tbody>
 					{#each serving.slots as s (s.family + s.timescale)}
 						{@const v = slotVerdict(s)}
@@ -169,7 +170,7 @@
 
 <section class="panel cards">
 	<div class="panel-head">
-		<h2>Decoder cards <span class="dim">({summaries.length} of {cardsTotal}, newest first)</span></h2>
+		<h2>Decoder cards <span class="dim">({summaries.length} of {cardsTotal}, newest first)</span><Info k="evolution.cards" /></h2>
 		<select bind:value={familyFilter} aria-label="output family">
 			<option value="">all output families</option>
 			{#each families as f}<option value={f}>{f}</option>{/each}
@@ -179,7 +180,7 @@
 	{#if summaries.length}
 		<div class="scroll tall">
 			<table>
-				<thead><tr><th>family → output</th><th>ts</th><th>score</th><th>skill</th><th>coverage</th><th>hit rate</th><th>trade PSR</th><th>generation</th><th>created</th><th></th></tr></thead>
+				<thead><tr><th>family → output</th><th>ts</th><th>score</th><th>skill<Info k="evolution.skillColumn" /></th><th>coverage</th><th>hit rate</th><th>trade PSR</th><th>generation</th><th>created</th><th></th></tr></thead>
 				<tbody>
 					{#each summaries as c (c.key)}
 						{@const role = roleOf(c.key)}

@@ -6,6 +6,7 @@
 	import Empty from '../../lib/Empty.svelte';
 	import Experts from '../../lib/Experts.svelte';
 	import GraphExplorer from '../../lib/GraphExplorer.svelte';
+	import Info from '../../lib/Info.svelte';
 	import Projection from '../../lib/Projection.svelte';
 	import QuantileStrip from '../../lib/QuantileStrip.svelte';
 	import RegionDetail from '../../lib/RegionDetail.svelte';
@@ -213,7 +214,7 @@
 
 <div class="toolbar">
 	<label>
-		timescale
+		timescale<Info k="latent.timescale" />
 		<select bind:value={ts} onchange={() => ((selected = null), refresh())}>
 			{#each timescales as t}
 				<option value={t}>{t}{seen.includes(t) ? '' : ' (no data)'}</option>
@@ -221,7 +222,7 @@
 		</select>
 	</label>
 	<label>
-		snapshot
+		snapshot<Info k="latent.snapshot" />
 		<select bind:value={snapshot} disabled={!forTimescale.length} title="GET /api/latent/snapshots (HelixDB)">
 			{#each forTimescale as s (s.snapshot_id)}
 				<option value={s.snapshot_id}>{s.snapshot_id} · {s.status} · gen {s.generation}</option>
@@ -245,7 +246,7 @@
 <div class="grid two">
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Region transition graph</h2>
+			<h2>Region transition graph<Info k="latent.graph" /></h2>
 			<div class="src">
 				<select bind:value={graphSource} aria-label="graph source">
 					<option value="live">live (latent.transition.{ts}, in-memory)</option>
@@ -290,7 +291,7 @@
 
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Regions</h2>
+			<h2>Regions<Info k="latent.regions" /></h2>
 			<span class="dim">lineage survives retraining (D-007)</span>
 		</div>
 		{#if regions.length}
@@ -318,7 +319,7 @@
 
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Expert states per instrument</h2>
+			<h2>Expert states per instrument<Info k="latent.states" /></h2>
 			<span class="dim">router weights · region per expert · ‖μ‖ · σ̄</span>
 		</div>
 		{#if states.length}
@@ -359,7 +360,7 @@
 
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Decoder outputs</h2>
+			<h2>Decoder outputs<Info k="latent.decoderOutputs" /></h2>
 			<select bind:value={family} onchange={refresh}>
 				<option value="">all families</option>
 				{#each families as f}<option value={f}>{f}</option>{/each}

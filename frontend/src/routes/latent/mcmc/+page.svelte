@@ -5,6 +5,7 @@
 	// (REFINES), cross-asset priors, and the live soft memberships / lifecycle events on the bus.
 	import { onMount, untrack } from 'svelte';
 	import Empty from '../../../lib/Empty.svelte';
+	import Info from '../../../lib/Info.svelte';
 	import ViewHeader from '../../../lib/ViewHeader.svelte';
 	import { live, num, pct, short, type Snapshot } from '../../../lib/api';
 	import { since } from '../../../lib/alerts';
@@ -201,7 +202,7 @@
 <div class="grid cols">
 	<section class="panel wide">
 		<div class="panel-head">
-			<h2>Kernels <span class="dim">({kernels.length})</span></h2>
+			<h2>Kernels <span class="dim">({kernels.length})</span><Info k="latent.kernels" /></h2>
 			<span class="dim">samplers scored prequentially (log score ↑, Brier ↓, ECE ↓, PIT KS ↓, cost ↓); serving from the Pareto front with hysteresis</span>
 		</div>
 		{#if kernels.length}
@@ -239,7 +240,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Query</h2><span class="dim">every answer is mean [lower, upper] at level {level}</span></div>
+		<div class="panel-head"><h2>Query<Info k="latent.mcmcQuery" /></h2><span class="dim">every answer is mean [lower, upper] at level {level}</span></div>
 		<form class="qform" onsubmit={(e) => (e.preventDefault(), runQuery())}>
 			<select bind:value={query} aria-label="query">{#each QUERIES as qd}<option value={qd.id}>{qd.label}</option>{/each}</select>
 			{#if needs.includes('from') || needs.includes('region')}
@@ -303,7 +304,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Region lineage</h2><span class="dim">DescendsFrom carry · split · merge · partial</span></div>
+		<div class="panel-head"><h2>Region lineage<Info k="latent.lineageTrace" /></h2><span class="dim">DescendsFrom carry · split · merge · partial</span></div>
 		<form class="qform" onsubmit={(e) => (e.preventDefault(), loadLineage())}>
 			<input list="regions" bind:value={lineageRegion} placeholder="region id" size="18" />
 			<button type="submit">trace</button>
@@ -329,7 +330,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Hierarchy <span class="dim">({hierarchy.length} REFINES edges)</span></h2></div>
+		<div class="panel-head"><h2>Hierarchy <span class="dim">({hierarchy.length} REFINES edges)</span><Info k="latent.hierarchy" /></h2></div>
 		{#if hierError}<p class="badge warn">{hierError}</p>{/if}
 		{#if hierarchy.length}
 			<div class="scroll mid">
@@ -348,7 +349,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Cross-asset priors <span class="dim">({priors.length}, {ts})</span></h2></div>
+		<div class="panel-head"><h2>Cross-asset priors <span class="dim">({priors.length}, {ts})</span><Info k="latent.crossPriors" /></h2></div>
 		{#if priorsError}<p class="badge warn">{priorsError}</p>{/if}
 		{#if priors.length}
 			<div class="scroll mid">
@@ -368,7 +369,7 @@
 
 	<section class="panel">
 		<div class="panel-head">
-			<h2>Soft memberships <span class="dim">({memberRows.length} instruments, {ts})</span></h2>
+			<h2>Soft memberships <span class="dim">({memberRows.length} instruments, {ts})</span><Info k="latent.memberships" /></h2>
 			<span class="badge" class:ok={bus.status === 'open'} class:warn={bus.status !== 'open'}>latent.membership.{ts}.* {bus.status}</span>
 		</div>
 		{#if memberRows.length}
@@ -398,7 +399,7 @@
 	</section>
 
 	<section class="panel">
-		<div class="panel-head"><h2>Lifecycle events <span class="dim">({lifecycle.length})</span></h2><span class="dim">latent.lifecycle.* (event-timed)</span></div>
+		<div class="panel-head"><h2>Lifecycle events <span class="dim">({lifecycle.length})</span><Info k="latent.lifecycle" /></h2><span class="dim">latent.lifecycle.* (event-timed)</span></div>
 		{#if lifecycle.length}
 			<div class="scroll mid">
 				<table>

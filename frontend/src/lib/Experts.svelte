@@ -3,6 +3,7 @@
 	// top share, regions, and the correlation matrix between experts as a heatmap (spec 51 §6.3).
 	import Empty from './Empty.svelte';
 	import Heatmap from './Heatmap.svelte';
+	import Info from './Info.svelte';
 	import { ago, type ExpertsView } from './api';
 
 	interface Props {
@@ -18,7 +19,7 @@
 
 <section class="panel">
 	<div class="panel-head">
-		<h2>Experts</h2>
+		<h2>Experts<Info k="latent.experts" /></h2>
 		{#if view}
 			<span class="dim">source {view.source} · {view.live.messages} live states{view.live.last_as_of ? ` · last ${ago(view.live.last_as_of, now)} ago` : ''}</span>
 		{/if}
@@ -56,7 +57,7 @@
 		</table>
 		{#if view.covariance}
 			<div class="heat-head">
-				<h3 class="sub">Expert {matrixKind === 'correlation' ? 'correlation' : 'covariance'} <span class="dim">· n={view.covariance.n} · feature: {view.covariance.feature}</span></h3>
+				<h3 class="sub">Expert {matrixKind === 'correlation' ? 'correlation' : 'covariance'}<Info k="latent.expertCorrelation" /> <span class="dim">· n={view.covariance.n} · feature: {view.covariance.feature}</span></h3>
 				<select bind:value={matrixKind}>
 					<option value="correlation">correlation</option>
 					<option value="matrix">covariance</option>

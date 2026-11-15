@@ -7,6 +7,7 @@
 	import { onMount } from 'svelte';
 	import Empty from '../../../lib/Empty.svelte';
 	import Heatmap from '../../../lib/Heatmap.svelte';
+	import Info from '../../../lib/Info.svelte';
 	import ViewHeader from '../../../lib/ViewHeader.svelte';
 	import { live, num, pct, poll, type Snapshot } from '../../../lib/api';
 	import { since } from '../../../lib/alerts';
@@ -128,7 +129,7 @@
 <div class="layout">
 	<section class="panel list">
 		<div class="panel-head">
-			<h2>Snapshots <span class="dim">({shown.length})</span></h2>
+			<h2>Snapshots <span class="dim">({shown.length})</span><Info k="latent.snapshotList" /></h2>
 			<select bind:value={tsFilter} aria-label="timescale">
 				<option value="">all timescales</option>
 				{#each timescales as t}<option value={t}>{t}</option>{/each}
@@ -178,7 +179,7 @@
 			<div class="grid two">
 				<section class="panel">
 					<div class="panel-head">
-						<h2>Promotion checklist</h2>
+						<h2>Promotion checklist<Info k="latent.checklist" /></h2>
 						<span class="badge" class:ok={checks.passed} class:danger={!checks.passed}>{checks.passed ? 'passes' : 'blocked'}</span>
 					</div>
 					<table>
@@ -202,20 +203,20 @@
 						<ul class="small dim">{#each checks.notEvaluated as n}<li>{n}</li>{/each}</ul>
 					{/if}
 					{#if shadowGauges.length}
-						<h3 class="sub">Shadow gauges (model-runtime heartbeat)</h3>
+						<h3 class="sub">Shadow gauges (model-runtime heartbeat)<Info k="latent.shadowGauges" /></h3>
 						<div class="gauges">{#each shadowGauges as [k, v]}<span class="badge mono">{k} = {num(v, 3)}</span>{/each}</div>
 					{/if}
 				</section>
 
 				<section class="panel">
 					<div class="panel-head">
-						<h2>Expert health</h2>
+						<h2>Expert health<Info k="latent.expertHealthPanel" /></h2>
 						<span class="dim">validation split{health?.n_windows ? `, ${health.n_windows} windows` : ''}</span>
 					</div>
 					{#if health}
 						<div class="kpis">
-							<div><span class="dim">K_eff</span><b class="mono" class:neg={(health.k_eff ?? 0) < 2}>{num(health.k_eff, 2)}</b><span class="dim small">≥ 2{health.pre_prune_k_eff !== null ? ` · pre-prune ${num(health.pre_prune_k_eff, 2)}` : ''}</span></div>
-							<div><span class="dim">max |resid corr|</span><b class="mono" class:neg={(health.resid_corr_max ?? 0) > 0.1}>{num(health.resid_corr_max, 3)}</b><span class="dim small">≤ 0.1</span></div>
+							<div><span class="dim">K_eff<Info k="latent.kEff" /></span><b class="mono" class:neg={(health.k_eff ?? 0) < 2}>{num(health.k_eff, 2)}</b><span class="dim small">≥ 2{health.pre_prune_k_eff !== null ? ` · pre-prune ${num(health.pre_prune_k_eff, 2)}` : ''}</span></div>
+							<div><span class="dim">max |resid corr|<Info k="latent.residCorr" /></span><b class="mono" class:neg={(health.resid_corr_max ?? 0) > 0.1}>{num(health.resid_corr_max, 3)}</b><span class="dim small">≤ 0.1</span></div>
 							<div><span class="dim">min skill</span><b class="mono" class:neg={Math.min(...health.skill) < 0.02}>{health.skill.length ? num(Math.min(...health.skill), 3) : '—'}</b><span class="dim small">≥ 0.02</span></div>
 							<div><span class="dim">mixture skill</span><b class="mono">{num(health.mix_skill, 3)}</b><span class="dim small">{health.pruned ? `${health.pruned} pruned` : ''}</span></div>
 						</div>
@@ -242,7 +243,7 @@
 
 				<section class="panel">
 					<div class="panel-head">
-						<h2>Live expert health</h2>
+						<h2>Live expert health<Info k="latent.liveHealth" /></h2>
 						<span class="dim">latent.expert.health{liveHealth ? ` · ${liveHealth.source} · ${liveHealth.n_windows ?? 0} windows${liveHealth.as_of ? ` · ${since(liveHealth.as_of, now)}` : ''}` : ''}</span>
 					</div>
 					{#if liveHealth}
@@ -273,7 +274,7 @@
 				</section>
 
 				<section class="panel">
-					<div class="panel-head"><h2>Training</h2></div>
+					<div class="panel-head"><h2>Training<Info k="latent.training" /></h2></div>
 					<table>
 						<tbody>
 							{#each [['backbone', params.backbone], ['context steps', params.context_steps], ['d_model', params.d_model], ['expert_dim', params.expert_dim], ['experts', metrics.n_experts], ['params', metrics.n_params], ['device', params.device]] as [k, v]}
