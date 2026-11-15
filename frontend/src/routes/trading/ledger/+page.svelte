@@ -1,7 +1,9 @@
 <script lang="ts">
 	// Ledger reports (D-067, spec 42 §4): P&L with the FX split per book and strategy, tax lots
-	// (FIFO), the statement (JSON summary + CSV download) and orphan fills.
+	// (FIFO), the statement (JSON summary + CSV download) and orphan fills. Round 9 adds the
+	// organisational books of D-104 (segment funds, balances by kind, journal, close day).
 	import { onMount } from 'svelte';
+	import { accountingApi, closeConfirmText, closeDayBody, groupByKind, segmentFunds, trialBalanceOk, yesterdayUtc, type BalancesView, type CloseReport, type JournalEntry } from '../../../lib/accounting';
 	import Empty from '../../../lib/Empty.svelte';
 	import ViewHeader from '../../../lib/ViewHeader.svelte';
 	import { eur, num, poll, short } from '../../../lib/api';
@@ -124,19 +126,69 @@
 		}
 	}
 
+	// Accounting panel (D-104, spec 51 §6 round 9): organisational books, journal, close day.
+	let acct = $state<BalancesView | null>(null);
+	let acctError = $state('');
+	let journal = $state<JournalEntry[]>([]);
+	let journalCount = $state(0);
+	let journalError = $state('');
+	let journalLimit = $state(loadPref('ledger.journalLimit', 20));
+	$effect(() => savePref('ledger.journalLimit', journalLimit));
+	const funds = $derived(segmentFunds(acct?.segment_funds_eur ?? {}));
+	const acctGroups = $derived(groupByKind(acct?.accounts ?? {}));
+	const tbOk = $derived(!acct || trialBalanceOk(acct.trial_balance));
+
+	let closeDay = $state(yesterdayUtc());
+	let closeReport = $state<CloseReport | null>(null);
+	let closeMsg = $state('');
+	let closeOk = $state(true);
+	let closeBusy = $state(false);
+
+	async function loadJournal() {
+		try {
+			const r = await accountingApi.entries(journalLimit);
+			((journal = r.entries), (journalCount = r.count), (journalError = ''));
+		} catch (e) {
+			journalError = errText(e);
+		}
+	}
+
+	async function closeTheDay() {
+		const v = closeDayBody(closeDay);
+		if ('error' in v) return ((closeMsg = v.error), (closeOk = false));
+		if (!confirm(closeConfirmText(v.body.day))) return;
+		closeBusy = true;
+		try {
+			const r = await accountingApi.close(v.body.day);
+			closeReport = r.report;
+			closeMsg = `closed ${r.report.period}: ${r.report.entries_posted} entry(ies) posted, ${r.report.entries_already} already booked`;
+			closeOk = !!r.ok;
+			await refresh();
+		} catch (e) {
+			closeReport = null;
+			closeMsg = `close failed: ${errText(e)}`;
+			closeOk = false;
+		} finally {
+			closeBusy = false;
+		}
+	}
+
 	const figure = (v: unknown) => (v === null || v === undefined || v === '' ? '—' : Number.isFinite(Number(v)) ? Number(v).toFixed(2) : String(v));
 	const pnlNet = (b: Record<string, unknown> | undefined) => (b?.pnl as Record<string, unknown> | undefined)?.net_eur;
 
 	async function refresh() {
 		const f = from || undefined;
 		const t = to || undefined;
-		const [p, l, o] = await Promise.allSettled([consoleApi.pnlBreakdown(book, f, t), consoleApi.lots(book), consoleApi.orphans('open')]);
+		const [p, l, o, a] = await Promise.allSettled([consoleApi.pnlBreakdown(book, f, t), consoleApi.lots(book), consoleApi.orphans('open'), accountingApi.balances()]);
 		if (p.status === 'fulfilled') ((pnl = p.value), (pnlError = ''));
 		else pnlError = errText(p.reason);
 		if (l.status === 'fulfilled') ((lots = l.value.lots as Record<string, unknown>[]), (lotsError = ''));
 		else lotsError = errText(l.reason);
 		if (o.status === 'fulfilled') ((orphans = o.value.orphans), (orphansError = ''));
 		else orphansError = errText(o.reason);
+		if (a.status === 'fulfilled') ((acct = a.value), (acctError = ''));
+		else acctError = errText(a.reason);
+		await loadJournal();
 	}
 
 	/** The statement carries every fill of the range: loaded on demand, not polled. */
@@ -304,6 +356,89 @@
 		<p class="dim small"><code>POST /api/trading/payouts</code> (spec 42 §6): a cash movement out of the book, after a confirmation; the risk-engine's daily quota (<code>[payout]</code>) is advisory, booking stays an operator action.</p>
 	</section>
 
+	<section class="panel">
+		<div class="panel-head"><h2>Organisational books <span class="dim">(D-104)</span></h2><span class="dim">double-entry above the trading book · EUR</span></div>
+		{#if acctError}<p class="badge danger">{acctError}</p>{/if}
+		{#if acct}
+			<table class="funds">
+				<thead><tr>{#each funds as f (f.segment)}<th>{f.segment}</th>{/each}</tr></thead>
+				<tbody><tr>{#each funds as f (f.segment)}<td class="mono" class:dim={f.eur === 0}>{eur(f.eur)}</td>{/each}</tr></tbody>
+			</table>
+			<div class="scroll tall">
+				{#each acctGroups as g (g.kind)}
+					<h3 class="kind">{g.kind}</h3>
+					<table>
+						<tbody>
+							{#each g.accounts as a (a.name)}
+								<tr>
+									<td class="mono">{a.name}</td>
+									<td class="dim">{a.segment}{a.external_ref ? ` · ${a.external_ref}` : ''}</td>
+									<td class="mono right">{eur(a.normal_eur)}</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				{/each}
+			</div>
+			<p class="small" class:dim={tbOk}>
+				trial balance <span class="mono" class:bad={!tbOk}>{eur(acct.trial_balance)}</span>{#if !tbOk}<span class="bad"> — non-zero: the books are out of balance (broken invariant)</span>{/if} · {acct.entries} journal entries
+			</p>
+		{:else if !acctError}
+			<Empty producer="GET /api/accounting/balances" hint="" />
+		{/if}
+	</section>
+
+	<section class="panel">
+		<div class="panel-head">
+			<h2>Journal <span class="dim">({journal.length} of {journalCount})</span></h2>
+			<label class="dim">limit <select bind:value={journalLimit} onchange={() => void loadJournal()}>{#each [20, 100, 500] as n (n)}<option value={n}>{n}</option>{/each}</select></label>
+		</div>
+		{#if journalError}<p class="badge danger">{journalError}</p>{/if}
+		{#if journal.length}
+			<div class="scroll tall">
+				{#each journal as e (e.id)}
+					<div class="entry">
+						<div class="entry-head"><span class="mono">{e.entry_ref}</span><span class="dim grow">{e.memo}</span><span class="mono dim">{e.ts.slice(0, 19).replace('T', ' ')}</span></div>
+						<table>
+							<tbody>
+								{#each e.postings as p (p.account)}
+									<tr>
+										<td class="mono">{p.account}</td>
+										<td class="mono right" class:neg={p.amount < 0}>{eur(p.amount)}</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+					</div>
+				{/each}
+			</div>
+			<p class="dim small">Balanced entries, newest first; debit positive, credit negative.</p>
+		{:else if !journalError}
+			<p class="dim">No journal entries yet.</p>
+		{/if}
+	</section>
+
+	<section class="panel">
+		<div class="panel-head"><h2>Close day <span class="dim">(accounting)</span></h2><span class="dim">POST /api/accounting/close · idempotent</span></div>
+		<div class="toolbar">
+			<label>day (UTC) <input type="date" bind:value={closeDay} /></label>
+			<button disabled={closeBusy || !closeDay} onclick={closeTheDay}>close day…</button>
+		</div>
+		{#if closeMsg}<p class="badge" class:ok={closeOk} class:danger={!closeOk}>{closeMsg}</p>{/if}
+		{#if closeReport}
+			<table>
+				<tbody>
+					<tr><th>period</th><td class="mono">{closeReport.period}</td></tr>
+					<tr><th>revenue</th><td class="mono">{eur(closeReport.revenue_eur)}</td></tr>
+					<tr><th>opex</th><td class="mono dim">{closeReport.opex.length ? JSON.stringify(closeReport.opex) : 'none'}</td></tr>
+					<tr><th>allocation</th><td class="mono">owner {eur(closeReport.allocation.owner)} · infra {eur(closeReport.allocation.infra)} · reserves {eur(closeReport.allocation.reserves)} · retained {eur(closeReport.allocation.retained)}</td></tr>
+					<tr><th>entries</th><td class="mono">{closeReport.entries_posted} posted · {closeReport.entries_already} already booked</td></tr>
+				</tbody>
+			</table>
+		{/if}
+		<p class="dim small">Books the day's trading revenue, opex accrual and split as <code>close:&#123;period&#125;:*</code> entries (D-104) after a confirmation. Only finished UTC days close; the server answers 400 otherwise.</p>
+	</section>
+
 	<section class="panel wide">
 		<div class="panel-head"><h2>FX restatement <span class="dim">(book {book})</span></h2><span class="dim">POST /api/trading/restatements/fx · dry run first</span></div>
 		<form class="toolbar" onsubmit={(e) => (e.preventDefault(), restateDryRun())}>
@@ -426,5 +561,33 @@
 	}
 	.neg {
 		color: var(--danger);
+	}
+	.funds th {
+		text-transform: capitalize;
+	}
+	.kind {
+		margin: 10px 0 4px;
+		font-size: 12px;
+		text-transform: capitalize;
+		color: var(--text-dim);
+	}
+	.right {
+		text-align: right;
+	}
+	.bad {
+		color: var(--danger);
+		font-weight: 700;
+	}
+	.entry {
+		margin-bottom: 10px;
+	}
+	.entry-head {
+		display: flex;
+		gap: 10px;
+		align-items: baseline;
+		padding: 2px 0;
+	}
+	.grow {
+		flex: 1;
 	}
 </style>
