@@ -31,12 +31,15 @@ media_downsample_after_d = 30 # spec 20 §6.5: full video → sampled frames aft
 [control_api]
 bind = "0.0.0.0:7700"
 
-# Organisational books (D-104): split fractions of a closed day's positive net income and
-# prices for the system's own metered costs. All zero: no split, no opex, until the owner sets them.
+# Organisational books (D-104; values owner-confirmed 2026-11-15, D-106): of a closed day's
+# positive net income, 20% is declared to the owner, 30% feeds the infrastructure fund and the
+# remaining 50% stays as trading capital. Opex prices are notional cloud-equivalent estimates
+# (dedicated host ~30 EUR/mo amortised; S3-class storage; cloud GPU hourly) to be replaced with
+# real invoices when they exist.
 [accounting]
-owner_frac = 0.0
-infra_frac = 0.0
+owner_frac = 0.2
+infra_frac = 0.3
 reserve_frac = 0.0
-base_eur_per_day = 0.0
-gpu_eur_per_hour = 0.0
-storage_eur_per_gib_month = 0.0
+base_eur_per_day = 1.0
+gpu_eur_per_hour = 0.5
+storage_eur_per_gib_month = 0.02
