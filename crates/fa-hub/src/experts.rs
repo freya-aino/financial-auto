@@ -23,6 +23,13 @@ pub fn expert_uid(snapshot_id: &str, expert_id: u32) -> String {
     format!("{snapshot_id}/e{expert_id}")
 }
 
+/// The expert's readable handle, e.g. `nimble-elephant` (D-111). Derived from [`expert_uid`], so
+/// it is stable for the life of the expert and recomputable anywhere without a lookup — it is
+/// written to the row for querying and display, never supplied by the caller.
+pub fn expert_name(snapshot_id: &str, expert_id: u32) -> String {
+    fa_core::names::name_for(&expert_uid(snapshot_id, expert_id))
+}
+
 /// One expert of a snapshot as the trainer writes it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewExpert {
@@ -60,6 +67,9 @@ pub struct ExpertRow {
     #[serde(default)]
     pub timescale: String,
     pub expert_id: u32,
+    /// Readable handle (D-111), e.g. `nimble-elephant`; derived from `expert_uid`.
+    #[serde(default)]
+    pub name: String,
     #[serde(default)]
     pub dim: u32,
     #[serde(default)]
@@ -105,6 +115,7 @@ impl HubClient {
             ("skill", e.skill.into()),
             ("born_gen", e.born_gen.into()),
             ("specialisation", s(&e.specialisation)),
+            ("name", s(&expert_name(&e.snapshot_id, e.expert_id))),
             ("updated_at", Input::Now),
         ];
         let mut set = Op::nodes(NodeRef::var("existing"));

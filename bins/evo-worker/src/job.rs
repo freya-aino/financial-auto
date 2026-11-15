@@ -635,7 +635,10 @@ impl Worker {
             })
             .collect();
         DecoderOutput {
-            decoder_id: format!("baseline-{}-{:08x}", genome.family.as_str(), stable_hash(&genome.id) as u32),
+            decoder_id: {
+                let h = stable_hash(&genome.id);
+                format!("baseline-{}-{}-{:08x}", genome.family.as_str(), fa_core::names::name_from_hash(h), h as u32)
+            },
             genome_id: job.genome_id.clone(),
             family: genome.family.output_family().as_str().into(),
             snapshot_id: job.snapshot_id.clone(),

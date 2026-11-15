@@ -130,7 +130,7 @@ impl StrategyGenome {
                 self.snapshot.as_deref().unwrap_or(""),
                 self.assets.join(",")
             );
-            return format!("{NN_ID_PREFIX}{:016x}", stable_hash(&key));
+            return fa_core::names::tagged(NN_ID_PREFIX, stable_hash(&key));
         }
         let key = format!(
             "{}|{}|{}|{}|{}|{}",
@@ -148,7 +148,7 @@ impl StrategyGenome {
         };
         // an asset set restricts the phenotype; unrestricted genomes keep their old ids
         let key = if self.assets.is_empty() { key } else { format!("{key}|assets={}", self.assets.join(",")) };
-        format!("{GP_ID_PREFIX}{:016x}", stable_hash(&key))
+        fa_core::names::tagged(GP_ID_PREFIX, stable_hash(&key))
     }
 
     pub fn horizon(&self) -> Horizon {
@@ -434,6 +434,12 @@ mod tests {
             let g = StrategyGenome::from_def(&def).unwrap();
             assert_eq!(g.parents, vec![def.id.clone()], "baseline provenance");
             assert!(g.id().starts_with(GP_ID_PREFIX));
+            // D-111: the id carries a readable attribute-animal handle, and still ends in the
+            // content-addressed digest so phenotype-equal genomes share an id.
+            let id = g.id();
+            assert!(fa_core::names::name_of(&id).is_some(), "no readable name in `{id}`");
+            assert_eq!(id, g.id(), "id must be deterministic");
+            println!("baseline {} -> {id}", def.id);
             assert_eq!(g.build().horizon, def.horizon());
         }
         assert!(matches!(StrategyGenome::parse(""), Err(GenomeError::Empty)));

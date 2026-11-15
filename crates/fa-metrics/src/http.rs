@@ -67,6 +67,13 @@ fn looks_like_id(seg: &str) -> bool {
         || (n == 26 && all(|c| c.is_ascii_alphanumeric()) && seg.chars().any(|c| c.is_ascii_digit()))
         || (n >= 16 && all(|c| c.is_ascii_hexdigit()))
         || (seg.contains(['-', '_', ':']) && seg.chars().filter(|c| c.is_ascii_digit()).count() >= 6)
+        // Generated identities carry a readable name before the digest (D-111), e.g.
+        // `gp-nimble-elephant-6433eb2ddeeddf72`. Rule 4 no longer sees those as all-hex, and a
+        // digest with few decimal digits would slip past the rule above too, so match the
+        // trailing digest directly — otherwise every genome id becomes its own metric label.
+        || seg.rsplit_once('-').is_some_and(|(head, digest)| {
+            !head.is_empty() && digest.len() >= 8 && digest.chars().all(|c| c.is_ascii_hexdigit())
+        })
 }
 
 pub(crate) fn record(method: &str, path: &str, status: u16, secs: f64) {
@@ -153,5 +160,26 @@ mod tests {
         );
         assert!(out.contains("fa_http_requests_total{method=\"GET\",path=\"/api/nope\",status=\"404\"} 1\n"), "{out}");
         assert!(out.contains("fa_http_request_duration_seconds_count{method=\"GET\",path=\"/api/items/{id}\"} 2\n"));
+    }
+}
+
+#[cfg(test)]
+mod id_shape_tests {
+    use super::looks_like_id;
+
+    /// D-111 ids must still be redacted from metric labels, including a digest with no decimal
+    /// digits at all (which every other rule misses).
+    #[test]
+    fn named_ids_are_redacted() {
+        assert!(looks_like_id("gp-nimble-elephant-6433eb2ddeeddf72"));
+        assert!(looks_like_id("alloc-quick-fox-abcdefabcdefabcd"));
+        assert!(looks_like_id("baseline-trend-silent-ibex-deadbeef"));
+    }
+
+    #[test]
+    fn ordinary_route_segments_are_not_redacted() {
+        for seg in ["genomes", "evolution", "api", "graph", "health", "e-mail"] {
+            assert!(!looks_like_id(seg), "{seg} must not be treated as an id");
+        }
     }
 }

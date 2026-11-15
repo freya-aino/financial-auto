@@ -255,7 +255,7 @@ impl AllocatorGenome {
 
     /// Stable identity: `alloc-<hash of the canonical text>`.
     pub fn id(&self) -> String {
-        format!("alloc-{:016x}", stable_hash(&self.to_string()))
+        fa_core::names::tagged("alloc-", stable_hash(&self.to_string()))
     }
 
     /// The allocator this genome describes.
