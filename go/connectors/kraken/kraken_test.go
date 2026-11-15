@@ -130,6 +130,14 @@ func TestPollNormalize(t *testing.T) {
 	if trades[4].GetTrade().Aggressor != fav1.Side_SIDE_BUY || trades[0].EventTime.AsTime() != time.Unix(1794362222, 196271400).UTC() {
 		t.Fatalf("trade 4 / time: %v %v", trades[4], trades[0].EventTime.AsTime())
 	}
+	// Both trade cursors persisted: newest trade time and highest trade id
+	// (encoded in the cursor's seconds).
+	if got, _, _ := cur.GetCursor(context.Background(), ID, inst, tradesScope); got != time.Unix(1794362312, 664586000).UTC() {
+		t.Fatalf("trade time cursor %v", got)
+	}
+	if got, _, _ := cur.GetCursor(context.Background(), ID, inst, tradesIDScope); got != time.Unix(110355600, 0).UTC() {
+		t.Fatalf("trade id cursor %v", got)
+	}
 
 	quotes, _, err := c.Normalize(m["ticker"])
 	if err != nil || len(quotes) != 1 {
@@ -155,10 +163,51 @@ func TestPollNormalize(t *testing.T) {
 		t.Fatalf("trades cursor not advanced: %s", s.reqs[1])
 	}
 
-	// A restarted connector resumes from the persisted cursors.
-	c2, _ := newTest(t, now, cur)
+	// A restarted connector resumes from the persisted cursors: no bars and,
+	// with the restored trade-id filter (D-094), no trades are re-emitted.
+	c2, s2 := newTest(t, now, cur)
 	if e, _, _ := c2.Normalize(m["ohlc"]); len(e) != 0 {
 		t.Fatalf("restart re-emitted %d bars", len(e))
+	}
+	if e, _, _ := c2.Normalize(m["trades"]); len(e) != 0 {
+		t.Fatalf("restart re-emitted %d trades", len(e))
+	}
+	// Its first poll resumes `since` from the persisted newest trade time.
+	if _, err := c2.Poll(context.Background(), connector.PollRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(s2.reqs[1], "since=1794362312664586000") {
+		t.Fatalf("restart trades since: %s", s2.reqs[1])
+	}
+}
+
+// TestLegacyTradeCursor restores from a pre-D-094 cursor state that has only
+// the "trades" timestamp row: `since` still resumes from it, and without the
+// trades_id row the id filter starts empty (the old behaviour), so Init stays
+// backward compatible.
+func TestLegacyTradeCursor(t *testing.T) {
+	cur := connector.NewMemCursors()
+	newest := time.Unix(1794362312, 664586000).UTC()
+	if err := cur.SetCursor(context.Background(), ID, inst, tradesScope, newest); err != nil {
+		t.Fatal(err)
+	}
+	c, s := newTest(t, now, cur)
+	raws, err := c.Poll(context.Background(), connector.PollRequest{})
+	if err != nil || len(raws) != 3 {
+		t.Fatalf("poll: %v %d", err, len(raws))
+	}
+	if !strings.Contains(s.reqs[1], "since=1794362312664586000") {
+		t.Fatalf("legacy trades since: %s", s.reqs[1])
+	}
+	m := byEndpoint(t, raws)
+	trades, _, err := c.Normalize(m["trades"])
+	if err != nil || len(trades) != 5 {
+		t.Fatalf("legacy trades: %v %d", err, len(trades))
+	}
+	// Normalizing writes the trades_id row, so the next restart is filtered.
+	c2, _ := newTest(t, now, cur)
+	if e, _, _ := c2.Normalize(m["trades"]); len(e) != 0 {
+		t.Fatalf("upgraded restart re-emitted %d trades", len(e))
 	}
 }
 

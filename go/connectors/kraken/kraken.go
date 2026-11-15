@@ -20,8 +20,14 @@
 // De-duplication (live): bars per symbol by open time, persisted as an
 // ingest.backfill_cursor row (instrument, scope = tf, cursor = bar close);
 // trades per symbol by trade_id, with the Trades `since` cursor kept in memory
-// and the newest emitted trade time persisted (instrument, scope "trades").
-// Without a trade cursor the first poll asks for the last poll interval only.
+// and two rows persisted per instrument: the newest emitted trade time (scope
+// "trades") and the highest emitted trade_id (scope "trades_id", encoded as
+// time.Unix(id, 0) because the cursor column is a timestamp; seconds survive
+// Postgres' microsecond precision where nanoseconds would not). Init restores
+// both, so a restart re-sends nothing (D-094); an older cursor state that has
+// only the "trades" timestamp row still restores `since` and just lacks the
+// id filter for the first poll. Without any trade cursor the first poll asks
+// for the last poll interval only.
 //
 // Backfill re-reads OHLC with `since`; Kraken only ever returns the latest 720
 // intervals (12 h of 1m bars, 30 d of 1h, ~2 y of 1d), so older ranges come
@@ -55,6 +61,11 @@ const (
 	Venue          = "kraken"
 	DefaultBaseURL = "https://api.kraken.com"
 	tradesScope    = "trades"
+	// tradesIDScope persists the highest emitted trade_id per instrument,
+	// encoded in the cursor's seconds (time.Unix(id, 0)): ingest.backfill_cursor
+	// stores a timestamptz, whose microsecond precision would corrupt an id
+	// packed into nanoseconds.
+	tradesIDScope = "trades_id"
 	// MaxOHLCRows is how many intervals Kraken returns at most.
 	MaxOHLCRows = 720
 )
@@ -126,6 +137,11 @@ func (c *Connector) Init(ctx context.Context, cfg connector.SourceConfig, deps c
 			}
 			if t, ok, err := deps.Cursors.GetCursor(ctx, ID, inst, tradesScope); err == nil && ok {
 				c.since[s] = strconv.FormatInt(t.UnixNano(), 10)
+			}
+			// Older cursor states have no trades_id row; they still restore
+			// `since` above and just start with an empty id filter.
+			if t, ok, err := deps.Cursors.GetCursor(ctx, ID, inst, tradesIDScope); err == nil && ok {
+				c.lastTrade[s] = t.Unix()
 			}
 		}
 	}
@@ -454,6 +470,7 @@ func (c *Connector) normTrades(raw connector.RawMessage, symbol, inst string, da
 	if !backfill && maxID > lastID {
 		c.lastTrade[symbol] = maxID
 		c.setCursor(inst, tradesScope, newest)
+		c.setCursor(inst, tradesIDScope, time.Unix(maxID, 0).UTC())
 	}
 	return envs, nil, nil
 }

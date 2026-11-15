@@ -9,6 +9,7 @@ target/
 
 # go
 go/bin/
+go/evo-orchestrator
 *.test
 
 # frontend
