@@ -25,6 +25,112 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/accounting/balances": {
+      "get": {
+        "operationId": "accounting_balances",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Balances",
+        "tags": [
+          "accounting"
+        ],
+        "x-handler": "bins/control-api/src/accounting_routes.rs::balances"
+      }
+    },
+    "/api/accounting/close": {
+      "post": {
+        "operationId": "accounting_close",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Close",
+        "tags": [
+          "accounting"
+        ],
+        "x-handler": "bins/control-api/src/accounting_routes.rs::close"
+      }
+    },
+    "/api/accounting/entries": {
+      "get": {
+        "operationId": "accounting_entries",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "Entries",
+        "tags": [
+          "accounting"
+        ],
+        "x-handler": "bins/control-api/src/accounting_routes.rs::entries"
+      }
+    },
     "/api/alerts": {
       "get": {
         "operationId": "alerts_list",
