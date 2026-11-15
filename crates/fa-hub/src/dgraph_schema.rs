@@ -250,6 +250,79 @@ feedback_from.weight: float .
 feedback_from.output_family: string .
 feedback_from.score: float .
 
+# ── genomes, fitness, evolution (Helix-resident before D-110) ──────────────
+genome.genome_id: string @index(exact) @upsert .
+genome.kind: string @index(exact) .
+genome.family: string .
+genome.params: string .
+genome.status: string @index(exact) .
+genome.strategy_id: string @index(exact) .
+genome.status_reason: string .
+genome.status_since_ms: int .
+genome.status_updated_at: datetime .
+genome.created_at: datetime @index(hour) .
+
+fitness_record.genome_id: string @index(exact) .
+fitness_record.generation: int @index(int) .
+fitness_record.objectives: string .
+fitness_record.pareto_rank: int .
+fitness_record.created_at: datetime .
+
+genome_parent.key: string @index(exact) @upsert .
+genome_parent.parent_genome_id: string @index(exact) .
+genome_parent.child_genome_id: string @index(exact) .
+genome_parent.op: string .
+
+pareto_front.front_id: string @index(exact) @upsert .
+pareto_front.generation_id: string @index(exact) .
+pareto_front.gen_index: int .
+pareto_front.kind: string @index(exact) .
+pareto_front.snapshot_id: string .
+pareto_front.keys: string .
+pareto_front.members: string .
+pareto_front.hypervolume: float .
+pareto_front.final_loop: bool .
+pareto_front.created_at: datetime .
+
+evaluated_on.key: string @index(exact) @upsert .
+evaluated_on.genome_id: string @index(exact) .
+evaluated_on.snapshot_id: string @index(exact) .
+evaluated_on.generation: string .
+evaluated_on.gen_index: int .
+evaluated_on.rung: int .
+evaluated_on.score: float .
+evaluated_on.objectives: string .
+evaluated_on.job_id: string .
+evaluated_on.experts: string .
+
+# ── experts (spec 32) ──────────────────────────────────────────────────────
+expert.expert_uid: string @index(exact) @upsert .
+expert.snapshot_id: string @index(exact) .
+expert.timescale: string .
+expert.expert_id: int .
+expert.name: string @index(exact) .
+expert.dim: int .
+expert.usage: float .
+expert.skill: float .
+expert.born_gen: int .
+expert.died_gen: int .
+expert.specialisation: string .
+expert.updated_at: datetime .
+
+expert_align.key: string @index(exact) @upsert .
+expert_align.child_expert_uid: string @index(exact) .
+expert_align.parent_expert_uid: string @index(exact) .
+expert_align.cka: float .
+expert_align.kind: string .
+
+# ── schema marker ─────────────────────────────────────────────────────────
+# Replaces the Helix `SchemaMeta` row, whose fingerprint hashed Helix index DDL
+# and has no Dgraph analogue: the DQL schema is applied with `/alter`, so only
+# the version is worth recording.
+schema_marker.marker_id: string @index(exact) @upsert .
+schema_marker.version: int .
+schema_marker.applied_at: datetime .
+
 # ── types ──────────────────────────────────────────────────────────────────
 type RefEntity {
     ref_entity.entity_id
@@ -497,6 +570,81 @@ type FeedbackFrom {
     feedback_from.output_family
     feedback_from.score
 }
+type Genome {
+    genome.genome_id
+    genome.kind
+    genome.family
+    genome.params
+    genome.status
+    genome.strategy_id
+    genome.status_reason
+    genome.status_since_ms
+    genome.status_updated_at
+    genome.created_at
+}
+type FitnessRecord {
+    fitness_record.genome_id
+    fitness_record.generation
+    fitness_record.objectives
+    fitness_record.pareto_rank
+    fitness_record.created_at
+}
+type GenomeParent {
+    genome_parent.key
+    genome_parent.parent_genome_id
+    genome_parent.child_genome_id
+    genome_parent.op
+}
+type ParetoFront {
+    pareto_front.front_id
+    pareto_front.generation_id
+    pareto_front.gen_index
+    pareto_front.kind
+    pareto_front.snapshot_id
+    pareto_front.keys
+    pareto_front.members
+    pareto_front.hypervolume
+    pareto_front.final_loop
+    pareto_front.created_at
+}
+type EvaluatedOn {
+    evaluated_on.key
+    evaluated_on.genome_id
+    evaluated_on.snapshot_id
+    evaluated_on.generation
+    evaluated_on.gen_index
+    evaluated_on.rung
+    evaluated_on.score
+    evaluated_on.objectives
+    evaluated_on.job_id
+    evaluated_on.experts
+}
+type Expert {
+    expert.expert_uid
+    expert.snapshot_id
+    expert.timescale
+    expert.expert_id
+    expert.name
+    expert.dim
+    expert.usage
+    expert.skill
+    expert.born_gen
+    expert.died_gen
+    expert.specialisation
+    expert.updated_at
+}
+type ExpertAlign {
+    expert_align.key
+    expert_align.child_expert_uid
+    expert_align.parent_expert_uid
+    expert_align.cka
+    expert_align.kind
+}
+type SchemaMarker {
+    schema_marker.marker_id
+    schema_marker.version
+    schema_marker.applied_at
+}
 "#;
 
 /// Every `dgraph.type` the schema declares, in the order of the SQL migration.
@@ -530,6 +678,14 @@ pub const TYPES: &[&str] = &[
     "RegionEpisode",
     "TrainedOn",
     "FeedbackFrom",
+    "Genome",
+    "FitnessRecord",
+    "GenomeParent",
+    "ParetoFront",
+    "EvaluatedOn",
+    "Expert",
+    "ExpertAlign",
+    "SchemaMarker",
 ];
 
 /// The business-key predicate of a type, where it has one. `resolve_node` tries these in order
@@ -549,6 +705,9 @@ pub fn business_key(type_name: &str) -> Option<&'static str> {
         "KernelModel" => "kernel_model.kernel_id",
         "CrossPrior" => "cross_prior.pair_id",
         "RegionEpisode" => "region_episode.episode_id",
+        "Genome" => "genome.genome_id",
+        "ParetoFront" => "pareto_front.front_id",
+        "Expert" => "expert.expert_uid",
         _ => return None,
     })
 }

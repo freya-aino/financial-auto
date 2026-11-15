@@ -37,6 +37,7 @@ pub mod ast;
 pub mod buffer;
 pub mod catalog;
 pub mod dgraph;
+pub mod dgraph_evolution;
 pub mod dgraph_schema;
 pub mod graph_dgraph;
 pub mod evolution;

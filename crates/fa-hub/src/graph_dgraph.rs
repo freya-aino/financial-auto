@@ -40,55 +40,55 @@ pub struct DgraphGraph {
 
 /// Escape a DQL string literal. Business ids come from catalogues and model code, so they can
 /// legitimately contain quotes; an unescaped one would be a query-injection bug, not a typo.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// `"a", "b"` — a DQL value list for `eq(pred, [..])`.
-fn esc_list<'a>(vals: impl IntoIterator<Item = &'a str>) -> String {
+pub(crate) fn esc_list<'a>(vals: impl IntoIterator<Item = &'a str>) -> String {
     vals.into_iter().map(|v| format!("\"{}\"", esc(v))).collect::<Vec<_>>().join(", ")
 }
 
-fn str_of(j: &Json, k: &str) -> String {
+pub(crate) fn str_of(j: &Json, k: &str) -> String {
     j.get(k).and_then(Json::as_str).unwrap_or_default().to_owned()
 }
 
-fn opt_str(j: &Json, k: &str) -> Option<String> {
+pub(crate) fn opt_str(j: &Json, k: &str) -> Option<String> {
     j.get(k).and_then(Json::as_str).map(str::to_owned)
 }
 
-fn f64_of(j: &Json, k: &str) -> f64 {
+pub(crate) fn f64_of(j: &Json, k: &str) -> f64 {
     j.get(k).and_then(Json::as_f64).unwrap_or_default()
 }
 
-fn opt_f64(j: &Json, k: &str) -> Option<f64> {
+pub(crate) fn opt_f64(j: &Json, k: &str) -> Option<f64> {
     j.get(k).and_then(Json::as_f64)
 }
 
-fn i64_of(j: &Json, k: &str) -> i64 {
+pub(crate) fn i64_of(j: &Json, k: &str) -> i64 {
     j.get(k).and_then(Json::as_i64).unwrap_or_default()
 }
 
-fn u32_of(j: &Json, k: &str) -> u32 {
+pub(crate) fn u32_of(j: &Json, k: &str) -> u32 {
     u32::try_from(i64_of(j, k)).unwrap_or_default()
 }
 
-fn u64_of(j: &Json, k: &str) -> u64 {
+pub(crate) fn u64_of(j: &Json, k: &str) -> u64 {
     u64::try_from(i64_of(j, k)).unwrap_or_default()
 }
 
-fn bool_of(j: &Json, k: &str) -> bool {
+pub(crate) fn bool_of(j: &Json, k: &str) -> bool {
     j.get(k).and_then(Json::as_bool).unwrap_or_default()
 }
 
 /// The `uid` of a row as the `u64` node id the API hands out.
-fn uid_of(j: &Json) -> u64 {
+pub(crate) fn uid_of(j: &Json) -> u64 {
     j.get("uid").and_then(Json::as_str).and_then(uid_to_u64).unwrap_or_default()
 }
 
 /// Strip the `<type>.` prefix from every predicate, so a generic row looks like the Postgres one
 /// (`region_id`, `status`, …) to `NodeRow` / `EdgeRow` consumers and to the frontend.
-fn bare_props(j: &Json, prefix: &str, skip: &[&str]) -> Map<String, Json> {
+pub(crate) fn bare_props(j: &Json, prefix: &str, skip: &[&str]) -> Map<String, Json> {
     let mut m = Map::new();
     if let Some(obj) = j.as_object() {
         for (k, v) in obj {
@@ -105,13 +105,13 @@ fn bare_props(j: &Json, prefix: &str, skip: &[&str]) -> Map<String, Json> {
     m
 }
 
-fn node_row(j: &Json, label: &str, prefix: &str) -> NodeRow {
+pub(crate) fn node_row(j: &Json, label: &str, prefix: &str) -> NodeRow {
     NodeRow { id: uid_of(j), label: label.to_owned(), properties: bare_props(j, prefix, &[]) }
 }
 
 // ── row conversions, one per `GraphStore` return shape ─────────────────────
 
-fn snapshot_of(j: &Json) -> Snapshot {
+pub(crate) fn snapshot_of(j: &Json) -> Snapshot {
     Snapshot {
         id: uid_of(j),
         snapshot_id: str_of(j, "snapshot.snapshot_id"),
@@ -241,18 +241,18 @@ impl DgraphGraph {
     }
 
     /// Rows of the `q` block of a query.
-    async fn rows(&self, dql: &str) -> Result<Vec<Json>> {
+    pub(crate) async fn rows(&self, dql: &str) -> Result<Vec<Json>> {
         let d = self.dg.query(dql).await?;
         Ok(d.get("q").and_then(Json::as_array).cloned().unwrap_or_default())
     }
 
     /// The single row of the `q` block, if any.
-    async fn one(&self, dql: &str) -> Result<Option<Json>> {
+    pub(crate) async fn one(&self, dql: &str) -> Result<Option<Json>> {
         Ok(self.rows(dql).await?.into_iter().next())
     }
 
     /// Every predicate of one node addressed by business key.
-    async fn by_key(&self, ty: &str, key_pred: &str, key: &str) -> Result<Option<Json>> {
+    pub(crate) async fn by_key(&self, ty: &str, key_pred: &str, key: &str) -> Result<Option<Json>> {
         let dql = format!(
             "{{ q(func: eq({key_pred}, \"{k}\")) @filter(type({ty})) {{ uid dgraph.type expand(_all_) }} }}",
             k = esc(key)
@@ -261,7 +261,7 @@ impl DgraphGraph {
     }
 
     /// Every predicate of one node addressed by uid, checked against its type.
-    async fn by_uid(&self, ty: &str, id: u64) -> Result<Option<Json>> {
+    pub(crate) async fn by_uid(&self, ty: &str, id: u64) -> Result<Option<Json>> {
         let dql = format!(
             "{{ q(func: uid({uid})) @filter(type({ty})) {{ uid dgraph.type expand(_all_) }} }}",
             uid = u64_to_uid(id)
@@ -273,7 +273,7 @@ impl DgraphGraph {
     ///
     /// The uid is re-read instead of taken from the mutation response because Dgraph only reports
     /// uids it allocated: an update returns none, and the caller needs the id either way.
-    async fn upsert_keyed(&self, ty: &str, key_pred: &str, key: &str, fields: Map<String, Json>) -> Result<u64> {
+    pub(crate) async fn upsert_keyed(&self, ty: &str, key_pred: &str, key: &str, fields: Map<String, Json>) -> Result<u64> {
         let q = format!("{{ v as var(func: eq({key_pred}, \"{k}\")) }}", k = esc(key));
         let mut set = fields;
         set.insert("uid".into(), json!("uid(v)"));
@@ -289,7 +289,7 @@ impl DgraphGraph {
 
     /// Create a node that must not already exist, mirroring `INSERT` without `ON CONFLICT`:
     /// a duplicate business key is the 409 the Postgres backend raised from SQLSTATE 23505.
-    async fn insert_keyed(&self, ty: &str, key_pred: &str, key: &str, fields: Map<String, Json>) -> Result<u64> {
+    pub(crate) async fn insert_keyed(&self, ty: &str, key_pred: &str, key: &str, fields: Map<String, Json>) -> Result<u64> {
         if self.by_key(ty, key_pred, key).await?.is_some() {
             return Err(unique_violation(&format!("{ty} `{key}`")));
         }
@@ -297,14 +297,14 @@ impl DgraphGraph {
     }
 
     /// Set predicates on a node already addressed by uid.
-    async fn set_on(&self, id: u64, fields: Map<String, Json>) -> Result<()> {
+    pub(crate) async fn set_on(&self, id: u64, fields: Map<String, Json>) -> Result<()> {
         let mut set = fields;
         set.insert("uid".into(), json!(u64_to_uid(id)));
         self.dg.mutate(vec![Json::Object(set)]).await.map(drop)
     }
 
     /// Delete whole nodes by uid.
-    async fn delete_uids(&self, uids: &[u64]) -> Result<u64> {
+    pub(crate) async fn delete_uids(&self, uids: &[u64]) -> Result<u64> {
         if uids.is_empty() {
             return Ok(0);
         }
@@ -315,7 +315,7 @@ impl DgraphGraph {
     }
 
     /// Append an immutable event-time row (the `*_version` tables are append-only).
-    async fn append(&self, ty: &str, fields: Map<String, Json>) -> Result<()> {
+    pub(crate) async fn append(&self, ty: &str, fields: Map<String, Json>) -> Result<()> {
         let mut set = fields;
         set.insert("uid".into(), json!("_:v"));
         set.insert("dgraph.type".into(), json!(ty));
@@ -331,27 +331,27 @@ pub(crate) fn t3339(ms: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-fn now3339() -> String {
+pub(crate) fn now3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// Parse an RFC 3339 timestamp back to epoch milliseconds, for the as-of comparisons.
-fn ms_of(s: Option<&str>) -> Option<i64> {
+pub(crate) fn ms_of(s: Option<&str>) -> Option<i64> {
     s.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|t| t.timestamp_millis())
 }
 
 /// `json!({..})` as a field map for the mutation helpers.
-fn obj(j: Json) -> Map<String, Json> {
+pub(crate) fn obj(j: Json) -> Map<String, Json> {
     j.as_object().cloned().unwrap_or_default()
 }
 
 /// The projection every full-node read uses.
-const ALL: &str = "uid dgraph.type expand(_all_)";
+pub(crate) const ALL: &str = "uid dgraph.type expand(_all_)";
 
 /// Newest-first ordering that matches Postgres's `ORDER BY ts DESC, id DESC`. DQL cannot sort by
 /// `uid`, so the tie-break is applied here; without it two versions written in the same
 /// millisecond could come back in either order.
-fn by_ts_desc(rows: &mut [Json], ts_pred: &str) {
+pub(crate) fn by_ts_desc(rows: &mut [Json], ts_pred: &str) {
     rows.sort_by(|a, b| {
         let ka = (ms_of(a.get(ts_pred).and_then(Json::as_str)), uid_of(a));
         let kb = (ms_of(b.get(ts_pred).and_then(Json::as_str)), uid_of(b));
@@ -376,7 +376,7 @@ impl DgraphGraph {
     }
 
     /// Rows of one type whose `pred` equals any of `vals` (the `= ANY($1)` replacement).
-    async fn rows_in(&self, ty: &str, pred: &str, vals: &[String]) -> Result<Vec<Json>> {
+    pub(crate) async fn rows_in(&self, ty: &str, pred: &str, vals: &[String]) -> Result<Vec<Json>> {
         if vals.is_empty() {
             return Ok(Vec::new());
         }
