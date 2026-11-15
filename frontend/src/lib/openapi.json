@@ -467,6 +467,38 @@
         "x-handler": "bins/control-api/src/config_routes.rs::put_section"
       }
     },
+    "/api/connections": {
+      "get": {
+        "operationId": "connections_connections",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "one row per keyed catalog source (credential fields as {name, required, set, hint} with the secrets.toml ref and env override, plus non-secret account info), the [garage] S3 credential and the infra endpoint URLs with passwords redacted",
+        "tags": [
+          "connections"
+        ],
+        "x-handler": "bins/control-api/src/connections_routes.rs::connections"
+      }
+    },
     "/api/decoders/cards": {
       "get": {
         "operationId": "console_decoder_cards",

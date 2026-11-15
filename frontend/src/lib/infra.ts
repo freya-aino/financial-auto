@@ -105,8 +105,48 @@ export interface DlqView {
 	messages: DlqMessage[];
 }
 
+// ---- external connections (connections_routes.rs, owner request 2026-11-15) ----
+
+/** One credential field: whether it is set and where to set it — never its value. */
+export interface CredentialField {
+	name: string;
+	required: boolean;
+	set: boolean;
+	/** At most the last 4 characters, only when set and long enough (`…3456`). */
+	hint: string | null;
+	/** Exact secrets.toml location, e.g. `[sources.oanda] api_key`. */
+	secret_ref: string;
+	/** Env override, e.g. `FA_OANDA_API_KEY`. */
+	env: string;
+}
+
+export interface Connection {
+	id: string;
+	name: string;
+	category: string | null;
+	auth: string | null;
+	status: string | null;
+	configured: boolean;
+	credentials: CredentialField[];
+	/** Non-secret account info: ids, host, practice flag, MIC… */
+	account: Record<string, string | boolean>;
+	note?: string;
+}
+
+export interface ConnectionsView {
+	connections: Connection[];
+	garage: {
+		configured: boolean;
+		access_key_id: string | null;
+		endpoint: string;
+		credentials: CredentialField[];
+	};
+	endpoints: { name: string; url: string }[];
+}
+
 export const infraApi = {
 	stores: () => getApi<StoresView>('/api/infra/stores'),
+	connections: () => getApi<ConnectionsView>('/api/connections'),
 	maintenance: () => getApi<{ jobs: MaintJob[] }>('/api/infra/maintenance'),
 	backup: () => getApi<BackupView>('/api/infra/backup'),
 	dlq: (limit = 50) => getApi<DlqView>(`/api/dlq${q({ limit })}`),
@@ -224,6 +264,88 @@ export const MAINT_LABELS: Record<string, string> = {
 	'ops.media_downsample': 'Media downsample',
 	'ops.accounting_close': 'Accounting close'
 };
+
+// ---- external connections: row shaping (the missing credentials are the headline) ----
+
+/** One display row of the connections table (catalog sources + the Garage S3 credential). */
+export interface ConnRow {
+	id: string;
+	name: string;
+	/** Catalog category plus auth scheme, e.g. `broker · api_key`. */
+	kind: string;
+	status: string | null;
+	statusCls: 'ok' | 'warn' | 'danger' | '';
+	credentials: CredentialField[];
+	missing: CredentialField[];
+	/** Non-secret account info as ordered label/value pairs. */
+	account: [string, string][];
+	note?: string;
+}
+
+/** Catalog status → badge class (live is proven, stub is implemented-unverified). */
+export function statusClass(status: string | null): ConnRow['statusCls'] {
+	if (status === 'live') return 'ok';
+	if (status === 'stub') return 'warn';
+	if (status === 'disabled') return 'danger';
+	return '';
+}
+
+export const missingCreds = (c: { credentials: CredentialField[] }): CredentialField[] =>
+	c.credentials.filter((f) => f.required && !f.set);
+
+/** `account` object → ordered pairs; booleans named (practice → `practice` / `live`). */
+export function accountPairs(account: Record<string, string | boolean>): [string, string][] {
+	return Object.entries(account)
+		.filter(([k]) => k !== 'practice') // folded into env below
+		.map(([k, v]) => [k, typeof v === 'boolean' ? (v ? 'yes' : 'no') : v] as [string, string]);
+}
+
+/**
+ * All connection rows for the table, Garage included, sorted so what the owner must act on
+ * comes first: active (stub/live) sources with missing credentials, then configured ones,
+ * then the planned catalog tail.
+ */
+export function connectionRows(v: ConnectionsView): ConnRow[] {
+	const rows: ConnRow[] = v.connections.map((c) => ({
+		id: c.id,
+		name: c.name,
+		kind: [c.category, c.auth].filter(Boolean).join(' · ') || 'unknown',
+		status: c.status,
+		statusCls: statusClass(c.status),
+		credentials: c.credentials,
+		missing: missingCreds(c),
+		account: accountPairs(c.account),
+		note: c.note
+	}));
+	rows.push({
+		id: 'garage',
+		name: 'Garage S3',
+		kind: 'object store · access key',
+		status: v.garage.configured ? 'configured' : null,
+		statusCls: v.garage.configured ? 'ok' : '',
+		credentials: v.garage.credentials,
+		missing: missingCreds(v.garage),
+		account: v.garage.access_key_id ? [['access_key_id', v.garage.access_key_id]] : []
+	});
+	const rank = (r: ConnRow) => {
+		// Catalog-planned sources and secrets-only rows (note set) are the tail; Garage is active.
+		const planned = r.status === 'planned' || (r.status === null && r.note !== undefined);
+		return (planned ? 2 : 0) + (r.missing.length ? 0 : 1);
+	};
+	return rows.sort((a, b) => rank(a) - rank(b) || a.id.localeCompare(b.id));
+}
+
+/** Headline for the panel: how many connections, and how many still need credentials. */
+export function connectionsSummary(rows: ConnRow[]): { total: number; missing: number; text: string } {
+	const missing = rows.filter((r) => r.missing.length).length;
+	return {
+		total: rows.length,
+		missing,
+		text: missing
+			? `${missing} of ${rows.length} connections missing credentials`
+			: `all ${rows.length} connections configured`
+	};
+}
 
 export const replayConfirmText = (m: DlqMessage) =>
 	`Replay DLQ seq ${m.seq} (${bytes(m.size)}) to ${m.original_subject}? The message is republished to its original subject and removed from the DLQ stream.`;

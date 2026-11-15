@@ -9,6 +9,8 @@
 	import { errText } from '../../lib/console';
 	import {
 		backupRows,
+		connectionRows,
+		connectionsSummary,
 		fmtAge,
 		infraApi,
 		MAINT_LABELS,
@@ -17,6 +19,7 @@
 		replayConfirmText,
 		vmBudget,
 		type BackupView,
+		type ConnectionsView,
 		type DlqView,
 		type MaintJob,
 		type StoresView
@@ -24,6 +27,9 @@
 
 	let stores = $state<StoresView | null>(null);
 	let storesError = $state('');
+	let connections = $state<ConnectionsView | null>(null);
+	let connectionsError = $state('');
+	let openConn = $state<string | null>(null);
 	let backup = $state<BackupView | null>(null);
 	let backupError = $state('');
 	let jobs = $state<MaintJob[]>([]);
@@ -40,6 +46,8 @@
 
 	const vm = $derived(stores ? vmBudget(stores.stores.victoriametrics) : null);
 	const backupCard = $derived(backup ? backupRows(backup) : []);
+	const connRows = $derived(connections ? connectionRows(connections) : []);
+	const connSummary = $derived(connRows.length ? connectionsSummary(connRows) : null);
 
 	async function loadStores() {
 		try {
@@ -47,6 +55,14 @@
 			storesError = '';
 		} catch (e) {
 			storesError = errText(e);
+		}
+	}
+	async function loadConnections() {
+		try {
+			connections = await infraApi.connections();
+			connectionsError = '';
+		} catch (e) {
+			connectionsError = errText(e);
 		}
 	}
 	async function loadBackup() {
@@ -97,11 +113,12 @@
 	});
 	onMount(() => {
 		void loadStores();
+		void loadConnections();
 		void loadBackup();
 		void loadJobs();
 		const stopFast = poll(loadDlq, 15_000);
 		const stopSlow = poll(async () => {
-			await Promise.all([loadStores(), loadBackup(), loadJobs()]);
+			await Promise.all([loadStores(), loadConnections(), loadBackup(), loadJobs()]);
 		}, 30_000);
 		const t = setInterval(() => (now = Date.now()), 5000);
 		return () => {
@@ -118,6 +135,65 @@
 <ViewHeader title="Infra" spec="51 §6 round 9" note="GET /api/infra/stores|maintenance|backup · /api/dlq — real usage, backup health, maintenance runs, dead letters" />
 
 <div class="grid cols">
+	<section class="panel wide">
+		<div class="panel-head">
+			<h2>External connections</h2>
+			{#if connSummary}
+				<span class="badge {connSummary.missing ? 'danger' : 'ok'}">{connSummary.text}</span>
+			{/if}
+		</div>
+		{#if connectionsError}<p class="badge danger">{connectionsError}</p>
+		{:else if !connections}<p class="dim">loading…</p>
+		{:else}
+			<table>
+				<thead><tr><th>connection</th><th>kind</th><th>status</th><th>credentials</th><th>account</th></tr></thead>
+				<tbody>
+					{#each connRows as c (c.id)}
+						<tr class="click" onclick={() => (openConn = openConn === c.id ? null : c.id)}>
+							<td>{c.name}</td>
+							<td class="dim">{c.kind}</td>
+							<td>{#if c.status}<span class="badge {c.statusCls}">{c.status}</span>{:else}<span class="dim">—</span>{/if}</td>
+							<td>
+								{#each c.credentials as f (f.name)}
+									{#if f.set}
+										<span class="cred mono" title="{f.secret_ref} · {f.env}">{f.name}{f.hint ? ` ${f.hint}` : ''} ✓</span>
+									{:else if f.required}
+										<span class="badge danger" title="set {f.secret_ref} in config/secrets.toml (or {f.env})">{f.name} missing</span>
+									{/if}
+								{/each}
+							</td>
+							<td class="dim">{c.account.map(([k, v]) => `${k}: ${v}`).join(' · ') || '—'}{c.note ? ` · ${c.note}` : ''}</td>
+						</tr>
+						{#if openConn === c.id}
+							<tr class="detail"><td colspan="5">
+								{#if c.missing.length}
+									<p class="small">Missing credentials — owner-edited in <span class="mono">config/secrets.toml</span> (never writable through this API):</p>
+									<ul class="small">
+										{#each c.missing as f (f.name)}
+											<li><span class="mono">{f.secret_ref}</span> <span class="dim">(env override <span class="mono">{f.env}</span>)</span></li>
+										{/each}
+									</ul>
+								{:else}
+									<p class="small dim">All credentials set. Values stay in config/secrets.toml; this view only shows masked tails.</p>
+								{/if}
+							</td></tr>
+						{/if}
+					{/each}
+				</tbody>
+			</table>
+			<details>
+				<summary class="dim small">Infra endpoints ({connections.endpoints.length}) — passwords redacted</summary>
+				<table class="endpoints">
+					<tbody>
+						{#each connections.endpoints as e (e.name)}
+							<tr><td>{e.name}</td><td class="mono dim">{e.url}</td></tr>
+						{/each}
+					</tbody>
+				</table>
+			</details>
+		{/if}
+	</section>
+
 	<section class="panel">
 		<div class="panel-head"><h2>Postgres</h2>{#if storeErr(stores?.stores.postgres)}<span class="badge danger">down</span>{/if}</div>
 		{#if storesError}<p class="badge danger">{storesError}</p>
@@ -352,5 +428,22 @@
 		margin: 4px 0;
 		white-space: pre-wrap;
 		word-break: break-all;
+	}
+	.cred {
+		margin-right: 10px;
+		white-space: nowrap;
+	}
+	details {
+		margin-top: 8px;
+	}
+	summary {
+		cursor: pointer;
+	}
+	.endpoints {
+		margin-top: 4px;
+		width: auto;
+	}
+	.endpoints td:first-child {
+		padding-right: 12px;
 	}
 </style>

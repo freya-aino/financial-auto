@@ -1,17 +1,24 @@
 import { describe, expect, it } from 'vitest';
 import {
+	accountPairs,
 	ageClass,
 	backupRows,
 	BACKUP_OK_S,
+	connectionRows,
+	connectionsSummary,
 	DRILL_OK_S,
 	fmtAge,
 	MAINT_LABELS,
 	maintSummary,
+	missingCreds,
 	purgeConfirmText,
 	replayConfirmText,
+	statusClass,
 	vmBudget,
 	WAL_STALE_S,
 	type BackupView,
+	type ConnectionsView,
+	type CredentialField,
 	type DlqMessage
 } from './infra';
 
@@ -119,5 +126,88 @@ describe('DLQ confirm texts name the consequence', () => {
 		expect(purgeConfirmText(1)).toContain('all 1 message of');
 		expect(purgeConfirmText(3, 'dlq.LATENT.>')).toContain('subjects matching dlq.LATENT.>');
 		expect(purgeConfirmText(0)).toContain('cannot be replayed');
+	});
+});
+
+describe('external connections', () => {
+	const field = (name: string, over: Partial<CredentialField> = {}): CredentialField => ({
+		name,
+		required: true,
+		set: false,
+		hint: null,
+		secret_ref: `[sources.x] ${name}`,
+		env: `FA_X_${name.toUpperCase()}`,
+		...over
+	});
+	const view: ConnectionsView = {
+		connections: [
+			{
+				id: 'zz_planned', name: 'ZZ', category: 'market_data', auth: 'api_key', status: 'planned',
+				configured: false, credentials: [field('api_key')], account: {}
+			},
+			{
+				id: 'oanda', name: 'OANDA', category: 'broker', auth: 'api_key', status: 'stub', configured: false,
+				credentials: [
+					field('api_key', { secret_ref: '[sources.oanda] api_key' }),
+					field('account_id', { set: true, hint: '…-001' })
+				],
+				account: { account_id: '001-004-1234567-001', env: 'practice', practice: true, host: 'https://api-fxpractice.oanda.com' }
+			},
+			{
+				id: 'kraken', name: 'Kraken', category: 'crypto_exchange', auth: 'hmac', status: 'live', configured: true,
+				credentials: [field('api_key', { set: true, hint: '…abcd' }), field('api_secret', { set: true, hint: null })],
+				account: {}
+			}
+		],
+		garage: {
+			configured: false,
+			access_key_id: 'GK31c2f218a2e44f329df7',
+			endpoint: 'http://127.0.0.1:3900',
+			credentials: [
+				field('access_key_id', { set: true, hint: '…9df7', secret_ref: '[garage] access_key_id' }),
+				field('secret_access_key', { secret_ref: '[garage] secret_access_key' })
+			]
+		},
+		endpoints: [{ name: 'postgres', url: 'postgres://fa:***@127.0.0.1:5432/fa' }]
+	};
+
+	it('maps catalog status to badge classes', () => {
+		expect(statusClass('live')).toBe('ok');
+		expect(statusClass('stub')).toBe('warn');
+		expect(statusClass('disabled')).toBe('danger');
+		expect(statusClass('planned')).toBe('');
+		expect(statusClass(null)).toBe('');
+	});
+
+	it('missing = required and not set', () => {
+		expect(missingCreds({ credentials: [field('a'), field('b', { set: true }), field('c', { required: false })] }).map((f) => f.name)).toEqual(['a']);
+	});
+
+	it('account pairs name booleans and skip the folded practice flag', () => {
+		expect(accountPairs({ account_id: '001', practice: true, env: 'practice' })).toEqual([
+			['account_id', '001'],
+			['env', 'practice']
+		]);
+	});
+
+	it('rows put active-but-missing first, then configured, then planned; garage is a row', () => {
+		const rows = connectionRows(view);
+		expect(rows.map((r) => r.id)).toEqual(['garage', 'oanda', 'kraken', 'zz_planned']);
+		const oanda = rows[1];
+		expect(oanda.missing.map((f) => f.name)).toEqual(['api_key']);
+		expect(oanda.missing[0].secret_ref).toBe('[sources.oanda] api_key');
+		expect(oanda.kind).toBe('broker · api_key');
+		expect(oanda.account).toContainEqual(['account_id', '001-004-1234567-001']);
+		const garage = rows[0];
+		expect(garage.missing.map((f) => f.name)).toEqual(['secret_access_key']);
+		expect(garage.account).toEqual([['access_key_id', 'GK31c2f218a2e44f329df7']]);
+		expect(rows[2].statusCls).toBe('ok');
+	});
+
+	it('the summary headlines what is not configured', () => {
+		const rows = connectionRows(view);
+		expect(connectionsSummary(rows)).toMatchObject({ total: 4, missing: 3, text: '3 of 4 connections missing credentials' });
+		const allSet = rows.map((r) => ({ ...r, missing: [] }));
+		expect(connectionsSummary(allSet).text).toBe('all 4 connections configured');
 	});
 });
