@@ -27,6 +27,7 @@ fa-strategies = { path = "crates/fa-strategies" }
 fa-allocator = { path = "crates/fa-allocator" }
 fa-risk = { path = "crates/fa-risk" }
 fa-ledger = { path = "crates/fa-ledger" }
+fa-accounting = { path = "crates/fa-accounting" }
 fa-backtest = { path = "crates/fa-backtest" }
 fa-metrics = { path = "crates/fa-metrics" }
 

@@ -1084,6 +1084,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fa-accounting"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "fa-ledger",
+ "rust_decimal",
+ "serde",
+ "sqlx",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "fa-allocator"
 version = "0.1.0"
 dependencies = [
