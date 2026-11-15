@@ -22,9 +22,30 @@ pub struct PlatformConfig {
     pub postgres: PostgresConfig,
     pub garage: GarageConfig,
     pub control_api: ControlApiConfig,
+    /// Organisational books: revenue split and opex prices (D-104); absent = defaults.
+    #[serde(default)]
+    pub accounting: AccountingConfig,
     /// Operator-tunable keys; absent = defaults, overridden by `runtime.toml` when present.
     #[serde(default)]
     pub runtime: RuntimeConfig,
+}
+
+/// `[accounting]` (D-104): the daily close of the organisational books, run by control-api.
+/// Fractions split a closed day's positive net income (owner payable / infrastructure fund /
+/// reserves; the rest stays retained); prices turn the resource meters into EUR opex. Everything
+/// defaults to zero — no split and no opex until the owner sets numbers.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountingConfig {
+    pub owner_frac: f64,
+    pub infra_frac: f64,
+    pub reserve_frac: f64,
+    /// Flat EUR per day for the host itself (power, wear).
+    pub base_eur_per_day: f64,
+    /// EUR per GPU hour, applied to `ops.job_run.used_gpu_ms` of the closed day.
+    pub gpu_eur_per_hour: f64,
+    /// EUR per GiB-month of stored data (VictoriaMetrics + Postgres), charged as 1/30 per day.
+    pub storage_eur_per_gib_month: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -299,7 +320,18 @@ impl PlatformConfig {
 
     /// Section names of the platform config in file order.
     pub fn section_names() -> &'static [&'static str] {
-        &["timescales", "nats", "helix", "qdrant", "victoriametrics", "postgres", "garage", "control_api", "runtime"]
+        &[
+            "timescales",
+            "nats",
+            "helix",
+            "qdrant",
+            "victoriametrics",
+            "postgres",
+            "garage",
+            "control_api",
+            "accounting",
+            "runtime",
+        ]
     }
 
     /// One section as a TOML value (`None` for an unknown name). Secrets are not part of this

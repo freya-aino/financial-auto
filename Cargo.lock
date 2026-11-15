@@ -574,6 +574,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "fa-accounting",
  "fa-backtest",
  "fa-blob",
  "fa-bus",

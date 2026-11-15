@@ -1,6 +1,8 @@
 //! control-api: axum REST + WebSocket control plane for the frontend (spec 50).
 //! Local only, no auth (ADR 0006).
 
+mod accounting;
+mod accounting_routes;
 mod alerts_routes;
 mod audit;
 mod bus_tap;
@@ -88,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
     ops_routes::spawn(&state); // JOB_RESULTS → ops.job_run, config → ops.config_snapshot (wait for Postgres)
     ref_mirror::spawn(&state); // Postgres ref → Helix Instrument/Entity/Venue mirror: full at start + periodic, incremental on ref.changed.* (spec 12 §5)
     refdata_maint::spawn(&state); // daily calendar refresh + adjusted daily bars (spec 12 §7)
+    accounting::spawn(&state); // daily close of the organisational books (D-104)
     maintenance::spawn(&state); // daily VictoriaMetrics retention + weekly genome GC (spec 20 §6.5)
     let app = app(state, Some(args.frontend)).await;
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
@@ -113,7 +116,8 @@ async fn app(state: state::AppState, frontend: Option<PathBuf>) -> axum::Router 
         .merge(alerts_routes::router(state.clone())) // vmalert receiver → ops.alert + audit (spec 60 §6.5)
         .merge(console_routes::router().with_state(state.clone())) // decoders, pipeline, halts/re-arm, risk events, refdata reads
         .merge(ops_routes::router().with_state(state.clone())) // ops schema: job history, config snapshots (spec 20 §5.4)
-        .merge(metrics_routes::router().with_state(state.clone())); // VictoriaMetrics query passthrough with limits (spec 50 §5)
+        .merge(metrics_routes::router().with_state(state.clone())) // VictoriaMetrics query passthrough with limits (spec 50 §5)
+        .merge(accounting_routes::router().with_state(state.clone())); // organisational books (D-104)
     let app = ledger_routes::install(state.clone(), app).await; // Postgres pool + paper-book seed + ledger routes (D-047)
     let app = services_routes::install(state.clone(), app); // start/stop/restart via the Docker socket (D-060)
     let app = trading_routes::install(state.clone(), app); // strategy lifecycle + limits via ctl.risk.* (D-051)
@@ -157,7 +161,12 @@ mod tests {
         super::app(state, None).await
     }
 
-    async fn send(app: &axum::Router, method: &str, uri: &str, body: &str) -> (StatusCode, Option<String>, Option<String>) {
+    async fn send(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, Option<String>, Option<String>) {
         let req = Request::builder()
             .method(method)
             .uri(uri)
@@ -229,7 +238,8 @@ mod tests {
         // pre-trade check: request/reply on ctl.risk.pretrade, a read (not audited)
         let (status, audit, _) = send(&app, "POST", "/api/trading/pretrade", order).await;
         assert_eq!((status, audit), (StatusCode::SERVICE_UNAVAILABLE, None));
-        let (status, _, _) = send(&app, "POST", "/api/trading/pretrade", r#"{"instrument_id":"x","side":"hold","quantity":1}"#).await;
+        let (status, _, _) =
+            send(&app, "POST", "/api/trading/pretrade", r#"{"instrument_id":"x","side":"hold","quantity":1}"#).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         // reads are not audited; the v1 alias serves every route
         let (status, audit, _) = send(&app, "GET", "/api/v1/health", "").await;

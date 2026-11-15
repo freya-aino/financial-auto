@@ -125,6 +125,23 @@ impl PgAccounting {
         Ok(chart)
     }
 
+    /// The newest `limit` entries with their postings, newest first (API listings).
+    pub async fn recent_entries(&self, limit: i64) -> Result<Vec<Entry>, PgAcctError> {
+        let rows = sqlx::query("SELECT id, ts, entry_ref, memo FROM acct.entry ORDER BY ts DESC, id DESC LIMIT $1")
+            .bind(limit.clamp(1, 1000))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let id: Uuid = r.get(0);
+            let mut tx = self.pool.begin().await?;
+            let postings = postings_of(&mut tx, id).await?;
+            tx.rollback().await?;
+            out.push(Entry { id, ts: r.get(1), entry_ref: r.get(2), memo: r.get(3), postings });
+        }
+        Ok(out)
+    }
+
     /// Rebuilds the in-memory journal from Postgres, replaying entries in `(ts, id)` order.
     pub async fn load(&self) -> Result<Journal, PgAcctError> {
         let chart = self.load_chart().await?;

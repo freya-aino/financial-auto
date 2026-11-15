@@ -30,3 +30,13 @@ media_downsample_after_d = 30 # spec 20 §6.5: full video → sampled frames aft
 
 [control_api]
 bind = "0.0.0.0:7700"
+
+# Organisational books (D-104): split fractions of a closed day's positive net income and
+# prices for the system's own metered costs. All zero: no split, no opex, until the owner sets them.
+[accounting]
+owner_frac = 0.0
+infra_frac = 0.0
+reserve_frac = 0.0
+base_eur_per_day = 0.0
+gpu_eur_per_hour = 0.0
+storage_eur_per_gib_month = 0.0
