@@ -437,13 +437,14 @@ impl DgraphGraph {
     /// Helix expanded label-free with `both`/`both_e`. Dgraph has no untyped edge traversal
     /// either, so the walk follows the reified edge types by business id — which is what the
     /// model-state graph is actually linked by.
-    pub async fn dg_neighborhood(&self, start: u64, depth: usize) -> Result<Vec<crate::queries::NodeRow>> {
+    pub async fn dg_neighborhood(&self, start: u64, depth: usize) -> Result<crate::queries::Neighborhood> {
+        let mut out = crate::queries::Neighborhood::default();
         let Some(row) = self.one(&format!("{{ q(func: uid({u})) {{ {ALL} }} }}", u = crate::dgraph::u64_to_uid(start)))
             .await?
         else {
-            return Ok(Vec::new());
+            return Ok(out);
         };
-        let mut out = vec![typed_row(&row)];
+        push_row(&mut out, &row);
         let mut seen = vec![start];
         let mut frontier = vec![row];
         for _ in 0..depth.max(1) {
@@ -453,7 +454,7 @@ impl DgraphGraph {
                     let id = uid_of(&n);
                     if id != 0 && !seen.contains(&id) {
                         seen.push(id);
-                        out.push(typed_row(&n));
+                        push_row(&mut out, &n);
                         next.push(n);
                     }
                 }
@@ -517,6 +518,22 @@ impl DgraphGraph {
             }
         }
         Ok(out)
+    }
+}
+
+/// Sort a row into the `Neighborhood`'s nodes or edges, by whether its type is a reified edge.
+fn push_row(out: &mut crate::queries::Neighborhood, j: &Json) {
+    let row = typed_row(j);
+    if crate::dgraph_schema::is_edge_type(&row.label) {
+        out.edges.push(crate::queries::EdgeRow {
+            id: row.id,
+            label: row.label,
+            from: 0,
+            to: 0,
+            properties: row.properties,
+        });
+    } else {
+        out.nodes.push(row);
     }
 }
 

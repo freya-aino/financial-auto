@@ -688,6 +688,31 @@ pub const TYPES: &[&str] = &[
     "SchemaMarker",
 ];
 
+/// Types that are reified *edges* rather than entities.
+///
+/// The Helix model had real edges carrying properties; here they are nodes, because `GraphStore`
+/// hands edges to callers as rows with ids. The explorer's `Neighborhood` still separates nodes
+/// from edges, so it needs to know which is which.
+pub fn is_edge_type(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "Transition"
+            | "DescendsFrom"
+            | "Hier"
+            | "RegionMatch"
+            | "SnapshotParent"
+            | "TrainedOn"
+            | "FeedbackFrom"
+            | "GenomeParent"
+            | "ExpertAlign"
+            | "EvaluatedOn"
+            | "RefIssuedBy"
+            | "RefListedOn"
+            | "RefSameExposure"
+            | "RefInSector"
+    )
+}
+
 /// The business-key predicate of a type, where it has one. `resolve_node` tries these in order
 /// when the explorer is handed a string id rather than a `uid`; it mirrors `BUSINESS_KEYS` in
 /// `queries.rs`, widened to the whole schema.
@@ -768,6 +793,21 @@ mod tests {
                 assert!(SCHEMA.contains(&format!("{k}:")), "business key `{k}` of {t} is not declared");
             }
         }
+    }
+
+    #[test]
+    fn edge_types_are_declared_types() {
+        for t in TYPES {
+            let _ = is_edge_type(t);
+        }
+        // and nothing claims to be an edge type without being in the schema
+        for t in ["Transition", "Hier", "GenomeParent", "ExpertAlign", "EvaluatedOn"] {
+            assert!(is_edge_type(t), "{t} should be an edge type");
+            assert!(TYPES.contains(&t), "{t} is not a declared type");
+        }
+        assert!(!is_edge_type("LatentRegion"));
+        assert!(!is_edge_type("Snapshot"));
+        assert!(!is_edge_type("Genome"));
     }
 
     #[test]

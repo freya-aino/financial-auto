@@ -314,8 +314,15 @@ async fn evolution_and_experts_round_trip() {
     assert_eq!(by_id.id, g0.id);
     assert!(g.dg_resolve_node(&format!("{run}-nope")).await.unwrap().is_none());
     let hood = g.dg_neighborhood(g0.id, 1).await.unwrap();
-    assert!(hood.len() > 1, "genome should reach its fitness/parent/evaluation rows, got {}", hood.len());
-    assert_eq!(hood[0].id, g0.id, "the start node comes first");
+    assert_eq!(hood.nodes.first().map(|n| n.id), Some(g0.id), "the start node comes first");
+    // reified edges come back as edges, not nodes: fitness is an entity, the parent link is an edge
+    assert!(hood.nodes.iter().any(|n| n.label == "FitnessRecord"), "nodes: {:?}", hood.nodes.len());
+    assert!(
+        hood.edges.iter().any(|e| e.label == "GenomeParent"),
+        "the parent link must be an edge, got {:?}",
+        hood.edges.iter().map(|e| &e.label).collect::<Vec<_>>()
+    );
+    assert!(hood.edges.iter().any(|e| e.label == "EvaluatedOn"));
 
     // cleanup
     for (ty, pred) in [
@@ -333,5 +340,138 @@ async fn evolution_and_experts_round_trip() {
         let del: Vec<Json> =
             data["q"].as_array().map(|a| a.iter().map(|r| json!({"uid": r["uid"]})).collect()).unwrap_or_default();
         g.client().delete(del).await.unwrap();
+    }
+}
+
+/// The D-110 cutover: `HubClient` must serve the whole surface from Dgraph.
+///
+/// The client's own base URL points at a dead port, so anything that still fell through to the
+/// Helix query layer would fail rather than quietly working — which is the only way to be sure the
+/// routing is complete and not merely present.
+#[tokio::test]
+async fn hub_client_routes_everything_to_dgraph() {
+    let Some(dg) = client() else {
+        println!("FA_DGRAPH_URL not set; skipping");
+        return;
+    };
+    let graph = fa_hub::DgraphGraph::new(dg);
+    graph.ensure_schema().await.expect("schema");
+    let hub = fa_hub::HubClient::new("http://127.0.0.1:1").with_graph(Some(graph.clone())).with_vectors(None);
+    assert_eq!(hub.graph_backend(), "dgraph");
+
+    let run = run_id();
+    let sid = format!("{run}-snap");
+    let gid = format!("{run}-genome");
+
+    // schema readiness goes through /alter + the marker, with no index receipts to wait on
+    hub.ensure_schema_ready(std::time::Duration::from_secs(10)).await.expect("ensure_schema_ready");
+
+    // model-state graph (GraphStore surface)
+    let snap = hub
+        .ensure_snapshot(&fa_hub::NewSnapshot {
+            snapshot_id: sid.clone(),
+            timescale: "1m".into(),
+            encoder_family: "stat".into(),
+            generation: 1,
+            garage_key: String::new(),
+            status: "candidate".into(),
+        })
+        .await
+        .expect("ensure_snapshot via hub");
+    assert!(hub.snapshot_by_id(&sid).await.unwrap().is_some());
+
+    // genomes + fitness + lineage (was Helix-only)
+    let g = hub
+        .upsert_genome(&fa_hub::NewGenome {
+            genome_id: gid.clone(),
+            kind: "strategy".into(),
+            family: "momentum".into(),
+            params: "{}".into(),
+        })
+        .await
+        .expect("upsert_genome via hub");
+    hub.add_fitness_record(&fa_hub::NewFitness {
+        genome_id: gid.clone(),
+        generation: 1,
+        objectives: "{}".into(),
+        pareto_rank: 1,
+    })
+    .await
+    .expect("fitness via hub");
+    assert_eq!(hub.genome_fitness(g.id).await.unwrap().len(), 1);
+    assert!(hub.genome_detail(&gid).await.unwrap().is_some());
+
+    // experts (was Helix-only), including the D-111 derived name
+    hub.upsert_expert(&fa_hub::experts::NewExpert {
+        snapshot_id: sid.clone(),
+        timescale: "1m".into(),
+        expert_id: 0,
+        dim: 8,
+        usage: 0.1,
+        skill: 0.2,
+        born_gen: 1,
+        specialisation: "{}".into(),
+    })
+    .await
+    .expect("upsert_expert via hub");
+    let experts = hub.snapshot_experts(&sid).await.expect("snapshot_experts via hub");
+    assert_eq!(experts.len(), 1);
+    assert_eq!(experts[0].name, fa_hub::experts::expert_name(&sid, 0));
+
+    // evolution (was Helix-only)
+    hub.record_evaluation(&fa_hub::evolution::Evaluation {
+        genome_id: gid.clone(),
+        snapshot_id: sid.clone(),
+        generation: format!("{run}-gen"),
+        gen_index: 1,
+        rung: 0,
+        score: 0.5,
+        objectives: "{}".into(),
+        job_id: String::new(),
+        experts: None,
+    })
+    .await
+    .expect("record_evaluation via hub");
+    hub.upsert_pareto_front(&fa_hub::evolution::NewParetoFront {
+        generation_id: format!("{run}-gen"),
+        gen_index: 1,
+        kind: "decoder".into(),
+        snapshot_id: sid.clone(),
+        keys: vec!["sharpe".into()],
+        members: vec![],
+        hypervolume: 0.1,
+        final_loop: false,
+    })
+    .await
+    .expect("upsert_pareto_front via hub");
+    assert_eq!(hub.pareto_fronts(&format!("{run}-gen")).await.unwrap().len(), 1);
+
+    // explorer (was Helix-only, and label-free there)
+    let node = hub.resolve_node(&gid).await.expect("resolve_node via hub").expect("found");
+    assert_eq!(node.label, "Genome");
+    let hood = hub.neighborhood(g.id, 1).await.expect("neighborhood via hub");
+    assert!(!hood.nodes.is_empty());
+
+    // the named-query catalogue the UI drives
+    let listed = hub.run_named("listSnapshots", &json!({})).await.expect("run_named via hub");
+    assert!(listed.to_string().contains(&sid), "listSnapshots must see the snapshot");
+
+    let _ = snap;
+    // cleanup
+    for (ty, pred) in [
+        ("FitnessRecord", "fitness_record.genome_id"),
+        ("EvaluatedOn", "evaluated_on.genome_id"),
+        ("ParetoFront", "pareto_front.generation_id"),
+        ("Expert", "expert.snapshot_id"),
+        ("Genome", "genome.genome_id"),
+        ("RegionStatusVersion", "region_status_version.region_id"),
+        ("Snapshot", "snapshot.snapshot_id"),
+    ] {
+        let f = fa_hub::dgraph_schema::prefix_filter(pred, &run);
+        let q = format!("{{ q(func: type({ty})) @filter({f}) {{ uid }} }}");
+        let data = graph.client().query(&q).await.unwrap();
+        let del: Vec<Json> =
+            data["q"].as_array().map(|a| a.iter().map(|r| json!({"uid": r["uid"]})).collect()).unwrap_or_default();
+        graph.client().delete(del).await.unwrap();
     }
 }

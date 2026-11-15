@@ -29,32 +29,37 @@ use crate::regions::{
     RegionSetRow, RegionStatsUpdate,
 };
 use crate::versions::{RegionStatusVersion, TransitionVersion, edge_key};
+use crate::graph_dgraph::DgraphGraph;
 use crate::{HubError, Result, schema};
 
 /// Backend names accepted by `[graph] backend` / `FA_GRAPH_BACKEND`.
-pub const BACKENDS: [&str; 2] = ["postgres", "helix"];
+///
+/// `postgres` is gone: D-110 replaced the Postgres graph with Dgraph, and [`PgGraph`] now exists
+/// only so `examples/graph_migrate.rs` can read the old schema during the cutover. A config still
+/// naming it fails to load rather than silently attaching a store the platform no longer writes.
+pub const BACKENDS: [&str; 2] = ["dgraph", "helix"];
 
-static DEFAULT_GRAPH: RwLock<Option<Arc<PgGraph>>> = RwLock::new(None);
+static DEFAULT_GRAPH: RwLock<Option<Arc<DgraphGraph>>> = RwLock::new(None);
 
 /// Applies `[graph]` for this process (like [`crate::qdrant::configure_vectors`]): with backend
-/// `postgres` a lazily connected [`PgGraph`] on `postgres.url` (`FA_POSTGRES_URL` wins) becomes
-/// the default of every client created afterwards; `helix` detaches it. Returns the backend.
+/// `dgraph` a [`DgraphGraph`] on `dgraph.url` (`FA_DGRAPH_URL` wins) becomes the default of every
+/// client created afterwards; `helix` detaches it. Returns the backend.
 pub fn configure_graph(cfg: &fa_core::config::PlatformConfig) -> &'static str {
     let backend =
         std::env::var("FA_GRAPH_BACKEND").ok().filter(|b| !b.is_empty()).unwrap_or_else(|| cfg.graph.backend.clone());
-    let pg = (backend != "helix").then(|| {
+    let dg = (backend != "helix").then(|| {
         let url =
-            std::env::var("FA_POSTGRES_URL").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| cfg.postgres.url.clone());
-        Arc::new(PgGraph::connect_lazy(&url))
+            std::env::var("FA_DGRAPH_URL").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| cfg.dgraph.url.clone());
+        Arc::new(DgraphGraph::new(crate::dgraph::DgraphClient::new(&url)))
     });
-    let name = if pg.is_some() { "postgres" } else { "helix" };
-    *DEFAULT_GRAPH.write().unwrap_or_else(std::sync::PoisonError::into_inner) = pg;
+    let name = if dg.is_some() { "dgraph" } else { "helix" };
+    *DEFAULT_GRAPH.write().unwrap_or_else(std::sync::PoisonError::into_inner) = dg;
     name
 }
 
 /// The process default set by [`configure_graph`] (`None` until a service configured it, so
 /// plain `HubClient::new` outside a configured service keeps the historical Helix behaviour).
-pub(crate) fn default_graph() -> Option<Arc<PgGraph>> {
+pub(crate) fn default_graph() -> Option<Arc<DgraphGraph>> {
     DEFAULT_GRAPH.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
