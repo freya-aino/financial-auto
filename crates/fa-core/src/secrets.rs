@@ -9,6 +9,9 @@
 //!
 //! [sources.lemon]
 //! api_key = ""
+//!
+//! [llm]
+//! api_key = ""
 //! ```
 //! `FA_GARAGE_ACCESS_KEY_ID` overrides `[garage] access_key_id`; `FA_LEMON_API_KEY`
 //! overrides `[sources.lemon] api_key`. A missing file yields empty secrets, not an error,
@@ -54,6 +57,9 @@ impl std::fmt::Debug for GarageSecrets {
 pub struct Secrets {
     pub garage: GarageSecrets,
     pub sources: BTreeMap<String, BTreeMap<String, String>>,
+    /// `[llm]`: the OpenAI-compatible endpoint's key (D-117). Written by control-api when the
+    /// operator enters it in the UI, so it is the one secret the platform itself persists.
+    pub llm: LlmSecrets,
 }
 
 impl std::fmt::Debug for Secrets {
@@ -63,7 +69,30 @@ impl std::fmt::Debug for Secrets {
             .iter()
             .map(|(s, kv)| (s.as_str(), kv.iter().map(|(k, v)| (k.as_str(), redact_value(k, v))).collect()))
             .collect();
-        f.debug_struct("Secrets").field("garage", &self.garage).field("sources", &sources).finish()
+        f.debug_struct("Secrets")
+            .field("garage", &self.garage)
+            .field("sources", &sources)
+            .field("llm", &self.llm)
+            .finish()
+    }
+}
+
+/// `[llm]`: credentials for the OpenAI-compatible endpoint the LLM suite calls (D-117).
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct LlmSecrets {
+    pub api_key: String,
+}
+
+impl LlmSecrets {
+    pub fn is_configured(&self) -> bool {
+        !self.api_key.is_empty()
+    }
+}
+
+impl std::fmt::Debug for LlmSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmSecrets").field("api_key", &redact_value("api_key", &self.api_key)).finish()
     }
 }
 
@@ -124,6 +153,12 @@ impl Secrets {
             let Some(rest) = k.as_ref().strip_prefix("FA_") else { continue };
             let value: String = v.into();
             if value.is_empty() || rest.is_empty() {
+                continue;
+            }
+            if let Some(key) = rest.strip_prefix("LLM_") {
+                if key.eq_ignore_ascii_case("api_key") {
+                    self.llm.api_key = value;
+                }
                 continue;
             }
             if let Some(key) = rest.strip_prefix("GARAGE_") {

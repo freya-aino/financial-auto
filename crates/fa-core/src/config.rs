@@ -24,6 +24,9 @@ pub struct PlatformConfig {
     /// Graph store (ADR 0010, D-108); absent = defaults (Postgres).
     #[serde(default)]
     pub graph: GraphConfig,
+    /// The OpenAI-compatible endpoint the LLM suite calls (D-117); absent = defaults (off).
+    #[serde(default)]
+    pub llm: LlmConfig,
     pub victoriametrics: Endpoint,
     pub postgres: PostgresConfig,
     pub garage: GarageConfig,
@@ -73,6 +76,56 @@ pub struct QdrantConfig {
     /// `FA_VECTOR_BACKEND`; `FA_QDRANT_URL` overrides `url`.
     #[serde(default = "default_vector_backend")]
     pub vector_backend: String,
+}
+
+/// `[llm]`: the OpenAI-compatible endpoint the LLM suite calls — chat for the agent, embeddings
+/// for the encoder's text expert (D-117).
+///
+/// The key is not here: it lives in the git-ignored `config/secrets.toml` under `[llm]`
+/// (`fa_core::secrets::LlmSecrets`, `FA_LLM_API_KEY`), so a platform config can be committed and
+/// shown in the UI without redaction. An empty `base_url` means the suite is not configured: the
+/// agent answers that it has no endpoint and the embedder falls back to hashed embeddings rather
+/// than stalling the encoder.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LlmConfig {
+    /// Base URL of an OpenAI-compatible API, without a trailing slash, e.g.
+    /// `https://api.openai.com/v1`. Overridden by `FA_LLM_BASE_URL`.
+    pub base_url: String,
+    /// Chat model the agent uses. Overridden by `FA_LLM_MODEL`.
+    pub model: String,
+    /// Embedding model the text expert's news embeddings come from. Overridden by
+    /// `FA_LLM_EMBEDDING_MODEL`.
+    pub embedding_model: String,
+    /// Width of that model's vectors. The value is checked against the first response and a
+    /// mismatch is refused rather than written, because a collection's dimension is fixed at
+    /// creation and silently mixing widths is unrecoverable.
+    pub embedding_dim: usize,
+    /// Request timeout in seconds.
+    pub timeout_secs: u64,
+    /// Most embedding inputs per request (providers cap this; 0 = one per request).
+    pub embed_batch: usize,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            model: "gpt-4o-mini".into(),
+            embedding_model: "text-embedding-3-small".into(),
+            embedding_dim: 1536,
+            timeout_secs: 60,
+            embed_batch: 64,
+        }
+    }
+}
+
+impl LlmConfig {
+    /// Whether an endpoint is configured at all (the key is checked separately, by the caller
+    /// holding the secrets).
+    pub fn is_configured(&self) -> bool {
+        !self.base_url.trim().is_empty()
+    }
 }
 
 /// `[graph]`: where the model-state graph lives (ADR 0010, D-108).

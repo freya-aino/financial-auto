@@ -20,11 +20,12 @@ RUN --mount=type=cache,id=fa-cargo-registry,target=/usr/local/cargo/registry \
     # makes them always newer than any cached artifact; registry dependencies stay cached.
     find crates bins -type f -exec touch {} + \
     && cargo build --release --locked -p control-api -p model-runtime -p evo-worker -p trainer \
-          -p strategy-runtime -p risk-engine \
+          -p strategy-runtime -p risk-engine -p llm-suite \
     && mkdir -p /out \
     && cp target/release/control-api target/release/model-runtime \
           target/release/evo-worker target/release/trainer \
-          target/release/strategy-runtime target/release/risk-engine /out/
+          target/release/strategy-runtime target/release/risk-engine \
+          target/release/llm-suite /out/
 
 # ── runtime ─────────────────────────────────────────────────────────────
 FROM debian:trixie-slim

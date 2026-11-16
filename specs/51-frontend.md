@@ -110,6 +110,10 @@ Topics: `bus`, `latent`, `evolution`, `trading`, `ops`. Stores update at most at
 
 ## 9. Acceptance criteria
 **Remaining (2026-11-15):**
+0. The **Agent tab** (`/agent/`, D-117) is new and unverified in a real browser: the conversation,
+   approval flow, endpoint form and embedding mix are built and type-checked, but only the pure
+   logic is tested (`agent.test.ts`).
+
 1. **50 000 points on the workstation's browser** (criterion 3): measured headless only; checked in the last, live round.
 
 Round 9 (Accounting panel, `/infra` with the control-api infra/DLQ endpoints, `/growth`) built 2026-11-15; `pnpm test` 25 files / 182 tests.

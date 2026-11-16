@@ -528,6 +528,30 @@ services:
       start_period: 20s
     restart: unless-stopped
 
+  # The LLM suite (D-117): news embeddings for the encoder's text expert, and the operator agent
+  # control-api proxies at /api/llm/*. No host port: the UI reaches it only through control-api,
+  # keeping spec 51's one-API rule.
+  llm-suite:
+    profiles: ["app"]
+    image: financial-auto/rust:dev
+    build: *rust-build
+    command: ["llm-suite"]
+    environment:
+      <<: *rust-env
+      FA_CONTROL_API: http://control-api:7700
+      FA_LLM_BIND: 0.0.0.0:7710
+    volumes: *secrets-volume
+    ports:
+      - "127.0.0.1:9109:9100" # metrics (9110-9119 is the evo-worker replica range)
+    depends_on: *core-deps
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9100/metrics"]
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 20s
+    restart: unless-stopped
+
   # The JOBS_TRAIN work-queue worker plus the periodic planner (D-115): without it adapter and
   # generation jobs queue up unprocessed (9 `train.adapter` jobs sat queued from 2026-11-15 to
   # 2026-11-16 because the trainer only existed as the `tools` CLI below).

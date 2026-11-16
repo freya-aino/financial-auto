@@ -8,6 +8,7 @@ mod audit;
 mod bus_tap;
 mod config_routes;
 mod connections_routes;
+mod llm_routes;
 mod console_routes;
 mod decoder_store;
 mod dlq_routes;
@@ -125,6 +126,7 @@ async fn app(state: state::AppState, frontend: Option<PathBuf>) -> axum::Router 
         .merge(accounting_routes::router().with_state(state.clone())) // organisational books (D-104)
         .merge(infra_routes::router().with_state(state.clone())) // store usage, maintenance runs, backup status (spec 51 round 9)
         .merge(connections_routes::router().with_state(state.clone())) // external connections & credential status (owner request 2026-11-15)
+        .merge(llm_routes::router().with_state(state.clone())) // LLM suite proxy + endpoint config (D-117)
         .merge(dlq_routes::router().with_state(state.clone())); // DLQ browser over JetStream (spec 51 round 9)
     let app = ledger_routes::install(state.clone(), app).await; // Postgres pool + paper-book seed + ledger routes (D-047)
     let app = services_routes::install(state.clone(), app); // start/stop/restart via the Docker socket (D-060)

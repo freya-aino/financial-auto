@@ -30,6 +30,7 @@ fa-ledger = { path = "crates/fa-ledger" }
 fa-accounting = { path = "crates/fa-accounting" }
 fa-backtest = { path = "crates/fa-backtest" }
 fa-metrics = { path = "crates/fa-metrics" }
+fa-llm = { path = "crates/fa-llm" }
 
 # external
 anyhow = "1.0.104"

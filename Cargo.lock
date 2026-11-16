@@ -1265,6 +1265,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fa-llm"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "fa-core",
+ "fa-metrics",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fa-mcmc"
 version = "0.1.0"
 dependencies = [
@@ -2370,6 +2385,32 @@ name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
+
+[[package]]
+name = "llm-suite"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "fa-bus",
+ "fa-core",
+ "fa-hub",
+ "fa-llm",
+ "fa-proto",
+ "futures",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+]
 
 [[package]]
 name = "lock_api"

@@ -228,8 +228,20 @@ Manifests carry `k_eff_usage`, `latent_cka_max`, `ssl_skill`, `recon_skill`, `ro
 
 ## 9. Acceptance criteria
 **Remaining (why this spec stays):**
-- The item 2 checklist (usage `K_eff` ≥ 2, latent CKA ≤ 0.7, SSL skill ≥ 0.1, min skill ≥ 0.02, no collapse; D-099, tightened D-102) is met by every default family on synthetic 3-factor data at the tightened limits (§6.3.1 rounds 5–6, 12/12) but has **not been evaluated on live market data** — that is the final live round.
-- The item 2 thresholds are **provisional** until confirmed on real bars (D-099, D-102).
+- **Item 2 is met on real market data** (2026-11-16, first live generation `gen-1m-cycle-01m7k5ss…`,
+  9 687 bars of 9 instruments at 1m, 8 102 train / 1 432 validation windows, three candidate
+  families): usage `K_eff` **3.99** ≥ 2, latent CKA **0.033** ≤ 0.7, SSL skill **0.547** ≥ 0.1, min
+  expert skill **0.328** ≥ 0.02, no collapse — every candidate family passed, not only the selected
+  one (`fsq_hybrid` 0.032/0.225/0.324, `hier_vae_flow` 0.023/0.250/0.324, `jepa_vae`
+  0.033/0.547/0.328 for CKA / SSL skill / min skill). The D-102 thresholds were set on synthetic
+  data and real bars clear them with room, so they stand rather than needing re-tuning.
+- The generation was still **rejected**, by two checks that are not item 2: `carried_mass` 0.0 < 0.5
+  (a neural generation whose parent is the gen-0 *statistical* snapshot carries no region mass — the
+  check wants a comparable parent) and `mcmc_ece` 0.0375 > 0.02 (the fresh graph's calibration).
+  Both need a second neural generation, with a neural parent, before they mean anything. Until then
+  the active snapshots stay statistical.
+- Promotion itself remains the owner's (`POST /api/latent/snapshots/{id}/promote`), and the shadow
+  checks (`shadow_served`, `shadow_minutes`, `shadow_region_agreement`) are only evaluated there.
 
 *Superseded (owner decision 2026-11-13, D-099):* rounds 1–4 (§6.3.1) showed that `K_eff ≥ 2`, residual correlation ≤ 0.1 and min skill ≥ 0.02 are not met together on validation; residual decorrelation is no longer a criterion.
 

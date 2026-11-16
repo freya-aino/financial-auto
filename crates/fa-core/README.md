@@ -11,3 +11,12 @@ Core Rust types used by every crate.
 - [01-architecture](../../specs/01-architecture.md)
 - [Ingestion reference (ex spec 10)](../../go/services/ingestor/README.md#ingestion-reference)
 - [Reference data reference (ex spec 12)](../fa-warehouse/README.md#reference-data-reference)
+
+## `[llm]` and `[llm] api_key` (D-117)
+
+`LlmConfig` (`config.rs`) holds the OpenAI-compatible endpoint the LLM suite calls — `base_url`,
+`model`, `embedding_model`, `embedding_dim`, `timeout_secs`, `embed_batch` — and `LlmSecrets`
+(`secrets.rs`) holds its key, separately and git-ignored, so a platform config can be committed and
+shown in the UI without redaction. `FA_LLM_API_KEY` overrides the file; `LlmSecrets`'s `Debug` is
+redacted like the Garage credentials. An empty `base_url` means "not configured", which the suite
+treats as a state to run in rather than an error.

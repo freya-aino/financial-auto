@@ -17,7 +17,8 @@
 		{ href: '/', label: 'Ops', sub: [{ href: '/', label: 'Overview' }, { href: '/alerts/', label: 'Alerts' }, { href: '/refdata/', label: 'Reference data' }, { href: '/history/', label: 'History' }, { href: '/infra/', label: 'Infra' }, { href: '/growth/', label: 'Growth' }] },
 		{ href: '/latent/', label: 'Latent & Graph', sub: [{ href: '/latent/', label: 'Explorer' }, { href: '/latent/mcmc/', label: 'MCMC' }, { href: '/latent/snapshots/', label: 'Encoder snapshots' }] },
 		{ href: '/evolution/', label: 'Evolution Lab', sub: [{ href: '/evolution/', label: 'Lab' }, { href: '/evolution/decoders/', label: 'Neural decoders' }] },
-		{ href: '/trading/', label: 'Trading Desk', sub: [{ href: '/trading/', label: 'Desk' }, { href: '/trading/pipeline/', label: 'Strategy pipeline' }, { href: '/trading/risk/', label: 'Risk & halts' }, { href: '/trading/validation/', label: 'Holdouts & shadow' }, { href: '/trading/ledger/', label: 'Ledger' }] }
+		{ href: '/trading/', label: 'Trading Desk', sub: [{ href: '/trading/', label: 'Desk' }, { href: '/trading/pipeline/', label: 'Strategy pipeline' }, { href: '/trading/risk/', label: 'Risk & halts' }, { href: '/trading/validation/', label: 'Holdouts & shadow' }, { href: '/trading/ledger/', label: 'Ledger' }] },
+		{ href: '/agent/', label: 'Agent', sub: [{ href: '/agent/', label: 'Console' }] }
 	];
 	const path = $derived(page.url.pathname);
 	const section = $derived(nav.find((n) => n.sub?.some((s) => s.href === path)) ?? nav.find((n) => n.href !== '/' && path.startsWith(n.href)) ?? nav[0]);

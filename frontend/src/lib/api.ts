@@ -890,7 +890,7 @@ export async function postJson<T>(path: string, body: unknown = {}): Promise<T> 
 	return sendJson<T>('POST', path, body);
 }
 
-async function putJson<T>(path: string, body: unknown): Promise<T> {
+export async function putJson<T>(path: string, body: unknown): Promise<T> {
 	return sendJson<T>('PUT', path, body);
 }
 

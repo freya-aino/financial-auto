@@ -2461,6 +2461,228 @@
         "x-handler": "bins/control-api/src/graph_routes.rs::snapshot_regions"
       }
     },
+    "/api/llm/chat": {
+      "post": {
+        "operationId": "llm_chat",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "one agent turn ({message, conversation_id?, approvals[]})",
+        "tags": [
+          "llm"
+        ],
+        "x-handler": "bins/control-api/src/llm_routes.rs::chat"
+      }
+    },
+    "/api/llm/conversations": {
+      "get": {
+        "operationId": "llm_conversations",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "conversation list, newest first",
+        "tags": [
+          "llm"
+        ],
+        "x-handler": "bins/control-api/src/llm_routes.rs::conversations"
+      }
+    },
+    "/api/llm/conversations/{id}": {
+      "get": {
+        "operationId": "llm_conversation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "one conversation with its messages and tool calls",
+        "tags": [
+          "llm"
+        ],
+        "x-handler": "bins/control-api/src/llm_routes.rs::conversation"
+      }
+    },
+    "/api/llm/embeddings": {
+      "get": {
+        "operationId": "llm_embeddings",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "news-embedding health: counts per provider, newest item",
+        "tags": [
+          "llm"
+        ],
+        "x-handler": "bins/control-api/src/llm_routes.rs::embeddings"
+      }
+    },
+    "/api/llm/endpoint": {
+      "put": {
+        "operationId": "llm_set_endpoint",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "set base URL / models / key; the key goes to secrets.toml",
+        "tags": [
+          "llm"
+        ],
+        "x-handler": "bins/control-api/src/llm_routes.rs::set_endpoint"
+      }
+    },
+    "/api/llm/status": {
+      "get": {
+        "operationId": "llm_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "endpoint, model, tool catalogue, whether mutating tools are available",
+        "tags": [
+          "llm"
+        ],
+        "x-handler": "bins/control-api/src/llm_routes.rs::status"
+      }
+    },
     "/api/mcmc/cross-priors": {
       "get": {
         "operationId": "mcmc_cross_priors",
