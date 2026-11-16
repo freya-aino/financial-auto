@@ -9,7 +9,7 @@ url = "nats://127.0.0.1:4222"
 url = "http://127.0.0.1:6969"
 
 [dgraph] # graph store (ADR 0011, D-110): replaces HelixDB and the Postgres `graph` schema
-url = "http://127.0.0.1:8180"
+url = "http://127.0.0.1:18180"
 
 [qdrant] # vector store, ADR 0010 / D-101 (the graph stays in [helix])
 url = "http://127.0.0.1:16333"
@@ -18,7 +18,7 @@ vector_backend = "qdrant" # or "helix" (pre-ADR-0010 HelixDB vector indexes)
 # Graph store (ADR 0010, D-108): the model-state graph (snapshots, regions, transitions,
 # lineage, ref mirror) in the platform Postgres, schema `graph`. `helix` keeps the old backend.
 [graph]
-backend = "dgraph"
+backend = "postgres" # D-112: the Dgraph cutover was rolled back (it cannot hold this graph); `graph` is the live store
 
 [victoriametrics]
 url = "http://127.0.0.1:8428"

@@ -494,6 +494,10 @@ pub struct Live {
     halts: BTreeMap<String, HaltView>,
     /// Peak paper equity, for drawdown of the paper book.
     peak_equity: f64,
+    /// Net cash paid into the paper book (deposits − withdrawals), the baseline P&L is measured
+    /// against. [`PAPER_CASH_EUR`] until the book is seeded from Postgres, then the sum of the
+    /// cash movements this view has applied (`Live::seed_ledger`, `Live::sync_from_ledger`).
+    opening_eur: f64,
     /// Latest EUR rate per upper-cased currency (`ref.fx_rate`, newest `ts` across sources),
     /// refreshed by [`crate::state::AppState::spawn_live_fx_refresher`]; EUR itself is implicit.
     fx_rates: BTreeMap<String, f64>,
@@ -532,6 +536,7 @@ impl Default for Live {
             risk: None,
             halts: BTreeMap::new(),
             peak_equity: PAPER_CASH_EUR,
+            opening_eur: PAPER_CASH_EUR,
             fx_rates: BTreeMap::new(),
             instrument_ccy: HashMap::new(),
             fx_fallback_fills: 0,
@@ -587,9 +592,55 @@ impl Live {
     }
 
     /// Replaces the paper book with one loaded from Postgres (startup seed; `ledger_routes`).
-    pub fn seed_ledger(&mut self, ledger: Ledger) {
+    ///
+    /// `opening_eur` is the net cash paid into that book (deposits − withdrawals) as Postgres has
+    /// it, which is the P&L and drawdown baseline — not [`PAPER_CASH_EUR`], because the seed can
+    /// run before the opening deposit is written (the 2026-11-15 seed read cash 0.0 two seconds
+    /// before the 100 000 EUR deposit row and never caught up).
+    pub fn seed_ledger(&mut self, ledger: Ledger, opening_eur: f64) {
         self.ledger = ledger;
+        self.opening_eur = opening_eur;
+        self.peak_equity = opening_eur.max(self.paper_equity());
         self.update_peak();
+    }
+
+    /// Clone of the paper book, for reconciliation against Postgres (`ledger_routes`).
+    pub fn ledger_snapshot(&self) -> Ledger {
+        self.ledger.clone()
+    }
+
+    /// Applies ledger rows this view has not seen — cash movements and fills written by another
+    /// writer (the risk-engine, an operator-booked orphan, the opening deposit) — to the paper
+    /// book, the way the risk-engine's reconciliation does (`bins/risk-engine/src/recon.rs`).
+    /// Both applies are idempotent (`Ledger::apply_cash` / `apply_exact` dedupe by key), so a row
+    /// is never counted twice. Returns the fill ids and cash keys actually applied.
+    pub fn sync_from_ledger(
+        &mut self,
+        fills: &[fa_ledger::ExactFill],
+        cash: &[fa_ledger::pg::CashRow],
+    ) -> (Vec<String>, Vec<String>) {
+        let mut f_ids = Vec::new();
+        for f in fills {
+            if self.ledger.apply_exact(f) {
+                self.marks.entry(f.instrument.0.to_string()).or_insert(fa_ledger::money::f(f.price_eur()));
+                f_ids.push(f.fill_id.clone());
+            }
+        }
+        let mut c_keys = Vec::new();
+        for c in cash {
+            if self.ledger.apply_cash(&c.key, &c.kind, c.amount_eur) {
+                if c.kind == "deposit" || c.kind == "withdrawal" {
+                    self.opening_eur += fa_ledger::money::f(c.amount_eur);
+                }
+                c_keys.push(c.key.clone());
+            }
+        }
+        if !f_ids.is_empty() || !c_keys.is_empty() {
+            self.peak_equity = self.peak_equity.max(self.opening_eur);
+            self.update_peak();
+            self.emit_book();
+        }
+        (f_ids, c_keys)
     }
 
     /// Replaces the FX view used to convert non-EUR fills and marks: `rates` maps upper-cased
@@ -1570,7 +1621,7 @@ impl Live {
                 "deployable_eur": equity, // payout quota not tracked in the paper book yet
                 "gross_exposure_eur": gross,
                 "drawdown": if self.peak_equity > 0.0 { 1.0 - equity / self.peak_equity } else { 0.0 },
-                "pnl_eur": equity - PAPER_CASH_EUR,
+                "pnl_eur": equity - self.opening_eur,
             },
             "halts": halts,
             "portfolio_halted": self.is_halted("portfolio"),
@@ -1842,6 +1893,41 @@ mod tests {
         assert_eq!(v["jobs"][0]["objectives"]["cost"], 3.0);
         assert_eq!(v["objectives"], json!(["cost", "recon"]));
         assert_eq!(v["counts"]["evo.eval.decoder"]["ok"], 1);
+    }
+
+    /// The startup seed can run before the opening deposit is written (2026-11-15: seeded at
+    /// cash 0.0 two seconds before the 100 000 EUR deposit row). The periodic sync must adopt
+    /// that movement, and P&L and drawdown must then be measured against it — not against the
+    /// `PAPER_CASH_EUR` default, and not against the empty book.
+    #[test]
+    fn a_deposit_written_after_the_seed_is_adopted() {
+        use fa_ledger::{Ledger, pg::CashRow};
+        let mut l = Live::default();
+        // Seeded from a book that has no cash movement yet.
+        l.seed_ledger(Ledger::with_cash_exact(fa_ledger::money::dec(0.0)), 0.0);
+        let r = l.risk_view();
+        assert_eq!(r["paper"]["equity_eur"], 0.0);
+        assert_eq!(r["paper"]["pnl_eur"], 0.0, "no deposit, no P&L");
+        assert_eq!(r["paper"]["drawdown"], 0.0, "an empty book is not in drawdown");
+
+        let deposit = CashRow {
+            key: "paper:deposit:initial".into(),
+            kind: "deposit".into(),
+            amount_eur: fa_ledger::money::dec(100_000.0),
+            occurred_at: Utc::now(),
+        };
+        let (fills, cash) = l.sync_from_ledger(&[], std::slice::from_ref(&deposit));
+        assert!(fills.is_empty());
+        assert_eq!(cash, vec!["paper:deposit:initial".to_string()]);
+        let r = l.risk_view();
+        assert_eq!(r["paper"]["equity_eur"], 100_000.0);
+        assert_eq!(r["paper"]["pnl_eur"], 0.0, "a deposit is not profit");
+        assert_eq!(r["paper"]["drawdown"], 0.0);
+
+        // Idempotent: the same row on the next tick changes nothing.
+        let (_, cash) = l.sync_from_ledger(&[], std::slice::from_ref(&deposit));
+        assert!(cash.is_empty(), "a cash movement is applied once");
+        assert_eq!(l.risk_view()["paper"]["equity_eur"], 100_000.0);
     }
 
     #[test]

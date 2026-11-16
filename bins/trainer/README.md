@@ -17,7 +17,7 @@ Encoder training lifecycle (the retired spec 36, see *Training lifecycle* below)
 | `trainer reproduce --run <manifest>` | re-runs a run manifest (local file or Garage key) and compares the data and weights digests | — | a re-run snapshot under `--out` |
 | `trainer plan` | prints the planner schedule (active snapshots, the jobs of the next adapter / generation tick) | — | — |
 | `trainer cancel <job_id>` | `ctl.train.cancel {job_id}` → the worker's reply | — | — |
-| `trainer serve` | work-queue worker for `jobs.train.>` + the periodic planner | — | — |
+| `trainer serve` | work-queue worker for `jobs.train.>` + the periodic planner; **deployed as the compose service `trainer-worker`** (profile `app`, metrics `:9108`, D-113) — without it nothing pulls `JOBS_TRAIN` | — | — |
 
 ### Training data (`src/data.rs`)
 Per instrument, **connector bars first**: `fa_tsdb::Tsdb::bars` reads `fa_bar_{open,high,low,close,volume,vwap}{tf="1m"}` (Yahoo), aggregated into step buckets for coarser timescales (first open, max high, min low, last close, summed volume); real volume reaches the activity expert. An instrument with fewer than 16 bars, every `1s` fit, and windows longer than 20 000 one-minute points fall back to **price-only bars from `fa_trade_price`** (`open` = previous close, `volume` = 1). `manifest.data.instruments[] = {instrument, source: bars|trades, n_bars, start_ms, end_ms}`, `data.source` is `victoriametrics:fa_bar`, `…:fa_trade_price` or `…:fa_bar+fa_trade_price`; checkpoints pin `(instrument, source)` so a resumed job re-reads exactly the same series.

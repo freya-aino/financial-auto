@@ -1630,6 +1630,26 @@ pub struct TransitionVersionImport {
     pub ts: String,
 }
 
+/// Historical node timestamps as read from the source: the creation / update marks the runtime
+/// API cannot carry.
+///
+/// Every live write stamps `now()`, as it must, so copying current values through `GraphStore`
+/// *manufactures* `snapshot.created_at`, `region.created_at` and every other node timestamp —
+/// they come out as the migration's wall-clock. Nothing errors and the row counts still match,
+/// which is exactly how the first cutover (2026-11-16 20:48) left all five snapshots and 451
+/// regions stamped at migration time: an as-of read for any earlier instant then sees no
+/// snapshot at all, because `snapshot_graph_as_of` filters `le(snapshot.created_at, t)`.
+#[derive(Debug, Clone)]
+pub struct NodeTimesImport {
+    /// Dgraph type of the node, e.g. `Snapshot`.
+    pub ty: &'static str,
+    /// Predicate holding its business key, e.g. `snapshot.snapshot_id`.
+    pub key_pred: &'static str,
+    pub key: String,
+    /// `(predicate, RFC 3339)` pairs; empty values are skipped.
+    pub times: Vec<(&'static str, String)>,
+}
+
 /// One `RegionStatusVersion` as read from the source.
 #[derive(Debug, Clone)]
 pub struct RegionStatusVersionImport {
@@ -1653,6 +1673,50 @@ impl DgraphGraph {
     /// HTTP mutation each would make the cutover a multi-minute wall of round trips. Each chunk is
     /// one atomic mutation, and the rows are append-only, so a re-run after a failure duplicates
     /// only the chunk boundary rather than corrupting anything.
+    /// Set node timestamps ([`NodeTimesImport`]) to the values the source holds.
+    ///
+    /// The uid of each node is resolved by a read first and the mutation addresses it directly.
+    /// An upsert block would be shorter but unsafe here: in Dgraph a `uid(v)` whose variable
+    /// matched nothing *creates* a node, so one stale key would quietly add an empty node to the
+    /// store instead of being skipped.
+    pub async fn dg_import_node_times(&self, rows: &[NodeTimesImport]) -> Result<usize> {
+        let mut by_type: std::collections::BTreeMap<(&str, &str), Vec<&NodeTimesImport>> = Default::default();
+        for r in rows.iter().filter(|r| r.times.iter().any(|(_, t)| !t.is_empty())) {
+            by_type.entry((r.ty, r.key_pred)).or_default().push(r);
+        }
+        let mut written = 0;
+        for ((ty, key_pred), group) in by_type {
+            for chunk in group.chunks(500) {
+                let keys = chunk.iter().map(|r| format!("\"{}\"", esc(&r.key))).collect::<Vec<_>>().join(", ");
+                let dql =
+                    format!("{{ q(func: eq({key_pred}, [{keys}])) @filter(type({ty})) {{ uid {key_pred} }} }}");
+                let found = self.rows(&dql).await?;
+                let uids: std::collections::HashMap<&str, u64> = found
+                    .iter()
+                    .filter_map(|j| j.get(key_pred).and_then(Json::as_str).map(|k| (k, uid_of(j))))
+                    .collect();
+                let mut set = Vec::new();
+                for r in chunk {
+                    let Some(uid) = uids.get(r.key.as_str()) else {
+                        continue; // not in the destination: the generic pass skipped it, nothing to stamp
+                    };
+                    let mut m = Map::new();
+                    m.insert("uid".into(), json!(u64_to_uid(*uid)));
+                    for (pred, t) in r.times.iter().filter(|(_, t)| !t.is_empty()) {
+                        m.insert((*pred).to_owned(), json!(t));
+                    }
+                    set.push(Json::Object(m));
+                }
+                if set.is_empty() {
+                    continue;
+                }
+                written += set.len();
+                self.dg.mutate(set).await?;
+            }
+        }
+        Ok(written)
+    }
+
     pub async fn dg_import_transition_versions(&self, rows: &[TransitionVersionImport]) -> Result<usize> {
         let mut n = 0;
         for chunk in rows.chunks(IMPORT_CHUNK) {
@@ -1781,5 +1845,21 @@ impl DgraphGraph {
     pub async fn dg_count(&self, ty: &str) -> Result<u64> {
         let d = self.dg.query(&format!("{{ q(func: type({ty})) {{ count(uid) }} }}")).await?;
         Ok(d.pointer("/q/0/count").and_then(Json::as_u64).unwrap_or(0))
+    }
+
+    /// Oldest and newest value of one datetime predicate, for the migration's timestamp check.
+    ///
+    /// DQL has no `min()` over a predicate across a type, so this is two one-row ordered reads.
+    pub async fn dg_time_range(&self, ty: &str, pred: &str) -> Result<(Option<String>, Option<String>)> {
+        let one = |dir: &str| {
+            format!("{{ q(func: type({ty}), order{dir}: {pred}, first: 1) @filter(has({pred})) {{ {pred} }} }}")
+        };
+        let read = |dql: String| async move {
+            let d = self.dg.query(&dql).await?;
+            Ok::<Option<String>, HubError>(
+                d.pointer("/q/0").and_then(|j| j.get(pred)).and_then(Json::as_str).map(str::to_owned),
+            )
+        };
+        Ok((read(one("asc")).await?, read(one("desc")).await?))
     }
 }

@@ -537,6 +537,9 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Cmd::Serve { gpu_lease_mb, checkpoint_secs, plan } => {
+            // Only `serve` is long-running, so only `serve` exposes metrics (D-113): the one-off
+            // commands have nothing to scrape, and the compose healthcheck is this endpoint.
+            fa_bus::metrics::serve_from_env("trainer", env!("CARGO_PKG_VERSION")); // spec 60 §4, D-056
             let bus = fa_bus::Bus::connect(&cfg.nats.url).await?;
             let plan = plan.config()?;
             return worker::serve(bus, svc, worker::WorkerConfig { gpu_lease_mb, checkpoint_secs, plan }).await;

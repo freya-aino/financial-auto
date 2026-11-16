@@ -91,7 +91,10 @@ services:
   # Graph store (ADR 0011, D-110): Dgraph replaces HelixDB and the Postgres `graph` schema.
   # Zero manages the cluster layout and uid leases; alpha serves DQL over HTTP (8080) and gRPC (9080).
   # Single-node (one group, replicas 1) — this is a one-workstation stack.
+  # Not started by default since the D-112 rollback: `docker compose --profile dgraph up -d
+  # dgraph-zero dgraph-alpha` brings the pair up for another attempt at the cutover.
   dgraph-zero:
+    profiles: ["dgraph"]
     image: dgraph/dgraph:v25.5.1
     command: ["dgraph", "zero", "--my=dgraph-zero:5080", "--replicas=1"]
     ports:
@@ -107,11 +110,21 @@ services:
     restart: unless-stopped
 
   dgraph-alpha:
+    profiles: ["dgraph"]
     image: dgraph/dgraph:v25.5.1
+    # Memory is capped deliberately (D-112): importing the live graph's 898 k event-time version
+    # rows left the alpha rolling up postings at 11-16 GiB on this 31 GiB host, where it was
+    # killed and restarted before it could elect a leader — a store that answers nothing. The
+    # default cache is 4 GiB; GOMEMLIMIT makes the Go runtime collect instead of ballooning, and
+    # mem_limit turns a host-wide OOM into this container's own failure.
     command: ["dgraph", "alpha", "--my=dgraph-alpha:7080", "--zero=dgraph-zero:5080",
-              "--security", "whitelist=0.0.0.0/0"]
+              "--security", "whitelist=0.0.0.0/0",
+              "--cache", "size-mb=1024; percentage=40,40,20"]
+    environment:
+      GOMEMLIMIT: ${FA_DGRAPH_GOMEMLIMIT:-18GiB}
+    mem_limit: ${FA_DGRAPH_MEM_LIMIT:-22g}
     ports:
-      - "127.0.0.1:8180:8080" # DQL/HTTP; host 8080 is free but 8180 keeps the 81xx block with the other UIs
+      - "127.0.0.1:18180:8080" # DQL/HTTP; another project on this host publishes 8180 (D-109 pattern)
     volumes:
       - dgraph-alpha-data:/dgraph
     depends_on:
@@ -511,6 +524,30 @@ services:
       test: ["CMD", "healthprobe", "http://127.0.0.1:9100/metrics"]
       interval: 15s
       timeout: 4s
+      retries: 4
+      start_period: 20s
+    restart: unless-stopped
+
+  # The JOBS_TRAIN work-queue worker plus the periodic planner (D-115): without it adapter and
+  # generation jobs queue up unprocessed (9 `train.adapter` jobs sat queued from 2026-11-15 to
+  # 2026-11-16 because the trainer only existed as the `tools` CLI below).
+  trainer-worker:
+    profiles: ["app"]
+    image: financial-auto/rust:dev
+    build: *rust-build
+    command: ["trainer", "serve"]
+    environment:
+      <<: *rust-env
+      FA_TRAIN_ADAPTER_EVERY: ${FA_TRAIN_ADAPTER_EVERY:-15m}
+      FA_TRAIN_GENERATION_EVERY: ${FA_TRAIN_GENERATION_EVERY:-off} # generations are started deliberately
+    volumes: *secrets-volume
+    ports:
+      - "127.0.0.1:9108:9100" # metrics
+    depends_on: *core-deps
+    healthcheck: # GET /metrics answers ⇒ process up, HTTP loop alive (spec 60 §6.4)
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9100/metrics"]
+      interval: 15s
+      timeout: 3s
       retries: 4
       start_period: 20s
     restart: unless-stopped

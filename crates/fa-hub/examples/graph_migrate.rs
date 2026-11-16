@@ -30,9 +30,32 @@ fn arg(name: &str) -> Option<String> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Unknown flags are refused rather than ignored. `--times-only` was first typed at a shell
+    // that silently dropped it, and what ran instead was the full migration — against a live
+    // destination, where the history re-import is authoritative. A typo must not be able to do
+    // that.
+    const FLAGS: [&str; 6] = ["--from", "--to", "--dry-run", "--verify-only", "--times-only", "--help"];
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        if !FLAGS.contains(&a.as_str()) {
+            eprintln!("unknown argument {a:?}; expected one of {}", FLAGS.join(" "));
+            std::process::exit(2);
+        }
+        if a == "--from" || a == "--to" {
+            it.next(); // its value
+        }
+    }
+    if std::env::args().any(|a| a == "--help") {
+        println!(
+            "graph_migrate --from <helix|postgres> --to <postgres|dgraph> [--dry-run]\n               --dry-run      read and count, write nothing\n               --verify-only  compare source and destination, write nothing\n               --times-only   copy node timestamps only (repairs a cutover that stamped `now()`)"
+        );
+        return;
+    }
     let from = arg("--from").unwrap_or_else(|| "helix".into());
     let to = arg("--to").unwrap_or_else(|| "postgres".into());
     let dry = std::env::args().any(|a| a == "--dry-run");
+    let verify_only = std::env::args().any(|a| a == "--verify-only");
+    let times_only = std::env::args().any(|a| a == "--times-only");
     let helix_client = HubClient::from_env().with_graph(None);
     let helix = HelixGraph::new(helix_client.clone());
     let pg = PgGraph::connect_lazy(&std::env::var("DATABASE_URL").expect("DATABASE_URL"));
@@ -41,7 +64,24 @@ async fn main() {
         ("postgres", "helix") => migrate(&pg, &helix, dry).await,
         ("postgres", "dgraph") => {
             let dg = DgraphGraph::from_env();
+            if verify_only {
+                if !verify(&pg, &dg, false).await {
+                    eprintln!("verification FAILED: the copy is incomplete, do not drop the source");
+                    std::process::exit(1);
+                }
+                return;
+            }
             dg.ensure_schema().await.expect("dgraph schema");
+            if times_only {
+                // Node timestamps only: no history is cleared and no current value is written, so
+                // this is the one pass that is safe against a destination the platform is using.
+                copy_node_times(pg.pool(), &dg).await;
+                if !verify_node_times(pg.pool(), &dg).await {
+                    eprintln!("timestamp verification FAILED");
+                    std::process::exit(1);
+                }
+                return;
+            }
             migrate(&pg, &dg, dry).await;
             if !dry {
                 copy_pg_extras(&pg, &dg).await;
@@ -294,6 +334,93 @@ async fn copy_pg_extras(pg: &PgGraph, dg: &DgraphGraph) {
         .expect("import region_set");
     }
     println!("region_set (with family/method): {}", rows.len());
+
+    copy_node_times(pool, dg).await;
+}
+
+/// Node timestamps, which the runtime API always stamps `now()`.
+///
+/// Without this pass a faithful-looking copy carries the migration's wall-clock as every
+/// snapshot's and region's creation time, and `verify`'s row counts cannot see it: the first
+/// cutover (2026-11-16) stamped all 5 snapshots and 451 regions at 20:48, so an as-of read of
+/// any earlier instant returned an empty graph. [`verify_node_times`] now compares the extremes
+/// of every one of these columns, so a future run cannot lose them silently either.
+async fn copy_node_times(pool: &sqlx::PgPool, dg: &DgraphGraph) {
+    use fa_hub::graph_dgraph::NodeTimesImport;
+    let ts = |r: &sqlx::postgres::PgRow, c: &str| -> String {
+        r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(c)
+            .ok()
+            .flatten()
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            .unwrap_or_default()
+    };
+    let mut batch: Vec<NodeTimesImport> = Vec::new();
+
+    // (source query, dgraph type, key column, key predicate, timestamp columns → predicates).
+    // The queries are literals, so nothing from the data reaches the SQL.
+    type Spec = (&'static str, &'static str, &'static str, &'static str, &'static [(&'static str, &'static str)]);
+    let specs: &[Spec] = &[
+        (
+            "SELECT * FROM graph.snapshot",
+            "Snapshot",
+            "snapshot_id",
+            "snapshot.snapshot_id",
+            &[("created_at", "snapshot.created_at")],
+        ),
+        (
+            "SELECT * FROM graph.region",
+            "LatentRegion",
+            "region_id",
+            "region.region_id",
+            &[
+                ("created_at", "region.created_at"),
+                ("updated_at", "region.updated_at"),
+                ("died_at", "region.died_at"),
+            ],
+        ),
+        (
+            "SELECT * FROM graph.region_set",
+            "RegionSet",
+            "region_set_id",
+            "region_set.region_set_id",
+            &[("fit_time", "region_set.fit_time"), ("updated_at", "region_set.updated_at")],
+        ),
+        (
+            "SELECT * FROM graph.ref_venue",
+            "RefVenue",
+            "venue_id",
+            "ref_venue.venue_id",
+            &[("mirrored_at", "ref_venue.mirrored_at")],
+        ),
+        (
+            "SELECT * FROM graph.ref_instrument",
+            "RefInstrument",
+            "instrument_id",
+            "ref_instrument.instrument_id",
+            &[("mirrored_at", "ref_instrument.mirrored_at")],
+        ),
+        (
+            "SELECT * FROM graph.ref_entity",
+            "RefEntity",
+            "entity_id",
+            "ref_entity.entity_id",
+            &[("mirrored_at", "ref_entity.mirrored_at")],
+        ),
+    ];
+    for (sql, ty, key_col, key_pred, cols) in specs {
+        let rows = sqlx::query(*sql).fetch_all(pool).await.unwrap_or_else(|e| panic!("read for {ty}: {e}"));
+        for r in &rows {
+            let Ok(key) = r.try_get::<String, _>(*key_col) else { continue };
+            batch.push(NodeTimesImport {
+                ty,
+                key_pred,
+                key,
+                times: cols.iter().map(|(c, pred)| (*pred, ts(r, c))).collect(),
+            });
+        }
+    }
+    let n = dg.dg_import_node_times(&batch).await.expect("import node timestamps");
+    println!("node timestamps: {n} nodes stamped from the source");
 }
 
 /// Every `graph` table's row count in one static statement — the table names are fixed here,
@@ -374,8 +501,70 @@ async fn verify(pg: &PgGraph, dg: &DgraphGraph, dry: bool) -> bool {
         };
         println!("{mark}{table:<23} {src:>8} {dst:>8}");
     }
+    ok = verify_node_times(pg.pool(), dg).await && ok;
     if ok {
-        println!("\nverification OK: every table matches");
+        println!("\nverification OK: every table matches, every timestamp range matches");
+    }
+    ok
+}
+
+/// Timestamp ranges per node type, source against destination.
+///
+/// Row counts cannot see a manufactured creation time — the first cutover copied every count
+/// correctly while stamping all five snapshots and 451 regions with the migration's own clock.
+/// Comparing the extremes of each column catches exactly that, and is cheap: two aggregates.
+async fn verify_node_times(pool: &sqlx::PgPool, dg: &DgraphGraph) -> bool {
+    // (label, SQL over the source, dgraph type, predicate)
+    type Check = (&'static str, &'static str, &'static str, &'static str);
+    let checks: &[Check] = &[
+        (
+            "snapshot.created_at",
+            "SELECT min(created_at) a, max(created_at) b FROM graph.snapshot",
+            "Snapshot",
+            "snapshot.created_at",
+        ),
+        (
+            "region.created_at",
+            "SELECT min(created_at) a, max(created_at) b FROM graph.region",
+            "LatentRegion",
+            "region.created_at",
+        ),
+        (
+            "region_set.fit_time",
+            "SELECT min(fit_time) a, max(fit_time) b FROM graph.region_set",
+            "RegionSet",
+            "region_set.fit_time",
+        ),
+        (
+            "ref_instrument.mirrored_at",
+            "SELECT min(mirrored_at) a, max(mirrored_at) b FROM graph.ref_instrument",
+            "RefInstrument",
+            "ref_instrument.mirrored_at",
+        ),
+    ];
+    let mut ok = true;
+    println!("\n{:<28} {:<26} {:<26}", "timestamp range", "postgres", "dgraph");
+    for (label, sql, ty, pred) in checks {
+        let row = sqlx::query(*sql).fetch_one(pool).await.expect("read source timestamp range");
+        let fmt = |t: Option<chrono::DateTime<chrono::Utc>>| {
+            t.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_else(|| "-".into())
+        };
+        let src = (fmt(row.try_get("a").unwrap_or(None)), fmt(row.try_get("b").unwrap_or(None)));
+        let dst = dg.dg_time_range(ty, pred).await.unwrap_or_default();
+        let dst = (
+            dst.0.map(|t| t[..19.min(t.len())].to_string() + "Z").unwrap_or_else(|| "-".into()),
+            dst.1.map(|t| t[..19.min(t.len())].to_string() + "Z").unwrap_or_else(|| "-".into()),
+        );
+        let same = src == dst;
+        if !same {
+            ok = false;
+        }
+        println!(
+            "{}{label:<27} {:<26} {:<26}",
+            if same { " " } else { "!" },
+            format!("{} .. {}", src.0, src.1),
+            format!("{} .. {}", dst.0, dst.1)
+        );
     }
     ok
 }

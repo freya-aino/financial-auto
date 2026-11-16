@@ -272,8 +272,8 @@ pub struct HubClient {
     pub(crate) cache: Arc<ClientCache>,
     /// Vector store; `None` = the Helix vector indexes.
     pub(crate) vectors: Option<Arc<QdrantVectors>>,
-    /// Graph store; `None` = the Helix graph (D-110; see [`graph::configure_graph`]).
-    pub(crate) graph: Option<Arc<DgraphGraph>>,
+    /// Graph store; `None` = the Helix graph (D-108; see [`graph::configure_graph`]).
+    pub(crate) graph: Option<Arc<PgGraph>>,
 }
 
 impl HubClient {
@@ -316,19 +316,19 @@ impl HubClient {
     }
 
     /// Replace the graph store (`None` = the Helix graph), e.g. in tests or [`HelixGraph`].
-    pub fn with_graph(mut self, graph: Option<DgraphGraph>) -> Self {
+    pub fn with_graph(mut self, graph: Option<PgGraph>) -> Self {
         self.graph = graph.map(Arc::new);
         self
     }
 
-    /// The attached Dgraph store, if the graph is not in Helix.
-    pub fn graph(&self) -> Option<&DgraphGraph> {
+    /// The attached Postgres graph, if the graph is not in Helix.
+    pub fn graph(&self) -> Option<&PgGraph> {
         self.graph.as_deref()
     }
 
-    /// `"dgraph"` or `"helix"`.
+    /// `"postgres"` or `"helix"`.
     pub fn graph_backend(&self) -> &'static str {
-        if self.graph.is_some() { "dgraph" } else { "helix" }
+        if self.graph.is_some() { "postgres" } else { "helix" }
     }
 
     /// `"qdrant"` or `"helix"`.
@@ -517,12 +517,6 @@ impl HubClient {
     /// stamp the schema version marker ([`Self::migrate_schema`], spec 20 §8). Fails with
     /// [`HubError::SchemaTooNew`] when Helix was stamped by a newer build.
     pub async fn ensure_schema_ready(&self, timeout: Duration) -> Result<()> {
-        // Dgraph: the DQL schema is declarative and `/alter` is idempotent, so there are no index
-        // build receipts to wait on — applying it and stamping the version is the whole job.
-        if let Some(dg) = self.graph() {
-            dg.ensure_schema().await?;
-            return dg.dg_stamp_schema(meta::SCHEMA_VERSION).await;
-        }
         let receipts = self.ensure_schema().await?;
         self.wait_for_receipts(&receipts, timeout).await?;
         self.migrate_schema().await?;

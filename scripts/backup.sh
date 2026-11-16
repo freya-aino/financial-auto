@@ -60,7 +60,7 @@ fi
 # alpha's volume. The export is queued and lands in the alpha's own filesystem, so the admin
 # reply is not itself a backup; no service stop is needed, unlike the HelixDB tar above.
 if ! skip dgraph; then
-    D=${FA_DGRAPH_HOST_URL:-http://127.0.0.1:8180}
+    D=${FA_DGRAPH_HOST_URL:-http://127.0.0.1:18180}
     if curl -fsS -o /dev/null "$D/health" 2>/dev/null; then
         mkdir -p "$DEST/dgraph"
         vol=$(volume_name dgraph-alpha-data)

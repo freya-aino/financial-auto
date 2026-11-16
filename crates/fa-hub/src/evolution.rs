@@ -106,7 +106,6 @@ pub struct ParetoFrontRow {
 impl HubClient {
     /// `EVALUATED_ON` (upsert per genome × snapshot) and `READS` edges of one evaluation.
     pub async fn record_evaluation(&self, e: &Evaluation) -> Result<()> {
-        if let Some(dg) = self.graph() { return dg.dg_record_evaluation(e).await; }
         if e.genome_id.is_empty() || e.snapshot_id.is_empty() {
             return Ok(());
         }
@@ -179,7 +178,6 @@ impl HubClient {
     /// exists with `InFront{rank, hv, crowding, score}` (edges of a re-written front are added
     /// only for members not linked yet).
     pub async fn upsert_pareto_front(&self, f: &NewParetoFront) -> Result<()> {
-        if let Some(dg) = self.graph() { return dg.dg_upsert_pareto_front(f).await.map(drop); }
         let id = f.front_id();
         let props = vec![
             ("generation_id", s(&f.generation_id)),
@@ -232,7 +230,6 @@ impl HubClient {
 
     /// `ParetoFront` rows of a generation (every loop).
     pub async fn pareto_fronts(&self, generation_id: &str) -> Result<Vec<ParetoFrontRow>> {
-        if let Some(dg) = self.graph() { return dg.dg_pareto_fronts(generation_id).await; }
         let op = by_key(labels::PARETO_FRONT, "generation_id", generation_id).value_map(None);
         let mut resp = self.batch(&Batch::read().named("pareto_fronts").ret("rows", op)).await?;
         let mut rows: Vec<ParetoFrontRow> = resp.take("rows")?;

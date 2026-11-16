@@ -2,6 +2,14 @@
 
 axum REST + WebSocket control plane for the frontend. Local only, no auth (ADR 0006).
 
+**Paper book (D-114):** the in-memory paper book is seeded from Postgres at startup *and* kept in
+step by a reconcile loop (`FA_LEDGER_SYNC_SECS`, default 60 s, `off` disables) that applies fills
+and cash movements this view has not seen — the risk-engine's adopt pass without the halt, since
+this book is a mirror and not the book of record. The seed alone could lose a race: on 2026-11-15
+it read the book two seconds before the opening deposit was written, and `/api/trading/risk`
+reported 33.86 EUR equity and 99.97 % drawdown for a day against the risk-engine's 99 778 EUR.
+P&L and drawdown are measured against the book's own net deposits, not a constant.
+
 **Status:** every route of spec 50 §4 answers; `POST /api/services/{name}/start|stop|restart` is backed by the Docker Engine API over the compose socket (D-060, see Supervisor below; `501 no_supervisor` on a host run without a socket). Ops, sources, bus tap, latent views, evolution and paper trading are implemented and verified against live NATS and the compose services (2026-11-07); ingest start/stop and job cancel verified against host-run Go services (2026-11-08). The live views are in-memory aggregations of bus traffic (D-032); the paper book is seeded from the persisted `paper` ledger in Postgres at startup (D-047; it still accumulates bus fills in memory afterwards, D-028) and `GET /api/trading/pnl`, `/api/trading/reconciliation` and `/api/audit` read Postgres directly (503 when it is unreachable). Live trading is impossible through this API (D-029). Round 3 (D-078, D-080): `GET /api/openapi.json` is generated from the route declarations (131 paths / 141 operations, none `not_implemented`), and control-api writes the `ops` schema (job history, config snapshots, alert history). Since then: scheduled storage and reference-data maintenance (D-097), the decoder-output store and region reconstructions (D-098), the daily close of the organisational books (D-104, D-106) and the round-9 observability routes (connections, infra stores / backup / maintenance, DLQ browser). Vector reads go to Qdrant and graph reads to the Postgres graph store by default (`fa_hub::configure_vectors` / `configure_graph` at start; D-101, D-108).
 
 ## Run

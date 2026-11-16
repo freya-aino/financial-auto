@@ -1185,7 +1185,6 @@ impl HubClient {
 
     /// `addGenome`
     pub async fn add_genome(&self, g: &NewGenome) -> Result<Genome> {
-        if let Some(dg) = self.graph() { return dg.dg_add_genome(g).await; }
         let props = vec![
             ("genome_id", s(&g.genome_id)),
             ("kind", s(&g.kind)),
@@ -1199,7 +1198,6 @@ impl HubClient {
 
     /// `upsertGenome`: get-or-create by `genome_id` (evo-worker re-evaluating a known genome).
     pub async fn upsert_genome(&self, g: &NewGenome) -> Result<Genome> {
-        if let Some(dg) = self.graph() { return dg.dg_upsert_genome(g).await; }
         let props = vec![
             ("genome_id", s(&g.genome_id)),
             ("kind", s(&g.kind)),
@@ -1215,7 +1213,6 @@ impl HubClient {
     /// `setGenomeStatus`: mirrors a strategy's lifecycle status onto its `Genome` (spec 35 §5),
     /// creating the genome like `upsertGenome` when the evo-worker never wrote it. Idempotent.
     pub async fn set_genome_status(&self, g: &GenomeStatus) -> Result<Genome> {
-        if let Some(dg) = self.graph() { return dg.dg_set_genome_status(g).await; }
         let status_props = |op: Op| {
             op.set_property("status", g.status.as_str())
                 .set_property("strategy_id", g.strategy_id.as_str())
@@ -1255,7 +1252,6 @@ impl HubClient {
     /// `linkParent`: `ParentOf{op}` by business ids; returns the edge id, `NotFound` when a
     /// genome is missing.
     pub async fn link_parent(&self, parent_id: &str, child_id: &str, op: &str) -> Result<u64> {
-        if let Some(dg) = self.graph() { return dg.dg_link_parent(parent_id, child_id, op).await; }
         let batch = Batch::write()
             .named("link_parent")
             .var("parent", by_key_nodes(node::GENOME, "genome_id", parent_id))
@@ -1279,7 +1275,6 @@ impl HubClient {
 
     /// `addFitnessRecord`: like [`Self::add_fitness`] but keyed by `genome_id`.
     pub async fn add_fitness_record(&self, f: &NewFitness) -> Result<FitnessRecord> {
-        if let Some(dg) = self.graph() { return dg.dg_add_fitness_record(f).await; }
         let props = vec![
             ("genome_id", s(&f.genome_id)),
             ("generation", f.generation.into()),
@@ -1394,7 +1389,6 @@ impl HubClient {
     }
 
     pub async fn genome_by_id(&self, genome_id: &str) -> Result<Option<Genome>> {
-        if let Some(dg) = self.graph() { return dg.dg_genome_by_id(genome_id).await; }
         let mut resp = self.batch(&Batch::read().ret("row", by_key(node::GENOME, "genome_id", genome_id))).await?;
         resp.take_opt("row")
     }
@@ -1402,7 +1396,6 @@ impl HubClient {
     /// Genome, its `FitnessRecord`s and direct parents by business id in one round trip
     /// (spec 50 `/api/evolution/genomes/{id}`). `None` when the genome does not exist.
     pub async fn genome_detail(&self, genome_id: &str) -> Result<Option<GenomeDetail>> {
-        if let Some(dg) = self.graph() { return dg.dg_genome_detail(genome_id).await; }
         let batch = Batch::read()
             .named("genome_detail")
             .var("g", by_key_nodes(node::GENOME, "genome_id", genome_id))
@@ -1418,7 +1411,6 @@ impl HubClient {
 
     /// `addLineage`: `ParentOf{op}` parent → child; returns the edge id.
     pub async fn add_lineage(&self, parent: u64, child: u64, op: &str) -> Result<u64> {
-        if let Some(dg) = self.graph() { return dg.dg_add_lineage(parent, child, op).await; }
         let e = Op::nodes(parent).add_e(edge::PARENT_OF, child, vec![("op", op.into())]);
         let mut resp = self.batch(&Batch::write().named("add_lineage").ret("e", e)).await?;
         Ok(resp.take_one::<IdRow>("e")?.id)
@@ -1426,7 +1418,6 @@ impl HubClient {
 
     /// `addFitness`: inserts the record and the `Scored` edge from `genome`.
     pub async fn add_fitness(&self, genome: u64, f: &NewFitness) -> Result<FitnessRecord> {
-        if let Some(dg) = self.graph() { return dg.dg_add_fitness(genome, f).await; }
         let props = vec![
             ("genome_id", s(&f.genome_id)),
             ("generation", f.generation.into()),
@@ -1441,7 +1432,6 @@ impl HubClient {
 
     /// `genomeParents`: `N<Genome>(genome)::In<ParentOf>`
     pub async fn genome_parents(&self, genome: u64) -> Result<Vec<Genome>> {
-        if let Some(dg) = self.graph() { return dg.dg_genome_parents(genome).await; }
         let op = Op::nodes(genome).r#in(Some(edge::PARENT_OF)).value_map(None);
         let mut resp = self.batch(&Batch::read().named("genome_parents").ret("rows", op)).await?;
         resp.take("rows")
@@ -1449,7 +1439,6 @@ impl HubClient {
 
     /// `genomeFitness`: `N<Genome>(genome)::Out<Scored>`
     pub async fn genome_fitness(&self, genome: u64) -> Result<Vec<FitnessRecord>> {
-        if let Some(dg) = self.graph() { return dg.dg_genome_fitness(genome).await; }
         let op = Op::nodes(genome).out(Some(edge::SCORED)).value_map(None);
         let mut resp = self.batch(&Batch::read().named("genome_fitness").ret("rows", op)).await?;
         resp.take("rows")
@@ -1458,7 +1447,6 @@ impl HubClient {
     /// Ancestry levels of a genome (spec 50 `/api/graph/lineage/{genome_id}`): element `i` holds
     /// the ancestors `i + 1` `ParentOf` hops away, up to `max_depth`. Trailing empty levels are dropped.
     pub async fn genome_ancestry(&self, genome: u64, max_depth: usize) -> Result<Vec<Vec<Genome>>> {
-        if let Some(dg) = self.graph() { return dg.dg_genome_ancestry(genome, max_depth).await; }
         let mut batch = Batch::read().named("genome_ancestry").var("f0", Op::nodes(genome));
         for d in 1..=max_depth {
             let prev = format!("f{}", d - 1);
@@ -1481,7 +1469,6 @@ impl HubClient {
     /// (`region_id`, `snapshot_id`, `expert_space_id`, `genome_id`, `instrument_id`), or a node
     /// addressed directly by its numeric `$id`.
     pub async fn resolve_node(&self, id: &str) -> Result<Option<NodeRow>> {
-        if let Some(dg) = self.graph() { return dg.dg_resolve_node(id).await; }
         if let Ok(n) = id.parse::<u64>() {
             let mut resp =
                 self.batch(&Batch::read().named("resolve_node").ret("row", Op::nodes(n).value_map(None))).await?;
@@ -1498,7 +1485,6 @@ impl HubClient {
     /// Nodes within `depth` hops (any edge label, both directions) of `node`, and every edge
     /// touching the inner frontier (spec 50 `/api/graph/neighborhood`). Includes `node` itself.
     pub async fn neighborhood(&self, node_id: u64, depth: usize) -> Result<Neighborhood> {
-        if let Some(dg) = self.graph() { return dg.dg_neighborhood(node_id, depth).await; }
         let mut batch = Batch::read()
             .named("neighborhood")
             .var("f0", Op::nodes(node_id))

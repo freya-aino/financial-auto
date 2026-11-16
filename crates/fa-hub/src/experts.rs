@@ -105,7 +105,6 @@ impl HubClient {
     /// `upsertExpert`: insert or update the expert by `expert_uid`; a new node gets its `ExpertOf`
     /// edge to the snapshot.
     pub async fn upsert_expert(&self, e: &NewExpert) -> Result<()> {
-        if let Some(dg) = self.graph() { return dg.dg_upsert_expert(e).await; }
         let uid = expert_uid(&e.snapshot_id, e.expert_id);
         let props = vec![
             ("snapshot_id", s(&e.snapshot_id)),
@@ -143,7 +142,6 @@ impl HubClient {
     /// `alignExpert`: `AlignedTo{cka, kind}` child → parent (both must exist); the parent's
     /// `died_gen` stays unset (it lives on through the child).
     pub async fn align_expert(&self, a: &NewAlignment) -> Result<()> {
-        if let Some(dg) = self.graph() { return dg.dg_align_expert(a).await; }
         let b = Batch::write()
             .named("align_expert")
             .var("child", by_key(labels::EXPERT, "expert_uid", &expert_uid(&a.child_snapshot_id, a.child_expert_id)))
@@ -163,7 +161,6 @@ impl HubClient {
 
     /// Marks a parent-generation expert that no child continues (`died_gen`).
     pub async fn retire_expert(&self, snapshot_id: &str, expert_id: u32, died_gen: u32) -> Result<()> {
-        if let Some(dg) = self.graph() { return dg.dg_retire_expert(snapshot_id, expert_id, died_gen).await; }
         let b = Batch::write().named("retire_expert").var(
             "row",
             by_key(labels::EXPERT, "expert_uid", &expert_uid(snapshot_id, expert_id))
@@ -174,7 +171,6 @@ impl HubClient {
 
     /// `snapshotExperts`: experts of a snapshot by `expert_id`.
     pub async fn snapshot_experts(&self, snapshot_id: &str) -> Result<Vec<ExpertRow>> {
-        if let Some(dg) = self.graph() { return dg.dg_snapshot_experts(snapshot_id).await; }
         let op = by_key(labels::EXPERT, "snapshot_id", snapshot_id).value_map(None);
         let mut resp = self.batch(&Batch::read().named("snapshot_experts").ret("rows", op)).await?;
         let mut rows: Vec<ExpertRow> = resp.take("rows")?;
@@ -184,7 +180,6 @@ impl HubClient {
 
     /// `expertLineage`: the experts an expert is `AlignedTo` (its parent-generation expert(s)).
     pub async fn expert_parents(&self, snapshot_id: &str, expert_id: u32) -> Result<Vec<ExpertRow>> {
-        if let Some(dg) = self.graph() { return dg.dg_expert_parents(snapshot_id, expert_id).await; }
         let op = by_key(labels::EXPERT, "expert_uid", &expert_uid(snapshot_id, expert_id))
             .out(Some(labels::ALIGNED_TO))
             .value_map(None);
@@ -194,7 +189,6 @@ impl HubClient {
 
     /// `AlignedTo` edge properties out of an expert.
     pub async fn expert_alignments(&self, snapshot_id: &str, expert_id: u32) -> Result<Vec<AlignmentRow>> {
-        if let Some(dg) = self.graph() { return dg.dg_expert_alignments(snapshot_id, expert_id).await; }
         let op = by_key(labels::EXPERT, "expert_uid", &expert_uid(snapshot_id, expert_id))
             .out_e(Some(labels::ALIGNED_TO))
             .edge_properties();

@@ -9,6 +9,13 @@ aggregates) on HelixDB's standalone server (`ghcr.io/helixdb/helixdb:v0.0.14`, c
 contract shared by the official Helix SDKs, and wraps every query of `helix/queries.hx` as a
 typed function with the same name.
 
+**Graph store (2026-11-16, D-112):** the live backend is the Postgres `graph` schema (D-108). The
+Dgraph implementation of ADR 0011 is complete and stays in this crate (`graph_dgraph.rs`,
+`dgraph_schema.rs`, `dgraph_evolution.rs`, `examples/graph_migrate.rs`), but the cutover was rolled
+back the day it ran: the copy verified on all 25 tables, then `dgraph-alpha` could not apply the
+897 799 event-time version rows without being OOM-killed mid-`opRollup`, so its Raft group never
+elected a leader. Event-time history needs retention before any retry — see ADR 0011 and D-112.
+
 **Status:** implemented and verified against the live v0.0.14 image (unit tests + gated
 integration tests, see below); the graph conformance suite is green on both backends
 (2026-11-15, D-108). Supersedes the D-012 assumption of CLI-compiled

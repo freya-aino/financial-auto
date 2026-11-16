@@ -46,7 +46,7 @@ impl DgraphClient {
     /// `FA_DGRAPH_URL`, else the compose default.
     pub fn from_env() -> Self {
         let url = std::env::var("FA_DGRAPH_URL").ok().filter(|u| !u.is_empty());
-        Self::new(url.as_deref().unwrap_or("http://127.0.0.1:8180"))
+        Self::new(url.as_deref().unwrap_or("http://127.0.0.1:18180"))
     }
 
     pub fn url(&self) -> &str {

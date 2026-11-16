@@ -78,8 +78,8 @@ pub struct QdrantConfig {
 /// `[graph]`: where the model-state graph lives (ADR 0010, D-108).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GraphConfig {
-    /// `dgraph` (default; ADR 0011, D-110) or `helix` (the pre-D-108 HelixDB graph). Overridden by
-    /// `FA_GRAPH_BACKEND`. The D-108 Postgres graph is gone — see `fa_hub::graph::BACKENDS`.
+    /// `dgraph` (ADR 0011, D-110), `postgres` (schema `graph` on the platform Postgres, D-108) or
+    /// `helix` (the pre-D-108 HelixDB graph). Overridden by `FA_GRAPH_BACKEND`.
     #[serde(default = "default_graph_backend")]
     pub backend: String,
 }
@@ -91,11 +91,11 @@ impl Default for GraphConfig {
 }
 
 fn default_graph_backend() -> String {
-    "dgraph".into()
+    "postgres".into()
 }
 
 fn default_dgraph_endpoint() -> Endpoint {
-    Endpoint { url: "http://127.0.0.1:8180".into() }
+    Endpoint { url: "http://127.0.0.1:18180".into() }
 }
 
 fn default_qdrant_url() -> String {
@@ -336,8 +336,9 @@ impl PlatformConfig {
         if cfg.garage.public_endpoint.is_empty() {
             cfg.garage.public_endpoint = cfg.garage.endpoint.clone();
         }
-        if !matches!(cfg.graph.backend.as_str(), "dgraph" | "helix") {
-            let msg = format!("graph.backend must be `dgraph` or `helix`, not `{}`", cfg.graph.backend);
+        if !matches!(cfg.graph.backend.as_str(), "postgres" | "helix" | "dgraph") {
+            let msg =
+                format!("graph.backend must be `postgres`, `helix` or `dgraph`, not `{}`", cfg.graph.backend);
             return Err(ConfigError::Invalid { path: p, msg });
         }
         if !matches!(cfg.qdrant.vector_backend.as_str(), "qdrant" | "helix") {

@@ -1,8 +1,50 @@
 # ADR 0011 — Dgraph as the single graph store
 
-**Status:** **accepted** (owner 2026-11-15: "dgraph, and move the postgres graph data to dgraph as well") · **Date:** 2026-11-15 · **Supersedes:** ADR 0002 · **Amends:** ADR 0010 (graph half; the vector half stands)
+**Status:** **rolled back 2026-11-16** (D-112), decision reopened · accepted 2026-11-15 (owner: "dgraph, and move the postgres graph data to dgraph as well") · **Supersedes:** ADR 0002 · **Amends:** ADR 0010 (graph half; the vector half stands)
 
-## Decision
+## What happened on the cutover (2026-11-16, D-112)
+
+The code was complete and the migration was faithful. The store was not usable.
+
+`graph_migrate --from postgres --to dgraph` copied the live book — 5 snapshots, 15 expert spaces,
+406 regions, 5 916 transitions, **897 799** `transition_version` rows, 875 region-status versions,
+815 hierarchy edges, 19 136 episodes — and `verify` matched all 25 tables. The platform was then
+started on Dgraph and served graph reads for about fifteen minutes.
+
+Then `dgraph-alpha` restarted, and never recovered. Applying the import left it looping on
+`opRollup`, climbing to 11–16 GiB, where it was killed and restarted every 60–100 s. The
+single-voter Raft group never elected a leader (`/state`: `"leader": false`), so every query timed
+out while `/health` still reported `healthy`. Measured three ways on this 31 GiB host, all
+identical:
+
+| Attempt | Peak memory | Outcome |
+|---|---|---|
+| Default (4 GiB cache, no limit) | 16 GiB | killed, restart loop |
+| `--cache size-mb=1024`, `mem_limit 7g`, `GOMEMLIMIT 5GiB` | 7 GiB (the cap) | killed every ~65 s |
+| `mem_limit 22g`, `GOMEMLIMIT 18GiB`, rest of the platform stopped | 16.6 GiB | killed every ~90 s |
+
+ADR 0010 rejected Dgraph on latency and this ADR accepted that regression knowingly. The regression
+was not the problem: **the store could not stay up under the volume the platform actually produces.**
+
+And the volume is the real finding. Those 898 k version rows accumulated in ~26 hours of paper
+trading — roughly 1.2 M rows a day, because a version is appended per transition per kernel update.
+No graph store answers that forever without a retention or compaction policy for event-time
+history; Postgres holds it today only because 900 k narrow rows are nothing to Postgres.
+
+**Live state since the rollback:** `[graph] backend = "postgres"`, `HubClient.graph` is
+`Option<Arc<PgGraph>>` again, the `graph` schema is intact and was never dropped, and
+`dgraph-zero` / `dgraph-alpha` sit behind compose profile `dgraph`. Every line of the Dgraph
+implementation stays in the tree — `graph_dgraph.rs`, `dgraph_schema.rs`, `dgraph_evolution.rs`,
+the migration with its `--verify-only` / `--times-only` modes, and the live tests that drive the
+store directly — so a retry costs a config value, not a rewrite.
+
+**The decision is the owner's again,** in three shapes: (a) give event-time history a retention /
+compaction policy and retry Dgraph against a graph that stops growing without bound; (b) run Dgraph
+for current state and leave history in Postgres, accepting that as-of overlays lose their history
+and that "one graph store" is no longer true; (c) keep the Postgres graph and retire this ADR.
+
+## Decision (as accepted 2026-11-15)
+
 One graph store: Dgraph (`dgraph/dgraph:v25.5.1`, Apache-2.0, Go), replacing **both** the HelixDB graph of ADR 0002 and the PostgreSQL `graph` schema of ADR 0010 / D-108. Compose runs `dgraph-zero` + `dgraph-alpha` (single node, `--replicas=1`). `[graph] backend` accepts `dgraph` (default) or `helix`; `postgres` is no longer a valid value. Vectors stay in Qdrant (D-101, D-109) — this ADR does not reopen that.
 
 This is a **direct replacement**, chosen over a phased dual-backend period: `PgGraph`, `HelixGraph` and the `graph` schema all go, with no fallback.

@@ -27,6 +27,8 @@ scrape_configs:
         labels: { service: broker-gateway }
       - targets: ["evo-orchestrator:9100"]
         labels: { service: evo-orchestrator }
+      - targets: ["trainer-worker:9100"]
+        labels: { service: trainer }
 
   # evo-worker can run as N replicas (--scale); the compose DNS A record lists every replica.
   - job_name: fa-evo-worker

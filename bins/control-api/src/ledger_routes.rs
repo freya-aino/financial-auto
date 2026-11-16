@@ -65,16 +65,81 @@ pub async fn attach(state: &AppState) {
     };
     match PgLedger::from_pool(pool.clone()).load_book(PAPER_BOOK).await {
         Ok(ledger) => {
+            let opening = opening_eur(&pool, PAPER_BOOK).await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "opening cash unknown; P&L baseline falls back to the default");
+                crate::live::PAPER_CASH_EUR
+            });
             tracing::info!(
                 cash_eur = ledger.cash_eur,
+                opening_eur = opening,
                 positions = ledger.positions.values().filter(|p| p.quantity != 0.0).count(),
                 "paper book seeded from postgres"
             );
-            state.live_mut().seed_ledger(ledger);
+            state.live_mut().seed_ledger(ledger, opening);
         }
         Err(e) => tracing::warn!(error = %e, "paper book not seeded from postgres"),
     }
-    let _ = state.pg.set(pool);
+    let _ = state.pg.set(pool.clone());
+    spawn_ledger_sync(state.clone(), pool);
+}
+
+/// Net cash paid into `book` as Postgres has it (deposits − withdrawals, at each movement's
+/// booked rate): the P&L and drawdown baseline of the in-memory view.
+async fn opening_eur(pool: &PgPool, book: &str) -> Result<f64, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(amount * COALESCE(fx_rate_eur, 1)), 0)::float8 \
+         FROM ledger.cash_movement WHERE book = $1 AND kind IN ('deposit', 'withdrawal')",
+    )
+    .bind(book)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get::<f64, _>(0).unwrap_or(0.0))
+}
+
+/// Keeps the in-memory view in step with the persisted book.
+///
+/// The startup seed is a single read, and it can lose a race: on 2026-11-15 it read the `paper`
+/// book at cash 0.0 two seconds before the 100 000 EUR opening deposit was written, so every
+/// paper figure the UI showed was ~99.7 k EUR short of the risk-engine's for a day. This loop
+/// reconciles the view against Postgres every `FA_LEDGER_SYNC_SECS` (default 60, `off` disables)
+/// and applies what the view is missing — the same adopt-what-another-writer-booked pass the
+/// risk-engine runs (`bins/risk-engine/src/recon.rs`), minus the halt: this book is a mirror,
+/// not the book of record, so a diff is never a reason to stop trading.
+fn spawn_ledger_sync(state: AppState, pool: PgPool) {
+    let secs = std::env::var("FA_LEDGER_SYNC_SECS").unwrap_or_default();
+    if secs.trim().eq_ignore_ascii_case("off") {
+        tracing::info!("ledger sync disabled (FA_LEDGER_SYNC_SECS=off)");
+        return;
+    }
+    let period = Duration::from_secs(secs.trim().parse().unwrap_or(60).max(5));
+    tokio::spawn(async move {
+        let pg = PgLedger::from_pool(pool);
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let ours = state.live().ledger_snapshot();
+            let r = match pg.reconcile_cut(PAPER_BOOK, &ours, &[], 1e-6, 1e-12).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "ledger sync skipped: cannot read the ledger");
+                    continue;
+                }
+            };
+            if r.fills_only_theirs.is_empty() && r.cash_only_theirs.is_empty() {
+                continue;
+            }
+            let fills: Vec<fa_ledger::ExactFill> = r.fills_only_theirs.iter().map(|(f, _)| f.clone()).collect();
+            let (f_ids, c_keys) = state.live_mut().sync_from_ledger(&fills, &r.cash_only_theirs);
+            if !f_ids.is_empty() || !c_keys.is_empty() {
+                tracing::info!(
+                    fills = f_ids.len(),
+                    cash = c_keys.len(),
+                    "persisted ledger rows the paper view had not seen applied"
+                );
+            }
+        }
+    });
 }
 
 /// The pool, or the 503 the handler should return.
