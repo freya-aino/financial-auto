@@ -24,6 +24,7 @@ mod hub_log;
 mod hub_retention;
 mod hub_sink;
 mod mcmc_jobs;
+mod news;
 mod neural_serving;
 mod occupancy;
 mod pipeline;
@@ -252,6 +253,9 @@ struct Runtime {
     mcmc: mcmc_jobs::McmcJobs,
     /// `latent.expert.*` views and live expert health (spec 32 §4.3).
     experts: expert_view::ExpertPublisher,
+    /// News embeddings of the recent past, filled from the vector store by a poller and read
+    /// synchronously by the text expert (D-119, [`news`]).
+    news: std::sync::Arc<std::sync::Mutex<news::NewsCache>>,
 }
 
 impl Runtime {
@@ -340,7 +344,11 @@ impl Runtime {
             // spec 33 §10 q3: the coarse-timescale regime age is a kernel covariate
             st.pipeline.set_coarse_context(inst, self.xscale.coarse_context(ts, inst));
         }
-        let input = StepInput { instrument_id: inst, as_of_ms, bars: &bars, bar_closed: closed };
+        // The text expert reads the news of the window being encoded (D-119). The window is the
+        // encoder's context: from the first bar's start to `as_of_ms`.
+        let window_from_ms = bars.len().checked_sub(1).map_or(as_of_ms, |n| as_of_ms - (n as i64 + 1) * ts.duration().as_millis() as i64);
+        let news = self.news.lock().unwrap_or_else(std::sync::PoisonError::into_inner).window(window_from_ms, as_of_ms);
+        let input = StepInput { instrument_id: inst, as_of_ms, bars: &bars, bar_closed: closed, news: &news };
         let mut out = match st.pipeline.step(&input) {
             Ok(o) => o,
             Err(e) => {
@@ -921,6 +929,41 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(run_news(bus.clone(), news_tx, refs_rx.clone()));
     }
 
+    // The text expert's input (D-119): `llm-suite` writes a vector per news item to the store and
+    // this poller keeps the recent ones in memory, so the synchronous encode path reads them
+    // without an await and a replay of a window reads the same items from the same store.
+    let news_cache = std::sync::Arc::new(std::sync::Mutex::new(news::NewsCache::new()));
+    let news_dim = std::env::var("FA_LLM_EMBEDDING_DIM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|d| *d > 0)
+        .unwrap_or(cfg.llm.embedding_dim);
+    if !args.no_hub {
+        news::spawn_poller(
+            fa_hub::HubClient::with_timeout(hub_url.clone(), Duration::from_secs(5)),
+            news_dim,
+            news_cache.clone(),
+        );
+    }
+    tracing::info!(news_dim, "text expert reads news embeddings of this width");
+    {
+        // The text expert's input is worth a gauge: a latent that suddenly carries no news looks
+        // like a model change otherwise (`fa_news_cached` / `fa_news_newest_age_seconds`).
+        let c = news_cache.clone();
+        fa_bus::metrics::register_collector(move || {
+            let (n, newest) = {
+                let g = c.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                (g.len(), g.newest_ms())
+            };
+            fa_bus::metrics::gauge("fa_news_cached", "news embeddings held for the text expert").set(n as f64);
+            if let Some(ts) = newest {
+                let age = (chrono::Utc::now().timestamp_millis() - ts).max(0) as f64 / 1000.0;
+                fa_bus::metrics::gauge("fa_news_newest_age_seconds", "age of the newest cached news embedding")
+                    .set(age);
+            }
+        });
+    }
+
     let mut rt = Runtime {
         bus: bus.clone(),
         counters: counters.clone(),
@@ -952,6 +995,7 @@ async fn main() -> anyhow::Result<()> {
         experts: expert_view::ExpertPublisher::with_vm(fa_tsdb::Tsdb::new(
             args.vm_url.clone().unwrap_or_else(|| cfg.victoriametrics.url.clone()),
         )),
+        news: news_cache,
     };
     // Cross-asset tracker and the refitted kernels of the restored spaces survive restarts.
     if let Some(v) = rt.mcmc.load_cross().await {

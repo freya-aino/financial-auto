@@ -141,7 +141,10 @@ pub struct NewEmbedding {
 pub struct EmbeddingHit {
     #[serde(rename = "$id")]
     pub node: u64,
-    #[serde(rename = "$distance")]
+    /// Distance to the query vector, `0.0` for a row that was not scored — a window scan
+    /// ([`HubClient::news_docs_in_window`]) has no query to be near, and without the default every
+    /// such row failed to deserialise and was dropped without a word.
+    #[serde(rename = "$distance", default)]
     pub distance: f64,
     #[serde(alias = "doc_id", alias = "segment_id", default)]
     pub id: String,
@@ -336,6 +339,24 @@ impl HubClient {
     /// once per client. Returns node ids.
     pub async fn add_news_docs(&self, docs: &[NewEmbedding]) -> Result<Vec<u64>> {
         self.add_embeddings(node::NEWS_DOC, docs).await
+    }
+
+    /// News embeddings of the window `(from_ms, to_ms]`, newest first, with their vectors.
+    ///
+    /// This is what the encoder's text expert reads (D-117/D-119): the items whose knowledge time
+    /// falls inside the window being encoded, never a k-NN neighbourhood, so re-encoding the same
+    /// window reads the same set and a replay reproduces the latent. Only the Qdrant backend
+    /// implements it — the Helix vector path is pre-ADR-0010 and has no window scan — so it
+    /// returns an empty vector there rather than failing the encode.
+    pub async fn news_docs_in_window(
+        &self,
+        dim: usize,
+        from_ms: i64,
+        to_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(EmbeddingHit, Vec<f32>)>> {
+        let Some(q) = &self.vectors else { return Ok(Vec::new()) };
+        self.q_embeddings_in_window(q, node::NEWS_DOC, dim, from_ms, to_ms, limit).await
     }
 
     /// `searchNews`: k nearest `NewsDoc`s, optionally as of `ts <= as_of_ms`.

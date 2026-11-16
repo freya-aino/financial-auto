@@ -112,11 +112,19 @@ impl RegionMap {
     }
 
     /// Mass-weighted carry over all experts.
+    /// Mean carried mass over the experts that had a parent to carry from.
+    ///
+    /// An expert with no parent regions is skipped rather than counted as 0 (D-119). Otherwise a
+    /// single silent expert — the text expert during a window with no news, say — would drag the
+    /// average below the `min_carry_mass` gate and report a regime break of the whole
+    /// representation, when in fact every expert that saw data carried its mass across.
     pub fn carried_mass(&self) -> f64 {
-        if self.experts.is_empty() {
+        let counted: Vec<f64> =
+            self.experts.iter().filter(|e| e.parent_regions > 0).map(|e| e.carried_mass).collect();
+        if counted.is_empty() {
             return 0.0;
         }
-        self.experts.iter().map(|e| e.carried_mass).sum::<f64>() / self.experts.len() as f64
+        counted.iter().sum::<f64>() / counted.len() as f64
     }
 
     pub fn n_regions(&self) -> usize {
@@ -321,7 +329,9 @@ mod tests {
         assert_eq!(back, map);
         assert_eq!(back.n_regions(), 6);
         assert_eq!(back.n_matched(), 2);
-        assert!((back.carried_mass() - 5.0 / 16.0).abs() < 1e-12);
+        // Expert 1 has no parent to carry from, so it is skipped rather than averaged in as 0
+        // (D-119): the figure is expert 0's 5/8, not (5/8 + 0)/2.
+        assert!((back.carried_mass() - 5.0 / 8.0).abs() < 1e-12);
         assert_eq!(back.expert(1).unwrap().regions[0].to_region("snap").method, DiscoveryMethod::Leader);
     }
 }

@@ -6,7 +6,7 @@ Expert encoder families on candle (training and serving; D-070 departs from ADR 
 
 ## Statistical baseline
 - Input: `EncoderInput::from_bars(as_of_ms, &[MarketBar])` (rows `[open, high, low, close, volume, trade_count]`), the last `context_steps` bars are used.
-- Output: `ExpertView` with 3 experts (`EXPERT_NAMES`: returns, volatility, activity), each `EXPERT_DIM = 8` features bounded to (−1, 1) via `tanh(z/2)` of in-window z-scores and correlations; `log_var = −ln(n_bars)` per dim (short history = wide posterior). `router_weights` are left to the router stage.
+- Output: `ExpertView` with 4 experts (`EXPERT_NAMES`: returns, volatility, activity, **text**), each `EXPERT_DIM = 8` features bounded to (−1, 1) via `tanh(z/2)` of in-window z-scores and correlations; `log_var = −ln(n_bars)` per dim (short history = wide posterior). `router_weights` are left to the router stage.
 - Snapshot id `stat-v1-<timescale>`; bump `StatisticalEncoder::VERSION` when feature definitions change.
 
 ## Snapshots (`snapshot.rs`, spec 36 §5)
@@ -67,3 +67,33 @@ Spec 31 (expert encoders) was retired on 2026-11-11 once every in-scope acceptan
 
 ## Governing specs
 - Spec 31 (retired 2026-11-11; content above), [32-expert-spaces](../../specs/32-expert-spaces.md), decisions D-010, D-058, D-070, D-073, D-080, D-081, D-099
+
+
+## The text expert (`text`, D-119)
+
+The fourth expert reads the news embeddings whose knowledge time falls inside the window being
+encoded — `llm-suite` (D-117) embeds each item once on arrival and stores it, model-runtime caches
+the recent ones, and `StepInput::news` hands them to the encoder. Nothing here calls an API: a
+re-encode of a window must give the same latent, and an endpoint cannot be asked to return the same
+vector twice.
+
+| Dim | Feature |
+|---|---|
+| 0 | **volume** — `squash(ln k / 2)`, saturating in the item count |
+| 1 | **coherence** — mean pairwise cosine of the window's unit vectors (1 = all the same story, 0 = unrelated, −1 = opposed) |
+| 2–7 | **content** — the window's mean embedding projected onto six fixed pseudo-random unit directions, rescaled by √dim and squashed |
+
+Projections rather than more summary statistics, because a decoder reconstructing a news embedding
+can only beat its training mean if the latent carries some of that embedding's own geometry — the
+state the live text decoders were stuck in before this existed. The basis is derived from the
+embedding width with a constant seed, so it is identical in every process and every replay; it is
+versioned with the encoder rather than tuned.
+
+Scale-free by construction (a log count, a cosine, projections of unit vectors), so the text expert
+is **not** z-scored: `NormStats` covers the `MARKET_EXPERTS` only, and a snapshot fitted on bars
+carries the text expert unchanged. `log_var = −(ln k + 1)`; an empty window is zeros at unit
+variance, which says "no news" instead of implying "news saying nothing".
+
+Vectors of a width other than the window's modal one are dropped rather than mixed in — they come
+from another model and share no geometry — and each item is scaled to unit length first, so one
+long vector cannot dominate.

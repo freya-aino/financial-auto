@@ -228,6 +228,11 @@ Manifests carry `k_eff_usage`, `latent_cka_max`, `ssl_skill`, `recon_skill`, `ro
 
 ## 9. Acceptance criteria
 **Remaining (why this spec stays):**
+- **A text expert now exists** (D-119): the statistical family is `stat-v2` with four experts
+  (returns, volatility, activity, text), the text one reading the news embeddings of the encoded
+  window. The expert count is therefore no longer fixed by the market features alone, and the
+  live item-2 numbers below were measured on the three-expert `stat-v1` latents — they want
+  re-measuring on a generation trained against `stat-v2`.
 - **Item 2 is met on real market data** (2026-11-16, first live generation `gen-1m-cycle-01m7k5ss…`,
   9 687 bars of 9 instruments at 1m, 8 102 train / 1 432 validation windows, three candidate
   families): usage `K_eff` **3.99** ≥ 2, latent CKA **0.033** ≤ 0.7, SSL skill **0.547** ≥ 0.1, min

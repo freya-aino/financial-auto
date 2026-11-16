@@ -1,9 +1,11 @@
 //! Statistical baseline encoder (pure Rust, deterministic, no learned parameters).
 //!
 //! Stands in for the neural families while the ML backends are off (D-004). It turns a
-//! window of bars at one timescale into a fixed-dimensional latent per expert. The three
-//! "experts" are fixed statistical views (returns, volatility, activity), each `EXPERT_DIM`
-//! bounded features in `(-1, 1)` built from in-window z-scores. The posterior log-variance
+//! window of bars at one timescale into a fixed-dimensional latent per expert. Three of the four
+//! "experts" are fixed statistical views of the market (returns, volatility, activity), each
+//! `EXPERT_DIM` bounded features in `(-1, 1)` built from in-window z-scores; the fourth is the
+//! **text expert** ([`crate::text`], D-119), eight features of the news embeddings whose knowledge
+//! time falls in the window. The posterior log-variance
 //! encodes estimation uncertainty from the window length, so a short history shows up as
 //! a wide posterior. Nothing here is a model forecast: the latent is a descriptive summary
 //! of the window and is swapped for a learned encoder behind [`EncoderFamily`].
@@ -77,7 +79,16 @@ pub const MARKET_ROW_LEN: usize = 6;
 /// Latent dimension of every baseline expert.
 pub const EXPERT_DIM: usize = 8;
 /// The fixed expert views, in `expert_index` order.
-pub const EXPERT_NAMES: [&str; 3] = ["returns", "volatility", "activity"];
+pub const EXPERT_NAMES: [&str; 4] = ["returns", "volatility", "activity", "text"];
+
+/// Experts built from the bar window, and therefore covered by the fitted [`NormStats`]: the first
+/// three. The text expert's features are already bounded and scale-free (a log count, a cosine and
+/// projections of unit vectors), so they are not z-scored against a training distribution — which
+/// also means a snapshot fitted before D-119 keeps its 3 × `EXPERT_DIM` statistics unchanged.
+pub const MARKET_EXPERTS: usize = 3;
+
+/// Index of the text expert in [`EXPERT_NAMES`].
+pub const TEXT_EXPERT: usize = MARKET_EXPERTS;
 /// Bars of the short sub-window used for short/long ratios.
 const SHORT: usize = 5;
 
@@ -120,7 +131,9 @@ impl Default for FitConfig {
 impl StatisticalEncoder {
     /// Snapshot ids are versioned by hand: the encoder has no trained weights, so any change
     /// to the feature definitions must bump this.
-    pub const VERSION: &'static str = "stat-v1";
+    /// `stat-v2` since D-119 added the text expert: the latent is 4 × `EXPERT_DIM` wide where
+    /// `stat-v1` was 3, so the two are different spaces and must not share region maps.
+    pub const VERSION: &'static str = "stat-v2";
 
     pub fn new(ts: Timescale) -> Self {
         let descriptor = FamilyDescriptor {
@@ -155,12 +168,12 @@ impl StatisticalEncoder {
             )));
         }
         let norm = NormStats::from_bytes(weights)?;
-        if norm.n_experts() != EXPERT_NAMES.len() || norm.dim() != EXPERT_DIM {
+        if norm.n_experts() != MARKET_EXPERTS || norm.dim() != EXPERT_DIM {
             return Err(EncoderError::Manifest(format!(
-                "weights are {}x{}, encoder is {}x{EXPERT_DIM}",
+                "weights are {}x{}, encoder needs {}x{EXPERT_DIM} market experts",
                 norm.n_experts(),
                 norm.dim(),
-                EXPERT_NAMES.len()
+                MARKET_EXPERTS
             )));
         }
         let mut enc = Self::with_stats(manifest.timescale, manifest.snapshot_id.clone(), norm);
@@ -272,16 +285,24 @@ impl EncoderFamily for StatisticalEncoder {
                 }
             }
         }
+        // The text expert (D-119) is appended after the market experts and is not z-scored: its
+        // features are bounded and scale-free already, and keeping it out of `NormStats` is what
+        // lets a snapshot fitted on bars alone carry it.
+        let news = text_embeddings(input);
+        latents.push(crate::text::features(&news));
+
         // Estimation uncertainty of in-window z-scores shrinks like 1/n (variance), so the
-        // posterior log-variance is −ln(n); one bar → unit variance.
-        let log_var = -(w.len() as f32).ln();
+        // posterior log-variance is −ln(n); one bar → unit variance. The text expert counts items,
+        // not bars, and an empty window gets unit variance instead.
+        let market_log_var = -(w.len() as f32).ln();
+        let text_log_var = crate::text::log_var(news.len());
         let experts = latents
             .into_iter()
             .enumerate()
             .map(|(i, mean)| ExpertLatent {
                 expert_index: i as u32,
                 mean,
-                log_var: vec![log_var; EXPERT_DIM],
+                log_var: vec![if i == TEXT_EXPERT { text_log_var } else { market_log_var }; EXPERT_DIM],
                 region_id: None,
                 region_lineage_id: None,
             })
@@ -295,6 +316,20 @@ impl EncoderFamily for StatisticalEncoder {
             router_weights: Vec::new(), // filled by the router stage
         })
     }
+}
+
+/// The window's text embeddings, newest first as the caller passed them.
+///
+/// `Modality::Text` entries of [`EncoderInput::media`] only: image, video and audio embeddings
+/// belong to media front-ends that are out of scope (spec 31), and mixing them into the text
+/// expert would make its features mean two things at once.
+fn text_embeddings(input: &EncoderInput) -> Vec<Vec<f32>> {
+    input
+        .media
+        .iter()
+        .filter(|(m, v)| *m == crate::Modality::Text && !v.is_empty())
+        .map(|(_, v)| v.clone())
+        .collect()
 }
 
 /// Derived series of one window; every feature is bounded by [`squash`].
@@ -501,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn encodes_three_bounded_experts_deterministically() {
+    fn encodes_four_bounded_experts_deterministically() {
         let enc = StatisticalEncoder::new(Timescale::Minute);
         let bars = walk(120, 3, 0.001);
         let input = EncoderInput::from_bars(1_000, &bars);
@@ -513,7 +548,7 @@ mod tests {
             assert_eq!(x.mean.len(), EXPERT_DIM);
             assert!(x.mean.iter().all(|v| v.is_finite() && v.abs() <= 1.0), "{:?}", x.mean);
         }
-        assert_eq!(a.snapshot_id, "stat-v1-1m");
+        assert_eq!(a.snapshot_id, "stat-v2-1m");
         assert!((a.experts[0].log_var[0] - (-(120f32).ln())).abs() < 1e-6);
     }
 
@@ -549,7 +584,7 @@ mod tests {
         assert_eq!(ends.first(), Some(&16));
         assert_eq!(ends.last(), Some(&300));
         assert_eq!(stats.n_windows, ends.len() as u64);
-        assert_eq!(stats.n_experts(), 3);
+        assert_eq!(stats.n_experts(), MARKET_EXPERTS, "the text expert is not z-scored (D-119)");
         assert!(stats.std.iter().flatten().all(|s| s.is_finite() && *s >= 0.0));
         // chunked accumulation equals one pass
         let enc = StatisticalEncoder::new(Timescale::Minute);

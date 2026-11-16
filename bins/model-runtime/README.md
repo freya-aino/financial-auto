@@ -131,3 +131,19 @@ Real-time inference loop per timescale.
 - [trainer README](../../bins/trainer/README.md#training-lifecycle-lasting-content-of-the-retired-spec-36) (retired spec 36)
 - [Strategy model (ex spec 35)](../../crates/fa-strategies/README.md#strategy-model-lasting-content-of-the-retired-spec-35)
 - [20-storage](../../specs/20-storage.md) §5.2 (Helix rows written by `hub_sink`, D-048)
+
+
+## News embeddings for the text expert (D-119)
+
+`news::NewsCache` holds the recent news vectors `llm-suite` stored (D-117) so the synchronous
+encode path can take the window's news without an await: a poller refreshes it every 10 s from
+`HubClient::news_docs_in_window`, keeps 6 h or 1 024 items (whichever binds first), and drops the
+oldest beyond that. `StepInput::news` carries the window's items, newest first, into
+`EncoderInput::media` as `Modality::Text`.
+
+The window is the encoder's context — from the first bar's start to `as_of_ms` — and the read is a
+half-open `(from, to]` scan of the store, not a k-NN search, so **live and replay read the same
+set**: re-encoding a past window sees exactly the items whose knowledge time was inside it.
+
+Gauges: `fa_news_cached` (items held) and `fa_news_newest_age_seconds` (age of the newest). A latent
+that suddenly carries no news looks like a model change otherwise.

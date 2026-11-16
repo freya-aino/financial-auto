@@ -188,16 +188,16 @@ mod tests {
             .collect();
         for end in 2..=bars.len() {
             let input =
-                StepInput { instrument_id: "i", as_of_ms: end as i64 * 60_000, bars: &bars[..end], bar_closed: true };
+                StepInput { instrument_id: "i", as_of_ms: end as i64 * 60_000, bars: &bars[..end], bar_closed: true, news: &[] };
             let a = active.step(&input).unwrap().state;
             assert!(sh.step(&input, a.as_ref()).is_some());
         }
         assert_eq!(sh.states, 29);
-        assert_eq!(sh.compared, 29 * 3);
+        assert_eq!(sh.compared, 29 * fa_encoders::EXPERT_NAMES.len() as u64);
         assert_eq!(sh.region_agreement(), 1.0, "the same encoder walks the same regions");
         let g: HashMap<String, f64> = sh.gauges(Timescale::Minute).into_iter().collect();
         assert_eq!(g["shadow.1m.snapshot"], 0.0);
-        assert_eq!(g["shadow.1m.snapshot_id.stat-v1-1m"], 1.0);
+        assert_eq!(g[&format!("shadow.1m.snapshot_id.{}", fa_encoders::StatisticalEncoder::baseline_id(Timescale::Minute))], 1.0);
         assert_eq!(g["shadow.1m.states"], 29.0);
         assert_eq!(g["shadow.1m.region_agreement"], 1.0);
         assert_eq!(g["shadow.1m.carried_mass"], 0.0);

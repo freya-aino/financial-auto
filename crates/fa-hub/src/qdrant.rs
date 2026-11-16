@@ -506,6 +506,47 @@ impl HubClient {
         rows(&points)
     }
 
+    /// Embeddings whose `ts` falls in `(from_ms, to_ms]`, newest first, with their vectors.
+    ///
+    /// A window scan, not a k-NN search: the encoder's text expert wants *the news of this window*,
+    /// not the news nearest some query vector, and it must see exactly the items whose knowledge
+    /// time is inside the window so a replay of that window reads the same set.
+    pub(crate) async fn q_embeddings_in_window(
+        &self,
+        q: &QdrantVectors,
+        label: &'static str,
+        dim: usize,
+        from_ms: i64,
+        to_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(EmbeddingHit, Vec<f32>)>> {
+        let c = embedding_collection(label, dim)?;
+        // `from_ms` is exclusive and `to_ms` inclusive, matching the half-open windows the
+        // encoders use everywhere else; Qdrant's range takes `gt`/`lte`.
+        let filter = json!({ "must": [{ "key": "ts", "range": { "gt": from_ms, "lte": to_ms } }] });
+        let points = q.scroll_by_ts(&c, filter, limit.max(1), true).await?;
+        let mut out = Vec::with_capacity(points.len());
+        for p in &points {
+            let row = point_to_row(p);
+            let vector: Vec<f32> = row
+                .get(latent_vec_property(dim))
+                .and_then(Json::as_array)
+                .map(|a| a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect())
+                .unwrap_or_default();
+            if vector.len() != dim {
+                continue; // a point of another width in the same collection cannot happen, but a
+                // partial payload can: skip rather than hand the encoder a short vector
+            }
+            // The shape error is returned, not swallowed: when `$distance` was required here every
+            // scrolled row failed to deserialise and was dropped silently, which from the
+            // encoder's side looks exactly like "there is no news".
+            let hit: EmbeddingHit = serde_json::from_value(row)
+                .map_err(|e| HubError::Shape { name: label.into(), detail: e.to_string() })?;
+            out.push((hit, vector));
+        }
+        Ok(out)
+    }
+
     /// One page of the observation fold (see [`crate::retention`]) on Qdrant: read the oldest
     /// [`PRUNE_PAGE`] observations before the cut-off and the aggregates of their regions, upsert
     /// the merged aggregates, then delete the folded observations. Not one transaction: a crash

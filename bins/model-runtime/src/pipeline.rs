@@ -159,6 +159,9 @@ pub struct StepInput<'a> {
     /// True when the last bar is closed: a step of the timescale's Markov chain. Only then
     /// are transitions observed; previews between closes update states and regions only.
     pub bar_closed: bool,
+    /// News embeddings whose knowledge time falls in the encoded window, newest first — what the
+    /// text expert reads (D-119). Empty is a normal state: no news, or no endpoint configured.
+    pub news: &'a [Vec<f32>],
 }
 
 #[derive(Debug, Default)]
@@ -635,6 +638,9 @@ impl TimescalePipeline {
         let (mut view, extras) = self.encoder.encode_with_extras(&EncoderInput {
             // the asset embedding / cross-asset context of `asset_attn` encoders (spec 31 §6.4)
             instrument: Some(fa_tsdb::inst_token(input.instrument_id)),
+            // the text expert's input (D-119); `Modality::Text` because the media front-ends of
+            // spec 31 are what would fill the other modalities, and they are out of scope
+            media: input.news.iter().map(|v| (fa_encoders::Modality::Text, v.clone())).collect(),
             ..EncoderInput::from_bars(input.as_of_ms, input.bars)
         })?;
         // A neural encoder ships its learned top-k gates (spec 32 §6.1); only encoders without a
@@ -946,11 +952,12 @@ mod tests {
                     as_of_ms: end as i64 * 60_000,
                     bars: &all[..end],
                     bar_closed: true,
+                    news: &[],
                 })
                 .unwrap();
             let s = out.state.unwrap();
             assert_eq!(s.timescale, "1m");
-            assert_eq!(s.experts.len(), 3);
+            assert_eq!(s.experts.len(), fa_encoders::EXPERT_NAMES.len());
             assert!(s.experts.iter().all(|e| !e.region_id.is_empty() && e.region_id.starts_with("1m-e")));
             assert!((s.router_weights.iter().sum::<f32>() - 1.0).abs() < 1e-5);
             n_states += 1;
@@ -965,7 +972,11 @@ mod tests {
         }
         assert_eq!(n_states, 39);
         assert!(n_created >= 3, "at least one region per expert");
-        assert_eq!(n_trans, 38 * 3, "one transition row per expert per closed step after the first");
+        assert_eq!(
+            n_trans,
+            38 * fa_encoders::EXPERT_NAMES.len(),
+            "one transition row per expert per closed step after the first"
+        );
         assert!(pl.live_regions() >= 3 && pl.transition_rows() >= 3);
     }
 
@@ -980,6 +991,7 @@ mod tests {
                 as_of_ms: end as i64 * 60_000,
                 bars: &all[..end],
                 bar_closed: true,
+                news: &[],
             })
             .unwrap();
         }
@@ -1055,7 +1067,7 @@ mod tests {
         assert_eq!(pl.transition_rows(), old_rows, "experts 1 and 2 have no map and restart from the prior");
         assert!(pl.transitions[1].graph().unwrap().regions().count() == 0);
         let out =
-            pl.step(&StepInput { instrument_id: "i", as_of_ms: 31 * 60_000, bars: &all, bar_closed: true }).unwrap();
+            pl.step(&StepInput { instrument_id: "i", as_of_ms: 31 * 60_000, bars: &all, bar_closed: true, news: &[] }).unwrap();
         assert!(out.transitions.is_empty(), "chain position cleared: first closed bar observes nothing");
         let st = out.state.unwrap();
         assert_eq!(st.snapshot_id, "snap-x");
@@ -1073,6 +1085,7 @@ mod tests {
                 as_of_ms: end as i64 * 60_000,
                 bars: &all[..end],
                 bar_closed: true,
+                news: &[],
             })
             .unwrap();
         }
@@ -1095,6 +1108,7 @@ mod tests {
                 as_of_ms: end as i64 * 60_000,
                 bars: &all[..end],
                 bar_closed: true,
+                news: &[],
             })
             .unwrap();
         }
@@ -1106,7 +1120,7 @@ mod tests {
         pl.set_encoder(Box::new(same)).unwrap();
         assert_eq!((pl.live_regions(), pl.transition_rows()), (regions, rows));
         let out =
-            pl.step(&StepInput { instrument_id: "i", as_of_ms: 21 * 60_000, bars: &all, bar_closed: true }).unwrap();
+            pl.step(&StepInput { instrument_id: "i", as_of_ms: 21 * 60_000, bars: &all, bar_closed: true, news: &[] }).unwrap();
         assert!(!out.transitions.is_empty(), "chain position kept across an adapter");
     }
 
@@ -1116,7 +1130,7 @@ mod tests {
         let all = bars(10, 2);
         for end in 1..=all.len() {
             let out =
-                pl.step(&StepInput { instrument_id: "i", as_of_ms: 0, bars: &all[..end], bar_closed: false }).unwrap();
+                pl.step(&StepInput { instrument_id: "i", as_of_ms: 0, bars: &all[..end], bar_closed: false, news: &[] }).unwrap();
             assert!(out.transitions.is_empty());
             assert!(out.state.is_some());
         }
@@ -1140,10 +1154,11 @@ mod tests {
                     as_of_ms: end as i64 * 60_000,
                     bars: &all[..end],
                     bar_closed: true,
+                    news: &[],
                 })
                 .unwrap();
             let m = out.membership.expect("membership every step");
-            assert_eq!(m.experts.len(), 3);
+            assert_eq!(m.experts.len(), fa_encoders::EXPERT_NAMES.len());
             for e in &m.experts {
                 let w: f32 = e.weights.iter().map(|w| w.weight).sum();
                 assert!((w - 1.0).abs() < 1e-4, "{e:?}");
@@ -1159,7 +1174,7 @@ mod tests {
         }
         assert_eq!(born, out_created(&pl));
         // first closed step emits for every expert, then every 10 bars: 59 closed steps → 6 rounds
-        assert_eq!(kernels.len(), 3 * 6, "{}", kernels.len());
+        assert_eq!(kernels.len(), fa_encoders::EXPERT_NAMES.len() * 6, "{}", kernels.len());
         let last = kernels.last().unwrap();
         // conjugate, smc and the four richer kernels of spec 33 §6.2
         assert_eq!(last.samplers.len(), 6);
@@ -1189,12 +1204,13 @@ mod tests {
                         as_of_ms: end as i64 * 60_000,
                         bars: &series[..end],
                         bar_closed: true,
+                        news: &[],
                     })
                     .unwrap();
                 requests.extend(out.refits);
             }
         }
-        assert_eq!(requests.len(), 3, "one first refit per expert");
+        assert_eq!(requests.len(), fa_encoders::EXPERT_NAMES.len(), "one first refit per expert");
         let req = &requests[0];
         assert_eq!(req.space.expert_index, 0);
         assert!(req.dump.records.len() >= 60);
@@ -1266,6 +1282,7 @@ mod tests {
                     as_of_ms: end as i64 * 60_000,
                     bars: &s[lo..end],
                     bar_closed: true,
+                    news: &[],
                 })
                 .unwrap();
                 if end > ctx + 50 {
@@ -1304,11 +1321,12 @@ mod tests {
                 as_of_ms: end as i64 * 60_000,
                 bars: &all[..end],
                 bar_closed: true,
+                news: &[],
             })
             .unwrap();
         }
         let rows = pl.persist_rows();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), fa_encoders::EXPERT_NAMES.len());
         assert_eq!(rows[0].family, "stat_baseline");
         let mut fresh = TimescalePipeline::baseline(Timescale::Minute, &cfg);
         for (k, r) in rows.iter().enumerate() {
@@ -1361,6 +1379,7 @@ mod tests {
                 as_of_ms: end as i64 * 60_000,
                 bars: &all[..end],
                 bar_closed: true,
+                news: &[],
             })
             .unwrap();
         }
@@ -1427,7 +1446,7 @@ mod tests {
         assert!(report.lifecycle.iter().all(|l| l.regime_break));
         assert_eq!(
             report.lifecycle[2].space.as_ref().unwrap().snapshot_id,
-            "stat-v1-1m",
+            StatisticalEncoder::baseline_id(Timescale::Minute),
             "dead parent in the old space"
         );
         let seeded = pl.seeded_lifecycle(Some(&map), 0);

@@ -35,7 +35,7 @@ use std::collections::BTreeSet;
 
 use fa_core::{Timescale, rng::Rng};
 use fa_encoders::{
-    EXPERT_NAMES, EncoderFamily, EncoderInput, FitConfig, NormAccumulator, NormStats, STATISTICAL_FAMILY,
+    EncoderFamily, EncoderInput, FitConfig, MARKET_EXPERTS, NormAccumulator, NormStats, STATISTICAL_FAMILY,
     SnapshotManifest, StatisticalEncoder, default_sizing,
 };
 use fa_mcmc::{MarkovGraph, log_score};
@@ -51,7 +51,8 @@ pub struct Candidate {
     pub context_steps: u32,
     /// Divides every z-score before the squash (`tanh(z / (2 s))`).
     pub squash_scale: f64,
-    /// Per-expert feature weight (`EXPERT_NAMES` order).
+    /// Per-expert feature weight, for the market experts only (`EXPERT_NAMES` order): the text
+    /// expert's features are bounded and scale-free, so there is no gain to search over (D-119).
     pub expert_weights: Vec<f64>,
     pub region_radius: f32,
     pub max_regions: usize,
@@ -62,7 +63,7 @@ impl Candidate {
         Self {
             context_steps: default_sizing(ts).context_steps,
             squash_scale: 1.0,
-            expert_weights: vec![1.0; EXPERT_NAMES.len()],
+            expert_weights: vec![1.0; MARKET_EXPERTS],
             region_radius,
             max_regions,
         }
@@ -186,7 +187,7 @@ impl SearchSpec {
             let c = Candidate {
                 context_steps: ctx[pick(&mut rng, ctx.len())],
                 squash_scale: self.squash_scales.get(pick(&mut rng, self.squash_scales.len())).copied().unwrap_or(1.0),
-                expert_weights: (0..EXPERT_NAMES.len())
+                expert_weights: (0..MARKET_EXPERTS)
                     .map(|_| self.expert_weights.get(pick(&mut rng, self.expert_weights.len())).copied().unwrap_or(1.0))
                     .collect(),
                 region_radius: self.region_radii.get(pick(&mut rng, self.region_radii.len())).copied().unwrap_or(1.0),
@@ -301,7 +302,7 @@ pub fn encoder(ts: Timescale, snapshot_id: &str, stats: &NormStats, context_step
         feedback: None,
         seed: 0,
     };
-    StatisticalEncoder::from_manifest(&m, &stats.to_bytes()).expect("statistical manifest with 3x8 stats")
+    StatisticalEncoder::from_manifest(&m, &stats.to_bytes()).expect("statistical manifest with per-market-expert stats")
 }
 
 /// Per-instrument statistics at `context_steps` (the raw features depend on the context).
@@ -313,8 +314,8 @@ pub fn fit_stats(
 ) -> anyhow::Result<Vec<NormStats>> {
     let identity = NormStats {
         n_windows: 1,
-        mean: vec![vec![0.0; fa_encoders::EXPERT_DIM]; EXPERT_NAMES.len()],
-        std: vec![vec![1.0; fa_encoders::EXPERT_DIM]; EXPERT_NAMES.len()],
+        mean: vec![vec![0.0; fa_encoders::EXPERT_DIM]; MARKET_EXPERTS],
+        std: vec![vec![1.0; fa_encoders::EXPERT_DIM]; MARKET_EXPERTS],
         gain: Vec::new(),
     };
     let enc = encoder(ts, "search", &identity, context_steps);
@@ -344,7 +345,7 @@ pub fn evaluate(
     c: &Candidate,
 ) -> anyhow::Result<(f64, Vec<f64>, Vec<usize>, usize)> {
     let enc = encoder(ts, "search", &stats.clone().with_gain(c.gains()), c.context_steps);
-    let n_experts = EXPERT_NAMES.len();
+    let n_experts = fa_encoders::EXPERT_NAMES.len();
     // latents[k] pooled over instruments (in order), lens = windows per instrument
     let mut latents: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_experts];
     let mut lens = Vec::with_capacity(histories.len());

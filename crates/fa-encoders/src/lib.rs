@@ -10,9 +10,13 @@ pub mod media;
 pub mod neural;
 pub mod snapshot;
 
-pub use baseline::{EXPERT_DIM, EXPERT_NAMES, FitConfig, MARKET_ROW_LEN, MarketBar, StatisticalEncoder};
+pub use baseline::{
+    EXPERT_DIM, EXPERT_NAMES, FitConfig, MARKET_EXPERTS, MARKET_ROW_LEN, MarketBar, StatisticalEncoder,
+    TEXT_EXPERT,
+};
 use fa_core::Timescale;
 use serde::{Deserialize, Serialize};
+pub mod text;
 pub use snapshot::{
     AdapterGuard, DataRef, InstrumentDataRef, MANIFEST_FILE, NormAccumulator, NormStats, ProbeSetRef, REGION_MAP_FILE,
     REGIONS_FILE, STATISTICAL_FAMILY, SnapshotManifest, WEIGHTS_FILE,

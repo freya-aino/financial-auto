@@ -15,7 +15,7 @@ use fa_core::Timescale;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{EXPERT_DIM, EXPERT_NAMES, EncoderError};
+use crate::{EXPERT_DIM, EncoderError};
 
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const WEIGHTS_FILE: &str = "weights.bin";
@@ -352,8 +352,10 @@ pub struct NormAccumulator {
 }
 
 impl Default for NormAccumulator {
+    /// Sized for the market experts only: the text expert's features are bounded and scale-free,
+    /// so they are never z-scored (D-119) and a fit over bars alone stays the right shape.
     fn default() -> Self {
-        Self::new(EXPERT_NAMES.len(), EXPERT_DIM)
+        Self::new(crate::MARKET_EXPERTS, EXPERT_DIM)
     }
 }
 

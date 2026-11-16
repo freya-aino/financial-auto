@@ -572,7 +572,7 @@ pub fn probe_version(ts: Timescale, ends: &[i64]) -> String {
     format!("probe-{ts}-{}-{}", ends.len(), &fnv(ends)[..8])
 }
 
-/// Snapshot id of a new fit: `stat-v1-<ts>-g<gen>-<unix seconds>`.
+/// Snapshot id of a new fit: `<StatisticalEncoder::VERSION>-<ts>-g<gen>-<unix seconds>`.
 pub fn snapshot_id(ts: Timescale, generation: u32, now_ms: i64) -> String {
     format!("{}-{ts}-g{generation}-{}", fa_encoders::StatisticalEncoder::VERSION, now_ms / 1000)
 }
@@ -665,7 +665,17 @@ mod tests {
             "{:?}",
             bc.region_map.experts.iter().map(|e| e.carried_mass).collect::<Vec<_>>()
         );
-        assert!(bc.regions.iter().flatten().filter(|r| r.mass > 0.0).all(|r| r.lineage_id.starts_with("L-")));
+        // Experts the parent covers inherit their lineage ids; the text expert (D-119) has no
+        // parent here — this fit's `ParentAssignment` was built from the market experts' probes —
+        // so its regions open new lineages, which is what a new expert is supposed to do.
+        for (k, regions) in bc.regions.iter().enumerate() {
+            let inherited = regions.iter().filter(|r| r.mass > 0.0).all(|r| r.lineage_id.starts_with("L-"));
+            if k < fa_encoders::MARKET_EXPERTS {
+                assert!(inherited, "expert {k} lost its lineage");
+            } else {
+                assert!(!inherited || regions.iter().all(|r| r.mass == 0.0), "expert {k} inherited from nowhere");
+            }
+        }
         assert_eq!(bc.manifest.parent_snapshot_id.as_deref(), Some("parent"));
         assert_eq!(bc.manifest.generation, 1);
         assert_eq!(bc.manifest.metrics["parent_probe_coverage"], 1.0);
@@ -746,7 +756,10 @@ mod tests {
     fn helpers() {
         assert_eq!(evenly(5, 10), vec![0, 1, 2, 3, 4]);
         assert_eq!(evenly(11, 3), vec![0, 5, 10]);
-        assert_eq!(snapshot_id(Timescale::Minute, 2, 1_700_000_000_123), "stat-v1-1m-g2-1700000000");
+        assert_eq!(
+            snapshot_id(Timescale::Minute, 2, 1_700_000_000_123),
+            format!("{}-1m-g2-1700000000", fa_encoders::StatisticalEncoder::VERSION)
+        );
         assert!(probe_version(Timescale::Hour, &[1, 2]).starts_with("probe-1h-2-"));
         let a = ParentAssignment::from_observations(
             "p",
