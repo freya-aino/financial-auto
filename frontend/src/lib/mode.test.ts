@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canGoLive, canGoPaper, liveBlockers, modeLabel, switchConfirmText, venueLines } from './mode';
+import { canGoLive, canGoPaper, liveBlockers, modeLabel, switchConfirmText, venueLines, venueReconLine } from './mode';
 import type { TradingModeView } from './console';
 
 const view = (over: Partial<TradingModeView> = {}): TradingModeView => ({
@@ -10,7 +10,7 @@ const view = (over: Partial<TradingModeView> = {}): TradingModeView => ({
 	max_order_eur: 50,
 	deployable_eur: 500,
 	switch_blockers: [],
-	venue_reconciliation: 'not implemented: compare by hand',
+	venue_reconciliation: { status: 'paper: no venue holds this book' },
 	venues: [{ venue: 'kraken', configured: true, open_orders: 0 }],
 	venues_ready: true,
 	...over
@@ -77,5 +77,26 @@ describe('the real-money switch', () => {
 			'account_id'
 		);
 		expect(venueLines(view({ venues: [{ venue: 'kraken', configured: true, open_orders: 2 }] }))[0]).toContain('2 open order(s)');
+	});
+});
+
+describe('the venue reconciliation line', () => {
+	it('never lets an incomplete pass read as a clean one', () => {
+		expect(venueReconLine(view({ venue_reconciliation: { status: 'ok', compared: 2 } }))).toContain('2 position(s) agree');
+		// a pass that could not ask a venue proves nothing, and must not be silent
+		const incomplete = venueReconLine(
+			view({ venue_reconciliation: { status: 'incomplete', unavailable: [{ venue: 'lemon', why: 'did not answer' }] } })
+		);
+		expect(incomplete).toContain('not reconciled');
+		expect(incomplete).toContain('lemon did not answer');
+		expect(venueReconLine(view({ venue_reconciliation: { status: 'unreachable', detail: 'no answer in time' } }))).toContain(
+			'no answer in time'
+		);
+		expect(venueReconLine(view({ venue_reconciliation: { status: 'diff', diffs: [{}, {}] } }))).toContain('halted');
+		// holdings outside the symbol mapping are reported, not treated as the platform's
+		expect(
+			venueReconLine(view({ venue_reconciliation: { status: 'ok', compared: 1, foreign: [{ symbol: 'DOGEEUR' }] } }))
+		).toContain('outside the symbol mapping');
+		expect(venueReconLine(view({ venue_reconciliation: { status: 'pending' } }))).toContain('not reconciled yet');
 	});
 });

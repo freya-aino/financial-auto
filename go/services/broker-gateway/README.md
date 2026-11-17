@@ -34,6 +34,22 @@ Shared in `venue.go`, which is what makes one conformance suite meaningful:
 - **A `LIVE` intent that cannot be routed is rejected with the reason** — no venue known for the
   instrument (no market data), no adapter, no credentials, no symbol mapping. It is never filled on
   the paper book, because the two ledgers would then disagree in the direction nobody checks.
+- **Every published event names the venue that produced it** (`OrderEvent.venue`, D-122). The
+  router stamps it, once, for everything it routes, and `publish` stamps `paper` on anything that
+  did not come through the router (a resting order filling on the tick, an algo slice). Not each
+  adapter: the field decides which venue a fill is booked against in `ledger.venue_fill`,
+  `ledger.lot` and `ledger.position_snapshot`, and an adapter that forgot it would file real money
+  under the paper venue with nothing downstream able to see it.
+- **Each venue's own book, on request.** `ctl.exec.positions` answers with every configured venue's
+  positions and balances, each symbol resolved back to one of our instruments through the operator's
+  mapping (`Instrument`, the inverse of `Symbol`) and left unresolved where the mapping does not
+  name it. The venues are asked when the question is put, never cached: the risk engine needs their
+  view at its own cut, and a stale number would look like a difference (D-122). Kraken has no
+  position endpoint, so its positions come from its balances — a holding of XBT *is* the position in
+  XBT/EUR — with the base asset read from the venue's own asset names rather than a table of quote
+  currencies, and an asset two mapped pairs share reported unattributed rather than charged to one.
+  A venue with no credentials and a venue that did not answer are two different answers, because
+  reconciliation must not read either as "flat".
 
 Credentials are `[venues.<id>] api_key / api_secret / account_id / env` in the git-ignored
 `config/secrets.toml` (`FA_VENUES_<ID>_<KEY>` overrides). `[sources.<id>]` — the data connector's
@@ -53,8 +69,8 @@ because "paper and live are the same path" is a claim that has to be tested rath
 a market order fills its quantity once; an unchanged venue produces no further events; fills never
 exceed the intent; an order ends in exactly one terminal event; a refusal is a rejection with a
 reason; the same intent twice creates one order; every fill carries instrument, a unique
-`venue_fill_id`, a fee with a currency and a slippage consistent with its side; a restart
-re-attaches an open order and emits only the increment.
+`venue_fill_id`, a fee with a currency and a slippage consistent with its side; every event names
+the venue that produced it; a restart re-attaches an open order and emits only the increment.
 
 Where a venue cannot express a case it is skipped and says so (OANDA fills an order in one
 transaction, so the partial-increment case does not apply to it; the paper engine's partials come

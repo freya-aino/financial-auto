@@ -57,6 +57,11 @@ message OrderEvent {
   // adapter knows it, and the venue's own symbol.
   string instrument_id = 13;
   string venue_symbol = 14;
+  // Which venue produced this event (`paper`, `kraken`, `lemon`, `oanda`; D-121). The ledger keys
+  // `venue_fill`, `lot`, `position_snapshot` and `venue_settlement` by venue, so a real fill filed
+  // under the paper venue id would be indistinguishable from a paper one and would settle by the
+  // paper rule. Empty from producers older than the live adapters, which only ever papered.
+  string venue = 15;
 }
 
 // `order.cancel.<account>`: cancels a working order (resting limit or the unfilled remainder of

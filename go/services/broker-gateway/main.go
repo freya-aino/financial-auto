@@ -55,6 +55,9 @@ const (
 	// mdResumeWithin: market-data consumers idle longer than this skip their backlog.
 	mdResumeWithin  = 2 * time.Minute
 	costsCalibrated = "exec.costs.calibrated"
+	// How long the venues get to answer `ctl.exec.positions`, comfortably inside the risk
+	// engine's own request timeout so a slow venue is reported rather than timing the caller out.
+	venueBooksTimeout = 8 * time.Second
 )
 
 func main() {
@@ -200,7 +203,10 @@ func main() {
 	calib.MinSamples = *calibMin
 	engine.Calib = calib
 	publish := func(items []Published) {
-		for _, it := range items {
+		// Anything that did not come through the router is the paper engine's own (a resting order
+		// filling on the tick, an algo slice), so this is where those get their venue. Only the
+		// router produces live events, and it has already stamped them.
+		for _, it := range stamp(PaperVenue, items) {
 			if err := pub.Publish(bus.OrderEvent(it.Account), it.Event); err != nil {
 				log.Warn("publish order event", "err", err)
 				continue
@@ -322,6 +328,34 @@ func main() {
 		}
 	}); err != nil {
 		log.Error("subscribe venue status", "err", err)
+		os.Exit(1)
+	}
+
+	// `ctl.exec.positions` answers "what does each venue say it holds?" — the question the live
+	// book is reconciled against (D-121). The venues are asked when the question is put, not on a
+	// timer: a reconciliation pass needs the venue's view *at its own cut*, and a cached one would
+	// make a stale number look like a difference.
+	if _, err := pub.NC.Subscribe(bus.Ctl("exec", "positions"), func(m *nats.Msg) {
+		var req fav1.CtlRequest
+		_ = proto.Unmarshal(m.Data, &req)
+		rctx, cancel := context.WithTimeout(ctx, venueBooksTimeout)
+		defer cancel()
+		books := router.Books(rctx)
+		ok := false
+		for _, b := range books {
+			if b.Configured && b.Error == "" {
+				ok = true
+			}
+		}
+		body, _ := json.Marshal(map[string]any{"venues": books, "asked_at": time.Now().UTC()})
+		reply := &fav1.CtlReply{Ok: ok, Message: string(body)}
+		_, l := bus.Consumed(ctx, log, m)
+		l.Info("ctl", "subject", m.Subject, "venues", len(books), "answered", ok)
+		if b, err := proto.Marshal(reply); err == nil && m.Reply != "" {
+			_ = m.Respond(b)
+		}
+	}); err != nil {
+		log.Error("subscribe venue positions", "err", err)
 		os.Exit(1)
 	}
 

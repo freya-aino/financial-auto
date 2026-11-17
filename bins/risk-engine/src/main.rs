@@ -1188,6 +1188,8 @@ async fn main() -> anyhow::Result<()> {
                 tick.tick().await;
                 let mut outs = recon::check_orphans(&p, &engine_r).await;
                 outs.extend(recon::reconcile(&p, &engine_r).await);
+                // and, in real-money mode, against the venues that actually hold the book (D-121)
+                outs.extend(recon::reconcile_venues(&p, &engine_r, &bus_r).await);
                 publish_outs_direct(&bus_r, &Some(p.clone()), &engine_r, outs).await;
             }
         });

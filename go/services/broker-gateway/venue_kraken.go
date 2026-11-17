@@ -97,6 +97,8 @@ func (k *Kraken) Symbol(instrumentID string) (string, bool) {
 	return s, ok
 }
 
+func (k *Kraken) Instrument(symbol string) (string, bool) { return instrumentOf(k.Symbols, symbol) }
+
 // sign builds the signed request for one private endpoint.
 func (k *Kraken) sign(path string, form map[string]string) (*http.Request, error) {
 	secret, err := base64.StdEncoding.DecodeString(k.Creds.Secret)
@@ -293,10 +295,61 @@ func (k *Kraken) Balances(ctx context.Context) ([]VenueBalance, error) {
 	return out, nil
 }
 
-// Positions: Kraken spot has no positions, only balances — a holding of XBT *is* the position, and
-// reporting it twice (here and as a balance) would double it in reconciliation. Margin positions
-// (`OpenPositions`) are not traded by this platform.
-func (k *Kraken) Positions(context.Context) ([]VenuePosition, error) { return nil, nil }
+// Positions are derived from the balances, because Kraken spot has no position endpoint: a holding
+// of XBT *is* the position in XBT/EUR. Margin positions (`OpenPositions`) are not traded by this
+// platform.
+//
+// Which balance belongs to which mapped pair is read from the venue's own asset names rather than
+// from a table of quote currencies: the base asset is the longest balance code that prefixes the
+// pair and leaves a remainder (`XBT` + `EUR` for `XBTEUR`, and `USDT` rather than `USD` for
+// `USDTEUR` when both are held). A balance that no mapped pair accounts for stays a balance —
+// it is reported, not turned into a position nobody asked for.
+//
+// Two mapped pairs on the same base asset (XBT/EUR and XBT/USD) make the holding unattributable:
+// Kraken holds one XBT balance and cannot say which of the two instruments it belongs to. Such a
+// balance is reported with no symbol of ours, so reconciliation treats it as foreign and leaves it
+// to the operator instead of charging it to one instrument by accident. For the same reason a
+// mapped pair whose base is the settlement currency (EUR/USD on a EUR account) reports the cash
+// balance as its position: on a cash venue a currency holding and a currency position are the same
+// thing, and this adapter does not pretend otherwise.
+func (k *Kraken) Positions(ctx context.Context) ([]VenuePosition, error) {
+	balances, err := k.Balances(ctx)
+	if err != nil {
+		return nil, err
+	}
+	codes := make([]string, 0, len(balances))
+	held := map[string]float64{}
+	for _, b := range balances {
+		codes = append(codes, b.Currency)
+		held[b.Currency] = b.Amount
+	}
+	// longest code first, so USDT wins over USD
+	sort.Slice(codes, func(i, j int) bool { return len(codes[i]) > len(codes[j]) })
+	byBase := map[string][]string{}
+	for _, pair := range k.Symbols {
+		up := strings.ToUpper(strings.TrimSpace(pair))
+		for _, code := range codes {
+			if len(up) > len(code) && strings.HasPrefix(up, code) {
+				byBase[code] = append(byBase[code], up)
+				break
+			}
+		}
+	}
+	out := make([]VenuePosition, 0, len(byBase))
+	for base, pairs := range byBase {
+		qty := held[base]
+		if qty == 0 {
+			continue
+		}
+		symbol := ""
+		if len(pairs) == 1 {
+			symbol = pairs[0]
+		}
+		out = append(out, VenuePosition{Venue: krakenVenue, Symbol: symbol, Quantity: qty})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Symbol < out[j].Symbol })
+	return out, nil
+}
 
 // krakenCurrency strips Kraken's X/Z asset-class prefixes (ZEUR → EUR, XXBT → XBT).
 func krakenCurrency(code string) string {

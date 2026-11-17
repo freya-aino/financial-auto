@@ -187,3 +187,124 @@ func TestFillIncrementsAreNeverDoubleCounted(t *testing.T) {
 		t.Fatalf("events after the terminal one: %v", more)
 	}
 }
+
+// The books the risk engine reconciles against (`ctl.exec.positions`): every configured venue's
+// own positions and balances, with each reported symbol resolved back to an instrument of ours
+// where the operator's mapping names it — and nothing resolved by guesswork where it does not.
+func TestVenueBooksResolveWhatTheMappingNames(t *testing.T) {
+	ctx := context.Background()
+	for _, v := range []struct {
+		name  string
+		build func(t *testing.T) scriptedVenue
+		// symbol the fixture reports a position in, and its quantity
+		symbol string
+		qty    float64
+	}{
+		{"kraken", newKrakenScript, "XBTEUR", 0.025},
+		{"lemon", newLemonScript, "US0378331005", 3},
+		{"oanda", newOandaScript, "EUR_USD", 1000},
+	} {
+		t.Run(v.name, func(t *testing.T) {
+			s := v.build(t)
+			r := confRouter(t, s)
+			books := r.Books(ctx)
+			if len(books) != 1 {
+				t.Fatalf("want one venue's books, got %d", len(books))
+			}
+			b := books[0]
+			if b.Venue != v.name || !b.Configured {
+				t.Fatalf("books %+v", b)
+			}
+			if b.Error != "" {
+				t.Fatalf("the stub answered with an error: %s", b.Error)
+			}
+			var found *VenuePosition
+			for i := range b.Positions {
+				if strings.EqualFold(b.Positions[i].Symbol, v.symbol) {
+					found = &b.Positions[i]
+				}
+			}
+			if found == nil {
+				t.Fatalf("no position in %s: %+v", v.symbol, b.Positions)
+			}
+			if found.Quantity != v.qty {
+				t.Fatalf("%s quantity %g, want %g", v.symbol, found.Quantity, v.qty)
+			}
+			// The mapping names this symbol, so the position must carry our instrument id: a
+			// position the risk engine cannot attribute is one it cannot reconcile.
+			if found.Instrument != testInstrument {
+				t.Fatalf("%s resolved to %q, want %q", v.symbol, found.Instrument, testInstrument)
+			}
+			if len(b.Balances) == 0 {
+				t.Fatal("a venue that holds a position holds cash too; the balances are missing")
+			}
+			for _, bal := range b.Balances {
+				if bal.Currency == "" {
+					t.Fatalf("a balance without a currency: %+v", bal)
+				}
+			}
+		})
+	}
+}
+
+// A venue with no credentials and a venue that cannot be reached are two different answers, and
+// reconciliation must not read either as "flat".
+func TestVenueBooksSeparateUnconfiguredFromUnreachable(t *testing.T) {
+	r := NewRouter(free())
+	r.Add(NewLemon(VenueCreds{}, nil)) // no key: never going to trade
+	// A configured venue pointed at nothing: it will answer with a transport error.
+	unreachable := NewKraken(VenueCreds{Key: "k", Secret: "c2VjcmV0"}, nil)
+	unreachable.BaseURL, unreachable.Fetch = "http://127.0.0.1:1", fastFetcher()
+	r.Add(unreachable)
+
+	books := r.Books(context.Background())
+	if len(books) != 2 {
+		t.Fatalf("want two venues, got %d", len(books))
+	}
+	by := map[string]VenueBooks{}
+	for _, b := range books {
+		by[b.Venue] = b
+	}
+	if l := by["lemon"]; l.Configured || l.Detail == "" || l.Error != "" {
+		t.Fatalf("an unconfigured venue must say so and raise no error: %+v", l)
+	}
+	if k := by["kraken"]; !k.Configured || k.Error == "" {
+		t.Fatalf("an unreachable venue must be configured and carry the error: %+v", k)
+	}
+	if k := by["kraken"]; strings.Contains(k.Error, "c2VjcmV0") || strings.Contains(k.Detail, "c2VjcmV0") {
+		t.Fatalf("a credential leaked into the books: %+v", k)
+	}
+}
+
+// Kraken has no position endpoint, so its positions come from the balances. Which balance belongs
+// to which pair is read from the venue's own asset names, and an asset two mapped pairs share is
+// left unattributed rather than charged to one of them.
+func TestKrakenPositionsComeFromBalances(t *testing.T) {
+	s := newKrakenScript(t)
+	k := s.Adapter().(*Kraken)
+	pos, err := k.Positions(context.Background())
+	if err != nil {
+		t.Fatalf("positions: %v", err)
+	}
+	// balance.json holds ZEUR 1000 and XXBT 0.025; only XBTEUR is mapped.
+	if len(pos) != 1 || pos[0].Symbol != "XBTEUR" || pos[0].Quantity != 0.025 {
+		t.Fatalf("want one XBTEUR position of 0.025, got %+v", pos)
+	}
+
+	// A second pair on the same base asset: Kraken holds one XBT balance and cannot say which
+	// instrument it belongs to, so it is reported with no symbol of ours.
+	k.Symbols["01900000-0000-7000-8000-000000000043"] = "XBTUSD"
+	pos, err = k.Positions(context.Background())
+	if err != nil {
+		t.Fatalf("positions: %v", err)
+	}
+	if len(pos) != 1 || pos[0].Symbol != "" || pos[0].Quantity != 0.025 {
+		t.Fatalf("an ambiguous holding must be reported unattributed, got %+v", pos)
+	}
+	if _, ok := k.Instrument(""); ok {
+		t.Fatal("an empty symbol must resolve to nothing")
+	}
+	if got, ok := k.Instrument(" xbteur "); !ok || got != testInstrument {
+		t.Fatalf("reverse mapping ignores case and space: %q %v", got, ok)
+	}
+}

@@ -361,6 +361,24 @@ export interface VenueStatus {
 }
 
 /** `GET /api/trading/mode` (D-121): the mode, the owner's numbers, and what blocks a switch. */
+/**
+ * The last comparison of the live book against the venues' own books (D-121).
+ *
+ * `status` is `paper: …` or `pending` when no pass has run, `incomplete` when a venue could not be
+ * asked (and nothing was compared, so it is not a clean bill of health), `ok`, or `diff` — which
+ * has already halted trading by the time the UI sees it.
+ */
+export interface VenueReconciliation {
+	status: string;
+	at?: string;
+	compared?: number;
+	diffs?: Record<string, unknown>[];
+	foreign?: Record<string, unknown>[];
+	unavailable?: Record<string, unknown>[];
+	balances?: { venue: string; currency: string; amount: number }[];
+	detail?: string;
+}
+
 export interface TradingModeView {
 	mode: 'paper' | 'live';
 	live_permitted: boolean;
@@ -369,7 +387,7 @@ export interface TradingModeView {
 	max_order_eur: number;
 	deployable_eur: number;
 	switch_blockers: string[];
-	venue_reconciliation: string;
+	venue_reconciliation: VenueReconciliation;
 	venues: VenueStatus[] | null;
 	venues_ready: boolean | null;
 	venues_error?: string;

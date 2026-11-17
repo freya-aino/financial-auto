@@ -43,6 +43,19 @@ pub fn uuid_of(id: &str) -> Uuid {
     Uuid::parse_str(id).unwrap_or_else(|_| Uuid::new_v5(&NS, id.as_bytes()))
 }
 
+/// Venue id for a gateway venue name (`paper`, `kraken`, `lemon`, `oanda`; D-121).
+///
+/// Derived rather than registered, because `venue_fill`, `lot`, `position_snapshot` and
+/// `venue_settlement` are all keyed by `venue_id` and the name is what the execution path carries
+/// (`OrderEvent.venue`). An empty name is the paper venue: that is what every producer sent before
+/// the live adapters existed, and all of them were papering.
+pub fn venue_uuid(name: &str) -> Uuid {
+    match name.trim() {
+        "" | "paper" => PAPER_VENUE,
+        v => Uuid::new_v5(&NS, format!("venue:{v}").as_bytes()),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PgError {
     #[error("sql: {0}")]
@@ -917,6 +930,20 @@ mod tests {
         assert_eq!(w[0].0 + w[1].0, q);
         // no usable weights: the even split of D-047
         assert_eq!(attribution_split(q, fee, 2, &[]), vec![(money::dec(0.15), money::dec(0.5)); 2]);
+    }
+
+    #[test]
+    fn a_live_venue_gets_its_own_id_and_paper_keeps_the_old_one() {
+        // The paper venue's id must not move: every row written since 2026-11-06 carries it.
+        assert_eq!(venue_uuid("paper"), PAPER_VENUE);
+        assert_eq!(venue_uuid(""), PAPER_VENUE, "an unstamped event is from before the live adapters");
+        assert_eq!(venue_uuid(" paper "), PAPER_VENUE);
+        let k = venue_uuid("kraken");
+        assert_ne!(k, PAPER_VENUE, "a real fill must not be filed under the paper venue");
+        assert_ne!(k, venue_uuid("lemon"));
+        assert_eq!(k, venue_uuid("kraken"), "the id is derived, so it is stable across restarts");
+        // Not the bare-name hash: a venue called like an intent id could not collide with one.
+        assert_ne!(k, uuid_of("kraken"));
     }
 
     async fn ledger() -> Option<PgLedger> {

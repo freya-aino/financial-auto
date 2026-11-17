@@ -133,6 +133,11 @@ pub struct BookedFill {
     pub at_ms: i64,
     /// Currency, FX source, arrival price and slippage for `ledger.fill`.
     pub details: FillDetails,
+    /// Which venue filled it (`OrderEvent.venue`: `paper`, `kraken`, …; D-121). Empty means paper,
+    /// which is what producers older than the live adapters send.
+    pub venue: String,
+    /// The venue's own symbol for the instrument, as the venue reported it.
+    pub venue_symbol: String,
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +321,10 @@ pub struct Engine {
     /// Real money or not (D-121). It starts at `settings.mode` and only `set_trading_mode` moves
     /// it, which is what makes the switch one audited event rather than a config reload.
     live: bool,
+    /// The last venue reconciliation pass ([`crate::recon::reconcile_venues`]), as the API reports
+    /// it. `None` means no pass has run — which is what paper mode looks like, and is deliberately
+    /// not the same as a pass that found nothing.
+    venue_recon: Option<Value>,
     allocator: Box<dyn Allocator>,
     /// Name + parameters of the active allocator (`risk.toml` or the last runtime switch).
     allocator_spec: Value,
@@ -507,6 +516,7 @@ impl Engine {
             last_dists: BTreeMap::new(),
             last_tick_ms: None,
             counters: BTreeMap::new(),
+            venue_recon: None,
             calendars: BTreeMap::new(),
             day_keys: BTreeMap::new(),
             session_days: fa_risk::session::SessionDays::default(),
@@ -895,6 +905,21 @@ impl Engine {
         self.live
     }
 
+    /// Every non-zero position of the active book, for the venue comparison.
+    pub fn book_positions(&self) -> Vec<(InstrumentId, f64)> {
+        self.ledger
+            .positions
+            .iter()
+            .filter(|(_, p)| p.quantity.abs() > 1e-9)
+            .map(|(i, p)| (*i, p.quantity))
+            .collect()
+    }
+
+    /// Records the outcome of a venue reconciliation pass, for `mode_view` and the API.
+    pub fn set_venue_recon(&mut self, view: Value) {
+        self.venue_recon = Some(view);
+    }
+
     /// The mode the intents it emits carry.
     fn intent_mode(&self) -> TradingMode {
         if self.live { TradingMode::Live } else { TradingMode::Paper }
@@ -919,9 +944,11 @@ impl Engine {
             "max_order_eur": self.risk.cfg.live.max_order_eur,
             "deployable_eur": self.risk.deployable_in(self.equity(), self.live),
             "switch_blockers": blockers,
-            // The platform cannot yet read a venue's own book, so nobody should flip this without
-            // having reconciled by hand. Saying so in the API is better than implying otherwise.
-            "venue_reconciliation": "not implemented: compare the venue's positions and balances by hand before the first flip",
+            // The last pass against the venues' own books (D-121). In paper mode there is nothing
+            // to compare, and saying so is not the same as saying the books agree.
+            "venue_reconciliation": self.venue_recon.clone().unwrap_or_else(|| {
+                json!({"status": if self.live { "pending" } else { "paper: no venue holds this book" }})
+            }),
         })
     }
 
@@ -1492,6 +1519,8 @@ impl Engine {
                 strategy_weights: info.weights.clone(),
                 at_ms,
                 details,
+                venue: m.venue.trim().to_owned(),
+                venue_symbol: m.venue_symbol.trim().to_owned(),
             };
             self.unconfirmed.insert(booked.fill.fill_id.clone(), (booked.clone(), now_ms, now_ms));
             self.booked.push(booked);

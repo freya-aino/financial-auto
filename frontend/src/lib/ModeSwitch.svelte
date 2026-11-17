@@ -11,7 +11,7 @@
 	// the operator has to act on.
 	import Info from './Info.svelte';
 	import { consoleApi, errText, type TradingModeView } from './console';
-	import { canGoLive, canGoPaper, liveBlockers, modeLabel, switchConfirmText, venueLines } from './mode';
+	import { canGoLive, canGoPaper, liveBlockers, modeLabel, switchConfirmText, venueLines, venueReconLine } from './mode';
 
 	let { onchanged }: { onchanged?: () => void } = $props();
 
@@ -23,6 +23,7 @@
 
 	const blockers = $derived(liveBlockers(mode));
 	const venues = $derived(venueLines(mode));
+	const reconLine = $derived(venueReconLine(mode));
 	const live = $derived(mode?.mode === 'live');
 
 	export async function refresh() {
@@ -97,7 +98,6 @@
 			</button>
 			<p class="dim">
 				Sleeve {mode.sleeve_eur.toLocaleString()} EUR · {mode.max_order_eur.toLocaleString()} EUR per order.
-				{mode.venue_reconciliation}
 			</p>
 		{:else}
 			<p class="dim">Real money is not available yet:</p>
@@ -105,6 +105,7 @@
 				{#each blockers as b, i (i)}<li>{b}</li>{/each}
 			</ul>
 		{/if}
+		{#if reconLine}<p class="dim">{reconLine}</p>{/if}
 		{#if venues.length}
 			<ul class="venues">
 				{#each venues as v, i (i)}<li>{v}</li>{/each}

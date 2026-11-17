@@ -6,7 +6,7 @@
 // risk engine checks the owner's numbers, a flat book, unfilled intents and halts; the broker
 // gateway checks credentials — this is the second of two locks, and it exists so that the button
 // is not offered when it cannot work and never offered without saying what will happen.
-import type { TradingModeView } from './console';
+import type { TradingModeView, VenueReconciliation } from './console';
 
 /** Everything that currently prevents a switch to live, newest reason first. */
 export function liveBlockers(m: TradingModeView | null): string[] {
@@ -67,6 +67,36 @@ export function venueLines(m: TradingModeView | null): string[] {
 			? `${v.venue}: ready${v.open_orders ? ` · ${v.open_orders} open order(s)` : ''}`
 			: `${v.venue}: ${v.detail ?? 'no credentials'}`
 	);
+}
+
+/**
+ * One line about the venue reconciliation, or null when there is nothing worth saying.
+ *
+ * `incomplete` is deliberately not silent: it means a venue could not be asked, so the pass proves
+ * nothing — the one state an operator is most likely to mistake for "fine".
+ */
+export function venueReconLine(m: TradingModeView | null): string | null {
+	const r: VenueReconciliation | undefined = m?.venue_reconciliation as VenueReconciliation | undefined;
+	if (!r || typeof r !== 'object') return null;
+	switch (r.status) {
+		case 'ok':
+			return `venues reconciled: ${r.compared ?? 0} position(s) agree${foreignText(r)}`;
+		case 'diff':
+			return `the book differs from the venues in ${r.diffs?.length ?? 0} position(s): trading is halted until it is resolved`;
+		case 'incomplete':
+			return `not reconciled: ${(r.unavailable ?? []).map((u) => `${u.venue} ${u.why}`).join(', ') || 'a venue could not be asked'}`;
+		case 'unreachable':
+			return `not reconciled: ${r.detail ?? 'the broker-gateway did not answer'}`;
+		case 'pending':
+			return 'not reconciled yet: the first pass runs with the next reconciliation tick';
+		default:
+			return r.status ? `venue reconciliation: ${r.status}` : null;
+	}
+}
+
+function foreignText(r: VenueReconciliation): string {
+	const n = r.foreign?.length ?? 0;
+	return n > 0 ? ` · ${n} holding(s) outside the symbol mapping, left alone` : '';
 }
 
 function eurText(v: number): string {

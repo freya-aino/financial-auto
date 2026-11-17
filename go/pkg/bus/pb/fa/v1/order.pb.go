@@ -271,8 +271,13 @@ type OrderEvent struct {
 	// What was traded (spec 42 §8), so a consumer that does not know the intent (an orphan fill)
 	// can identify the instrument instead of assuming: the internal instrument id when the venue
 	// adapter knows it, and the venue's own symbol.
-	InstrumentId  string `protobuf:"bytes,13,opt,name=instrument_id,json=instrumentId,proto3" json:"instrument_id,omitempty"`
-	VenueSymbol   string `protobuf:"bytes,14,opt,name=venue_symbol,json=venueSymbol,proto3" json:"venue_symbol,omitempty"`
+	InstrumentId string `protobuf:"bytes,13,opt,name=instrument_id,json=instrumentId,proto3" json:"instrument_id,omitempty"`
+	VenueSymbol  string `protobuf:"bytes,14,opt,name=venue_symbol,json=venueSymbol,proto3" json:"venue_symbol,omitempty"`
+	// Which venue produced this event (`paper`, `kraken`, `lemon`, `oanda`; D-121). The ledger keys
+	// `venue_fill`, `lot`, `position_snapshot` and `venue_settlement` by venue, so a real fill filed
+	// under the paper venue id would be indistinguishable from a paper one and would settle by the
+	// paper rule. Empty from producers older than the live adapters, which only ever papered.
+	Venue         string `protobuf:"bytes,15,opt,name=venue,proto3" json:"venue,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -405,6 +410,13 @@ func (x *OrderEvent) GetVenueSymbol() string {
 	return ""
 }
 
+func (x *OrderEvent) GetVenue() string {
+	if x != nil {
+		return x.Venue
+	}
+	return ""
+}
+
 // `order.cancel.<account>`: cancels a working order (resting limit or the unfilled remainder of
 // an algo order) by its intent id (spec 40 §6.4). Field 1 is wire-compatible with
 // `OrderIntent.intent_id`, so senders still publishing an `OrderIntent` keep working.
@@ -504,7 +516,7 @@ const file_fa_v1_order_proto_rawDesc = "" +
 	"\n" +
 	"created_at\x18\n" +
 	" \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAtB\x0e\n" +
-	"\f_limit_price\"\xf3\x04\n" +
+	"\f_limit_price\"\x89\x05\n" +
 	"\n" +
 	"OrderEvent\x12\x1b\n" +
 	"\tintent_id\x18\x01 \x01(\tR\bintentId\x12$\n" +
@@ -523,7 +535,8 @@ const file_fa_v1_order_proto_rawDesc = "" +
 	"\fslippage_bps\x18\v \x01(\x01R\vslippageBps\x12\"\n" +
 	"\rvenue_fill_id\x18\f \x01(\tR\vvenueFillId\x12#\n" +
 	"\rinstrument_id\x18\r \x01(\tR\finstrumentId\x12!\n" +
-	"\fvenue_symbol\x18\x0e \x01(\tR\vvenueSymbol\"v\n" +
+	"\fvenue_symbol\x18\x0e \x01(\tR\vvenueSymbol\x12\x14\n" +
+	"\x05venue\x18\x0f \x01(\tR\x05venue\"v\n" +
 	"\x04Kind\x12\x14\n" +
 	"\x10KIND_UNSPECIFIED\x10\x00\x12\f\n" +
 	"\bKIND_ACK\x10\x01\x12\x15\n" +

@@ -302,6 +302,29 @@ var conformanceCases = []struct {
 		}
 	}},
 
+	{name: "every event names the venue that produced it", run: func(t *testing.T, v scriptedVenue) {
+		// Routed rather than submitted directly, because the venue stamp is the router's job: it
+		// is what decides which venue a fill is booked against in the ledger, and a fill of real
+		// money filed under the paper venue would settle by the paper rule and reconcile against
+		// the wrong book.
+		v.Mark(testInstrument, symbolFor(v.Name()), 100)
+		r := confRouter(t, v)
+		in := confIntent(v, "01VENUE00000000000000A9", 2, nil)
+		evs := r.Execute(context.Background(), in)
+		if v.Can(featAsync) {
+			v.FillTo(in.IntentId, 2, 100, 0.2)
+			evs = append(evs, r.Poll(context.Background())...)
+		}
+		if len(evs) == 0 {
+			t.Fatal("a routed intent must produce at least one event")
+		}
+		for i, e := range evs {
+			if e.Event.Venue != v.Name() {
+				t.Fatalf("event %d (%v) names venue %q, want %q", i, e.Event.Kind, e.Event.Venue, v.Name())
+			}
+		}
+	}},
+
 	{name: "a restart re-attaches an open order and emits only the increment", needs: featRestart,
 		run: func(t *testing.T, v scriptedVenue) {
 			v.Mark(testInstrument, symbolFor(v.Name()), 100)
@@ -356,6 +379,22 @@ func confSubmit(t *testing.T, v scriptedVenue, in *fav1.OrderIntent) []Published
 		out = append(out, Published{Account: in.AccountId, Event: e})
 	}
 	return out
+}
+
+// confRouter puts the venue under test behind a router, the way the gateway runs it.
+func confRouter(t *testing.T, v scriptedVenue) *Router {
+	t.Helper()
+	paper, ok := v.Adapter().(*PaperEngine)
+	if !ok {
+		paper = NewPaperEngine(DefaultCostModel())
+		paper.Guard = &RiskGuard{Timeout: 0}
+	}
+	r := NewRouter(paper)
+	r.VenueOf = func(string) (string, bool) { return v.Name(), true }
+	if live, ok := v.Adapter().(LiveVenue); ok {
+		r.Add(live)
+	}
+	return r
 }
 
 // summarise checks the ordering invariants and returns the filled quantity and terminal kind.

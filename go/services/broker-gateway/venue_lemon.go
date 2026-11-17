@@ -84,6 +84,8 @@ func (l *Lemon) Symbol(instrumentID string) (string, bool) {
 	return s, ok
 }
 
+func (l *Lemon) Instrument(symbol string) (string, bool) { return instrumentOf(l.Symbols, symbol) }
+
 func (l *Lemon) do(ctx context.Context, method, path string, body any) ([]byte, error) {
 	if err := l.Ready(); err != nil {
 		return nil, err

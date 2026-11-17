@@ -40,6 +40,10 @@ import (
 	"github.com/fey/financial-auto/go/pkg/connector"
 )
 
+// PaperVenue is the venue id of the paper engine, as it appears in `OrderEvent.venue` and (through
+// `fa_ledger::pg::venue_uuid`) as the paper venue's row in the ledger's venue-keyed tables.
+const PaperVenue = "paper"
+
 // LiveVenue is a VenueAdapter that talks to a real venue.
 type LiveVenue interface {
 	VenueAdapter
@@ -56,6 +60,13 @@ type LiveVenue interface {
 	Balances(ctx context.Context) ([]VenueBalance, error)
 	// Symbol maps an internal instrument id to the venue's symbol, when the adapter knows it.
 	Symbol(instrumentID string) (string, bool)
+	// Instrument is Symbol's inverse: which instrument of ours a symbol the venue reported is.
+	//
+	// It exists for reconciliation, and what it cannot answer matters as much as what it can: a
+	// holding the operator's mapping does not name is *not* attributed to anything by guesswork.
+	// It is reported as foreign, because an instrument the mapping omits cannot be traded live at
+	// all — so a holding in it cannot be one this platform opened.
+	Instrument(symbol string) (string, bool)
 	// Snapshot and Restore carry this adapter's open orders across a gateway restart.
 	//
 	// They are needed because the venue cannot supply what they hold: a venue knows its own order
@@ -86,12 +97,14 @@ type LiveOrderState struct {
 	Seq        int     `json:"seq"`
 }
 
-// VenuePosition is one open position as the venue reports it.
+// VenuePosition is one open position as the venue reports it. `Instrument` is filled in by the
+// router from the operator's symbol mapping and is empty for a holding the mapping does not name.
 type VenuePosition struct {
-	Venue    string  `json:"venue"`
-	Symbol   string  `json:"symbol"`
-	Quantity float64 `json:"quantity"`
-	AvgPrice float64 `json:"avg_price"`
+	Venue      string  `json:"venue"`
+	Symbol     string  `json:"symbol"`
+	Quantity   float64 `json:"quantity"`
+	AvgPrice   float64 `json:"avg_price"`
+	Instrument string  `json:"instrument_id,omitempty"`
 }
 
 // VenueBalance is one cash balance as the venue reports it.
@@ -217,6 +230,94 @@ func (r *Router) Ready() ([]VenueStatus, bool) {
 	return st, false
 }
 
+// VenueBooks is one venue's own view of what it holds: the answer to `ctl.exec.positions`, which
+// is what lets the risk engine reconcile the live book against the venue rather than against
+// itself (`bins/risk-engine/src/recon.rs`).
+//
+// A venue that is not configured and a venue that did not answer are reported as two different
+// things on purpose. The first is a venue the platform was never going to trade; the second is a
+// venue that may hold a position right now and cannot be asked — and reconciliation must not read
+// a network failure as "flat".
+type VenueBooks struct {
+	Venue      string          `json:"venue"`
+	Configured bool            `json:"configured"`
+	Detail     string          `json:"detail,omitempty"`
+	Error      string          `json:"error,omitempty"`
+	Positions  []VenuePosition `json:"positions"`
+	Balances   []VenueBalance  `json:"balances"`
+}
+
+// Books asks every configured venue for its positions and balances, resolving each reported symbol
+// back to an instrument id where the operator's mapping names it.
+func (r *Router) Books(ctx context.Context) []VenueBooks {
+	ids := make([]string, 0, len(r.live))
+	for id := range r.live {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]VenueBooks, 0, len(ids))
+	for _, id := range ids {
+		v := r.live[id]
+		b := VenueBooks{Venue: id, Configured: true, Positions: []VenuePosition{}, Balances: []VenueBalance{}}
+		if err := v.Ready(); err != nil {
+			b.Configured, b.Detail = false, err.Error()
+			out = append(out, b)
+			continue
+		}
+		pos, err := v.Positions(ctx)
+		if err != nil {
+			b.Error = err.Error()
+		}
+		for _, p := range pos {
+			if inst, ok := v.Instrument(p.Symbol); ok {
+				p.Instrument = inst
+			}
+			b.Positions = append(b.Positions, p)
+		}
+		bal, err := v.Balances(ctx)
+		if err != nil && b.Error == "" {
+			b.Error = err.Error()
+		}
+		b.Balances = append(b.Balances, bal...)
+		if r.Counters != nil && b.Error != "" {
+			r.Counters.Add("live.book_errors", 1)
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
+// instrumentOf is the inverse of an adapter's symbol map. The comparison ignores case and
+// surrounding space and nothing else: every venue here reports positions under the same symbol the
+// mapping was written with (a Kraken pair, a lemon ISIN, a v20 instrument), and a looser match
+// would be a guess about which instrument holds real money.
+func instrumentOf(symbols map[string]string, symbol string) (string, bool) {
+	want := strings.ToUpper(strings.TrimSpace(symbol))
+	if want == "" {
+		return "", false
+	}
+	for instrument, s := range symbols {
+		if strings.ToUpper(strings.TrimSpace(s)) == want {
+			return instrument, true
+		}
+	}
+	return "", false
+}
+
+// stamp records which venue produced each event (`OrderEvent.venue`, D-121).
+//
+// Done here, once, rather than in each adapter: the field decides which venue a fill is booked
+// against in `ledger.venue_fill`, `ledger.lot` and `ledger.position_snapshot`, and an adapter that
+// forgot it would file real money under the paper venue — a mistake nothing downstream could see.
+func stamp(venue string, out []Published) []Published {
+	for _, p := range out {
+		if p.Event != nil && p.Event.Venue == "" {
+			p.Event.Venue = venue
+		}
+	}
+	return out
+}
+
 // Execute routes one approved intent.
 //
 // A `LIVE` intent that cannot be routed is **rejected with the reason**, never passed to the paper
@@ -225,7 +326,7 @@ func (r *Router) Ready() ([]VenueStatus, bool) {
 func (r *Router) Execute(ctx context.Context, in *fav1.OrderIntent) []Published {
 	if in.Mode != fav1.TradingMode_TRADING_MODE_LIVE {
 		if ev := r.Paper.Execute(in); ev != nil {
-			return []Published{{Account: in.AccountId, Event: ev}}
+			return stamp(PaperVenue, []Published{{Account: in.AccountId, Event: ev}})
 		}
 		return nil
 	}
@@ -263,13 +364,13 @@ func (r *Router) Execute(ctx context.Context, in *fav1.OrderIntent) []Published 
 	if r.Counters != nil {
 		r.Counters.Add("live.submitted", 1)
 	}
-	return out
+	return stamp(venue, out)
 }
 
 // Cancel routes a cancel to whichever adapter holds the order.
 func (r *Router) Cancel(ctx context.Context, intentID string) []Published {
 	if c := r.Paper.CancelResting(intentID); c != nil {
-		return []Published{*c}
+		return stamp(PaperVenue, []Published{*c})
 	}
 	for _, v := range r.live {
 		if h, ok := v.(interface{ Holds(string) bool }); ok && !h.Holds(intentID) {
@@ -299,7 +400,7 @@ func (r *Router) Poll(ctx context.Context) []Published {
 		if len(evs) > 0 && r.Counters != nil {
 			r.Counters.Add("live.events."+id, float64(len(evs)))
 		}
-		out = append(out, evs...)
+		out = append(out, stamp(id, evs)...)
 	}
 	return out
 }

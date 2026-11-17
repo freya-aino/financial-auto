@@ -102,6 +102,8 @@ func (o *Oanda) Symbol(instrumentID string) (string, bool) {
 	return s, ok
 }
 
+func (o *Oanda) Instrument(symbol string) (string, bool) { return instrumentOf(o.Symbols, symbol) }
+
 func (o *Oanda) path(suffix string) string {
 	return strings.TrimSuffix(o.BaseURL, "/") + "/v3/accounts/" + o.Creds.Account + suffix
 }

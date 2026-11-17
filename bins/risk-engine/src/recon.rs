@@ -13,16 +13,27 @@
 //! - **Reconciliation** at one cut ([`PgLedger::reconcile_cut`]): exact decimals, in-flight
 //!   writes excluded, rows only Postgres has (operator-booked orphans, payouts) applied to the
 //!   paper book. A remaining diff halts scope `broker`.
+//! - **Venue reconciliation** ([`reconcile_venues`], D-121): in real-money mode the live book is
+//!   also compared against what the venues themselves say they hold (`ctl.exec.positions`). The
+//!   two reconciliations answer different questions — one asks whether this process and Postgres
+//!   agree about the fills they saw, the other whether either of them describes the position that
+//!   actually exists at the venue — and only the second can catch a fill that never reached the
+//!   bus at all.
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use chrono::{DateTime, TimeZone, Utc};
+use fa_bus::Bus;
 use fa_ledger::{
     Fill,
-    pg::{FillDetails, IntentRecord, PAPER_VENUE, PgLedger},
+    pg::{self, FillDetails, IntentRecord, PAPER_VENUE, PgLedger},
     pg_accounting::{FillEvent, Recorded},
 };
-use fa_proto::v1::{Halt, OrderEvent};
+use fa_proto::v1::{CtlReply, CtlRequest, Halt, OrderEvent};
 use fa_risk::HaltScope;
+use fa_proto::prost::Message as _;
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -31,6 +42,13 @@ use crate::{
     engine::{BookedFill, Engine, Out, fill_id_of},
     persist::Persist,
 };
+
+/// How long the gateway gets to ask every venue and answer `ctl.exec.positions`. Longer than its
+/// own per-pass budget, so a slow venue comes back as a reported error rather than as silence.
+const VENUE_BOOKS_TIMEOUT: Duration = Duration::from_secs(12);
+/// Quantity difference that counts as a difference. The book's quantities came from the venue's
+/// own fills, so this is float noise, not a tolerance.
+const VENUE_QTY_TOL: f64 = 1e-9;
 
 /// Unconfirmed fills younger than this are in flight (not expected in Postgres yet); older
 /// ones count as missing.
@@ -59,8 +77,11 @@ fn event(p: &Persist, b: &BookedFill) -> FillEvent {
         strategy_weights: b.strategy_weights.clone(),
         details: b.details.clone(),
         book: Some(p.book().as_str().to_owned()),
-        venue: Some(PAPER_VENUE),
-        venue_symbol: None,
+        // Which venue filled it, so a real fill is not filed under the paper venue id: the
+        // ledger's `venue_fill`, `lot`, `position_snapshot` and `venue_settlement` are all keyed
+        // by it, and the paper venue's settlement rule is not every venue's (D-121).
+        venue: Some(pg::venue_uuid(&b.venue)),
+        venue_symbol: Some(b.venue_symbol.clone()).filter(|s| !s.is_empty()),
         fee_native: None,
     }
 }
@@ -191,7 +212,7 @@ pub async fn resolve_unknown(p: &Persist, engine: &Shared, events: Vec<OrderEven
                 slippage_bps: (ev.arrival_price > 0.0).then_some(ev.slippage_bps),
             },
             book: Some(p.book().as_str().to_owned()),
-            venue: Some(PAPER_VENUE),
+            venue: Some(pg::venue_uuid(&ev.venue)),
             venue_symbol: Some(ev.venue_symbol.trim().to_owned()).filter(|s| !s.is_empty()),
             fee_native: Some(fa_ledger::pg_accounting::NativeFee {
                 amount: ev.fee,
@@ -304,6 +325,221 @@ pub async fn reconcile(p: &Persist, engine: &Shared) -> Vec<Out> {
     vec![Out::Halt(h)]
 }
 
+// ---------------------------------------------------------------- the venue's own book (D-121)
+
+/// One venue's own view of what it holds, as the broker-gateway reports it.
+#[derive(Debug, Clone, Deserialize)]
+struct VenueBooks {
+    venue: String,
+    #[serde(default)]
+    configured: bool,
+    /// Why it is not configured (no credentials, a mis-shaped secret).
+    #[serde(default)]
+    detail: String,
+    /// Why it could not be asked. A venue that did not answer is not a venue that holds nothing.
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    positions: Vec<VenuePosition>,
+    #[serde(default)]
+    balances: Vec<VenueBalance>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct VenuePosition {
+    #[serde(default)]
+    symbol: String,
+    #[serde(default)]
+    quantity: f64,
+    /// Our instrument id, when the operator's symbol mapping names this symbol. Empty otherwise,
+    /// which the gateway deliberately does not guess at.
+    #[serde(default)]
+    instrument_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct VenueBalance {
+    #[serde(default)]
+    currency: String,
+    #[serde(default)]
+    amount: f64,
+}
+
+/// Asks the broker-gateway what each venue holds (`ctl.exec.positions`).
+async fn ask_venues(bus: &Bus) -> Result<Vec<VenueBooks>, String> {
+    let req = CtlRequest { verb: "positions".into(), args: Default::default() };
+    let msg = tokio::time::timeout(
+        VENUE_BOOKS_TIMEOUT,
+        bus.client().request(fa_bus::subjects::ctl("exec", "positions"), req.encode_to_vec().into()),
+    )
+    .await
+    .map_err(|_| "the broker-gateway did not answer ctl.exec.positions in time".to_owned())?
+    .map_err(|e| format!("ctl.exec.positions: {e}"))?;
+    let reply = CtlReply::decode(msg.payload.as_ref()).map_err(|e| format!("decoding the reply: {e}"))?;
+    let body: serde_json::Value =
+        serde_json::from_str(&reply.message).map_err(|e| format!("the reply is not JSON: {e}"))?;
+    serde_json::from_value(body["venues"].clone()).map_err(|e| format!("the reply has no venues: {e}"))
+}
+
+/// What comparing the book against the venues found, before any of it is recorded.
+struct VenueComparison {
+    status: &'static str,
+    /// Positions the book and the venues disagree about. Non-empty means a halt.
+    diffs: Vec<serde_json::Value>,
+    /// Holdings at a venue in instruments the operator's mapping does not name.
+    foreign: Vec<serde_json::Value>,
+    /// Venues that could not be compared, and why. Non-empty means nothing was compared.
+    unavailable: Vec<serde_json::Value>,
+    balances: Vec<serde_json::Value>,
+}
+
+/// The comparison itself, with no I/O: the book's positions against the venues' own.
+fn compare_books(ours: &[(fa_core::InstrumentId, f64)], books: &[VenueBooks]) -> VenueComparison {
+    // Their side, summed per instrument: one instrument may be held at more than one venue, while
+    // the book holds one position in it.
+    let mut theirs: std::collections::BTreeMap<String, (f64, Vec<String>)> = Default::default();
+    let (mut foreign, mut unavailable, mut balances) = (Vec::new(), Vec::new(), Vec::new());
+    for b in books {
+        if !b.configured {
+            unavailable.push(json!({"venue": b.venue, "why": "no credentials", "detail": b.detail}));
+            continue;
+        }
+        if !b.error.is_empty() {
+            unavailable.push(json!({"venue": b.venue, "why": "did not answer", "detail": b.error}));
+            continue;
+        }
+        for pos in &b.positions {
+            if pos.quantity.abs() <= VENUE_QTY_TOL {
+                continue;
+            }
+            if pos.instrument_id.trim().is_empty() {
+                foreign.push(json!({"venue": b.venue, "symbol": pos.symbol, "quantity": pos.quantity}));
+                continue;
+            }
+            let e = theirs.entry(pos.instrument_id.trim().to_owned()).or_insert((0.0, Vec::new()));
+            e.0 += pos.quantity;
+            e.1.push(b.venue.clone());
+        }
+        for bal in &b.balances {
+            balances.push(json!({"venue": b.venue, "currency": bal.currency, "amount": bal.amount}));
+        }
+    }
+    // A pass that could not ask every venue compares nothing: see `reconcile_venues`.
+    if !unavailable.is_empty() {
+        return VenueComparison { status: "incomplete", diffs: Vec::new(), foreign, unavailable, balances };
+    }
+    let mut diffs = Vec::new();
+    for (instrument, qty) in ours {
+        let id = instrument.0.to_string();
+        match theirs.remove(&id) {
+            Some((at_venue, venues)) if (at_venue - qty).abs() <= VENUE_QTY_TOL => {
+                tracing::debug!(instrument = %id, qty, venues = ?venues, "position agrees with the venue")
+            }
+            Some((at_venue, venues)) => diffs.push(json!({
+                "instrument_id": id, "book": qty, "venue": at_venue, "venues": venues,
+                "why": "the quantities differ"})),
+            None => diffs.push(json!({
+                "instrument_id": id, "book": qty, "venue": 0.0,
+                "why": "no venue reports this position"})),
+        }
+    }
+    // Whatever is left is a position at a venue, in an instrument the mapping names, that the book
+    // does not have: the platform could have opened it and does not know it exists.
+    for (id, (qty, venues)) in theirs {
+        diffs.push(json!({
+            "instrument_id": id, "book": 0.0, "venue": qty, "venues": venues,
+            "why": "a position only the venue has"}));
+    }
+    let status = if diffs.is_empty() { "ok" } else { "diff" };
+    VenueComparison { status, diffs, foreign, unavailable, balances }
+}
+
+/// One venue reconciliation pass: the live book against the venues that hold it (D-121).
+///
+/// Three rules decide what this does, and each exists because the alternative is worse:
+///
+/// - **Only in real-money mode.** A paper position lives nowhere, so comparing it to a venue would
+///   report the whole book as missing.
+/// - **Partial information never halts.** A venue that did not answer, or whose credentials were
+///   removed, could be holding exactly the position that looks missing here. Such a pass is
+///   recorded as `incomplete` and compares nothing: a halt must mean "the books disagree", not
+///   "a request failed", or it will be re-armed by habit.
+/// - **A holding the operator's mapping does not name is foreign.** An instrument absent from the
+///   mapping cannot be traded live at all, so a holding in it cannot be one this platform opened —
+///   it is somebody's own asset in their own account. It is reported and left alone. A holding the
+///   mapping *does* name and the book does not is the dangerous case, and it halts.
+pub async fn reconcile_venues(p: &Persist, engine: &Shared, bus: &Bus) -> Vec<Out> {
+    if !engine.lock().await.is_live() {
+        return Vec::new();
+    }
+    let books = match ask_venues(bus).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "venue reconciliation skipped: the gateway did not answer");
+            let mut g = engine.lock().await;
+            g.set_venue_recon(json!({"status": "unreachable", "at": Utc::now(), "detail": e}));
+            g.counters.insert("venue_recon.unreachable", 1.0);
+            return Vec::new();
+        }
+    };
+    // Our side of the comparison: every non-zero position of the active (live) book.
+    let ours: Vec<(fa_core::InstrumentId, f64)> = engine.lock().await.book_positions();
+    let c = compare_books(&ours, &books);
+    // Balances are reported, not compared: the book is EUR at the fill's rate (spec 42 §6) and a
+    // venue reports settled native cash, so an equality between them is not a thing that can be
+    // true. The positions are what protect against trading around a position that is not there.
+    let view = json!({
+        "status": c.status, "at": Utc::now(), "compared": ours.len(),
+        "diffs": c.diffs, "foreign": c.foreign, "unavailable": c.unavailable, "balances": c.balances,
+    });
+    let (status, diffs, complete) = (c.status, c.diffs, c.unavailable.is_empty());
+    {
+        let mut g = engine.lock().await;
+        g.set_venue_recon(view.clone());
+        g.counters.insert("venue_recon.diffs", diffs.len() as f64);
+        g.counters.insert("venue_recon.foreign", c.foreign.len() as f64);
+        g.counters.insert("venue_recon.unavailable", c.unavailable.len() as f64);
+        g.counters.insert("venue_recon.unreachable", 0.0);
+    }
+    // One row per venue that was asked, each carrying the whole pass: the comparison is
+    // cross-venue (an instrument may be held at two venues, and a book position missing everywhere
+    // belongs to no single one of them), so attributing parts of it to one venue would be a guess.
+    for b in &books {
+        let per_venue = if b.configured {
+            if b.error.is_empty() { status } else { "error" }
+        } else {
+            "not_configured"
+        };
+        if let Err(e) = p.pg().record_reconciliation(pg::venue_uuid(&b.venue), per_venue, Some(&view)).await {
+            tracing::warn!(venue = %b.venue, error = %e, "venue reconciliation run not recorded");
+        }
+    }
+    if status != "diff" {
+        if !complete {
+            tracing::warn!(view = %view, "venue reconciliation incomplete: nothing compared");
+        }
+        return Vec::new();
+    }
+    tracing::error!(diffs = ?diffs, "the live book differs from the venues: halting scope broker");
+    p.audit("reconciliation.venue_diff", Some(p.book().as_str()), view).await;
+    let mut e = engine.lock().await;
+    if e.has_halt(HaltScope::Broker) {
+        return Vec::new();
+    }
+    let h = Halt {
+        scope: "broker".into(),
+        reason: format!(
+            "venue reconciliation: {} position(s) differ from what the venues report (first: {})",
+            diffs.len(),
+            diffs[0]
+        ),
+        since: Some(fa_proto::now()),
+        manual: false,
+    };
+    e.on_halt(&h, now_ms());
+    vec![Out::Halt(h)]
+}
+
 /// Today's payout quota from the configured rule (spec 42 §10 Q1); raise-only. Returns the
 /// quota in force.
 pub async fn apply_payout_rule(p: &Persist, rule: &fa_ledger::payout::PayoutRule) -> Option<f64> {
@@ -320,6 +556,98 @@ pub async fn apply_payout_rule(p: &Persist, rule: &fa_ledger::payout::PayoutRule
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn book(venue: &str, configured: bool, error: &str, pos: Vec<(&str, f64, &str)>) -> VenueBooks {
+        VenueBooks {
+            venue: venue.into(),
+            configured,
+            detail: if configured { String::new() } else { "no credentials".into() },
+            error: error.into(),
+            positions: pos
+                .into_iter()
+                .map(|(symbol, quantity, instrument_id)| VenuePosition {
+                    symbol: symbol.into(),
+                    quantity,
+                    instrument_id: instrument_id.into(),
+                })
+                .collect(),
+            balances: vec![VenueBalance { currency: "EUR".into(), amount: 500.0 }],
+        }
+    }
+
+    fn inst(n: u128) -> fa_core::InstrumentId {
+        fa_core::InstrumentId(Uuid::from_u128(n))
+    }
+
+    #[test]
+    fn a_book_that_matches_the_venue_reconciles() {
+        let ours = vec![(inst(1), 0.025)];
+        let id = inst(1).0.to_string();
+        let c = compare_books(&ours, &[book("kraken", true, "", vec![("XBTEUR", 0.025, &id)])]);
+        assert_eq!(c.status, "ok");
+        assert!(c.diffs.is_empty(), "{:?}", c.diffs);
+        assert_eq!(c.balances.len(), 1, "the balances are reported even when nothing differs");
+    }
+
+    #[test]
+    fn every_way_the_books_can_disagree_is_a_diff() {
+        let (a, b) = (inst(1), inst(2));
+        let (id_a, id_b) = (a.0.to_string(), b.0.to_string());
+        // the quantity differs
+        let c = compare_books(&[(a, 0.025)], &[book("kraken", true, "", vec![("XBTEUR", 0.02, &id_a)])]);
+        assert_eq!(c.status, "diff");
+        assert_eq!(c.diffs[0]["why"], "the quantities differ");
+        // the book holds a position no venue reports: a fill that was undone, or never happened
+        let c = compare_books(&[(a, 0.025)], &[book("kraken", true, "", vec![])]);
+        assert_eq!(c.status, "diff");
+        assert_eq!(c.diffs[0]["why"], "no venue reports this position");
+        // a venue holds a position the book does not know about, in a mapped instrument
+        let c = compare_books(&[], &[book("kraken", true, "", vec![("XBTEUR", 0.025, &id_a)])]);
+        assert_eq!(c.status, "diff");
+        assert_eq!(c.diffs[0]["why"], "a position only the venue has");
+        // one instrument held at two venues sums to the book's one position
+        let c = compare_books(
+            &[(a, 3.0)],
+            &[
+                book("kraken", true, "", vec![("XBTEUR", 1.0, &id_a)]),
+                book("lemon", true, "", vec![("US0378331005", 2.0, &id_a)]),
+            ],
+        );
+        assert_eq!(c.status, "ok", "{:?}", c.diffs);
+        // and an instrument the book holds at neither is still a diff
+        let c = compare_books(&[(a, 1.0), (b, 1.0)], &[book("kraken", true, "", vec![("XBTEUR", 1.0, &id_a)])]);
+        assert_eq!(c.diffs.len(), 1);
+        assert_eq!(c.diffs[0]["instrument_id"], id_b);
+    }
+
+    /// A holding the operator's symbol mapping does not name cannot have been opened by this
+    /// platform (an unmapped instrument is rejected before it reaches a venue), so it is reported
+    /// and left alone rather than halting trading on somebody's own asset.
+    #[test]
+    fn an_unmapped_holding_is_foreign_and_does_not_halt() {
+        let c = compare_books(&[], &[book("kraken", true, "", vec![("DOGEEUR", 10_000.0, "")])]);
+        assert_eq!(c.status, "ok");
+        assert!(c.diffs.is_empty());
+        assert_eq!(c.foreign.len(), 1);
+        assert_eq!(c.foreign[0]["symbol"], "DOGEEUR");
+    }
+
+    /// The rule that keeps a halt meaningful: a venue that could not be asked might be holding
+    /// exactly the position that looks missing, so an incomplete pass compares nothing.
+    #[test]
+    fn a_venue_that_cannot_be_asked_compares_nothing() {
+        let a = inst(1);
+        let id = a.0.to_string();
+        for missing in [
+            book("lemon", false, "", vec![]),
+            book("lemon", true, "connection refused", vec![]),
+        ] {
+            let c = compare_books(&[(a, 0.025)], &[book("kraken", true, "", vec![("XBTEUR", 0.03, &id)]), missing]);
+            assert_eq!(c.status, "incomplete");
+            assert!(c.diffs.is_empty(), "an incomplete pass must not report a diff: {:?}", c.diffs);
+            assert_eq!(c.unavailable.len(), 1);
+        }
+    }
 
     #[test]
     fn only_this_accounts_order_subjects_are_booked() {
