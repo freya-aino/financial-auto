@@ -497,26 +497,50 @@ async fn handle_ctl(
             let Some(want) = req.args.get("set") else {
                 return Ok(engine.lock().await.mode_view(now));
             };
-            let (before, result) = {
-                let mut e = engine.lock().await;
-                let before = e.trading_mode().to_owned();
-                (before, e.set_trading_mode(want, now))
+            let (before, checked) = {
+                let e = engine.lock().await;
+                (e.trading_mode().to_owned(), e.check_mode_switch(want, now)?)
             };
-            let out = result?;
+            let Some((to_live, account)) = checked else {
+                return Ok(serde_json::json!({"mode": before, "changed": false}));
+            };
+            // Real money trades on its own book, so switching means loading that book — and
+            // without Postgres there is no book to load. Refusing is the only safe answer: an
+            // in-memory live book would lose every real fill on restart.
+            let Some(p) = store else {
+                return Err("conflict: switching the trading mode needs Postgres: real money trades \
+                            on its own book and that book has to be loaded"
+                    .into());
+            };
+            // A book this engine has not opened before starts with **no** cash, whichever
+            // direction the switch goes: a live book is funded by the operator's own deposit
+            // (`POST /api/ledger/cash`), never by a constant in a config file, and the paper book
+            // already exists with its own opening deposit.
+            let ledger = p
+                .switch_book(&account, 0.0)
+                .await
+                .map_err(|e| format!("conflict: the {account} book could not be opened: {e}"))?;
+            let out = {
+                let mut e = engine.lock().await;
+                // Re-check under the same lock the commit happens in: the first check was taken
+                // while Postgres was being read, and a fill could have arrived since.
+                match e.check_mode_switch(want, now_ms())? {
+                    Some(_) => e.commit_mode(to_live, ledger, now_ms()),
+                    None => serde_json::json!({"mode": e.trading_mode(), "changed": false}),
+                }
+            };
             if out["changed"] == serde_json::Value::Bool(true) {
                 let after = out["mode"].as_str().unwrap_or_default().to_owned();
-                if let Some(p) = store {
-                    p.audit_as(
-                        &actor,
-                        "trading.mode.changed",
-                        Some(&after),
-                        serde_json::json!({"before": before, "after": after, "limits": out}),
-                    )
-                    .await;
-                }
+                p.audit_as(
+                    &actor,
+                    "trading.mode.changed",
+                    Some(&after),
+                    serde_json::json!({"before": before, "after": after, "account": account, "state": out}),
+                )
+                .await;
                 // At warn level in both directions: going live is the most consequential change
                 // this platform can make, and coming back means someone decided to stop.
-                tracing::warn!(%actor, %before, %after, "trading mode switched");
+                tracing::warn!(%actor, %before, %after, %account, "trading mode switched");
             }
             Ok(out)
         }
@@ -812,14 +836,18 @@ async fn main() -> anyhow::Result<()> {
         let mut sub = // durable and never skipped (spec 21 §5): every intent, approval and fill is seen once a
         // restart resumes; fills are idempotent by fill id (`Ledger::apply_fill`)
         bus.subscribe_durable_raw(LiveSpec::durable("ORDERS", "risk-engine-order", &["order.>"])).await?;
-        let account = settings.account.clone();
+        let accounts = [settings.account.clone(), settings.live_account.clone()];
         tokio::spawn(async move {
             while let Some(m) = sub.next().await {
                 let subject = m.subject.as_str();
-                // order.<stage>.<account>: only this engine's account is gated and booked. Other
-                // accounts (e.g. a `paper-test` harness) used to be booked into the paper book,
-                // which Postgres files under their own book — a real reconciliation diff.
-                if !recon::own_account(subject, &account) {
+                // order.<stage>.<account>: only this engine's own accounts are gated and booked.
+                // Other accounts (e.g. a `paper-test` harness) used to be booked into the paper
+                // book, which Postgres files under their own book — a real reconciliation diff.
+                //
+                // Both of this engine's accounts are accepted, not just the active one (D-121): a
+                // fill for an order placed before the mode was switched still has to be booked,
+                // and the book each row lands in follows the order's own account.
+                if !accounts.iter().any(|a| recon::own_account(subject, a)) {
                     continue;
                 }
                 match Input::parse(subject, m.payload.as_ref()) {

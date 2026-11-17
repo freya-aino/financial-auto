@@ -876,6 +876,16 @@ impl Engine {
         &self.risk.cfg
     }
 
+    /// The account (and therefore the ledger book) orders are placed on right now (D-121).
+    pub fn active_account(&self) -> &str {
+        if self.live { &self.settings.live_account } else { &self.settings.account }
+    }
+
+    /// The account the given mode would trade on.
+    pub fn account_for(&self, live: bool) -> &str {
+        if live { &self.settings.live_account } else { &self.settings.account }
+    }
+
     /// `paper` or `live` (D-121).
     pub fn trading_mode(&self) -> &'static str {
         if self.live { "live" } else { "paper" }
@@ -901,6 +911,8 @@ impl Engine {
         let blockers = self.mode_blockers(!self.live, now_ms);
         json!({
             "mode": self.trading_mode(),
+            "account": self.active_account(),
+            "live_account": self.settings.live_account,
             "live_permitted": self.live_permitted().is_ok(),
             "live_blocked_by": self.live_permitted().err(),
             "sleeve_eur": self.risk.cfg.live.sleeve_eur,
@@ -954,32 +966,50 @@ impl Engine {
         out
     }
 
-    /// Flips the trading mode. `Err` is the reason, which the caller relays verbatim.
+    /// Checks a mode switch and returns the account (and ledger book) it would move to, or the
+    /// reason it cannot. Nothing is changed.
     ///
-    /// Switching **to** paper is not automatically safe either: a real position cannot be allowed
-    /// to continue as a paper one, so the flat-book rule applies in both directions.
-    pub fn set_trading_mode(&mut self, want: &str, now_ms: i64) -> Result<Value, String> {
+    /// Split from [`Self::commit_mode`] because the book has to be loaded from Postgres between
+    /// the two, and that is the I/O layer's job: real money trades on its own book, so switching
+    /// means *changing which book this engine keeps*, not relabelling the one it has.
+    pub fn check_mode_switch(&self, want: &str, now_ms: i64) -> Result<Option<(bool, String)>, String> {
         let to_live = match want {
             "live" => true,
             "paper" => false,
             other => return Err(format!("invalid: mode {other:?}; use paper or live")),
         };
         if to_live == self.live {
-            return Ok(json!({"mode": self.trading_mode(), "changed": false}));
+            return Ok(None);
         }
         let blockers = self.mode_blockers(to_live, now_ms);
         if !blockers.is_empty() {
             return Err(format!("conflict: {}", blockers.join("; ")));
         }
+        Ok(Some((to_live, self.account_for(to_live).to_owned())))
+    }
+
+    /// Applies a checked switch, together with the book that mode trades on.
+    ///
+    /// The drawdown peak and the day-start baseline are re-taken from the new book's equity: they
+    /// are properties of *that* book, and carrying the paper book's peak into a 500 EUR live
+    /// sleeve would read as an instant 99 % drawdown and halt the platform on its first tick.
+    pub fn commit_mode(&mut self, to_live: bool, ledger: Ledger, now_ms: i64) -> Value {
         self.live = to_live;
+        self.ledger = ledger;
+        let equity = self.equity();
+        self.risk.reset_peak(equity);
+        self.risk.start_day(equity);
         self.bump(if to_live { "mode.live" } else { "mode.paper" });
-        Ok(json!({
+        let _ = now_ms;
+        json!({
             "mode": self.trading_mode(),
             "changed": true,
+            "account": self.active_account(),
+            "equity_eur": equity,
             "sleeve_eur": self.risk.cfg.live.sleeve_eur,
             "max_order_eur": self.risk.cfg.live.max_order_eur,
-            "deployable_eur": self.risk.deployable_in(self.equity(), self.live),
-        }))
+            "deployable_eur": self.risk.deployable_in(equity, self.live),
+        })
     }
 
     fn bump(&mut self, k: &'static str) {
@@ -2392,7 +2422,7 @@ impl Engine {
             *self.algo_counts.entry(choice.name().to_owned()).or_insert(0.0) += 1.0;
             let intent = OrderIntent {
                 intent_id: intent_id.clone(),
-                account_id: self.settings.account.clone(),
+                account_id: self.active_account().to_owned(),
                 instrument_id: inst.to_string(),
                 side: if delta > 0.0 { Side::Buy } else { Side::Sell } as i32,
                 quantity: delta.abs() / mark,
@@ -3289,6 +3319,16 @@ mod tests {
         assert!(e.state(T0 + 3000).drawdown.abs() < 1e-9, "peak re-armed");
     }
 
+    /// check + commit in one step, with the target book handed in. In production the I/O layer
+    /// loads that book from Postgres between the two (`handle_ctl`), which is the whole reason
+    /// the switch is split.
+    fn switch(e: &mut Engine, want: &str, book: Ledger, now: i64) -> Result<Value, String> {
+        match e.check_mode_switch(want, now)? {
+            Some((to_live, _)) => Ok(e.commit_mode(to_live, book, now)),
+            None => Ok(json!({"mode": e.trading_mode(), "changed": false})),
+        }
+    }
+
     #[test]
     fn the_mode_switch_needs_the_numbers_a_flat_book_and_no_halts() {
         let inst = InstrumentId::new();
@@ -3296,7 +3336,7 @@ mod tests {
 
         // No numbers in risk.toml: the switch cannot move, and says which number is missing.
         assert_eq!(e.trading_mode(), "paper");
-        let err = e.set_trading_mode("live", T0).expect_err("no sleeve");
+        let err = switch(&mut e, "live", Ledger::with_cash(500.0), T0).expect_err("no sleeve");
         assert!(err.starts_with("conflict:") && err.contains("sleeve_eur"), "{err}");
         assert!(!e.mode_view(T0)["live_permitted"].as_bool().unwrap());
 
@@ -3304,10 +3344,17 @@ mod tests {
         // (50 EUR here), so the absolute cap is the one that bites — which is its whole point.
         e.risk.cfg.live = fa_risk::LiveLimits { sleeve_eur: 500.0, max_order_eur: 20.0 };
         assert!(e.mode_view(T0)["live_permitted"].as_bool().unwrap());
-        let out = e.set_trading_mode("live", T0).expect("flat, no halts, numbers set");
+        // The live book is its own book: 500 EUR of real money, not the paper 100 000.
+        let out = switch(&mut e, "live", Ledger::with_cash(500.0), T0).expect("flat, no halts, numbers set");
         assert_eq!(out["mode"], json!("live"));
         assert_eq!(out["changed"], json!(true));
         assert_eq!(e.trading_mode(), "live");
+        // Real money trades on its own account, so every intent and ledger row carries `live`,
+        // and the drawdown peak is this book's — not the paper book's 100 000, which would read
+        // as an instant 99 % drawdown.
+        assert_eq!(e.active_account(), "live");
+        assert_eq!(e.equity(), 500.0);
+        assert_eq!(e.risk.peak_equity(), 500.0);
 
         // The sleeve binds on deployable capital, so every fraction-of-deployable cap shrinks.
         assert_eq!(e.risk.deployable_in(100_000.0, true), 500.0);
@@ -3339,7 +3386,7 @@ mod tests {
         let small = OrderIntent { intent_id: "s".into(), quantity: 0.1, mode: TradingMode::Live as i32, ..paper.clone() };
         assert!(e.on_intent_seen(&small, true, T0).is_empty());
         fill(&mut e, &small, PX, T0 + 10);
-        let err = e.set_trading_mode("paper", T0 + 20).expect_err("not flat");
+        let err = switch(&mut e, "paper", Ledger::with_cash(100_000.0), T0 + 20).expect_err("not flat");
         assert!(err.contains("not flat"), "{err}");
 
         // Flat again, but halted: still refused.
@@ -3348,13 +3395,13 @@ mod tests {
         assert!(e.on_intent_seen(&close, true, T0 + 30).is_empty());
         fill(&mut e, &close, PX, T0 + 40);
         e.on_halt(&Halt { scope: "portfolio".into(), manual: true, ..Default::default() }, T0 + 50);
-        let err = e.set_trading_mode("paper", T0 + 60).expect_err("halted");
+        let err = switch(&mut e, "paper", Ledger::with_cash(100_000.0), T0 + 60).expect_err("halted");
         assert!(err.contains("halts are active"), "{err}");
 
         // Nothing changed by a no-op request, in either direction.
-        let out = e.set_trading_mode("live", T0 + 70).expect("already live");
+        let out = switch(&mut e, "live", Ledger::with_cash(500.0), T0 + 70).expect("already live");
         assert_eq!(out["changed"], json!(false));
-        assert!(e.set_trading_mode("sideways", T0 + 70).unwrap_err().starts_with("invalid:"));
+        assert!(e.check_mode_switch("sideways", T0 + 70).unwrap_err().starts_with("invalid:"));
     }
 
     #[test]

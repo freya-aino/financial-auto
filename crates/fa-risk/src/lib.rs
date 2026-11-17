@@ -396,6 +396,13 @@ impl RiskEngine {
         self.peak_equity
     }
 
+    /// Re-takes the drawdown peak from a different book's equity (D-121: the trading-mode switch
+    /// changes which book this engine keeps). Carrying a 100 000 EUR paper peak into a 500 EUR
+    /// live sleeve would read as a 99 % drawdown and halt the platform on its first tick.
+    pub fn reset_peak(&mut self, equity: f64) {
+        self.peak_equity = equity;
+    }
+
     pub fn day_start_equity(&self) -> f64 {
         self.day_start_equity
     }

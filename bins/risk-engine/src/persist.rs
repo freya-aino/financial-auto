@@ -22,7 +22,11 @@ pub const ACTOR: &str = "system:risk-engine";
 
 pub struct Persist {
     pg: PgLedger,
-    book: String,
+    /// The book every write of *portfolio* state lands in (snapshots, risk state, strategy rows,
+    /// the payout quota). Intents and fills carry their own `account_id`, so those follow the
+    /// order; this is the one that has to be switched when the trading mode is (D-121), which is
+    /// why it is behind a lock rather than fixed at construction.
+    book: std::sync::RwLock<String>,
 }
 
 fn at(ms: i64) -> DateTime<Utc> {
@@ -36,15 +40,29 @@ impl Persist {
         let pg = PgLedger::connect(url).await?;
         let fresh = pg.ensure_initial_deposit(book, starting_cash_eur).await?;
         let ledger = pg.load_book(book).await?;
-        let me = Self { pg, book: book.into() };
+        let me = Self { pg, book: std::sync::RwLock::new(book.into()) };
         if fresh {
             me.audit("book.opened", Some(book), json!({"starting_cash_eur": starting_cash_eur})).await;
         }
         Ok((me, ledger))
     }
 
-    pub fn book(&self) -> &str {
-        &self.book
+    pub fn book(&self) -> String {
+        self.book.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Switches which book portfolio state is written to, and loads that book (D-121).
+    ///
+    /// `starting_cash_eur` is booked as the opening deposit **only if the book is new**, the same
+    /// idempotent rule as [`Self::open`]: a live book funded with real money gets its deposit from
+    /// the operator's own `cash_movement`, not from a constant in a config file, so this is called
+    /// with 0 for the live book.
+    pub async fn switch_book(&self, book: &str, starting_cash_eur: f64) -> anyhow::Result<Ledger> {
+        let fresh = self.pg.ensure_initial_deposit(book, starting_cash_eur).await?;
+        let ledger = self.pg.load_book(book).await?;
+        *self.book.write().unwrap_or_else(std::sync::PoisonError::into_inner) = book.to_owned();
+        self.audit("book.switched", Some(book), json!({"fresh": fresh, "cash_eur": ledger.cash_eur})).await;
+        Ok(ledger)
     }
 
     /// Records an intent seen on the bus (ours or foreign); replays are no-ops.
@@ -77,7 +95,7 @@ impl Persist {
     }
 
     pub async fn snapshot(&self, ledger: &Ledger, reason: &str) {
-        match self.pg.snapshot_positions(&self.book, ledger, Utc::now()).await {
+        match self.pg.snapshot_positions(&self.book(), ledger, Utc::now()).await {
             Ok(n) => tracing::debug!(rows = n, reason, "position snapshot written"),
             Err(e) => tracing::warn!(error = %e, reason, "position snapshot failed"),
         }
@@ -255,7 +273,7 @@ impl Persist {
     /// Today's reserved payout for this book from `ledger.payout_quota` (spec 42 §6): the
     /// larger of `quota − paid` and `reserved`, 0 without a row.
     pub async fn payout_reserve_today(&self) -> f64 {
-        match self.pg.payout_quota(&self.book, Utc::now().date_naive()).await {
+        match self.pg.payout_quota(&self.book(), Utc::now().date_naive()).await {
             Ok(Some(q)) => (q.quota_eur - q.paid_eur).max(q.reserved_eur).max(0.0),
             Ok(None) => 0.0,
             Err(e) => {
@@ -269,9 +287,9 @@ impl Persist {
     /// spec 40 §6.5).
     pub async fn raise_payout_quota(&self, quota_eur: f64) -> anyhow::Result<f64> {
         let day = Utc::now().date_naive();
-        let cur = self.pg.payout_quota(&self.book, day).await?;
+        let cur = self.pg.payout_quota(&self.book(), day).await?;
         let q = fa_ledger::pg::PayoutQuota {
-            book: self.book.clone(),
+            book: self.book(),
             day,
             quota_eur: cur.as_ref().map_or(quota_eur, |c| c.quota_eur.max(quota_eur)),
             reserved_eur: cur.as_ref().map_or(0.0, |c| c.reserved_eur),
@@ -517,7 +535,7 @@ impl Persist {
             "INSERT INTO ledger.risk_state (book, state, updated_at) VALUES ($1, $2, now()) \
              ON CONFLICT (book) DO UPDATE SET state = EXCLUDED.state, updated_at = now()",
         )
-        .bind(&self.book)
+        .bind(self.book())
         .bind(serde_json::to_value(r).unwrap_or_default())
         .execute(self.pg.pool())
         .await;
@@ -528,7 +546,7 @@ impl Persist {
 
     pub async fn load_risk_state(&self) -> Option<RiskRecord> {
         let v: Value = sqlx::query_scalar("SELECT state FROM ledger.risk_state WHERE book = $1")
-            .bind(&self.book)
+            .bind(self.book())
             .fetch_optional(self.pg.pool())
             .await
             .map_err(|e| tracing::warn!(error = %e, "risk state not loaded"))
@@ -549,7 +567,7 @@ mod tests {
     async fn strategy_state_round_trips_and_gate_is_kept() {
         let Ok(url) = std::env::var("DATABASE_URL") else { return };
         let pg = PgLedger::connect(&url).await.unwrap();
-        let p = Persist { pg, book: "paper".into() };
+        let p = Persist { pg, book: std::sync::RwLock::new("paper".into()) };
         let id = format!("test-{}", uuid::Uuid::now_v7());
         let mut s = StrategyState::new(&id, StrategyStatus::Shadow, 1_762_560_000_000);
         s.horizons_completed = 3;

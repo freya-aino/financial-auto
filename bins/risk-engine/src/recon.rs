@@ -58,7 +58,7 @@ fn event(p: &Persist, b: &BookedFill) -> FillEvent {
         strategy_ids: b.strategy_ids.clone(),
         strategy_weights: b.strategy_weights.clone(),
         details: b.details.clone(),
-        book: Some(p.book().to_owned()),
+        book: Some(p.book().as_str().to_owned()),
         venue: Some(PAPER_VENUE),
         venue_symbol: None,
         fee_native: None,
@@ -69,7 +69,7 @@ fn intent_record(p: &Persist, id: &str, info: (fa_core::InstrumentId, f64, Vec<S
     let (instrument, signed, strategy_ids) = info;
     IntentRecord {
         intent_id: id.to_owned(),
-        book: p.book().to_owned(),
+        book: p.book().as_str().to_owned(),
         instrument,
         side: if signed < 0.0 { "sell".into() } else { "buy".into() },
         qty: signed.abs(),
@@ -144,7 +144,7 @@ pub async fn resolve_unknown(p: &Persist, engine: &Shared, events: Vec<OrderEven
             "SELECT instrument_id, side, qty, params FROM ledger.order_intent WHERE idempotency_key = $1 AND book = $2",
         )
         .bind(&ev.intent_id)
-        .bind(p.book())
+        .bind(p.book().as_str())
         .fetch_optional(p.pg().pool())
         .await
         .unwrap_or_else(|e| {
@@ -190,7 +190,7 @@ pub async fn resolve_unknown(p: &Persist, engine: &Shared, events: Vec<OrderEven
                 arrival_price: (ev.arrival_price > 0.0).then_some(ev.arrival_price),
                 slippage_bps: (ev.arrival_price > 0.0).then_some(ev.slippage_bps),
             },
-            book: Some(p.book().to_owned()),
+            book: Some(p.book().as_str().to_owned()),
             venue: Some(PAPER_VENUE),
             venue_symbol: Some(ev.venue_symbol.trim().to_owned()).filter(|s| !s.is_empty()),
             fee_native: Some(fa_ledger::pg_accounting::NativeFee {
@@ -247,7 +247,7 @@ pub async fn check_orphans(p: &Persist, engine: &Shared) -> Vec<Out> {
 pub async fn reconcile(p: &Persist, engine: &Shared) -> Vec<Out> {
     let (ours, in_flight) = engine.lock().await.recon_cut(now_ms(), IN_FLIGHT_GRACE_MS);
     let pg: &PgLedger = p.pg();
-    let r = match pg.reconcile_cut(p.book(), &ours, &in_flight, CASH_TOL_EUR, QTY_TOL).await {
+    let r = match pg.reconcile_cut(p.book().as_str(), &ours, &in_flight, CASH_TOL_EUR, QTY_TOL).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "reconciliation skipped: cannot read the ledger");
@@ -263,17 +263,17 @@ pub async fn reconcile(p: &Persist, engine: &Shared) -> Vec<Out> {
                 cash = c_keys.len(),
                 "ledger rows from other writers applied to the paper book"
             );
-            p.audit("ledger.synced", Some(p.book()), json!({"fills": f_ids, "cash": c_keys})).await;
+            p.audit("ledger.synced", Some(p.book().as_str()), json!({"fills": f_ids, "cash": c_keys})).await;
         }
     }
     let d = &r.diff;
     let summary = json!({"compared_fills": r.compared_fills, "in_flight": r.in_flight});
     let (status, diffs) = if d.is_empty() {
-        ("ok", Some(json!({"book": p.book(), "cut": summary})))
+        ("ok", Some(json!({"book": p.book().as_str(), "cut": summary})))
     } else {
         (
             "diff",
-            Some(json!({"book": p.book(), "cut": summary,
+            Some(json!({"book": p.book().as_str(), "cut": summary,
                 "cash": {"memory": d.cash_ours, "postgres": d.cash_theirs},
                 "positions": d.positions.iter().map(|x| json!({"instrument_id": x.instrument, "memory": x.ours, "postgres": x.broker})).collect::<Vec<_>>(),
                 "fills_missing_in_postgres": d.fills_only_ours})),
@@ -287,7 +287,7 @@ pub async fn reconcile(p: &Persist, engine: &Shared) -> Vec<Out> {
         return Vec::new();
     }
     tracing::error!(diff = ?d, "paper book differs from Postgres at the same cut: halting scope broker");
-    p.audit("reconciliation.diff", Some(p.book()), serde_json::to_value(d).unwrap_or_default()).await;
+    p.audit("reconciliation.diff", Some(p.book().as_str()), serde_json::to_value(d).unwrap_or_default()).await;
     let h = Halt {
         scope: "broker".into(),
         reason: format!(
@@ -308,7 +308,7 @@ pub async fn reconcile(p: &Persist, engine: &Shared) -> Vec<Out> {
 /// quota in force.
 pub async fn apply_payout_rule(p: &Persist, rule: &fa_ledger::payout::PayoutRule) -> Option<f64> {
     let day = Utc::now().date_naive();
-    match p.pg().apply_payout_rule(p.book(), day, rule).await {
+    match p.pg().apply_payout_rule(p.book().as_str(), day, rule).await {
         Ok(q) => Some(q),
         Err(e) => {
             tracing::warn!(error = %e, "payout rule not applied");

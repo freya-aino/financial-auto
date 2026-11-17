@@ -21,8 +21,13 @@ pub struct Settings {
     /// supply. The mode can also be switched at runtime (`ctl.risk.mode`), and that switch obeys
     /// the same requirement plus a flat book.
     pub mode: String,
-    /// Account token in `order.*.<account>` subjects.
+    /// Account token in `order.*.<account>` subjects, and the `book` every ledger row of this
+    /// portfolio carries.
     pub account: String,
+    /// The account and book real money trades in (D-121). It must differ from [`Self::account`]:
+    /// a real fill must not land in the paper book's history, because that history is what the
+    /// tax report, the payout split and every P&L number are computed from.
+    pub live_account: String,
     pub starting_cash_eur: f64,
     /// `equal_weight` | `risk_parity` | `fractional_kelly` (spec 40 §6.2).
     pub allocator: String,
@@ -110,6 +115,7 @@ impl Default for Settings {
         Self {
             mode: "paper".into(),
             account: "paper".into(),
+            live_account: "live".into(),
             starting_cash_eur: PAPER_CASH_EUR,
             allocator: "equal_weight".into(),
             max_strategy_weight: 0.5,
@@ -253,6 +259,8 @@ pub enum SettingsError {
     Mode(String),
     #[error("mode `live` needs the owner's numbers: {0}")]
     LiveLimits(String),
+    #[error("live_account `{0}` must be set and must differ from `account`: real fills may not land in the paper book")]
+    LiveAccount(String),
     #[error("unknown allocator `{0}`")]
     Allocator(String),
     #[error("new_strategy_status `{0}` must be active or shadow")]
@@ -278,6 +286,9 @@ impl Settings {
         // `mode = "live"` line on its own must not put the whole book at a venue.
         if self.mode == "live" {
             self.limits.live.permits_live().map_err(SettingsError::LiveLimits)?;
+        }
+        if self.live_account.trim().is_empty() || self.live_account == self.account {
+            return Err(SettingsError::LiveAccount(self.live_account.clone()));
         }
         if fa_allocator::by_name(&self.allocator, self.max_strategy_weight, self.kelly_fraction).is_none() {
             return Err(SettingsError::Allocator(self.allocator.clone()));

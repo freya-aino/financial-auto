@@ -29,7 +29,7 @@ fn now_ms() -> i64 {
 /// not applied (the gateway re-announces the charge for six periods; reconciliation would
 /// otherwise see a cash row only memory has).
 pub async fn book_carry(engine: &Shared, store: &Store, c: &CarryCharge) -> bool {
-    let book = store.as_ref().map_or_else(|| "paper".to_owned(), |p| p.book().to_owned());
+    let book = store.as_ref().map_or_else(|| "paper".to_owned(), |p| p.book());
     let Some(b) = engine.lock().await.carry_booking(c, &book) else { return false };
     if let Some(p) = store
         && let Err(e) = p.pg().record_cash_movement(&b.movement).await
@@ -75,7 +75,7 @@ pub fn spawn_history(engine: Shared, p: Arc<Persist>, settings: &Settings) {
             tick.tick().await;
             let recs = engine.lock().await.take_history();
             if !recs.is_empty()
-                && let Err(e) = history::write(p.pg().pool(), p.book(), &recs).await
+                && let Err(e) = history::write(p.pg().pool(), &p.book(), &recs).await
             {
                 tracing::warn!(records = recs.len(), error = %e, "risk-chain history not written");
                 *engine.lock().await.counters.entry("history.write_errors").or_insert(0.0) += 1.0;
@@ -83,7 +83,7 @@ pub fn spawn_history(engine: Shared, p: Arc<Persist>, settings: &Settings) {
             let now = now_ms();
             if now - last_prune > 3_600_000 {
                 last_prune = now;
-                match history::prune(p.pg().pool(), p.book(), cfg.retention_days).await {
+                match history::prune(p.pg().pool(), &p.book(), cfg.retention_days).await {
                     Ok(n) if n > 0 => tracing::info!(rows = n, "risk-chain history pruned"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "risk-chain history not pruned"),
@@ -115,7 +115,7 @@ pub async fn review(
         checklist,
         evidence,
     };
-    if let Err(e) = history::write_review(p.pg().pool(), p.book(), &r).await {
+    if let Err(e) = history::write_review(p.pg().pool(), &p.book(), &r).await {
         tracing::warn!(strategy = strategy_id, error = %e, "promotion review not written");
     }
 }

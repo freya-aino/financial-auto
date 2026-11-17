@@ -3,6 +3,7 @@
 
 mode = "paper"              # paper | live (D-121); `live` needs [limits.live] below and refuses to start without it
 account = "paper"           # order.intent.paper / order.approved.paper / order.event.paper
+live_account = "live"       # the account *and* ledger book real money trades on (D-121): must differ from `account`, so a real fill never lands in the paper book's history
 starting_cash_eur = 100000  # D-028
 allocator = "equal_weight"  # equal-risk control allocator (spec 40 §6.2); risk_parity | fractional_kelly | thompson_rp also available
 max_strategy_weight = 0.5
