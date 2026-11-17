@@ -400,6 +400,19 @@ func (p *PaperEngine) CancelResting(intentID string) *Published {
 }
 
 // Resting returns the number of resting limit orders (heartbeat counter).
+// VenueOf is the venue an instrument was last priced from — the venue a live order for it goes
+// to. Market data is the authority here on purpose: an instrument the gateway has no price for is
+// one it must not trade live either, so the two conditions are the same condition.
+func (p *PaperEngine) VenueOf(instrumentID string) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	m, ok := p.markets[bus.SubjectToken(instrumentID)]
+	if !ok || m.venue == "" {
+		return "", false
+	}
+	return m.venue, true
+}
+
 func (p *PaperEngine) Resting() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()

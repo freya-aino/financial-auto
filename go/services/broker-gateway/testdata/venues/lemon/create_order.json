@@ -1,0 +1,15 @@
+{
+  "time": "2026-11-17T09:00:00.000+00:00",
+  "status": "ok",
+  "mode": "money",
+  "results": {
+    "id": "{{ORDER_ID}}",
+    "isin": "{{ISIN}}",
+    "status": "inactive",
+    "side": "{{SIDE}}",
+    "quantity": {{QTY}},
+    "estimated_price": {{EST_PRICE}},
+    "venue": "XMUN",
+    "currency": "EUR"
+  }
+}

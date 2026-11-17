@@ -1,8 +1,67 @@
 # broker-gateway
 
-Execution adapters: order intents → venues; paper mode first.
+Execution adapters: order intents → venues. Paper and real money are one path behind one switch (D-121).
 
-**Status:** implemented (paper only, D-051 + execution algorithms) — executes `order.approved.>` intents against the live tape with the cost + slippage model of spec 41 §6.3 (`costs.yaml`), publishes `OrderEvent` on `order.event.<account>` with `fee`, `arrival_price`, the realised `slippage_bps` and, per fill, a unique `venue_fill_id` (`pf-<unix ns>-<seq>`) plus `instrument_id` / `venue_symbol` (D-078; the ledger keys fills `intent:venue_order:vf:<id>` and books orphans from them), idempotent by `intent_id`. Execution algorithms (`algo.go`): market, limit, smart-limit, TWAP, VWAP, POV and an `auto` choice; working orders can be cancelled with `OrderCancel`. Live fills recalibrate the impact coefficient (`calib.go`). Working orders, resting limits, intent ids and positions persist across restarts, and risk-increasing intents are rejected while the risk-engine heartbeat is missing (`state.go`, D-079). Open positions pay the schedule's funding / borrow carry (`carry.go`, charged hourly on `exec.carry.<account>`). Live mode is rejected; `VenueAdapter` is the interface the paper engine implements and a live adapter will share.
+**Status:** implemented (paper only, D-051 + execution algorithms) — executes `order.approved.>` intents against the live tape with the cost + slippage model of spec 41 §6.3 (`costs.yaml`), publishes `OrderEvent` on `order.event.<account>` with `fee`, `arrival_price`, the realised `slippage_bps` and, per fill, a unique `venue_fill_id` (`pf-<unix ns>-<seq>`) plus `instrument_id` / `venue_symbol` (D-078; the ledger keys fills `intent:venue_order:vf:<id>` and books orphans from them), idempotent by `intent_id`. Execution algorithms (`algo.go`): market, limit, smart-limit, TWAP, VWAP, POV and an `auto` choice; working orders can be cancelled with `OrderCancel`. Live fills recalibrate the impact coefficient (`calib.go`). Working orders, resting limits, intent ids and positions persist across restarts, and risk-increasing intents are rejected while the risk-engine heartbeat is missing (`state.go`, D-079). Open positions pay the schedule's funding / borrow carry (`carry.go`, charged hourly on `exec.carry.<account>`). Live mode is no longer rejected here: `Router` (`venue.go`) sends an intent to the paper engine or to a live venue adapter **by the intent's own `TradingMode`**, which the risk engine stamps — see "Live venues" below.
+
+## Live venues (D-121)
+
+`VenueAdapter` was always "live differs in `Submit` only"; `venue.go` makes that true. The paper
+engine and the three live adapters implement the same interface, and `Router.Execute` picks one by
+the intent's mode. The mode travels **with the intent** rather than being a setting of this
+process: the risk engine decides what is real money one intent at a time, and a gateway restart
+cannot change the meaning of intents already in flight.
+
+| Venue | Endpoints used | Specifics |
+|---|---|---|
+| `kraken` (`venue_kraken.go`) | `AddOrder`, `CancelOrder`, `QueryOrders`, `Balance` | HMAC-SHA512 signing with a monotonic microsecond nonce; business errors arrive at HTTP 200; `cl_ord_id` carries the intent id, so a resubmitted intent cannot open a second order; spot has no positions, only balances |
+| `lemon` (`venue_lemon.go`) | `POST /orders` + `/activate`, `GET /orders/{id}`, `DELETE /orders/{id}`, `/positions`, `/account` | an order is created **inactive** and must be activated — a failed activation is a rejection, not an acknowledgement; **every amount is in cents**; whole shares only |
+| `oanda` (`venue_oanda.go`) | `POST /orders`, `GET|PUT /orders/{id}`, `GET /trades/{id}`, `/openPositions`, `/summary` | units are **signed**, not sided; a market order fills inside its own submit response; a filled limit's price comes from the trade it opened; `practice` hosts by default |
+
+Shared in `venue.go`, which is what makes one conformance suite meaningful:
+
+- **The fill-increment rule.** Venues report *cumulative* filled quantity. `liveBook.reconcile`
+  emits an event for the increment only, priced at the average of the new fills (backed out of the
+  cumulative average), so a venue repeating itself cannot double-count a fill, and a terminal state
+  closes the order so nothing can follow it.
+- **Readiness without a network call.** `Ready` fails on missing or mis-shaped credentials (a
+  Kraken secret that is not base64 cannot sign, and finding that out on the first real order is
+  worse than at the switch). `ctl.exec.venues` reports it per venue, never a credential.
+- **Restart re-attachment.** A venue knows its order id and the client id we sent, not which
+  account or instrument of *ours* the order belongs to, so open live orders are persisted in
+  `orders.json` (`GatewayState.Live`) and handed back at start. An order whose venue is no longer
+  registered is logged at error rather than dropped.
+- **A `LIVE` intent that cannot be routed is rejected with the reason** — no venue known for the
+  instrument (no market data), no adapter, no credentials, no symbol mapping. It is never filled on
+  the paper book, because the two ledgers would then disagree in the direction nobody checks.
+
+Credentials are `[venues.<id>] api_key / api_secret / account_id / env` in the git-ignored
+`config/secrets.toml` (`FA_VENUES_<ID>_<KEY>` overrides). `[sources.<id>]` — the data connector's
+key for the same venue — is deliberately **not** read: a read-only data key must not silently
+become a trading key.
+
+Instrument → venue symbol comes from `-venue-symbols` (`FA_VENUE_SYMBOLS`), a JSON file of
+`{venue: {instrument_id: symbol}}`. A file rather than a reference-database lookup, because this
+process must not need Postgres to execute an order and because the mapping is a decision an
+operator should make explicitly before real money moves. An unmapped instrument cannot be traded
+live at all.
+
+### One conformance suite
+
+`venue_conformance_test.go` runs the same cases against the paper engine and all three adapters,
+because "paper and live are the same path" is a claim that has to be tested rather than asserted:
+a market order fills its quantity once; an unchanged venue produces no further events; fills never
+exceed the intent; an order ends in exactly one terminal event; a refusal is a rejection with a
+reason; the same intent twice creates one order; every fill carries instrument, a unique
+`venue_fill_id`, a fee with a currency and a slippage consistent with its side; a restart
+re-attaches an open order and emits only the increment.
+
+Where a venue cannot express a case it is skipped and says so (OANDA fills an order in one
+transaction, so the partial-increment case does not apply to it; the paper engine's partials come
+from execution algorithms, which is `algo_test.go`'s subject). The live adapters run against stub
+servers serving `testdata/venues/` — **response shapes from each venue's published reference, not
+captures from a live venue**. The suite proves the mapping, not the venue; when a key exists, the
+fixtures are replaced by sandbox captures and the same cases re-run.
 
 ## Execution algorithms (`exec_algo`, spec 40 §6.4)
 Grammar: `name` or `name:k=v,k=v`; empty = `market`. Unknown names, unknown parameters or out-of-range values → `REJECTED` with the reason.

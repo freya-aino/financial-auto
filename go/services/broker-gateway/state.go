@@ -58,6 +58,10 @@ type GatewayState struct {
 	FillSeq   uint64             `json:"fill_seq"`
 	// Carry accruals and recently charged periods (carry.go); absent in older files.
 	Carry *carryState `json:"carry,omitempty"`
+	// Open orders at live venues, by venue id (D-121). A venue knows its own order id and the
+	// client id we sent, but not which account or instrument of ours the order belongs to, so a
+	// restarted gateway can only re-attach an open live order from here.
+	Live map[string][]LiveOrderState `json:"live,omitempty"`
 }
 
 func posKey(account, instrument string) string { return account + "|" + instrument }
@@ -170,8 +174,10 @@ func (p *PaperEngine) Restore(st *GatewayState) error {
 // StateStore writes and reads `orders.json`.
 type StateStore struct {
 	Path string
-	mu   sync.Mutex
-	last uint64
+	// Router, when set, contributes the open live orders to the file and to the change detection.
+	Router *Router
+	mu     sync.Mutex
+	last   uint64
 }
 
 // Load reads the state file; (nil, nil) when it does not exist.
@@ -195,12 +201,18 @@ func (s *StateStore) SaveIfChanged(p *PaperEngine, force bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rev := p.Revision()
+	if s.Router != nil {
+		rev += s.Router.Revision()
+	}
 	if !force && rev == s.last {
 		return false, nil
 	}
 	st, err := p.Snapshot()
 	if err != nil {
 		return false, err
+	}
+	if s.Router != nil {
+		st.Live = s.Router.Snapshot()
 	}
 	b, err := json.Marshal(st)
 	if err != nil {

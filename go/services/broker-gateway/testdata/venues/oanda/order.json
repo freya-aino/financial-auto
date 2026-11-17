@@ -1,0 +1,13 @@
+{
+  "order": {
+    "id": "{{ORDER_ID}}",
+    "type": "LIMIT",
+    "instrument": "{{SYMBOL}}",
+    "units": "{{UNITS}}",
+    "state": "{{STATE}}",
+    "tradeOpenedID": "{{TRADE_ID}}",
+    "filledTime": "{{FILLED_TIME}}",
+    "cancelledTime": "{{CANCELLED_TIME}}"
+  },
+  "lastTransactionID": "{{ORDER_ID}}"
+}

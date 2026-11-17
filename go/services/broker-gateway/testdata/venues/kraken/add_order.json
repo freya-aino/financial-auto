@@ -1,0 +1,7 @@
+{
+  "error": [],
+  "result": {
+    "descr": { "order": "{{DESCR}}" },
+    "txid": ["{{TXID}}"]
+  }
+}

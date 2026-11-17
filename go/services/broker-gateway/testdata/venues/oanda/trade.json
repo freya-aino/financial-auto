@@ -1,0 +1,12 @@
+{
+  "trade": {
+    "id": "{{TRADE_ID}}",
+    "instrument": "{{SYMBOL}}",
+    "price": "{{PRICE}}",
+    "initialUnits": "{{UNITS}}",
+    "currentUnits": "{{UNITS}}",
+    "financing": "{{FINANCING}}",
+    "state": "OPEN"
+  },
+  "lastTransactionID": "{{TRADE_ID}}"
+}

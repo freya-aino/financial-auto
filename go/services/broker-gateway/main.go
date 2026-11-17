@@ -1,5 +1,10 @@
-// Command broker-gateway executes approved order intents (spec 40). v1 runs
-// the paper engine only; live venue adapters are stubbed behind VenueAdapter.
+// Command broker-gateway executes approved order intents (spec 40).
+//
+// One execution path (D-121): the paper engine and the Kraken / lemon.markets / OANDA adapters all
+// implement `VenueAdapter`, and `Router` sends an intent to one of them by the intent's own
+// `TradingMode`. A `LIVE` intent that cannot be routed — no venue, no adapter, no credentials, no
+// symbol — is **rejected with the reason** and never filled on the paper book. `ctl.exec.venues`
+// reports per-venue readiness, which is what the mode switch consults before it will flip.
 //
 // Subjects: `order.approved.>` in → `order.event.<account>` out; `md.trade.>` and
 // `md.quote.>` feed the marks, volatility, volume and spread behind the cost model
@@ -20,10 +25,12 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -34,6 +41,8 @@ import (
 
 	"github.com/fey/financial-auto/go/pkg/bus"
 	fav1 "github.com/fey/financial-auto/go/pkg/bus/pb/fa/v1"
+	"github.com/fey/financial-auto/go/pkg/catalog"
+	"github.com/fey/financial-auto/go/pkg/connector"
 )
 
 const service = "broker-gateway"
@@ -61,6 +70,9 @@ func main() {
 	riskTimeout := flag.Duration("risk-heartbeat-timeout", 15*time.Second, "fail-closed: reject risk-increasing intents while the risk-engine heartbeat is older than this (0 disables)")
 	carryPeriod := flag.Duration("carry-period", time.Hour, "funding / borrow charging period on open paper positions, published on exec.carry.<account> (0 disables)")
 	marketData := flag.String("market-data", envOr("FA_MARKET_DATA", "real"), "market data the paper engine fills against: real (default; synthetic venues ignored), synthetic (ephemeral stacks) or all (D-103)")
+	secretsPath := flag.String("secrets", envOr("FA_SECRETS", "config/secrets.toml"), "secrets file holding [venues.<id>] trading credentials (D-121)")
+	venueSymbols := flag.String("venue-symbols", envOr("FA_VENUE_SYMBOLS", ""), "JSON file mapping venue id -> instrument id -> venue symbol for live orders; without it a live intent is rejected for want of a symbol")
+	livePoll := flag.Duration("live-poll", 2*time.Second, "how often open orders at live venues are polled for fills (0 disables live venues entirely)")
 	flag.Parse()
 	log := bus.NewLogger(service) // FA_LOG_FORMAT=json|text (spec 60 §4)
 	mdMode, err := bus.ParseMarketDataMode(*marketData)
@@ -110,9 +122,56 @@ func main() {
 	engine.CarryPeriod = *carryPeriod
 	guard := &RiskGuard{Timeout: *riskTimeout}
 	engine.Guard = guard
+	// The one execution path (D-121): the paper engine and the live venues behind one router, which
+	// routes by the intent's own mode. Adapters are registered even without credentials, so an
+	// intent for an unconfigured venue is rejected by name instead of vanishing.
+	router := NewRouter(engine)
+	router.Counters = counters
+	router.VenueOf = engine.VenueOf
+	if *livePoll > 0 {
+		secrets, err := connector.LoadSecrets(*secretsPath)
+		if err != nil {
+			log.Error("secrets", "path", *secretsPath, "err", err)
+			os.Exit(1)
+		}
+		symbols := map[string]map[string]string{}
+		if *venueSymbols != "" {
+			if symbols, err = loadVenueSymbols(*venueSymbols); err != nil {
+				log.Error("venue symbols", "path", *venueSymbols, "err", err)
+				os.Exit(1)
+			}
+		}
+		for _, id := range []string{krakenVenue, lemonVenue, oandaVenue} {
+			creds := LoadVenueCreds(secrets, id)
+			lim := connector.NewLimiter(catalog.DefaultRateLimit)
+			var v LiveVenue
+			switch id {
+			case krakenVenue:
+				k := NewKraken(creds, lim)
+				k.Symbols = symbols[id]
+				v = k
+			case lemonVenue:
+				l := NewLemon(creds, lim)
+				l.Symbols = symbols[id]
+				v = l
+			case oandaVenue:
+				o := NewOanda(creds, lim)
+				o.Symbols = symbols[id]
+				v = o
+			}
+			router.Add(v)
+			ready := "configured"
+			if err := v.Ready(); err != nil {
+				ready = err.Error()
+			}
+			// The credentials themselves are never logged, only whether each one is present.
+			log.Info("venue adapter", "venue", id, "state", ready, "creds", creds.Redacted(),
+				"symbols", len(symbols[id]))
+		}
+	}
 	var store *StateStore
 	if *statePath != "" {
-		store = &StateStore{Path: *statePath}
+		store = &StateStore{Path: *statePath, Router: router}
 		switch st, err := store.Load(); {
 		case err != nil:
 			log.Error("orders state unreadable; refusing to start with unknown working orders", "path", *statePath, "err", err)
@@ -122,8 +181,14 @@ func main() {
 				log.Error("orders state", "path", *statePath, "err", err)
 				os.Exit(1)
 			}
+			if orphaned := router.Restore(st.Live); len(orphaned) > 0 {
+				// Loud: an open order at a venue this process no longer talks to is nobody's, and
+				// only a human can decide what to do about it.
+				log.Error("open live orders belong to venues that are not registered; they are not being tracked",
+					"venues", strings.Join(orphaned, ", "))
+			}
 			log.Info("orders state restored", "path", *statePath, "working", len(st.Working), "resting", len(st.Resting),
-				"positions", len(st.Positions), "seen", len(st.Seen), "saved_at", st.SavedAt)
+				"positions", len(st.Positions), "seen", len(st.Seen), "live", len(st.Live), "saved_at", st.SavedAt)
 			counters.Set("state.restored_working", float64(len(st.Working)))
 		}
 	}
@@ -216,12 +281,12 @@ func main() {
 			counters.Add("errors.decode", 1)
 			return
 		}
-		ev := engine.Execute(&in)
-		if ev == nil {
+		out := router.Execute(ctx, &in)
+		if len(out) == 0 {
 			counters.Add("intents.duplicate", 1)
 			return
 		}
-		publish([]Published{{Account: in.AccountId, Event: ev}})
+		publish(out)
 	})
 	consume(bus.DurableLive("ORDERS", "broker-gateway-order-cancel", allOrderCancels), func(_ string, data []byte) {
 		in, err := decodeCancel(data)
@@ -229,12 +294,37 @@ func main() {
 			counters.Add("errors.decode", 1)
 			return
 		}
-		if c := engine.CancelResting(in.IntentId); c != nil {
-			publish([]Published{*c})
+		if c := router.Cancel(ctx, in.IntentId); len(c) > 0 {
+			publish(c)
 		} else {
+			// A live cancel is accepted by the venue and shows up as an event on the next poll,
+			// so "nothing published" is not the same as "unknown" there.
 			counters.Add("cancels.unknown", 1)
 		}
 	})
+	// `ctl.exec.venues` answers "could this platform trade real money, and where?" — the question
+	// the mode switch asks before it will flip (D-121). The reply carries the per-venue readiness
+	// as JSON in `message`; it never carries a credential, only whether one is present.
+	if _, err := pub.NC.Subscribe(bus.Ctl("exec", "venues"), func(m *nats.Msg) {
+		var req fav1.CtlRequest
+		_ = proto.Unmarshal(m.Data, &req)
+		status, possible := router.Ready()
+		body, _ := json.Marshal(map[string]any{
+			"venues":        status,
+			"live_possible": possible,
+			"live_polling":  *livePoll > 0,
+		})
+		reply := &fav1.CtlReply{Ok: possible, Message: string(body)}
+		_, l := bus.Consumed(ctx, log, m)
+		l.Info("ctl", "subject", m.Subject, "live_possible", possible)
+		if b, err := proto.Marshal(reply); err == nil && m.Reply != "" {
+			_ = m.Respond(b)
+		}
+	}); err != nil {
+		log.Error("subscribe venue status", "err", err)
+		os.Exit(1)
+	}
+
 	go func() {
 		t := time.NewTicker(*tick)
 		defer t.Stop()
@@ -246,6 +336,9 @@ func main() {
 				return
 			case <-t.C:
 				publish(engine.Tick())
+				if *livePoll > 0 {
+					publish(router.Poll(ctx))
+				}
 				for _, ch := range engine.TickCarry() {
 					if b, err := json.Marshal(ch); err == nil {
 						if err := pub.NC.Publish(CarrySubjectPrefix+ch.Account, b); err != nil {
@@ -327,6 +420,33 @@ func main() {
 		}
 	}
 	log.Info("stopped")
+}
+
+// loadVenueSymbols reads `{"kraken": {"<instrument-uuid>": "XBTEUR"}}`.
+//
+// A file rather than a lookup in the reference database, because this process must not need
+// Postgres to execute an order (spec 40: the execution path stays on the bus and its own state),
+// and because the mapping between an internal instrument and a venue's symbol is a decision an
+// operator should make explicitly before real money moves. An instrument that is not in the file
+// cannot be traded live at all — the order is rejected for want of a symbol, which is the safe
+// direction.
+func loadVenueSymbols(path string) (map[string]map[string]string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]map[string]string
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	for venue, m := range out {
+		for instrument, symbol := range m {
+			if instrument == "" || symbol == "" {
+				return nil, fmt.Errorf("%s: %s has an empty instrument or symbol", path, venue)
+			}
+		}
+	}
+	return out, nil
 }
 
 func envOr(k, def string) string {

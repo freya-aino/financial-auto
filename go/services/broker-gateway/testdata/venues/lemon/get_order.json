@@ -1,0 +1,19 @@
+{
+  "time": "2026-11-17T09:00:05.000+00:00",
+  "status": "ok",
+  "mode": "money",
+  "results": {
+    "id": "{{ORDER_ID}}",
+    "isin": "{{ISIN}}",
+    "status": "{{STATUS}}",
+    "side": "{{SIDE}}",
+    "quantity": {{QTY}},
+    "executed_quantity": {{EXEC_QTY}},
+    "executed_price": {{EXEC_PRICE}},
+    "executed_at": "{{EXEC_AT}}",
+    "charge": {{CHARGE}},
+    "regulatory_fee": 0,
+    "currency": "EUR",
+    "error_message": "{{ERROR}}"
+  }
+}

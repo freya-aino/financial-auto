@@ -1,0 +1,8 @@
+{
+  "orderCreateTransaction": {
+    "id": "{{ORDER_ID}}", "type": "LIMIT_ORDER", "instrument": "{{SYMBOL}}",
+    "units": "{{UNITS}}", "price": "{{LIMIT}}", "timeInForce": "GTC", "time": "{{TIME}}"
+  },
+  "relatedTransactionIDs": ["{{ORDER_ID}}"],
+  "lastTransactionID": "{{ORDER_ID}}"
+}

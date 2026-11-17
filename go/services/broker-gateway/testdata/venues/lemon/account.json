@@ -1,0 +1,5 @@
+{
+  "time": "2026-11-17T09:00:00.000+00:00",
+  "status": "ok",
+  "results": { "balance": 100000000, "cash_to_invest": 90000000, "currency": "EUR" }
+}

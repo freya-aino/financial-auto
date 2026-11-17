@@ -1,0 +1,5 @@
+{
+  "orderRejectTransaction": { "id": "9", "type": "MARKET_ORDER_REJECT", "rejectReason": "{{REASON}}" },
+  "errorMessage": "{{REASON}}",
+  "lastTransactionID": "9"
+}

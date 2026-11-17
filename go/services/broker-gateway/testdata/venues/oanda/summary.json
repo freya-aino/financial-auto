@@ -1,0 +1,4 @@
+{
+  "account": { "id": "{{ACCOUNT}}", "balance": "1000.0000", "currency": "EUR", "openTradeCount": 1 },
+  "lastTransactionID": "12"
+}

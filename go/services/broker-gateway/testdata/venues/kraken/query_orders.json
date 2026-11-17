@@ -1,0 +1,16 @@
+{
+  "error": [],
+  "result": {
+    "{{TXID}}": {
+      "status": "{{STATUS}}",
+      "opentm": 1794900000.1234,
+      "descr": { "pair": "{{PAIR}}", "type": "{{SIDE}}", "ordertype": "{{ORDERTYPE}}", "price": "{{LIMIT}}" },
+      "vol": "{{VOL}}",
+      "vol_exec": "{{VOL_EXEC}}",
+      "cost": "{{COST}}",
+      "fee": "{{FEE}}",
+      "price": "{{PRICE}}",
+      "reason": "{{REASON}}"
+    }
+  }
+}

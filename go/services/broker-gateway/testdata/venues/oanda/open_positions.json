@@ -1,0 +1,10 @@
+{
+  "positions": [
+    {
+      "instrument": "EUR_USD",
+      "long": { "units": "1000", "averagePrice": "1.08500", "pl": "1.2000" },
+      "short": { "units": "0", "averagePrice": "0" }
+    }
+  ],
+  "lastTransactionID": "12"
+}

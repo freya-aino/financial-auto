@@ -1,0 +1,16 @@
+{
+  "orderCreateTransaction": { "id": "{{ORDER_ID}}", "type": "MARKET_ORDER", "instrument": "{{SYMBOL}}", "units": "{{UNITS}}" },
+  "orderFillTransaction": {
+    "id": "{{FILL_ID}}",
+    "orderID": "{{ORDER_ID}}",
+    "accountID": "{{ACCOUNT}}",
+    "instrument": "{{SYMBOL}}",
+    "units": "{{FILLED_UNITS}}",
+    "price": "{{PRICE}}",
+    "commission": "{{COMMISSION}}",
+    "time": "{{TIME}}",
+    "type": "ORDER_FILL"
+  },
+  "relatedTransactionIDs": ["{{ORDER_ID}}", "{{FILL_ID}}"],
+  "lastTransactionID": "{{FILL_ID}}"
+}
