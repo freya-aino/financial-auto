@@ -2651,6 +2651,182 @@
         "x-handler": "bins/control-api/src/llm_routes.rs::set_endpoint"
       }
     },
+    "/api/llm/mcp": {
+      "get": {
+        "operationId": "llm_mcp_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "registered external MCP servers, their status and tools (D-120)",
+        "tags": [
+          "llm"
+        ],
+        "x-handler": "bins/control-api/src/llm_routes.rs::mcp_list"
+      }
+    },
+    "/api/llm/mcp/{id}": {
+      "delete": {
+        "operationId": "llm_mcp_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "remove one",
+        "tags": [
+          "llm"
+        ],
+        "x-handler": "bins/control-api/src/llm_routes.rs::mcp_delete"
+      },
+      "put": {
+        "operationId": "llm_mcp_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "register or update one; probes it and returns the outcome",
+        "tags": [
+          "llm"
+        ],
+        "x-handler": "bins/control-api/src/llm_routes.rs::mcp_put"
+      }
+    },
+    "/api/llm/mcp/{id}/probe": {
+      "post": {
+        "operationId": "llm_mcp_probe",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "re-handshake and re-read its tool list",
+        "tags": [
+          "llm"
+        ],
+        "x-handler": "bins/control-api/src/llm_routes.rs::mcp_probe"
+      }
+    },
     "/api/llm/status": {
       "get": {
         "operationId": "llm_status",

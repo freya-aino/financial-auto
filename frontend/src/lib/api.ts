@@ -872,11 +872,11 @@ export class ApiError extends Error {
 	}
 }
 
-async function sendJson<T>(method: 'POST' | 'PUT', path: string, body: unknown): Promise<T> {
+async function sendJson<T>(method: 'POST' | 'PUT' | 'DELETE', path: string, body: unknown): Promise<T> {
 	const res = await fetch(path, {
 		method,
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify(body)
+		headers: body === undefined ? {} : { 'content-type': 'application/json' },
+		body: body === undefined ? undefined : JSON.stringify(body)
 	});
 	const data = await res.json().catch(() => ({}));
 	if (!res.ok) {
@@ -892,6 +892,11 @@ export async function postJson<T>(path: string, body: unknown = {}): Promise<T> 
 
 export async function putJson<T>(path: string, body: unknown): Promise<T> {
 	return sendJson<T>('PUT', path, body);
+}
+
+/** A DELETE with no body; the response is decoded the same way. */
+export async function delJson<T>(path: string): Promise<T> {
+	return sendJson<T>('DELETE', path, undefined);
 }
 
 export const q = (params: Record<string, string | number | boolean | undefined>) => {

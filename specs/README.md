@@ -54,6 +54,7 @@ Specs were the source of truth until code existed; now the code is, and the spec
 | [0009](adr/0009-garage-s3.md) | Garage S3 for blobs | accepted |
 | [0010](adr/0010-vector-and-graph-store.md) | Qdrant for vectors, PostgreSQL for the model-state graph | vectors accepted (D-101); graph half back in force after the D-112 rollback of 0011 |
 | [0011](adr/0011-dgraph-graph-store.md) | Dgraph as the single graph store | **rolled back** 2026-11-16 (D-112): the copy was faithful, the store could not stay up under 898 k version rows; the graph is in Postgres again and the decision is reopened |
+| [0012](adr/0012-llm-suite-and-mcp-boundary.md) | The LLM suite, and what an agent inside this platform may do | accepted (D-117, D-119, D-120): the agent acts only through control-api, mutations need per-call approval, and an external MCP server grants it no new authority |
 
 ## Decision traceability checklist
 Every design decision made so far, and the spec that records it.

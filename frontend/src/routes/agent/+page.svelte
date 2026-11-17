@@ -11,6 +11,7 @@
 	import Info from '../../lib/Info.svelte';
 	import ViewHeader from '../../lib/ViewHeader.svelte';
 	import {
+		accessNote,
 		agentApi,
 		approvalKey,
 		canApprove,
@@ -18,9 +19,13 @@
 		embeddingNote,
 		endpointLabel,
 		groupTools,
+		mcpStatusNote,
+		validServerId,
 		type ConversationSummary,
 		type EmbeddingHealth,
 		type LlmStatus,
+		type McpList,
+		type McpServer,
 		type PendingCall,
 		type ToolRecord,
 		type TurnResponse
@@ -43,6 +48,12 @@
 	// the stored key alone" rather than "clear it" — the placeholder says which.
 	let form = $state({ base_url: '', model: '', embedding_model: '', embedding_dim: 0, api_key: '' });
 	let formNote = $state('');
+
+	// MCP servers (D-120). The token field behaves like the API key: blank means "leave the stored
+	// one alone", and removing one is a separate, explicit action.
+	let mcp = $state<McpList | null>(null);
+	let mcpForm = $state({ id: '', url: '', label: '', access: 'mutating' as 'read' | 'mutating', token: '' });
+	let mcpNote = $state('');
 
 	const tools = $derived(groupTools(status?.tools ?? []));
 	const live = $derived(status?.trading_mode === 'live');
@@ -67,6 +78,69 @@
 			conversations = (await agentApi.conversations()).conversations;
 		} catch {
 			conversations = [];
+		}
+		try {
+			mcp = await agentApi.mcp();
+		} catch {
+			mcp = null;
+		}
+	}
+
+	async function saveMcp() {
+		mcpNote = '';
+		const id = mcpForm.id.trim();
+		if (!validServerId(id)) {
+			mcpNote = 'the id is 1–32 characters of a–z, 0–9, `_` or `-`, starting alphanumeric';
+			return;
+		}
+		if (!/^https?:\/\//.test(mcpForm.url.trim())) {
+			mcpNote = 'the URL must be http(s): only the streamable-HTTP transport is supported';
+			return;
+		}
+		try {
+			const out = await agentApi.saveMcp(id, {
+				url: mcpForm.url.trim(),
+				label: mcpForm.label.trim(),
+				access: mcpForm.access,
+				enabled: true,
+				token: mcpForm.token || undefined
+			});
+			mcpForm = { id: '', url: '', label: '', access: 'mutating', token: '' };
+			mcpNote = out.ok ? 'registered and reachable' : `registered, but the probe failed: ${out.status}`;
+			await loadStatus();
+		} catch (e) {
+			mcpNote = errText(e);
+		}
+	}
+
+	async function probeMcp(id: string) {
+		mcpNote = '';
+		try {
+			const out = await agentApi.probeMcp(id);
+			mcpNote = `${id}: ${out.status}`;
+			await loadStatus();
+		} catch (e) {
+			mcpNote = errText(e);
+		}
+	}
+
+	async function toggleMcp(s: McpServer) {
+		try {
+			await agentApi.saveMcp(s.id, { url: s.url, label: s.label, access: s.access, enabled: !s.enabled });
+			await loadStatus();
+		} catch (e) {
+			mcpNote = errText(e);
+		}
+	}
+
+	async function removeMcp(s: McpServer) {
+		if (!confirm(`Remove MCP server \`${s.id}\`? Its ${s.tools.length} tools disappear from the agent's catalogue.`))
+			return;
+		try {
+			await agentApi.removeMcp(s.id);
+			await loadStatus();
+		} catch (e) {
+			mcpNote = errText(e);
 		}
 	}
 
@@ -278,6 +352,68 @@
 		</section>
 
 		<section>
+			<h2>MCP servers <Info text="External MCP servers the agent may call. Their tools join the catalogue as mcp__server__tool and obey the same approval rule; what a server returns is data, not instructions. Only the streamable-HTTP transport is supported." /></h2>
+			{#if mcp?.servers.length}
+				<ul class="servers">
+					{#each mcp.servers as s (s.id)}
+						<li>
+							<div class="row">
+								<code>{s.id}</code>
+								<span class="outcome {s.status}">{s.status}</span>
+								<span class="hint">{s.access}{s.token_set ? ' · token' : ''}</span>
+							</div>
+							<p class="hint">{s.label || s.url}</p>
+							<p class="hint">{mcpStatusNote(s)}</p>
+							{#if s.tools.length}
+								<details>
+									<summary>Tools ({s.tools.length})</summary>
+									<ul class="tools">
+										{#each s.tools as t (t.name)}
+											<li>
+												<code>{t.name}</code>
+												{#if t.read_only_hint}<span class="hint">(claims read-only)</span>{/if}
+												{t.description}
+											</li>
+										{/each}
+									</ul>
+								</details>
+							{/if}
+							<p class="hint">{accessNote(s.access, s.tools.filter((t) => t.read_only_hint).length, s.tools.length)}</p>
+							<div class="row">
+								<button onclick={() => probeMcp(s.id)} disabled={busy}>Probe</button>
+								<button onclick={() => toggleMcp(s)} disabled={busy}>{s.enabled ? 'Disable' : 'Enable'}</button>
+								<button onclick={() => removeMcp(s)} disabled={busy}>Remove</button>
+							</div>
+						</li>
+					{/each}
+				</ul>
+			{:else}
+				<p class="hint">No MCP servers registered.</p>
+			{/if}
+
+			<details>
+				<summary>Add a server</summary>
+				<label>Id<input bind:value={mcpForm.id} placeholder="docs" /></label>
+				<label>URL<input bind:value={mcpForm.url} placeholder="https://host/mcp" /></label>
+				<label>Label<input bind:value={mcpForm.label} placeholder="what it is for" /></label>
+				<label>
+					Authority
+					<select bind:value={mcpForm.access}>
+						<option value="mutating">mutating — every call needs approval</option>
+						<option value="read">read — the agent may call it freely</option>
+					</select>
+				</label>
+				<label>
+					Bearer token
+					<input type="password" bind:value={mcpForm.token} placeholder="if the server needs one" autocomplete="off" />
+				</label>
+				<button onclick={saveMcp} disabled={busy}>Register and probe</button>
+				<p class="hint">{accessNote(mcpForm.access, 0, 0)}</p>
+			</details>
+			{#if mcpNote}<p class="hint">{mcpNote}</p>{/if}
+		</section>
+
+		<section>
 			<h2>History</h2>
 			{#if conversations.length}
 				<ul class="history">
@@ -358,7 +494,8 @@
 	}
 	.calls,
 	.tools,
-	.history {
+	.history,
+	.servers {
 		list-style: none;
 		margin: 0.25rem 0 0;
 		padding: 0;
@@ -438,6 +575,32 @@
 	.error {
 		color: var(--bad, #e06c6c);
 		font-size: 0.85rem;
+	}
+	.servers li {
+		border-top: 1px solid var(--line);
+		padding-top: 0.4rem;
+	}
+	.servers li:first-child {
+		border-top: none;
+		padding-top: 0;
+	}
+	.row {
+		display: flex;
+		gap: 0.4rem;
+		align-items: baseline;
+		flex-wrap: wrap;
+	}
+	.outcome.pending,
+	.outcome.disabled {
+		color: var(--muted);
+	}
+	.outcome.error {
+		color: var(--bad, #e06c6c);
+	}
+	label select {
+		display: block;
+		width: 100%;
+		font: inherit;
 	}
 	.link {
 		background: none;

@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
+	accessNote,
 	approvalKey,
 	canApprove,
 	confirmText,
 	embeddingNote,
 	endpointLabel,
 	groupTools,
-	type LlmStatus
+	mcpStatusNote,
+	validServerId,
+	type LlmStatus,
+	type McpServer
 } from './agent';
 
 const status = (over: Partial<LlmStatus> = {}): LlmStatus => ({
@@ -19,6 +23,7 @@ const status = (over: Partial<LlmStatus> = {}): LlmStatus => ({
 	trading_mode: 'paper',
 	mutating_tools_available: true,
 	max_rounds: 6,
+	mcp_servers: 0,
 	tools: [
 		{ name: 'trading_risk', access: 'read', description: 'risk state' },
 		{ name: 'ingest_control', access: 'mutating', description: 'start or stop a connector' },
@@ -100,5 +105,63 @@ describe('embeddingNote', () => {
 		expect(embeddingNote({ total: 10, by_provider: [], hashed_share: 0 })).toContain('all from the endpoint');
 		expect(embeddingNote({ total: 10, by_provider: [], hashed_share: 1 })).toContain('all hashed fallback');
 		expect(embeddingNote({ total: 10, by_provider: [], hashed_share: 0.3 })).toContain('30% hashed fallback');
+	});
+});
+
+const server = (over: Partial<McpServer> = {}): McpServer => ({
+	id: 'docs',
+	url: 'https://host/mcp',
+	label: '',
+	access: 'mutating',
+	enabled: true,
+	token_set: false,
+	status: 'ok',
+	error: null,
+	probed_at: '2026-11-17T09:00:00Z',
+	info: 'docs 1.0',
+	protocol: '2025-06-18',
+	tools: [{ name: 'mcp__docs__search', remote: 'search', description: 'search', read_only_hint: true }],
+	...over
+});
+
+describe('MCP servers', () => {
+	it('accepts only ids that can become a tool name', () => {
+		for (const ok of ['docs', 'my-server', 'a_b', 's3']) expect(validServerId(ok), ok).toBe(true);
+		for (const bad of ['', 'Docs', '-x', '_x', 'has space', 'a/b', 'x'.repeat(33)])
+			expect(validServerId(bad), bad).toBe(false);
+	});
+
+	it('says what a probe found, and what a disabled server means', () => {
+		expect(mcpStatusNote(server())).toContain('1 tool');
+		expect(mcpStatusNote(server())).toContain('docs 1.0');
+		expect(mcpStatusNote(server({ enabled: false }))).toContain('not offered');
+		expect(mcpStatusNote(server({ status: 'error', error: 'connection refused' }))).toContain('connection refused');
+		expect(mcpStatusNote(server({ status: 'pending' }))).toContain('not probed');
+	});
+
+	it('puts the authority on the operator, not on the server', () => {
+		// The point of the wording: a read classification is an assertion the operator makes.
+		expect(accessNote('read', 0, 0)).toContain('You are asserting this');
+		const note = accessNote('mutating', 1, 2);
+		expect(note).toContain('needs your approval');
+		expect(note).toContain('live mode');
+		// A self-declared read-only hint is reported as a claim, never as a grant.
+		expect(note).toContain('1 of 2 call themselves read-only');
+	});
+
+	it('treats an MCP tool as any other tool in the approval rule', () => {
+		const s = status({
+			mcp_servers: 1,
+			tools: [
+				{ name: 'mcp__docs__search', access: 'read', description: 'search', server: 'docs' },
+				{ name: 'mcp__ops__deploy', access: 'mutating', description: 'deploy', server: 'ops' }
+			]
+		});
+		expect(canApprove(s, { tool: 'mcp__ops__deploy', arguments: {} })).toBe(true);
+		expect(canApprove(s, { tool: 'mcp__docs__search', arguments: {} })).toBe(false);
+		expect(canApprove({ ...s, mutating_tools_available: false }, { tool: 'mcp__ops__deploy', arguments: {} })).toBe(
+			false
+		);
+		expect(groupTools(s.tools).mutating.map((t) => t.name)).toEqual(['mcp__ops__deploy']);
 	});
 });

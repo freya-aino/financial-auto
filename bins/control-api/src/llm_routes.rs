@@ -8,6 +8,10 @@
 //! | `GET /api/llm/conversations/{id}` | one conversation with its messages and tool calls |
 //! | `GET /api/llm/embeddings` | news-embedding health: counts per provider, newest item |
 //! | `PUT /api/llm/endpoint` | set base URL / models / key; the key goes to `secrets.toml` |
+//! | `GET /api/llm/mcp` | registered external MCP servers, their status and tools (D-120) |
+//! | `PUT /api/llm/mcp/{id}` | register or update one; probes it and returns the outcome |
+//! | `DELETE /api/llm/mcp/{id}` | remove one |
+//! | `POST /api/llm/mcp/{id}/probe` | re-handshake and re-read its tool list |
 //!
 //! Why proxy rather than let the UI call the suite directly: spec 51 keeps the frontend on exactly
 //! one API, so everything the operator sees goes through control-api's audit middleware, its CORS
@@ -53,6 +57,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/llm/conversations/{id}", get(conversation))
         .route("/api/llm/embeddings", get(embeddings))
         .route("/api/llm/endpoint", put(set_endpoint))
+        .route("/api/llm/mcp", get(mcp_list))
+        .route("/api/llm/mcp/{id}", put(mcp_put).delete(mcp_delete))
+        .route("/api/llm/mcp/{id}/probe", post(mcp_probe))
 }
 
 /// GETs `path` from the suite and relays its answer.
@@ -71,6 +78,81 @@ async fn relay(path: &str) -> Response {
         )
             .into_response(),
     }
+}
+
+/// Sends `body` to the suite with `method` and relays its answer.
+async fn forward(method: reqwest::Method, path: &str, body: Option<Value>) -> Response {
+    let url = format!("{}{path}", suite_url());
+    let mut req = reqwest::Client::new().request(method, &url).timeout(std::time::Duration::from_secs(45));
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    match req.send().await {
+        Ok(r) => {
+            let code = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let out: Value = r.json().await.unwrap_or_else(|e| json!({"error": e.to_string()}));
+            (code, Json(out)).into_response()
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": format!("llm-suite unreachable: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// A server id as both a URL path segment and part of a tool name: a short slug, nothing else.
+fn valid_server_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 32
+        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+async fn mcp_list(State(_s): State<AppState>) -> Response {
+    relay("/api/llm/mcp").await
+}
+
+/// Registers or updates one MCP server.
+///
+/// The body passes through unchanged — including an optional `token`, which the suite stores
+/// write-only and no route returns. What this handler adds is the audit row, and that row names
+/// the server, its URL and the access level the operator chose, never the token: granting the
+/// agent a door out of the platform is exactly the kind of change the log exists for.
+async fn mcp_put(State(s): State<AppState>, Path(id): Path<String>, Json(body): Json<Value>) -> Response {
+    if !valid_server_id(&id) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad server id"}))).into_response();
+    }
+    let out = forward(reqwest::Method::PUT, &format!("/api/llm/mcp/{id}"), Some(body.clone())).await;
+    crate::audit::record(
+        &s,
+        "llm.mcp.set",
+        Some(&id),
+        json!({
+            "url": body.get("url").and_then(Value::as_str).unwrap_or_default(),
+            "access": body.get("access").and_then(Value::as_str).unwrap_or("mutating"),
+            "enabled": body.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            "token_given": body.get("token").and_then(Value::as_str).is_some_and(|t| !t.is_empty()),
+        }),
+    )
+    .await;
+    out
+}
+
+async fn mcp_delete(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    if !valid_server_id(&id) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad server id"}))).into_response();
+    }
+    let out = forward(reqwest::Method::DELETE, &format!("/api/llm/mcp/{id}"), None).await;
+    crate::audit::record(&s, "llm.mcp.remove", Some(&id), json!({})).await;
+    out
+}
+
+/// Re-probing changes nothing, so it is not audited.
+async fn mcp_probe(State(_s): State<AppState>, Path(id): Path<String>) -> Response {
+    if !valid_server_id(&id) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad server id"}))).into_response();
+    }
+    forward(reqwest::Method::POST, &format!("/api/llm/mcp/{id}/probe"), Some(json!({}))).await
 }
 
 async fn status(State(_s): State<AppState>) -> Response {
@@ -347,6 +429,16 @@ mod tests {
         assert!(text.contains("https://api.example.com/v1"), "base_url survived: {text}");
         assert!(text.contains("other-model"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_mcp_server_id_is_a_slug_so_it_cannot_reshape_the_proxied_path() {
+        for ok in ["docs", "my-server", "a_b", "s3"] {
+            assert!(valid_server_id(ok), "{ok}");
+        }
+        for bad in ["", "Docs", "has space", "../admin", "a/b", "a?b", &"x".repeat(33)] {
+            assert!(!valid_server_id(bad), "{bad:?} must be refused before it reaches the suite");
+        }
     }
 
     #[test]

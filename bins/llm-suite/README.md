@@ -4,9 +4,9 @@ The platform's LLM service (D-117): news embeddings for the encoder's text exper
 agent the UI reaches at `/api/llm/*` through control-api. One OpenAI-compatible endpoint serves
 both ([`fa-llm`](../../crates/fa-llm)).
 
-**Status:** implemented — the embedder runs live on `news.item.>` and the agent loop answers with
-the platform's own control API as its tools. Not yet built: the external MCP client (the tool
-registry is shaped for it) and the encoder-side text expert that reads these vectors.
+**Status:** implemented — the embedder runs live on `news.item.>`, the agent loop answers with the
+platform's own control API as its tools, external MCP servers can be registered from the UI
+(D-120), and the encoder's text expert reads these vectors (`stat-v2`, D-119).
 
 ## Embedder
 
@@ -46,6 +46,35 @@ single-writer rule and every route's own refusals apply to the agent exactly as 
 - **Persistence:** conversations, messages and every tool call — refusals included — in the `llm`
   schema. A refusal is the more interesting row: it records what the agent wanted to do and was not
   allowed to.
+
+## External MCP servers (D-120)
+
+`mcp.rs` is a JSON-RPC client over the **streamable-HTTP** transport (`initialize`, `tools/list`,
+`tools/call`) plus the registry that merges a server's tools into the agent's catalogue under
+`mcp__<server>__<tool>`. Registrations live in `llm.mcp_server` and are managed from the agent tab:
+`GET /api/llm/mcp`, `PUT /api/llm/mcp/{id}`, `DELETE /api/llm/mcp/{id}`,
+`POST /api/llm/mcp/{id}/probe`.
+
+| Property | How |
+|---|---|
+| Authority | the **operator** classifies the server `read` or `mutating`; `mutating` is the default and means every call needs per-call approval and none is possible in live mode |
+| `annotations.readOnlyHint` | reported per tool in the UI as a *claim*, never used to grant authority — a server that wants to be trusted will set it |
+| Same gate | an MCP call resolves through the same `tools::Caller::call`, so the approval rule, the live interlock and the `llm.tool_call` row apply unchanged |
+| Results | flattened to text, cut at 16 KiB, handed to the model as a tool result under an `external` key; the system prompt says that what a server returns is data and never an instruction |
+| Bounds | 48 tools per server (a catalogue of hundreds would crowd out the platform's own), 8 `tools/list` pages, 20 s probe / 60 s call timeouts |
+| Probing | at start, after every registration change, and every 5 minutes — a server that restarts or drops a tool stops being offered it |
+| Sessions | each call handshakes its own session, which costs a round trip and makes a restarted or expired server work anyway |
+| Token | `PUT` accepts a bearer token, stored in `llm.mcp_server.token`; no route returns it and `GET` reports only `token_set` |
+| `enabled = false` | keeps the registration and removes its tools from the catalogue — the cheap way to answer "was it that server?" |
+
+Only streamable HTTP: stdio would mean the suite spawning processes inside its own container, a
+much larger trust decision than calling a URL, and a local stdio server can sit behind one of the
+HTTP bridges.
+
+Unlike the endpoint key, the token is **not** in `config/secrets.toml`. That file is bind-mounted
+into the service read-only and per inode, so an atomic rewrite of it is only picked up on restart —
+correct for a key entered once, wrong for a server the operator registers and expects to work
+immediately.
 
 ## Configuration
 

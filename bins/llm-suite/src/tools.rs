@@ -15,15 +15,36 @@
 //! - Flipping trading mode, promoting or rolling back a snapshot, re-arming a halt and anything
 //!   that moves money are **not tools at all**. They are the owner's, and a model that can ask for
 //!   them is a model that can be talked into asking for them.
+//!
+//! An external MCP server's tools ([`crate::mcp`]) join this catalogue under
+//! `mcp__<server>__<tool>` and are resolved by the same [`Caller::call`], so they inherit the
+//! approval rule, the live-mode interlock and the `llm.tool_call` row. Their access level comes
+//! from the operator's registration, never from the server's own description of itself (D-120).
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-/// What a tool is allowed to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a tool is allowed to do. [`Access::Mutating`] is the default, so anything whose authority
+/// is not stated — an external MCP server, a registration row with a bad value — needs approval.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Access {
     Read,
+    #[default]
     Mutating,
+}
+
+impl Access {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Mutating => "mutating",
+        }
+    }
+
+    /// Parses a stored value; anything unrecognised is [`Access::Mutating`].
+    pub fn parse(s: &str) -> Self {
+        if s == "read" { Self::Read } else { Self::Mutating }
+    }
 }
 
 /// One tool: a name the model sees, a description, its arguments, and the control-api call.
@@ -330,11 +351,12 @@ impl Refusal {
     }
 }
 
-/// Calls control-api on the agent's behalf.
+/// Calls control-api — or a registered MCP server — on the agent's behalf.
 #[derive(Clone)]
 pub struct Caller {
     http: reqwest::Client,
     base: String,
+    mcp: crate::mcp::Registry,
 }
 
 impl Caller {
@@ -345,7 +367,21 @@ impl Caller {
                 .build()
                 .unwrap_or_default(),
             base: base.trim_end_matches('/').to_owned(),
+            mcp: crate::mcp::Registry::new(),
         }
+    }
+
+    /// Shares an MCP registry with this caller (the registry is cheap to clone and shared state).
+    pub fn with_mcp(mut self, mcp: crate::mcp::Registry) -> Self {
+        self.mcp = mcp;
+        self
+    }
+
+    /// The whole catalogue the model sees: the platform's tools, then every enabled MCP server's.
+    pub fn specs(&self) -> Vec<fa_llm::ToolSpec> {
+        let mut out = specs();
+        out.extend(self.mcp.specs());
+        out
     }
 
     /// Resolves and performs one tool call.
@@ -360,15 +396,10 @@ impl Caller {
         approved: bool,
         live_mode: bool,
     ) -> std::result::Result<Value, Refusal> {
-        let tool = find(name).ok_or_else(|| Refusal::UnknownTool(name.to_owned()))?;
-        if tool.access == Access::Mutating {
-            if live_mode {
-                return Err(Refusal::LiveMode(name.to_owned()));
-            }
-            if !approved {
-                return Err(Refusal::NeedsApproval(name.to_owned()));
-            }
-        }
+        let Some(tool) = find(name) else {
+            return self.call_mcp(name, args, approved, live_mode).await;
+        };
+        gate(tool.access, name, approved, live_mode)?;
         let obj = args.as_object().cloned().unwrap_or_default();
         let mut path = tool.path.to_owned();
         for key in tool.path_args {
@@ -406,6 +437,42 @@ impl Caller {
             Err(e) => Ok(json!({"status": 0, "error": format!("control-api unreachable: {e}")})),
         }
     }
+
+    /// One MCP tool call, under the access level of the server the operator registered.
+    ///
+    /// A server being unreachable is reported to the model as a result, not raised: the same
+    /// reasoning as for control-api above, and a remote server is the more likely of the two to
+    /// be down.
+    async fn call_mcp(
+        &self,
+        name: &str,
+        args: &Value,
+        approved: bool,
+        live_mode: bool,
+    ) -> std::result::Result<Value, Refusal> {
+        let Some((server, _)) = self.mcp.find(name) else {
+            return Err(Refusal::UnknownTool(name.to_owned()));
+        };
+        gate(server.access, name, approved, live_mode)?;
+        match self.mcp.call(name, args).await {
+            Ok(v) => Ok(json!({"status": 200, "server": server.id, "result": v})),
+            Err(e) => Ok(json!({"status": 0, "server": server.id, "error": e})),
+        }
+    }
+}
+
+/// The two rules that stand between a model and a change: the operator approved *this* call, and
+/// the platform is not trading real money.
+fn gate(access: Access, name: &str, approved: bool, live_mode: bool) -> std::result::Result<(), Refusal> {
+    if access == Access::Mutating {
+        if live_mode {
+            return Err(Refusal::LiveMode(name.to_owned()));
+        }
+        if !approved {
+            return Err(Refusal::NeedsApproval(name.to_owned()));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -490,6 +557,44 @@ mod tests {
         }
         let err = c.call("latent_regions", &json!({}), false, false).await.expect_err("missing ts");
         assert!(matches!(err, Refusal::BadArguments(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_mcp_tool_passes_through_the_same_gate_as_a_platform_tool() {
+        use crate::mcp;
+        let reg = mcp::Registry::new();
+        let read = mcp::Server {
+            id: "docs".into(),
+            url: "http://127.0.0.1:1/mcp".into(),
+            label: String::new(),
+            access: Access::Read,
+            enabled: true,
+            token: None,
+        };
+        let ops = mcp::Server { id: "ops".into(), access: Access::Mutating, ..read.clone() };
+        reg.set_servers(vec![read, ops]);
+        reg.set_tools_for_test("docs", &["search"]);
+        reg.set_tools_for_test("ops", &["deploy"]);
+        let c = Caller::new("http://127.0.0.1:1").with_mcp(reg);
+
+        assert_eq!(c.specs().len(), TOOLS.len() + 2, "the catalogue is platform tools plus MCP tools");
+        assert!(c.specs().iter().any(|s| s.name == "mcp__ops__deploy"));
+
+        // A mutating server's tool needs approval and is off in live mode, exactly like a local one.
+        let err = c.call("mcp__ops__deploy", &json!({}), false, false).await.expect_err("unapproved");
+        assert_eq!(err, Refusal::NeedsApproval("mcp__ops__deploy".into()));
+        let err = c.call("mcp__ops__deploy", &json!({}), true, true).await.expect_err("live");
+        assert_eq!(err, Refusal::LiveMode("mcp__ops__deploy".into()));
+
+        // A read server's tool runs without approval even in live mode; this one only fails to
+        // connect, which is a result rather than a refusal.
+        let out = c.call("mcp__docs__search", &json!({"q": "x"}), false, true).await.expect("reads stay open");
+        assert_eq!(out["status"], 0, "{out}");
+        assert_eq!(out["server"], "docs");
+
+        // An unregistered MCP name is an unknown tool, not an attempt at a server.
+        let err = c.call("mcp__ghost__x", &json!({}), true, false).await.expect_err("unknown");
+        assert_eq!(err, Refusal::UnknownTool("mcp__ghost__x".into()));
     }
 
     #[test]

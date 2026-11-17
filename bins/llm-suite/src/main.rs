@@ -8,8 +8,9 @@
 //!   keeps running on the deterministic hashed fallback, which is what lets the text expert exist
 //!   before anyone enters a key.
 //! - **Agent** (`agent`): an agentic loop over the platform's own control API, with tools the
-//!   operator approves, external MCP servers, and conversations persisted in Postgres. It reads
-//!   freely and can take the audited operator actions control-api already catalogues; it cannot
+//!   operator approves, external MCP servers ([`mcp`], D-120), and conversations persisted in
+//!   Postgres. It reads freely and can take the audited operator actions control-api already
+//!   catalogues; it cannot
 //!   flip trading mode, promote a snapshot or move money, and while the platform is in real-money
 //!   mode every mutating tool call is refused.
 //!
@@ -18,6 +19,7 @@
 //! one API. What it does expose is `/metrics` (spec 60 §4) and `/health`.
 mod agent;
 mod embedder;
+mod mcp;
 mod tools;
 
 use std::path::PathBuf;

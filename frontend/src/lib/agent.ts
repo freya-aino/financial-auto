@@ -8,13 +8,54 @@
 //   * an approval is for one call with exactly those arguments, so the page can never send a
 //     blanket "yes" (`approvalKey`);
 //   * nothing mutating is offered while trading mode is `live` (`canApprove`).
-import { postJson, putJson, q } from './api';
+import { delJson, postJson, putJson, q } from './api';
 import { getApi } from './console';
 
 export interface ToolInfo {
 	name: string;
 	access: 'read' | 'mutating';
 	description: string;
+	/** Set when the tool comes from an external MCP server (D-120). */
+	server?: string;
+}
+
+export interface McpTool {
+	name: string;
+	remote: string;
+	description: string;
+	read_only_hint: boolean;
+}
+
+export interface McpServer {
+	id: string;
+	url: string;
+	label: string;
+	access: 'read' | 'mutating';
+	enabled: boolean;
+	/** The token is write-only: the API reports only whether one is stored. */
+	token_set: boolean;
+	status: 'pending' | 'disabled' | 'ok' | 'error';
+	error: string | null;
+	probed_at: string | null;
+	info: string | null;
+	protocol: string | null;
+	tools: McpTool[];
+}
+
+export interface McpList {
+	servers: McpServer[];
+	protocol: string;
+	max_tools_per_server: number;
+	note: string;
+}
+
+export interface McpForm {
+	url: string;
+	label?: string;
+	access?: 'read' | 'mutating';
+	enabled?: boolean;
+	token?: string;
+	clear_token?: boolean;
 }
 
 export interface LlmStatus {
@@ -28,6 +69,7 @@ export interface LlmStatus {
 	mutating_tools_available: boolean;
 	max_rounds: number;
 	tools: ToolInfo[];
+	mcp_servers: number;
 }
 
 export interface PendingCall {
@@ -88,8 +130,53 @@ export const agentApi = {
 		postJson<TurnResponse>('/api/llm/chat', { message, conversation_id, approvals }),
 	/** The key is write-only: no route returns it, so the form sends it and forgets it. */
 	setEndpoint: (form: EndpointForm) =>
-		putJson<{ ok: boolean; fields: string[]; restart_required: boolean; note: string }>('/api/llm/endpoint', form)
+		putJson<{ ok: boolean; fields: string[]; restart_required: boolean; note: string }>('/api/llm/endpoint', form),
+	mcp: () => getApi<McpList>('/api/llm/mcp'),
+	saveMcp: (id: string, form: McpForm) =>
+		putJson<{ ok: boolean; server: McpServer | null; status: string }>(
+			`/api/llm/mcp/${encodeURIComponent(id)}`,
+			form
+		),
+	removeMcp: (id: string) => delJson<{ ok: boolean; removed: number }>(`/api/llm/mcp/${encodeURIComponent(id)}`),
+	probeMcp: (id: string) =>
+		postJson<{ status: string; server: McpServer | null }>(`/api/llm/mcp/${encodeURIComponent(id)}/probe`, {})
 };
+
+/**
+ * The same slug rule the suite and the proxy apply, checked here so the form says why before a
+ * round trip. The id becomes part of a tool name (`mcp__<id>__<tool>`), which the chat API
+ * restricts to `[A-Za-z0-9_-]`.
+ */
+export function validServerId(id: string): boolean {
+	return /^[a-z0-9][a-z0-9_-]{0,31}$/.test(id);
+}
+
+/** One line per MCP server: what it is, whether it answered, and how many tools it brought. */
+export function mcpStatusNote(s: McpServer): string {
+	if (!s.enabled) return 'disabled — its tools are not offered to the agent';
+	switch (s.status) {
+		case 'ok':
+			return `${s.tools.length} tool${s.tools.length === 1 ? '' : 's'}${s.info ? ` · ${s.info}` : ''}`;
+		case 'error':
+			return `unreachable: ${s.error ?? 'unknown error'}`;
+		default:
+			return 'not probed yet';
+	}
+}
+
+/**
+ * What approving a call on this server means, shown next to the access control.
+ *
+ * `read` is the operator asserting the server only reads; the server's own `readOnlyHint` is
+ * reported per tool and deliberately not used to decide this.
+ */
+export function accessNote(access: 'read' | 'mutating', hinted: number, total: number): string {
+	if (access === 'read') {
+		return 'read: the agent may call these without asking. You are asserting this, not the server.';
+	}
+	const hint = total > 0 ? ` ${hinted} of ${total} call themselves read-only.` : '';
+	return `mutating: every call needs your approval and none is possible in live mode.${hint}`;
+}
 
 /** Identity of one approvable call: tool name plus its arguments, key-order independent. */
 export function approvalKey(call: PendingCall): string {
