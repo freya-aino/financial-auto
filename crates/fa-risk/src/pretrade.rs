@@ -6,7 +6,8 @@
 //!
 //! - sanity: finite positive quantity, a known mark, a limit price inside
 //!   `limit_price_band` of the mark (fat-finger prices);
-//! - order size: notional ≤ `max_order_frac` × deployable (fat-finger quantities);
+//! - order size: notional ≤ `max_order_frac` × deployable (fat-finger quantities), and in live
+//!   mode also ≤ the absolute `live.max_order_eur` (D-121);
 //! - post-trade position ≤ the position cap (stricter for provisional instruments) and the
 //!   liquidity cap `k × horizon volume`;
 //! - post-trade gross per asset class, per venue and for the portfolio ≤ their caps;
@@ -39,6 +40,8 @@ pub struct OrderCheck<'a> {
     pub portfolio_gross_eur: f64,
     /// Margin currently tied up by shorts (Σ |short| × margin, EUR).
     pub short_margin_used_eur: f64,
+    /// Real money (D-121): `live.max_order_eur` applies on top of the fat-finger fraction.
+    pub live: bool,
 }
 
 /// `Ok(())` or the rejection reason.
@@ -78,6 +81,15 @@ pub fn check_order(cfg: &RiskConfig, o: &OrderCheck<'_>) -> Result<(), String> {
             delta.abs(),
             cfg.max_order_frac,
             deployable
+        ));
+    }
+    // The live per-order cap is absolute, not a fraction: on a small sleeve a fraction of
+    // deployable is not a meaningful fat-finger guard.
+    if o.live && delta.abs() > cfg.live.max_order_eur {
+        return Err(format!(
+            "pre-trade: live order notional {:.2} EUR > the per-order cap {:.2} EUR",
+            delta.abs(),
+            cfg.live.max_order_eur
         ));
     }
     let Some(m) = o.market else {
@@ -148,6 +160,7 @@ mod tests {
             fx_to_eur: 1.0,
             position_eur: 0.0,
             market: Some(m),
+            live: false,
             deployable_eur: 100_000.0,
             class_gross_eur: 0.0,
             venue_gross_eur: 0.0,

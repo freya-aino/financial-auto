@@ -117,6 +117,30 @@ impl AppState {
         });
     }
 
+    /// Keeps the live view's trading mode current (D-121).
+    ///
+    /// The mode is asked for rather than listened for: it changes rarely and only through
+    /// `ctl.risk.mode`, and a control plane that inferred it from the bus could hold a stale
+    /// "paper" across a switch — which is the one direction in which being wrong is dangerous.
+    /// Until the first successful read it is `None`, reported as `unknown`.
+    pub fn spawn_trading_mode_refresher(&self) {
+        let every = std::env::var("FA_TRADING_MODE_REFRESH_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(30);
+        if every == 0 {
+            tracing::info!("trading mode refresh disabled (FA_TRADING_MODE_REFRESH_SECS=0)");
+            return;
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mode, venues) = crate::console_routes::read_trading_mode(&state).await;
+                if mode.is_some() {
+                    state.live_mut().set_trading_mode(mode, venues);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(every)).await;
+            }
+        });
+    }
+
     pub fn record_heartbeat(&self, hb: Heartbeat) {
         let status = ServiceStatus {
             service: hb.service.clone(),

@@ -413,7 +413,8 @@ export interface RiskFigures {
 }
 
 export interface RiskView {
-	mode: 'paper';
+	/** `paper`, `live`, or `unknown` until the control plane has read it from the risk engine (D-121). */
+	mode: 'paper' | 'live' | 'unknown';
 	live_available: boolean;
 	reported: RiskFigures | null;
 	paper: RiskFigures;

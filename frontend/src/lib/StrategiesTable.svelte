@@ -36,7 +36,7 @@
 		pause: 'Pause: the strategy stops receiving allocations (signals are ignored).',
 		resume: 'Resume allocations for this strategy.',
 		flatten: 'Flatten: close its sub-book positions and pause it.',
-		promote: 'Promote shadow → active (the gate must be green; D-029: no live sleeve).',
+		promote: 'Promote shadow → active (the gate must be green). Promotion is within the current trading mode; it never switches the platform to real money.',
 		shadow: 'Move to shadow: virtual book only, gate progress starts counting.'
 	};
 

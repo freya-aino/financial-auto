@@ -1,7 +1,7 @@
 # risk-engine settings (spec 40). Hard limits are loaded from here only; the bus can never
 # loosen them. Values follow the spec 40 §7 placeholders unless noted.
 
-mode = "paper"              # the only mode that exists (D-029)
+mode = "paper"              # paper | live (D-121); `live` needs [limits.live] below and refuses to start without it
 account = "paper"           # order.intent.paper / order.approved.paper / order.event.paper
 starting_cash_eur = 100000  # D-028
 allocator = "equal_weight"  # equal-risk control allocator (spec 40 §6.2); risk_parity | fractional_kelly | thompson_rp also available
@@ -113,6 +113,18 @@ limit_price_band = 0.10     # pre-trade: limit price within ±10 % of the mark
 daily_payout_quota_eur = 0  # floor of the reserve; the [payout] rule writes today's ledger.payout_quota row; the larger is reserved
                             # (deployable = equity − reserve); ctl.risk.limits {set: {daily_payout_quota_eur}} raises both (tighten-only)
 short_margin_budget_frac = 0.5 # Σ |short| × short_margin(class) ≤ this × deployable (spec 40 §10 Q5, paper answer)
+
+# Real money (D-121). Zero means live trading is not permitted at all, which is the default: the
+# mode switch refuses while either number is zero, and `mode = "live"` refuses to start. These are
+# the owner's numbers — nothing on the bus can raise them, and a runtime change may only shrink
+# them (`ctl.risk.limits` is tighten-only, spec 40 §6.5).
+#
+# The sleeve binds on top of every fraction-of-deployable cap, so a 500 EUR sleeve with
+# max_position_frac = 0.05 is a 25 EUR position cap. max_order_eur is absolute, because a fraction
+# of a small sleeve is not a meaningful fat-finger guard.
+[limits.live]
+sleeve_eur = 0.0            # most capital that may be deployed while the mode is `live`
+max_order_eur = 0.0         # hard cap on one live order's notional
 
 [limits.leverage_cap]       # risk.gross_leverage_cap.<class>
 equity = 1.5

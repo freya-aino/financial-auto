@@ -89,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
     state.spawn_heartbeat_collector();
     state.spawn_live_collector();
     state.spawn_live_fx_refresher(); // ref.fx_rate + quote ccys → live book fill conversion (review 2026-11-15 §3.2 item 3)
+    state.spawn_trading_mode_refresher(); // ctl.risk.mode + ctl.exec.venues → the real-money state the UI shows (D-121)
     streams_routes::spawn_ensure_streams(&state);
     sources::spawn_health_collector(&state); // ingest.health|gap|unresolved.* mirror (D-054)
 

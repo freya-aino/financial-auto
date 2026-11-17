@@ -7,6 +7,7 @@
 	import Empty from '../../../lib/Empty.svelte';
 	import Info from '../../../lib/Info.svelte';
 	import KillSwitch from '../../../lib/KillSwitch.svelte';
+	import ModeSwitch from '../../../lib/ModeSwitch.svelte';
 	import ViewHeader from '../../../lib/ViewHeader.svelte';
 	import { live, poll, type RiskView } from '../../../lib/api';
 	import { since } from '../../../lib/alerts';
@@ -94,6 +95,7 @@
 <ViewHeader title="Risk & halts" spec="40 §6 · 51 §6.5" note="halts persist in ledger.risk_state; re-arm publishes fa.v1.Resume on risk.resume.<scope> (confirm + audit)" />
 
 <div class="killbar panel">
+	<ModeSwitch onchanged={refreshHalts} />
 	<KillSwitch {risk} onchanged={refreshHalts} />
 	<span class="dim">The kill switch halts the portfolio. Every other scope is raised by risk-engine itself (daily loss, feeds, model health, broker reconciliation, stale FX) and is re-armed here.</span><Info k="trading.killVsHalts" />
 	{#if msg}<span class="badge" class:ok class:danger={!ok}>{msg}</span>{/if}

@@ -4755,6 +4755,78 @@
         "x-handler": "bins/control-api/src/refdata_routes.rs::lots"
       }
     },
+    "/api/trading/mode": {
+      "get": {
+        "operationId": "console_trading_mode",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "ctl.risk.mode + ctl.exec.venues: the mode, the sleeve, and everything that would block a switch",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::trading_mode"
+      },
+      "post": {
+        "operationId": "console_set_trading_mode",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "error"
+          }
+        },
+        "summary": "{\"mode\": \"live\"|\"paper\", \"confirm\": true} → the switch itself; 428 without confirm, 409 while a venue has no credentials; audited trading.mode.set",
+        "tags": [
+          "console"
+        ],
+        "x-handler": "bins/control-api/src/console_routes.rs::set_trading_mode"
+      }
+    },
     "/api/trading/orders": {
       "get": {
         "operationId": "routes_orders",

@@ -12,6 +12,10 @@
 //!
 //! [llm]
 //! api_key = ""
+//!
+//! [venues.kraken]
+//! api_key = ""
+//! api_secret = ""
 //! ```
 //! `FA_GARAGE_ACCESS_KEY_ID` overrides `[garage] access_key_id`; `FA_LEMON_API_KEY`
 //! overrides `[sources.lemon] api_key`. A missing file yields empty secrets, not an error,
@@ -60,6 +64,13 @@ pub struct Secrets {
     /// `[llm]`: the OpenAI-compatible endpoint's key (D-117). Written by control-api when the
     /// operator enters it in the UI, so it is the one secret the platform itself persists.
     pub llm: LlmSecrets,
+    /// `[venues.<id>]`: **trading** credentials, `<venue_id>` → `<key>` → value (D-121).
+    ///
+    /// Separate from [`Self::sources`] on purpose. A venue usually appears in both — Kraken is a
+    /// data source and an execution venue — and a key that may only read market data must not
+    /// become a key that can place orders because one map was convenient. The broker-gateway
+    /// reads this section and nothing else; `FA_VENUES_<ID>_<KEY>` overrides.
+    pub venues: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl std::fmt::Debug for Secrets {
@@ -69,10 +80,16 @@ impl std::fmt::Debug for Secrets {
             .iter()
             .map(|(s, kv)| (s.as_str(), kv.iter().map(|(k, v)| (k.as_str(), redact_value(k, v))).collect()))
             .collect();
+        let venues: BTreeMap<&str, BTreeMap<&str, String>> = self
+            .venues
+            .iter()
+            .map(|(s, kv)| (s.as_str(), kv.iter().map(|(k, v)| (k.as_str(), redact_value(k, v))).collect()))
+            .collect();
         f.debug_struct("Secrets")
             .field("garage", &self.garage)
             .field("sources", &sources)
             .field("llm", &self.llm)
+            .field("venues", &venues)
             .finish()
     }
 }
@@ -161,6 +178,21 @@ impl Secrets {
                 }
                 continue;
             }
+            // `FA_VENUES_<ID>_<KEY>`: the id is everything up to the last `_`, so
+            // `FA_VENUES_KRAKEN_API_KEY` is (kraken, api_key) and not (kraken_api, key). The keys
+            // a venue takes are known, which makes that unambiguous.
+            if let Some(rest) = rest.strip_prefix("VENUES_") {
+                let lower = rest.to_ascii_lowercase();
+                for known in ["api_key", "api_secret", "account_id", "env"] {
+                    if let Some(id) = lower.strip_suffix(known).and_then(|p| p.strip_suffix('_'))
+                        && !id.is_empty()
+                    {
+                        self.venues.entry(id.to_owned()).or_default().insert(known.to_owned(), value);
+                        break;
+                    }
+                }
+                continue;
+            }
             if let Some(key) = rest.strip_prefix("GARAGE_") {
                 match key.to_ascii_lowercase().as_str() {
                     "access_key_id" => self.garage.access_key_id = value,
@@ -200,11 +232,30 @@ impl Secrets {
     pub fn source(&self, source: &str, key: &str) -> Option<&str> {
         self.sources.get(source).and_then(|kv| kv.get(key)).map(String::as_str).filter(|v| !v.is_empty())
     }
+
+    /// `[venues.<venue>] <key>`, if set and non-empty (D-121).
+    pub fn venue(&self, venue: &str, key: &str) -> Option<&str> {
+        self.venues.get(venue).and_then(|kv| kv.get(key)).map(String::as_str).filter(|v| !v.is_empty())
+    }
+
+    /// Which venues have trading credentials, and what each one is missing. Reported to the
+    /// operator; the values themselves never leave this struct.
+    pub fn venue_readiness(&self) -> Vec<(String, bool)> {
+        let needed: &[(&str, &[&str])] =
+            &[("kraken", &["api_key", "api_secret"]), ("lemon", &["api_key"]), ("oanda", &["api_key", "account_id"])];
+        needed
+            .iter()
+            .map(|(id, keys)| ((*id).to_owned(), keys.iter().all(|k| self.venue(id, k).is_some())))
+            .collect()
+    }
 }
 
 /// Env prefixes that address process configuration, not a source's secrets.
 fn is_reserved(section: &str) -> bool {
-    matches!(section, "config" | "secrets" | "garage" | "gpu" | "evo" | "log" | "nats" | "helix" | "postgres")
+    matches!(
+        section,
+        "config" | "secrets" | "garage" | "gpu" | "evo" | "log" | "nats" | "helix" | "postgres" | "venues"
+    )
 }
 
 /// Keys whose values must never be printed: match `*key*|*secret*|*token*` (spec 60 §6.7).
@@ -353,6 +404,36 @@ account_id = "001-004"
         if std::env::var_os(ENV_PATH).is_none() {
             assert_eq!(default_path(), PathBuf::from(DEFAULT_PATH));
         }
+    }
+
+    #[test]
+    fn venue_credentials_are_separate_from_a_sources_key() {
+        let s = Secrets::parse(
+            "[sources.kraken]\napi_key = \"data-only\"\n\n[venues.kraken]\napi_key = \"trade\"\napi_secret = \"sign\"\n",
+        )
+        .unwrap();
+        assert_eq!(s.venue("kraken", "api_key"), Some("trade"));
+        assert_eq!(s.source("kraken", "api_key"), Some("data-only"), "the data key is untouched");
+        // A read-only data key must never stand in for a trading key.
+        assert_eq!(s.venue("lemon", "api_key"), None);
+        assert_eq!(
+            s.venue_readiness(),
+            vec![("kraken".to_owned(), true), ("lemon".to_owned(), false), ("oanda".to_owned(), false)]
+        );
+        assert!(!format!("{s:?}").contains("trade"), "{s:?}");
+        assert!(!format!("{s:?}").contains("sign"));
+
+        let mut s = Secrets::default();
+        s.apply_env([
+            ("FA_VENUES_OANDA_API_KEY", "k"),
+            ("FA_VENUES_OANDA_ACCOUNT_ID", "001-004-1-001"),
+            ("FA_VENUES_OANDA_ENV", "practice"),
+            ("FA_VENUES_NOPE", "ignored"),
+        ]);
+        assert_eq!(s.venue("oanda", "api_key"), Some("k"));
+        assert_eq!(s.venue("oanda", "account_id"), Some("001-004-1-001"));
+        assert_eq!(s.venue("oanda", "env"), Some("practice"));
+        assert!(!s.sources.contains_key("venues"), "`venues` is not a source");
     }
 
     #[test]

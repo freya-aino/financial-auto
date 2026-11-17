@@ -6,7 +6,9 @@
 //! `svc.heartbeat.risk-engine`. Answers request/reply on `ctl.risk.strategy`
 //! (`{strategy_id, action: pause|resume|flatten|promote|shadow|retire|admit}` or `{action: list}`),
 //! `ctl.risk.limits` (`{}` → current limits; `{set: <json>}` → tighten-only change) and
-//! `ctl.risk.flatten` with a `CtlReply` whose message is JSON (D-051).
+//! `ctl.risk.flatten` with a `CtlReply` whose message is JSON (D-051). `ctl.risk.mode`
+//! (`{}` → the mode and what would block a switch; `{set: "live"|"paper"}` → the switch itself,
+//! D-121).
 //! Only paper trading exists: settings with any other mode are refused and non-paper intents
 //! are rejected (D-029). Starting cash 100 000 EUR (D-028). The halt/resume contract follows
 //! D-030. All decision logic is in [`engine`] (pure, tested); this file is I/O.
@@ -486,6 +488,38 @@ async fn handle_ctl(
                 other => Err(format!("invalid: pipeline action {other:?}; use status|run")),
             }
         }
+        // The switch into real money (D-121). The guards are the engine's
+        // (`Engine::mode_blockers`): the owner's numbers in `risk.toml`, a flat book in either
+        // direction, no unfilled intents and no active halts. Whether a venue could accept an
+        // order at all is control-api's precheck (`ctl.exec.venues`), because that is where the
+        // operator's request arrives.
+        "mode" => {
+            let Some(want) = req.args.get("set") else {
+                return Ok(engine.lock().await.mode_view(now));
+            };
+            let (before, result) = {
+                let mut e = engine.lock().await;
+                let before = e.trading_mode().to_owned();
+                (before, e.set_trading_mode(want, now))
+            };
+            let out = result?;
+            if out["changed"] == serde_json::Value::Bool(true) {
+                let after = out["mode"].as_str().unwrap_or_default().to_owned();
+                if let Some(p) = store {
+                    p.audit_as(
+                        &actor,
+                        "trading.mode.changed",
+                        Some(&after),
+                        serde_json::json!({"before": before, "after": after, "limits": out}),
+                    )
+                    .await;
+                }
+                // At warn level in both directions: going live is the most consequential change
+                // this platform can make, and coming back means someone decided to stop.
+                tracing::warn!(%actor, %before, %after, "trading mode switched");
+            }
+            Ok(out)
+        }
         _ => Err(format!("invalid: unknown verb {verb}")),
     }
 }
@@ -648,6 +682,9 @@ async fn main() -> anyhow::Result<()> {
                     let mut c: std::collections::HashMap<String, f64> =
                         e.counters.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect();
                     c.insert("equity_eur".into(), e.equity());
+                    // Whether this platform is trading real money, as a number an alert can watch
+                    // (D-121): the one change of state that nobody should have to read a log for.
+                    c.insert("live_mode".into(), if e.is_live() { 1.0 } else { 0.0 });
                     c.insert("cash_eur".into(), e.ledger().cash_eur);
                     c.insert(
                         "positions".into(),
@@ -929,7 +966,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // control plane: ctl.risk.strategy | limits | flatten | pipeline | allocators (request/reply, CtlReply)
-    for verb in ["strategy", "limits", "flatten", "pipeline", "allocators"] {
+    for verb in ["strategy", "limits", "flatten", "pipeline", "allocators", "mode"] {
         let (bus, engine, store, pipe) = (bus.clone(), engine.clone(), store.clone(), pipe.clone());
         let mut sub = bus.subscribe_raw(subjects::ctl("risk", verb)).await?;
         tokio::spawn(async move {

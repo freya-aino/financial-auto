@@ -508,6 +508,13 @@ pub struct Live {
     /// 2026-11-15 §3.2 item 3: never silent — each is also warned, and the count is served in
     /// `positions_view`).
     fx_fallback_fills: u64,
+    /// Trading mode as the risk engine last reported it (D-121), refreshed by
+    /// [`crate::state::AppState::spawn_trading_mode_refresher`]. `None` = not asked yet, which is
+    /// reported as such rather than as `paper`: this view is a mirror, and claiming the platform
+    /// is on paper when nobody has checked is the one wrong answer.
+    trading_mode: Option<String>,
+    /// Whether any execution venue has credentials (`ctl.exec.venues`).
+    venues_ready: Option<bool>,
     /// Operator-tunable bounds (`[runtime]`, `PUT /api/config/runtime`).
     runtime: RuntimeConfig,
     /// Change events for the WebSocket streams; nobody listening = nothing built.
@@ -540,6 +547,8 @@ impl Default for Live {
             fx_rates: BTreeMap::new(),
             instrument_ccy: HashMap::new(),
             fx_fallback_fills: 0,
+            trading_mode: None,
+            venues_ready: None,
             runtime: RuntimeConfig::default(),
             events: broadcast::channel(EVENT_CAPACITY).0,
         }
@@ -597,6 +606,12 @@ impl Live {
     /// it, which is the P&L and drawdown baseline — not [`PAPER_CASH_EUR`], because the seed can
     /// run before the opening deposit is written (the 2026-11-15 seed read cash 0.0 two seconds
     /// before the 100 000 EUR deposit row and never caught up).
+    /// Records the mode and venue readiness the control plane last read (D-121).
+    pub fn set_trading_mode(&mut self, mode: Option<String>, venues_ready: Option<bool>) {
+        self.trading_mode = mode;
+        self.venues_ready = venues_ready;
+    }
+
     pub fn seed_ledger(&mut self, ledger: Ledger, opening_eur: f64) {
         self.ledger = ledger;
         self.opening_eur = opening_eur;
@@ -1613,8 +1628,10 @@ impl Live {
             .sum();
         let halts: Vec<&HaltView> = self.halts.values().collect();
         json!({
-            "mode": "paper",
-            "live_available": false,
+            // The mode the risk engine reports, not an assumption: this view mirrors the book, it
+            // does not own it (D-121).
+            "mode": self.trading_mode.clone().unwrap_or_else(|| "unknown".into()),
+            "live_available": self.venues_ready.unwrap_or(false),
             "reported": reported,
             "paper": {
                 "equity_eur": equity,
@@ -2097,7 +2114,15 @@ mod tests {
         let r = l.risk_view();
         assert_eq!(r["reported"]["equity_eur"], 5.0);
         assert_eq!(r["halts"][0]["scope"], "strategy:s1");
+        // Nothing has read the risk engine's mode yet, and this view says so rather than claiming
+        // the platform is on paper (D-121).
+        assert_eq!(r["mode"], "unknown");
         assert_eq!(r["live_available"], false);
+
+        l.set_trading_mode(Some("live".into()), Some(true));
+        let r = l.risk_view();
+        assert_eq!(r["mode"], "live");
+        assert_eq!(r["live_available"], true);
     }
 
     #[test]

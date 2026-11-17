@@ -16,7 +16,10 @@ pub const PAPER_CASH_EUR: f64 = 100_000.0;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Must be `paper`; anything else is refused at startup (D-029).
+    /// `paper` or `live` (D-121). `live` is refused at startup unless `[limits.live]` carries
+    /// both the sleeve and the per-order cap — the owner's numbers, which nothing on the bus can
+    /// supply. The mode can also be switched at runtime (`ctl.risk.mode`), and that switch obeys
+    /// the same requirement plus a flat book.
     pub mode: String,
     /// Account token in `order.*.<account>` subjects.
     pub account: String,
@@ -246,8 +249,10 @@ impl FxSettings {
 pub enum SettingsError {
     #[error("parsing risk settings: {0}")]
     Toml(#[from] toml::de::Error),
-    #[error("mode `{0}` is not allowed: only `paper` exists (D-029)")]
+    #[error("mode `{0}` is not allowed: use `paper` or `live` (D-121)")]
     Mode(String),
+    #[error("mode `live` needs the owner's numbers: {0}")]
+    LiveLimits(String),
     #[error("unknown allocator `{0}`")]
     Allocator(String),
     #[error("new_strategy_status `{0}` must be active or shadow")]
@@ -266,8 +271,13 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<(), SettingsError> {
-        if self.mode != "paper" {
+        if !matches!(self.mode.as_str(), "paper" | "live") {
             return Err(SettingsError::Mode(self.mode.clone()));
+        }
+        // Starting in `live` is allowed, but only with the sleeve and the per-order cap set: a
+        // `mode = "live"` line on its own must not put the whole book at a venue.
+        if self.mode == "live" {
+            self.limits.live.permits_live().map_err(SettingsError::LiveLimits)?;
         }
         if fa_allocator::by_name(&self.allocator, self.max_strategy_weight, self.kelly_fraction).is_none() {
             return Err(SettingsError::Allocator(self.allocator.clone()));
@@ -320,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn repo_risk_toml_parses_and_live_is_refused() {
+    fn repo_risk_toml_parses_and_live_needs_the_owners_numbers() {
         let s = Settings::parse(include_str!("../risk.toml")).unwrap();
         assert_eq!(s.mode, "paper");
         assert_eq!(s.starting_cash_eur, PAPER_CASH_EUR);
@@ -329,7 +339,23 @@ mod tests {
         assert_eq!(s.fx.source, "ecb_daily");
         assert_eq!(s.limits.provisional_position_frac, None);
         assert_eq!(s.limits.provisional_position_frac(), 0.025);
-        assert!(matches!(Settings::parse("mode = 'live'"), Err(SettingsError::Mode(_))));
+        // `live` is a real mode now (D-121), but only with the sleeve and the per-order cap: a
+        // bare `mode = "live"` must not put the whole book at a venue.
+        assert!(matches!(Settings::parse("mode = 'live'"), Err(SettingsError::LiveLimits(_))));
+        assert!(matches!(Settings::parse("mode = 'shadow'"), Err(SettingsError::Mode(_))));
+        // A sleeve without a per-order cap is not enough, and one order may not be able to use
+        // the whole sleeve.
+        for partial in [
+            "mode = 'live'\n[limits.live]\nsleeve_eur = 500.0",
+            "mode = 'live'\n[limits.live]\nmax_order_eur = 50.0",
+            "mode = 'live'\n[limits.live]\nsleeve_eur = 100.0\nmax_order_eur = 200.0",
+        ] {
+            assert!(matches!(Settings::parse(partial), Err(SettingsError::LiveLimits(_))), "{partial}");
+        }
+        let live = Settings::parse("mode = 'live'\n[limits.live]\nsleeve_eur = 500.0\nmax_order_eur = 50.0")
+            .expect("both numbers set");
+        assert_eq!((live.limits.live.sleeve_eur, live.limits.live.max_order_eur), (500.0, 50.0));
+        assert_eq!(s.limits.live, fa_risk::LiveLimits::default(), "paper carries no live numbers");
         assert!(matches!(Settings::parse("allocator = 'evolved'"), Err(SettingsError::Allocator(_))));
         assert!(matches!(Settings::parse("new_strategy_status = 'live'"), Err(SettingsError::NewStatus(_))));
         assert_eq!(s.payout, fa_ledger::payout::PayoutRule::default(), "no payout reserved by default");

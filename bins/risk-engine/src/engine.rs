@@ -313,6 +313,9 @@ const ANY_SOURCE: &str = "*";
 
 pub struct Engine {
     settings: Settings,
+    /// Real money or not (D-121). It starts at `settings.mode` and only `set_trading_mode` moves
+    /// it, which is what makes the switch one audited event rather than a config reload.
+    live: bool,
     allocator: Box<dyn Allocator>,
     /// Name + parameters of the active allocator (`risk.toml` or the last runtime switch).
     allocator_spec: Value,
@@ -451,6 +454,7 @@ impl Engine {
         });
         Self {
             allocator_spec,
+            live: settings.mode == "live",
             risk: RiskEngine::new(settings.limits.clone(), cash),
             ledger: Ledger::with_cash(cash),
             perf: PerformanceTracker::new(settings.performance_decay, 0.01),
@@ -769,7 +773,7 @@ impl Engine {
         }
         json!({
             "equity_eur": equity,
-            "deployable_eur": self.risk.deployable(equity),
+            "deployable_eur": self.risk.deployable_in(equity, self.live),
             "payout_reserve_eur": self.risk.payout_reserve(),
             "gross_exposure_eur": self.gross_exposure_eur(),
             "by_venue": by_venue,
@@ -791,7 +795,7 @@ impl Engine {
     pub fn headroom(&self, now_ms: i64) -> Vec<(String, f64)> {
         let cfg = &self.risk.cfg;
         let equity = self.equity();
-        let deployable = self.risk.deployable(equity);
+        let deployable = self.risk.deployable_in(equity, self.live);
         let peak = self.risk.peak_equity();
         let dd = if peak > 0.0 { (1.0 - equity / peak).max(0.0) } else { 0.0 };
         let day = self.risk.day_start_equity();
@@ -870,6 +874,112 @@ impl Engine {
 
     pub fn limits(&self) -> &RiskConfig {
         &self.risk.cfg
+    }
+
+    /// `paper` or `live` (D-121).
+    pub fn trading_mode(&self) -> &'static str {
+        if self.live { "live" } else { "paper" }
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.live
+    }
+
+    /// The mode the intents it emits carry.
+    fn intent_mode(&self) -> TradingMode {
+        if self.live { TradingMode::Live } else { TradingMode::Paper }
+    }
+
+    /// Whether this process *could* trade real money: the owner's numbers are in `risk.toml`.
+    /// Nothing on the bus can supply them (spec 40 §6.5).
+    pub fn live_permitted(&self) -> Result<(), String> {
+        self.risk.cfg.live.permits_live()
+    }
+
+    /// What the switch would refuse on right now, as the API reports it.
+    pub fn mode_view(&self, now_ms: i64) -> Value {
+        let blockers = self.mode_blockers(!self.live, now_ms);
+        json!({
+            "mode": self.trading_mode(),
+            "live_permitted": self.live_permitted().is_ok(),
+            "live_blocked_by": self.live_permitted().err(),
+            "sleeve_eur": self.risk.cfg.live.sleeve_eur,
+            "max_order_eur": self.risk.cfg.live.max_order_eur,
+            "deployable_eur": self.risk.deployable_in(self.equity(), self.live),
+            "switch_blockers": blockers,
+            // The platform cannot yet read a venue's own book, so nobody should flip this without
+            // having reconciled by hand. Saying so in the API is better than implying otherwise.
+            "venue_reconciliation": "not implemented: compare the venue's positions and balances by hand before the first flip",
+        })
+    }
+
+    /// Why the switch cannot move right now. Empty means it can.
+    ///
+    /// The book must be **flat** in either direction. That is the rule that keeps the two ledgers
+    /// from ever describing the same position: a position opened with paper money must not become
+    /// a real one by a button press, and a real one must not become paper. Flattening first is the
+    /// operator's job, and the kill switch exists for it.
+    pub fn mode_blockers(&self, to_live: bool, now_ms: i64) -> Vec<String> {
+        let mut out = Vec::new();
+        if to_live
+            && let Err(e) = self.live_permitted()
+        {
+            out.push(e);
+        }
+        let open: Vec<String> = self
+            .ledger
+            .positions
+            .iter()
+            .filter(|(_, p)| p.quantity.abs() > 1e-9)
+            .map(|(i, p)| format!("{i} {:+}", p.quantity))
+            .collect();
+        if !open.is_empty() {
+            out.push(format!("the book is not flat: {}", open.join(", ")));
+        }
+        let pending = self.pending.len();
+        if pending > 0 {
+            out.push(format!("{pending} intent(s) are still unfilled"));
+        }
+        let halts: Vec<String> = self
+            .halts
+            .keys()
+            .map(|s| format!("{s:?}").to_lowercase())
+            .chain(self.source_halts.keys().map(|s| format!("source:{s}")))
+            .chain(self.model_halts.keys().map(|s| format!("model:{s}")))
+            .collect();
+        if !halts.is_empty() {
+            out.push(format!("halts are active: {}", halts.join(", ")));
+        }
+        let _ = now_ms;
+        out
+    }
+
+    /// Flips the trading mode. `Err` is the reason, which the caller relays verbatim.
+    ///
+    /// Switching **to** paper is not automatically safe either: a real position cannot be allowed
+    /// to continue as a paper one, so the flat-book rule applies in both directions.
+    pub fn set_trading_mode(&mut self, want: &str, now_ms: i64) -> Result<Value, String> {
+        let to_live = match want {
+            "live" => true,
+            "paper" => false,
+            other => return Err(format!("invalid: mode {other:?}; use paper or live")),
+        };
+        if to_live == self.live {
+            return Ok(json!({"mode": self.trading_mode(), "changed": false}));
+        }
+        let blockers = self.mode_blockers(to_live, now_ms);
+        if !blockers.is_empty() {
+            return Err(format!("conflict: {}", blockers.join("; ")));
+        }
+        self.live = to_live;
+        self.bump(if to_live { "mode.live" } else { "mode.paper" });
+        Ok(json!({
+            "mode": self.trading_mode(),
+            "changed": true,
+            "sleeve_eur": self.risk.cfg.live.sleeve_eur,
+            "max_order_eur": self.risk.cfg.live.max_order_eur,
+            "deployable_eur": self.risk.deployable_in(self.equity(), self.live),
+        }))
     }
 
     fn bump(&mut self, k: &'static str) {
@@ -1112,9 +1222,13 @@ impl Engine {
                 ..Default::default()
             },
         };
-        if mode != TradingMode::Paper {
+        if mode != self.intent_mode() {
             self.bump("rejected.mode");
-            return vec![reject("only paper trading exists; live/shadow intents are refused (D-029)")];
+            return vec![reject(&format!(
+                "this platform is in `{}` mode: an intent marked `{}` is refused (D-121)",
+                self.trading_mode(),
+                mode.as_str_name().trim_start_matches("TRADING_MODE_").to_lowercase()
+            ))];
         }
         if self.instrument_blocked(&inst) {
             let current = self.ledger.positions.get(&inst).map_or(0.0, |p| p.quantity);
@@ -1199,7 +1313,7 @@ impl Engine {
                 }
             }
         }
-        let deployable = self.risk.deployable(self.equity());
+        let deployable = self.risk.deployable_in(self.equity(), self.live);
         let short_margin_used = self.short_margin_used(&current, now_ms);
         let o = OrderCheck {
             quantity: signed_qty,
@@ -1213,6 +1327,7 @@ impl Engine {
             venue_gross_eur: venue_gross,
             portfolio_gross_eur: gross,
             short_margin_used_eur: short_margin_used,
+            live: self.live,
         };
         check_order(&self.risk.cfg, &o)?;
         let post = position_eur + signed_qty * mark.unwrap_or(0.0);
@@ -1963,7 +2078,7 @@ impl Engine {
         self.roll_days(now_ms);
         let mut out = self.check_equity(now_ms);
         let equity = self.equity();
-        let deployable = self.risk.deployable(equity);
+        let deployable = self.risk.deployable_in(equity, self.live);
         // strategy books first: they need the previous tick's marks, which update_performance replaces
         out.extend(self.track_strategy_books(deployable, now_ms));
         self.update_performance();
@@ -2283,7 +2398,7 @@ impl Engine {
                 quantity: delta.abs() / mark,
                 exec_algo: choice.algo.clone(),
                 limit_price: None,
-                mode: TradingMode::Paper as i32, // never anything else (D-029)
+                mode: self.intent_mode() as i32, // paper unless the switch was thrown (D-121)
                 strategy_ids: if target == 0.0 { Vec::new() } else { contributors(inst) },
                 created_at: Some(ts_of(now_ms)),
             };
@@ -3175,6 +3290,74 @@ mod tests {
     }
 
     #[test]
+    fn the_mode_switch_needs_the_numbers_a_flat_book_and_no_halts() {
+        let inst = InstrumentId::new();
+        let mut e = warm(inst);
+
+        // No numbers in risk.toml: the switch cannot move, and says which number is missing.
+        assert_eq!(e.trading_mode(), "paper");
+        let err = e.set_trading_mode("live", T0).expect_err("no sleeve");
+        assert!(err.starts_with("conflict:") && err.contains("sleeve_eur"), "{err}");
+        assert!(!e.mode_view(T0)["live_permitted"].as_bool().unwrap());
+
+        // 20 EUR per order against a 500 EUR sleeve: tighter than `max_order_frac` × deployable
+        // (50 EUR here), so the absolute cap is the one that bites — which is its whole point.
+        e.risk.cfg.live = fa_risk::LiveLimits { sleeve_eur: 500.0, max_order_eur: 20.0 };
+        assert!(e.mode_view(T0)["live_permitted"].as_bool().unwrap());
+        let out = e.set_trading_mode("live", T0).expect("flat, no halts, numbers set");
+        assert_eq!(out["mode"], json!("live"));
+        assert_eq!(out["changed"], json!(true));
+        assert_eq!(e.trading_mode(), "live");
+
+        // The sleeve binds on deployable capital, so every fraction-of-deployable cap shrinks.
+        assert_eq!(e.risk.deployable_in(100_000.0, true), 500.0);
+        assert_eq!(e.risk.deployable_in(100_000.0, false), 100_000.0);
+
+        // Intents the allocator emits now carry `live`, and a `paper` intent from outside is
+        // refused — the mode is a property of the platform, not a per-order choice.
+        let paper = OrderIntent {
+            intent_id: "p".into(),
+            account_id: "paper".into(),
+            instrument_id: inst.to_string(),
+            side: Side::Buy as i32,
+            quantity: 1.0,
+            mode: TradingMode::Paper as i32,
+            ..Default::default()
+        };
+        let out = e.on_intent_seen(&paper, false, T0);
+        let Out::Rejected { event, .. } = &out[0] else { panic!("{out:?}") };
+        assert!(event.reason.contains("live") && event.reason.contains("paper"), "{}", event.reason);
+
+        // A real-money order over the per-order cap is refused by the pre-trade check.
+        let big = OrderIntent { intent_id: "big".into(), quantity: 0.3, mode: TradingMode::Live as i32, ..paper.clone() };
+        let out = e.on_intent_seen(&big, false, T0);
+        let Out::Rejected { event, .. } = &out[0] else { panic!("{out:?}") };
+        assert!(event.reason.contains("per-order cap"), "{}", event.reason);
+
+        // Back to paper is refused while the book is not flat: a real position must not become a
+        // paper one by a button press.
+        let small = OrderIntent { intent_id: "s".into(), quantity: 0.1, mode: TradingMode::Live as i32, ..paper.clone() };
+        assert!(e.on_intent_seen(&small, true, T0).is_empty());
+        fill(&mut e, &small, PX, T0 + 10);
+        let err = e.set_trading_mode("paper", T0 + 20).expect_err("not flat");
+        assert!(err.contains("not flat"), "{err}");
+
+        // Flat again, but halted: still refused.
+        let close =
+            OrderIntent { intent_id: "c".into(), quantity: 0.1, side: Side::Sell as i32, mode: TradingMode::Live as i32, ..paper.clone() };
+        assert!(e.on_intent_seen(&close, true, T0 + 30).is_empty());
+        fill(&mut e, &close, PX, T0 + 40);
+        e.on_halt(&Halt { scope: "portfolio".into(), manual: true, ..Default::default() }, T0 + 50);
+        let err = e.set_trading_mode("paper", T0 + 60).expect_err("halted");
+        assert!(err.contains("halts are active"), "{err}");
+
+        // Nothing changed by a no-op request, in either direction.
+        let out = e.set_trading_mode("live", T0 + 70).expect("already live");
+        assert_eq!(out["changed"], json!(false));
+        assert!(e.set_trading_mode("sideways", T0 + 70).unwrap_err().starts_with("invalid:"));
+    }
+
+    #[test]
     fn foreign_intents_are_gated_and_live_is_impossible() {
         let inst = InstrumentId::new();
         let mut e = warm(inst);
@@ -3191,7 +3374,9 @@ mod tests {
         let Out::Rejected { account, event } = &out[0] else { panic!("{out:?}") };
         assert_eq!(account, "paper");
         assert_eq!(event.kind, order_event::Kind::Rejected as i32);
-        assert!(event.reason.contains("D-029"));
+        // A live intent is refused while this platform is in paper mode, and the refusal says so
+        // (D-121 replaced D-029's "live does not exist").
+        assert!(event.reason.contains("paper") && event.reason.contains("live"), "{}", event.reason);
         // a paper intent already approved elsewhere (control-api manual order) is only remembered
         let manual = OrderIntent { intent_id: "m".into(), mode: TradingMode::Paper as i32, ..live.clone() };
         assert!(e.on_intent_seen(&manual, true, T0).is_empty());

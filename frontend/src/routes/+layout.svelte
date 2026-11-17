@@ -95,7 +95,19 @@
 		<div class="brand">
 			<img src="/favicon.svg" alt="" width="18" height="18" />
 			<h1>financial-auto</h1>
-			<span class="badge ok mode" title="Live trading is impossible from this UI (D-029)">PAPER</span><Info k="chrome.mode" />
+			<!-- The real mode, from the risk engine through control-api (D-121). Never a constant:
+			     the one state nobody may be wrong about is whether this is real money. -->
+			<span
+				class="badge mode"
+				class:ok={risk?.mode === 'paper'}
+				class:danger={risk?.mode === 'live'}
+				class:warn={!risk || risk.mode === 'unknown'}
+				title={risk?.mode === 'live'
+					? 'This platform is trading real money. Switch it back on /trading/risk.'
+					: risk?.mode === 'paper'
+						? 'Paper money. The real-money switch is on /trading/risk.'
+						: 'The trading mode has not been read from the risk engine yet.'}
+			>{(risk?.mode ?? 'unknown').toUpperCase()}</span><Info k="chrome.mode" />
 		</div>
 		<nav>
 			{#each nav as item}

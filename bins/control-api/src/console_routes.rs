@@ -11,6 +11,8 @@
 //! | `GET /api/trading/halts` | persisted halts (`ledger.risk_state`, survive restarts) merged with the halts control-api saw on the bus |
 //! | `POST /api/trading/halts/{scope}/rearm` | `{"confirm": true, "reason"?}` → `fa.v1.Resume` on `risk.resume.<scope>`; 428 without confirm; audited `halt.rearm` |
 //! | `GET /api/trading/risk-events?since=&limit=&kind=` | `RiskEvent`s, halts, resumes and reconciliation diffs from `audit.log`, newest first |
+//! | `GET /api/trading/mode` | `ctl.risk.mode` + `ctl.exec.venues`: the mode, the sleeve, and everything that would block a switch |
+//! | `POST /api/trading/mode` | `{"mode": "live"\|"paper", "confirm": true}` → the switch itself; 428 without confirm, 409 while a venue has no credentials; audited `trading.mode.set` |
 //! | `GET /api/refdata/venues` | venues with their calendar rule and materialised session range |
 //! | `GET /api/refdata/calendar/{venue}?from=&to=` | sessions per day: `table` rows, else the built-in rule |
 //! | `GET /api/refdata/corporate-actions?instrument_id=&known_at=&limit=` | corporate actions (point-in-time when `instrument_id` is given) |
@@ -67,6 +69,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/trading/halts", get(halts))
         .route("/api/trading/halts/{scope}/rearm", post(rearm))
         .route("/api/trading/risk-events", get(risk_events))
+        .route("/api/trading/mode", get(trading_mode).post(set_trading_mode))
         .route("/api/refdata/venues", get(venues))
         .route("/api/refdata/calendar/{venue}", get(calendar_range))
         .route("/api/refdata/corporate-actions", get(corporate_actions))
@@ -392,6 +395,131 @@ async fn rearm(State(s): State<AppState>, Path(scope): Path<String>, body: Bytes
     )
     .await;
     Json(json!({ "ok": true, "resumed": scope, "subject": subject, "audited": audited })).into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ModeBody {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+/// What the broker-gateway says about its venues (`ctl.exec.venues`): per-venue readiness and
+/// whether any venue could accept an order at all.
+async fn venue_readiness(s: &AppState) -> Result<Value, Response> {
+    let reply = ctl(s, "exec", "venues", vec![]).await?;
+    Ok(message_json(&reply.message))
+}
+
+/// The mode and venue readiness, for the background refresher that keeps the live view honest.
+/// Both are `None` when the service behind them did not answer.
+pub async fn read_trading_mode(s: &AppState) -> (Option<String>, Option<bool>) {
+    let mode = match ctl(s, "risk", "mode", vec![]).await {
+        Ok(r) if r.ok => message_json(&r.message).get("mode").and_then(Value::as_str).map(str::to_owned),
+        _ => None,
+    };
+    let venues = match venue_readiness(s).await {
+        Ok(v) => v.get("live_possible").and_then(Value::as_bool),
+        Err(_) => None,
+    };
+    (mode, venues)
+}
+
+/// `GET /api/trading/mode`: the mode as the risk engine holds it, plus the venues' readiness.
+///
+/// Both halves matter and neither is sufficient: the risk engine knows whether the owner's numbers
+/// are set and the book is flat, the gateway knows whether a venue would take an order. A UI that
+/// showed only one of them would offer a switch that cannot work.
+async fn trading_mode(State(s): State<AppState>) -> Response {
+    let mut out = match ctl(&s, "risk", "mode", vec![]).await {
+        Ok(r) if r.ok => message_json(&r.message),
+        Ok(r) => return err(reply_status(&r.message), r.message),
+        Err(resp) => return resp,
+    };
+    match venue_readiness(&s).await {
+        Ok(v) => {
+            out["venues"] = v.get("venues").cloned().unwrap_or(Value::Null);
+            out["venues_ready"] = json!(v.get("live_possible").and_then(Value::as_bool).unwrap_or(false));
+        }
+        // The gateway being unreachable is reported rather than failing the read: the mode itself
+        // is still true, and "we cannot tell" must not look like "no venue is configured".
+        Err(_) => {
+            out["venues"] = Value::Null;
+            out["venues_ready"] = Value::Null;
+            out["venues_error"] = json!("broker-gateway did not answer ctl.exec.venues");
+        }
+    }
+    Json(out).into_response()
+}
+
+/// `POST /api/trading/mode`: the real-money switch.
+///
+/// Three gates, in this order, because each tells the operator something different:
+///
+/// 1. `confirm: true` — this is the most consequential request the API accepts, and a mistyped
+///    URL must not move real money.
+/// 2. the venues must have credentials (`ctl.exec.venues`) — going live with nowhere to send an
+///    order would simply reject every intent, which looks like a platform fault rather than a
+///    missing key. Refused with 409 and the per-venue detail.
+/// 3. the risk engine's own guards (`ctl.risk.mode`): the owner's numbers in `risk.toml`, a flat
+///    book in either direction, no unfilled intents, no active halts.
+///
+/// Switching back to paper skips gate 2 — stopping must never depend on a venue answering.
+async fn set_trading_mode(State(s): State<AppState>, body: Bytes) -> Response {
+    let body: ModeBody = match json_body(&body).map(serde_json::from_value) {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => return err(StatusCode::BAD_REQUEST, format!("bad body: {e}")),
+        Err(r) => return r,
+    };
+    let want = body.mode.trim().to_ascii_lowercase();
+    if !matches!(want.as_str(), "live" | "paper") {
+        return err(StatusCode::BAD_REQUEST, "mode must be `live` or `paper`");
+    }
+    if !body.confirm {
+        audit(&s, "trading.mode.refused", Some(&want), json!({"why": "confirm required"})).await;
+        return (
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(json!({
+                "error": "confirm_required",
+                "detail": format!("switching to {want} needs {{\"confirm\": true}}"),
+            })),
+        )
+            .into_response();
+    }
+    if want == "live" {
+        let venues = match venue_readiness(&s).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        if !venues.get("live_possible").and_then(Value::as_bool).unwrap_or(false) {
+            audit(&s, "trading.mode.refused", Some(&want), json!({"why": "no venue credentials"})).await;
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "no_venue_credentials",
+                    "detail": "no execution venue has credentials: enter them under [venues.<id>] in config/secrets.toml and restart the broker-gateway",
+                    "venues": venues.get("venues").cloned().unwrap_or(Value::Null),
+                })),
+            )
+                .into_response();
+        }
+    }
+    let reply = ctl(&s, "risk", "mode", vec![("set".into(), want.clone())]).await;
+    match reply {
+        Ok(r) if r.ok => {
+            let out = message_json(&r.message);
+            // The risk engine audits the change itself (`trading.mode.changed`); this row records
+            // that the request came through the API, and who asked.
+            let audited = audit(&s, "trading.mode.set", Some(&want), json!({"result": out})).await;
+            Json(json!({"ok": true, "mode": out, "audited": audited})).into_response()
+        }
+        Ok(r) => {
+            audit(&s, "trading.mode.refused", Some(&want), json!({"why": r.message})).await;
+            err(reply_status(&r.message), r.message)
+        }
+        Err(resp) => resp,
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

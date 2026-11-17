@@ -352,6 +352,29 @@ export interface Lot {
 
 const enc = encodeURIComponent;
 
+/** One execution venue's readiness, as the broker-gateway reports it (`ctl.exec.venues`). */
+export interface VenueStatus {
+	venue: string;
+	configured: boolean;
+	detail?: string;
+	open_orders: number;
+}
+
+/** `GET /api/trading/mode` (D-121): the mode, the owner's numbers, and what blocks a switch. */
+export interface TradingModeView {
+	mode: 'paper' | 'live';
+	live_permitted: boolean;
+	live_blocked_by: string | null;
+	sleeve_eur: number;
+	max_order_eur: number;
+	deployable_eur: number;
+	switch_blockers: string[];
+	venue_reconciliation: string;
+	venues: VenueStatus[] | null;
+	venues_ready: boolean | null;
+	venues_error?: string;
+}
+
 export const consoleApi = {
 	alerts: (limit = 50) => getApi<AlertsView>(`/api/alerts${q({ limit })}`),
 
@@ -380,6 +403,11 @@ export const consoleApi = {
 	rearm: (scope: string, reason: string) =>
 		postJson<{ ok: boolean; resumed: string; audited: boolean }>(`/api/trading/halts/${enc(scope)}/rearm`, { confirm: true, reason }),
 	riskEvents: (since = '24h', limit = 200, kind?: string) => getApi<RiskEventsView>(`/api/trading/risk-events${q({ since, limit, kind })}`),
+
+	tradingMode: () => getApi<TradingModeView>('/api/trading/mode'),
+	/** The real-money switch. Always sent with `confirm`, which the API requires (D-121). */
+	setTradingMode: (mode: 'live' | 'paper') =>
+		postJson<{ ok: boolean; mode: Record<string, unknown>; audited: boolean }>('/api/trading/mode', { mode, confirm: true }),
 
 	venues: () => getApi<{ venues: Venue[] }>('/api/refdata/venues'),
 	calendar: (venue: string, from?: string, to?: string) =>

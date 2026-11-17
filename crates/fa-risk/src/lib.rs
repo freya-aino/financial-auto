@@ -69,6 +69,48 @@ pub struct RiskConfig {
     pub short_margin: BTreeMap<AssetClass, f64>,
     /// Margin budget for shorts: Σ |short_i| × short_margin(class_i) ≤ this × deployable.
     pub short_margin_budget_frac: f64,
+    /// Real-money guardrails (D-121). Zero by default, which is what makes the mode switch
+    /// unflippable until the owner has named the numbers.
+    #[serde(default)]
+    pub live: LiveLimits,
+}
+
+/// What the platform may risk while the trading mode is `live` (D-121).
+///
+/// These are the owner's numbers and they live where every other hard limit lives: in
+/// `risk.toml`, which nothing on the bus can loosen (spec 40 §6.5). Both default to zero and both
+/// must be positive for live mode to be permitted at all, so a `mode = "live"` with no numbers
+/// behind it is refused at startup rather than trading the whole book.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LiveLimits {
+    /// Most capital that may be deployed while the mode is `live`: the sleeve. It binds **on top
+    /// of** every fraction-of-deployable cap, so the position, class, venue and gross caps all
+    /// shrink with it — a 1 % position cap on a 500 EUR sleeve is 5 EUR, not 1 % of the book.
+    pub sleeve_eur: f64,
+    /// Hard cap on one live order's notional, in EUR. Separate from `max_order_frac` because a
+    /// fraction of a small sleeve is not a fat-finger guard: this is an absolute number.
+    pub max_order_eur: f64,
+}
+
+impl LiveLimits {
+    /// Whether these numbers permit live trading: both set, and one order cannot exceed the
+    /// sleeve (which would make the sleeve meaningless on the first order).
+    pub fn permits_live(&self) -> Result<(), String> {
+        if !(self.sleeve_eur.is_finite() && self.sleeve_eur > 0.0) {
+            return Err("[limits.live] sleeve_eur must be a positive number of EUR".into());
+        }
+        if !(self.max_order_eur.is_finite() && self.max_order_eur > 0.0) {
+            return Err("[limits.live] max_order_eur must be a positive number of EUR".into());
+        }
+        if self.max_order_eur > self.sleeve_eur {
+            return Err(format!(
+                "[limits.live] max_order_eur {:.0} exceeds sleeve_eur {:.0}: one order could use the whole sleeve",
+                self.max_order_eur, self.sleeve_eur
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for RiskConfig {
@@ -94,6 +136,7 @@ impl Default for RiskConfig {
             limit_price_band: 0.10,
             short_margin: default_short_margin(),
             short_margin_budget_frac: 0.5,
+            live: LiveLimits::default(),
         }
     }
 }
@@ -144,6 +187,11 @@ impl RiskConfig {
         le("max_order_frac", self.max_order_frac, new.max_order_frac);
         le("limit_price_band", self.limit_price_band, new.limit_price_band);
         le("short_margin_budget_frac", self.short_margin_budget_frac, new.short_margin_budget_frac);
+        // The real-money numbers tighten like every other limit: a runtime change may shrink the
+        // sleeve or the per-order cap, never raise either. Raising what the platform may risk is a
+        // config change and a restart, deliberately (D-121).
+        le("live.sleeve_eur", self.live.sleeve_eur, new.live.sleeve_eur);
+        le("live.max_order_eur", self.live.max_order_eur, new.live.max_order_eur);
         for (class, cap) in &new.leverage_cap {
             let old = self.leverage_cap.get(class).copied().unwrap_or(0.0);
             le(&format!("leverage_cap.{class:?}").to_lowercase(), old, *cap);
@@ -282,6 +330,13 @@ impl RiskEngine {
     /// Deployable capital = equity − reserved daily payout quota (never negative).
     pub fn deployable(&self, equity: f64) -> f64 {
         (equity - self.payout_reserve()).max(0.0)
+    }
+
+    /// Deployable capital in one trading mode: in `live` the sleeve binds on top of everything
+    /// else, so every cap expressed as a fraction of deployable shrinks with it.
+    pub fn deployable_in(&self, equity: f64, live: bool) -> f64 {
+        let d = self.deployable(equity);
+        if live { d.min(self.cfg.live.sleeve_eur.max(0.0)) } else { d }
     }
 
     /// New trading day: resets the daily-loss baseline and clears the daily-loss halt.

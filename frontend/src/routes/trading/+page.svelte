@@ -266,13 +266,17 @@
 	});
 </script>
 
-<ViewHeader title="Trading Desk" spec="51 §6.5" note="paper only; no live broker is connected · live on /ws/trading, REST polling as fallback" />
+<ViewHeader title="Trading Desk" spec="51 §6.5" note="paper and real money are one path; the switch is on Risk & halts · live on /ws/trading, REST polling as fallback" />
 {#if error}<p class="badge danger">{error}</p>{/if}
 
 <div class="killbar panel" class:halted={risk?.portfolio_halted}>
 	<div class="modes">
 		<span class="badge ok mode">PAPER</span>
-		<button class="live" disabled title="no live broker connected (D-029): live trading is impossible from this UI">LIVE</button>
+		<!-- The switch lives with the kill switch on /trading/risk, behind confirmation, the
+		     owner's caps and a flat book (D-121). It is deliberately not a button on this page. -->
+		<a class="live" class:armed={risk?.mode === 'live'} href="/trading/risk/" title="the real-money switch, with its guards and the venues' readiness">
+			{risk?.mode === 'live' ? 'REAL MONEY' : 'PAPER'}
+		</a>
 		<span class="badge" class:ok={tradingWs.live} class:warn={!tradingWs.live} title="/ws/trading · {tradingWs.frames} frames · {tradingWs.lagged} superseded{tradingWs.flushMs ? ` · flush ${tradingWs.flushMs} ms` : ''}">ws {tradingWs.status}</span>
 		<span class="dim">Kill switch halts the portfolio and blocks orders (spec 40). Flatten closes every active strategy and pauses it (no halt).</span>
 	</div>
@@ -531,6 +535,17 @@
 	.live {
 		font-size: 11px;
 		letter-spacing: 0.06em;
+		align-self: center;
+		padding: 6px 10px;
+		border: 1px solid var(--line);
+		border-radius: 4px;
+		color: var(--muted);
+		text-decoration: none;
+	}
+	.live.armed {
+		border-color: var(--bad);
+		color: var(--bad);
+		font-weight: 700;
 	}
 	.flatten {
 		background: var(--warn);
