@@ -1,6 +1,14 @@
-# Everything runs through this file (D-034): local infrastructure (spec 60, ports per D-014) and,
-# under profile "app", the platform services and the operator UI (D-026, D-035). Images build from ./docker, context = repo root.
+# Everything runs through this file (D-034): local infrastructure (spec 60, ports per D-014), the
+# platform services and the operator UI (D-026, D-035). Images build from ./docker, context = repo root.
 # HelixDB runs from the official standalone image (D-033); the CLI-driven `helix push dev` flow is no longer needed.
+#
+# **No compose profiles** (D-123): `docker compose up -d` starts every service in this file, and
+# `docker compose build` builds every image. A profile meant a service that `up` silently skipped,
+# which is how `trainer serve` came to be missing for a day while 9 jobs queued (D-115) and how the
+# graph store's state depended on which flags were last typed. A subset is named rather than
+# selected: `just infra-up` starts the data stores, metrics, object store and backup sidecar alone
+# (`INFRA_SERVICES` in scripts/lib.sh) for the native dev loop, and `app_services()` beside it is
+# that list's complement, derived from `docker compose config --services`.
 name: financial-auto
 
 # Shared environment and secrets mount of the Rust services (and the trainer). Defined up here because
@@ -91,10 +99,13 @@ services:
   # Graph store (ADR 0011, D-110): Dgraph replaces HelixDB and the Postgres `graph` schema.
   # Zero manages the cluster layout and uid leases; alpha serves DQL over HTTP (8080) and gRPC (9080).
   # Single-node (one group, replicas 1) — this is a one-workstation stack.
-  # Not started by default since the D-112 rollback: `docker compose --profile dgraph up -d
-  # dgraph-zero dgraph-alpha` brings the pair up for another attempt at the cutover.
+  #
+  # The D-112 rollback left `[graph] backend = "postgres"`, so nothing reads these two: they start
+  # with the stack (D-123) and wait for another attempt at the cutover. Watch the alpha's memory
+  # when one is made — importing the live graph's 898 k version rows left it rolling up postings at
+  # 11-16 GiB on this 31 GiB host, which is what `mem_limit` / `FA_DGRAPH_MEM_LIMIT` now caps. To
+  # keep the pair down on a tight host: `docker compose stop dgraph-alpha dgraph-zero`.
   dgraph-zero:
-    profiles: ["dgraph"]
     image: dgraph/dgraph:v25.5.1
     command: ["dgraph", "zero", "--my=dgraph-zero:5080", "--replicas=1"]
     ports:
@@ -110,19 +121,22 @@ services:
     restart: unless-stopped
 
   dgraph-alpha:
-    profiles: ["dgraph"]
     image: dgraph/dgraph:v25.5.1
     # Memory is capped deliberately (D-112): importing the live graph's 898 k event-time version
     # rows left the alpha rolling up postings at 11-16 GiB on this 31 GiB host, where it was
     # killed and restarted before it could elect a leader — a store that answers nothing. The
     # default cache is 4 GiB; GOMEMLIMIT makes the Go runtime collect instead of ballooning, and
     # mem_limit turns a host-wide OOM into this container's own failure.
+    #
+    # The defaults are small because this now starts with the stack (D-123) and nothing reads it:
+    # a 22 GiB ceiling on a 31 GiB host belongs to a deliberate cutover attempt, not to an idle
+    # service. Raise them for one: `FA_DGRAPH_MEM_LIMIT=22g FA_DGRAPH_GOMEMLIMIT=18GiB`.
     command: ["dgraph", "alpha", "--my=dgraph-alpha:7080", "--zero=dgraph-zero:5080",
               "--security", "whitelist=0.0.0.0/0",
               "--cache", "size-mb=1024; percentage=40,40,20"]
     environment:
-      GOMEMLIMIT: ${FA_DGRAPH_GOMEMLIMIT:-18GiB}
-    mem_limit: ${FA_DGRAPH_MEM_LIMIT:-22g}
+      GOMEMLIMIT: ${FA_DGRAPH_GOMEMLIMIT:-3GiB}
+    mem_limit: ${FA_DGRAPH_MEM_LIMIT:-4g}
     ports:
       - "127.0.0.1:18180:8080" # DQL/HTTP; another project on this host publishes 8180 (D-109 pattern)
     volumes:
@@ -268,12 +282,11 @@ services:
       start_period: 5m # the first start may run a full backup before crond
     restart: unless-stopped
 
-  # ── application services (profile "app", D-026) ─────────────────────────
-  # Build: docker compose --profile app build
+  # ── application services (D-026) ────────────────────────────────────────
+  # Build: docker compose build
   # GPU (needs nvidia-container-toolkit): uncomment the `deploy.resources` blocks below.
 
   control-api:
-    profiles: ["app"]
     build: &rust-build
       context: .
       dockerfile: docker/rust.Dockerfile
@@ -314,7 +327,6 @@ services:
     restart: unless-stopped
 
   ui:
-    profiles: ["app"]
     build:
       context: .
       dockerfile: docker/ui.Dockerfile
@@ -332,7 +344,6 @@ services:
     restart: unless-stopped
 
   model-runtime:
-    profiles: ["app"]
     image: financial-auto/rust:dev
     command: ["model-runtime"]
     environment:
@@ -360,7 +371,6 @@ services:
     #           capabilities: [gpu]
 
   strategy-runtime:
-    profiles: ["app"]
     image: financial-auto/rust:dev
     command: ["strategy-runtime"]
     environment: *rust-env # FA_STRATEGIES=<file> for a non-baseline population
@@ -377,7 +387,6 @@ services:
     restart: unless-stopped
 
   risk-engine:
-    profiles: ["app"]
     image: financial-auto/rust:dev
     command: ["risk-engine"]
     environment:
@@ -400,7 +409,6 @@ services:
     restart: unless-stopped
 
   evo-worker:
-    profiles: ["app"]
     image: financial-auto/rust:dev
     command: ["evo-worker"]
     environment:
@@ -421,7 +429,7 @@ services:
       retries: 4
       start_period: 20s
     restart: unless-stopped
-    # Scale with: docker compose --profile app up -d --scale evo-worker=N
+    # Scale with: docker compose up -d --scale evo-worker=N
     # deploy:
     #   resources:
     #     reservations:
@@ -431,7 +439,6 @@ services:
     #           capabilities: [gpu]
 
   ingestor:
-    profiles: ["app"]
     build: &go-build
       context: .
       dockerfile: docker/go.Dockerfile
@@ -476,7 +483,6 @@ services:
     restart: unless-stopped
 
   broker-gateway:
-    profiles: ["app"]
     image: financial-auto/go:dev
     entrypoint: ["broker-gateway"]
     command: ["-nats", "nats://nats:4222"]
@@ -504,7 +510,6 @@ services:
     restart: unless-stopped
 
   evo-orchestrator:
-    profiles: ["app"]
     image: financial-auto/go:dev
     entrypoint: ["evo-orchestrator"]
     command: ["-nats", "nats://nats:4222"]
@@ -532,7 +537,6 @@ services:
   # control-api proxies at /api/llm/*. No host port: the UI reaches it only through control-api,
   # keeping spec 51's one-API rule.
   llm-suite:
-    profiles: ["app"]
     image: financial-auto/rust:dev
     build: *rust-build
     command: ["llm-suite"]
@@ -556,7 +560,6 @@ services:
   # generation jobs queue up unprocessed (9 `train.adapter` jobs sat queued from 2026-11-15 to
   # 2026-11-16 because the trainer only existed as the `tools` CLI below).
   trainer-worker:
-    profiles: ["app"]
     image: financial-auto/rust:dev
     build: *rust-build
     command: ["trainer", "serve"]
@@ -565,6 +568,15 @@ services:
       FA_TRAIN_ADAPTER_EVERY: ${FA_TRAIN_ADAPTER_EVERY:-15m}
       FA_TRAIN_GENERATION_EVERY: ${FA_TRAIN_GENERATION_EVERY:-off} # generations are started deliberately
     volumes: *secrets-volume
+    # GPU (needs nvidia-container-toolkit), for the fits this worker runs and for the one-off
+    # subcommands run through it:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
     ports:
       - "127.0.0.1:9108:9100" # metrics
     depends_on: *core-deps
@@ -576,25 +588,14 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-  # One-off CLI, not started by default:
-  #   docker compose --profile tools run --rm trainer pretrain --help
-  trainer:
-    profiles: ["tools"]
-    image: financial-auto/rust:dev
-    build: *rust-build
-    entrypoint: ["trainer"]
-    environment:
-      <<: *rust-env
-      FA_METRICS_BIND: "off" # one-off CLI, nothing to scrape
-    volumes: *secrets-volume
-    depends_on: *core-deps
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+  # The trainer's one-off subcommands (`pretrain`, `cycle`, `sweep`, `plan`, …) are run against the
+  # service above rather than from a second service definition of the same image (D-123):
+  #
+  #   just trainer pretrain --help
+  #   docker compose run --rm -e FA_METRICS_BIND=off trainer-worker trainer pretrain --help
+  #
+  # `run` replaces the command, so this is the old `tools`-profile container with one fewer place
+  # for the two definitions to drift apart.
 
 volumes:
   pg-wal-archive: # archived WAL for PITR (spec 60 §6.6), pruned by the backup sidecar

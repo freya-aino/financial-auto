@@ -1,8 +1,8 @@
 # docker
 
-Everything runs through Docker Compose (D-034): `compose.yaml` at the repo root covers the infrastructure (NATS, HelixDB, Qdrant, VictoriaMetrics, PostgreSQL, Garage) and, under profile `app`, every platform service plus the operator UI (D-026, D-033, D-035). This folder holds the Dockerfiles, the Garage config and its init script, the VictoriaMetrics scrape config and vmalert rules (`vm-scrape.yaml`, `vm-alerts.yaml`), the Postgres WAL-archiving files (`postgres/`) and the `backup` sidecar (`backup/`).
+Everything runs through Docker Compose (D-034): `compose.yaml` at the repo root covers the infrastructure (NATS, HelixDB, Qdrant, VictoriaMetrics, PostgreSQL, Garage), every platform service and the operator UI (D-026, D-033, D-035) — with no profiles, so `docker compose up -d` starts all of it (D-123). This folder holds the Dockerfiles, the Garage config and its init script, the VictoriaMetrics scrape config and vmalert rules (`vm-scrape.yaml`, `vm-alerts.yaml`), the Postgres WAL-archiving files (`postgres/`) and the `backup` sidecar (`backup/`).
 
-**Status:** compose working: infrastructure since 2026-11-06, the full `app` profile, vmalert, exporters and the backup sidecar running on this machine (rootless Docker) as of 2026-11-11 (D-056, D-060, D-066); `qdrant` added 2026-11-14 (D-101). No GPU on this machine: the images are CPU-only. Test runs go on ephemeral stacks (`scripts/eph.sh`, D-096), not this one.
+**Status:** compose working: infrastructure since 2026-11-06, every platform service, vmalert, exporters and the backup sidecar running on this machine (rootless Docker) as of 2026-11-11 (D-056, D-060, D-066); `qdrant` added 2026-11-14 (D-101); profiles removed 2026-11-17 (D-123). No GPU on this machine: the images are CPU-only. Test runs go on ephemeral stacks (`scripts/eph.sh`, D-096), not this one.
 
 ## Services (ports per D-014, bound to 127.0.0.1)
 | Service | Image | Ports | Health |
@@ -13,7 +13,7 @@ Everything runs through Docker Compose (D-034): `compose.yaml` at the repo root 
 | garage | `dxflrs/garage:v2.5.0` | S3 3900, admin 3903 | `docker compose exec garage /garage status` |
 | helix | `ghcr.io/helixdb/helixdb:v0.0.14` (data in `/var/lib/helix`) | 6969 → 8080 | `curl localhost:6969/healthz` |
 | `dgraph-zero` | `dgraph/dgraph:v25.5.1` | 6080 → 6080 | `curl localhost:6080/state` |
-| `dgraph-alpha` | `dgraph/dgraph:v25.5.1` | 18180 → 8080 | `curl localhost:18180/health` — profile `dgraph`, not started by default since D-112 |
+| `dgraph-alpha` | `dgraph/dgraph:v25.5.1` | 18180 → 8080 | `curl localhost:18180/health` — nothing reads it since the D-112 rollback (`[graph] backend = "postgres"`); its memory defaults are small (4 g / `GOMEMLIMIT` 3 GiB) because it starts with the stack and nothing reads it — raise them for a cutover attempt (`FA_DGRAPH_MEM_LIMIT=22g FA_DGRAPH_GOMEMLIMIT=18GiB`) |
 | qdrant | `qdrant/qdrant:v1.20.0` (vectors, ADR 0010 / D-101; data in `qdrant-data`) | 16333 | `curl localhost:16333/readyz` |
 | vmalert | `victoriametrics/vmalert:v1.155.0` (rules `vm-alerts.yaml`) | 8880 | `curl localhost:8880/health` |
 | nats-exporter | `natsio/prometheus-nats-exporter:0.17.3` | — (7777 in compose) | scraped as job `nats` |
@@ -24,14 +24,22 @@ Every long-running service except `helix`, `qdrant` and the two exporters has a 
 
 ## Usage
 ```sh
-just up        # docker compose up -d
+just up        # docker compose up -d — every service in the file (D-123), then waits for health
+just infra-up  # the stores, metrics and backup sidecar only (no platform services)
 just migrate   # apply migrations/ to postgres (optional: control-api applies them on start)
 just down
 ```
-`just` is optional (and not installed on this machine): every recipe in the root `justfile` is a one-liner, so run its body directly, e.g. `docker compose up -d`, `docker compose --profile app build`, `docker compose --profile app up -d && scripts/healthwait.sh`, `docker compose --profile app --profile tools down`, `docker compose --profile app logs -f --tail 100 <service>`, `scripts/backup.sh`, `scripts/restore.sh <dir>`, `scripts/restore-drill.sh`, `scripts/alert-drill.sh`, `scripts/eph.sh up|down <run>`, `docker compose exec backup run.sh`. The `just` names below map to those lines.
+`just` is optional (and not installed on this machine): every recipe in the root `justfile` is a one-liner, so run its body directly, e.g. `docker compose build`, `docker compose up -d && scripts/healthwait.sh`, `docker compose down`, `docker compose logs -f --tail 100 <service>`, `scripts/backup.sh`, `scripts/restore.sh <dir>`, `scripts/restore-drill.sh`, `scripts/alert-drill.sh`, `scripts/eph.sh up|down <run>`, `docker compose exec backup run.sh`. The `just` names below map to those lines.
 
 ## Running the full stack (D-026)
-The application services run in compose under the `app` profile. They use three images built from the repo root:
+**There are no compose profiles** (D-123): `docker compose up -d` starts every service in the file
+and `docker compose build` builds every image. A profile was a service that `up` silently skipped,
+which is how `trainer serve` came to be missing for a day while nine jobs queued (D-115) and how the
+graph store's state depended on which flags were last typed. A subset is named instead of selected:
+`just infra-up` (the data stores, metrics, object store and backup sidecar — `INFRA_SERVICES` in
+`scripts/lib.sh`) is what the native dev loop runs against.
+
+The platform services use three images built from the repo root:
 
 | Image | Dockerfile | Contains |
 |---|---|---|
@@ -42,19 +50,22 @@ The application services run in compose under the `app` profile. They use three 
 Inside the containers, services use `config/platform.docker.toml`, which has compose hostnames.
 
 ```sh
-just app-build                 # docker compose --profile app build
-just app-up                    # infra + services; UI at http://127.0.0.1:8080, API at http://127.0.0.1:7700
-just app-ps / just app-logs [service]
-just app-down                  # stops everything, keeps volumes
+just build                     # docker compose build
+just up                        # everything; UI at http://127.0.0.1:8080, API at http://127.0.0.1:7700
+just ps / just logs [service]
+just down                      # stops everything, keeps volumes
+just infra-up                  # the data stores only, for running services natively
 ```
+The old names (`just app-build`, `app-up`, `app-down`, `app-logs`, `app-ps`, `app-scale-workers`)
+are aliases of these, so existing notes and scripts keep working.
 
 - **Default feed:** the ingestor starts `heartbeat,yahoo,hackernews,google_news,frankfurter,ecb,gdelt,sec_edgar,kraken` with Postgres reference resolution and the Garage raw archive (D-050). `FA_CONNECTORS` overrides the set (ephemeral stacks: `synthetic,heartbeat`, D-096); `lemon`/`oanda` need keys in `config/secrets.toml`. The synthetic connector's tunables pass through as `FA_SYNTHETIC_*` (instruments, factors, seed, interval, news cadence).
 - **Market data (D-103):** `FA_MARKET_DATA` defaults to `real` in compose — model-runtime, strategy-runtime, risk-engine and the paper broker drop the synthetic venues (`sim`), so paper orders are priced and filled on real market data only. `synthetic` is the inverse (set by `scripts/eph.sh`), `all` the pre-D-103 behaviour. Ingestion stays neutral and stores every venue.
 - **Ephemeral test stacks (D-096):** every test run gets its own compose project `fa-eph-<run>` with fresh volumes and backups in `scratch/backups-<run>/` (`FA_BACKUP_DIR`), started with `just eph-up <run>` and removed — containers, volumes and backups — with `just eph-down <run>`; see `scripts/README.md` and AGENTS.md. One stack at a time (shared host ports).
 - **Migrations:** `control-api` applies the Postgres migrations on startup.
-- **Scaling workers:** `just app-scale-workers 4`, or `docker compose --profile app up -d --scale evo-worker=4`. Workers are stateless and pull jobs from a NATS work queue. For more machines later, point more `evo-worker` containers at the same NATS.
-- **Trainer:** a one-off CLI in the `tools` profile, not started by default. Run it with `just trainer pretrain --help` or `docker compose --profile tools run --rm trainer …`.
-- **GPU:** install `nvidia-container-toolkit`, then uncomment the `deploy.resources.reservations.devices` blocks on `model-runtime`, `evo-worker` and `trainer`. GPU time is still arbitrated by `evo-orchestrator` (D-006). The Rust image is CPU-only today: the ML crates run on candle's CPU backend and the `cuda` cargo feature is off (D-070); enabling CUDA needs `--features cuda` and a CUDA base / builder image. Untested: this machine has no GPU. Device selection: `FA_ML_DEVICE` (spec 60 §6.2).
+- **Scaling workers:** `just scale-workers 4`, or `docker compose up -d --scale evo-worker=4`. Workers are stateless and pull jobs from a NATS work queue. For more machines later, point more `evo-worker` containers at the same NATS.
+- **Trainer:** the `trainer-worker` service runs `trainer serve` (the `jobs.train.>` work queue plus the periodic planner, D-115). Its one-off subcommands run through that same service rather than a second definition of the image: `just trainer pretrain --help`, or `docker compose run --rm -e FA_METRICS_BIND=off trainer-worker trainer pretrain --help` (`run` replaces the `serve` command).
+- **GPU:** install `nvidia-container-toolkit`, then uncomment the `deploy.resources.reservations.devices` blocks on `model-runtime`, `evo-worker` and `trainer-worker`. GPU time is still arbitrated by `evo-orchestrator` (D-006). The Rust image is CPU-only today: the ML crates run on candle's CPU backend and the `cuda` cargo feature is off (D-070); enabling CUDA needs `--features cuda` and a CUDA base / builder image. Untested: this machine has no GPU. Device selection: `FA_ML_DEVICE` (spec 60 §6.2).
 - **Qdrant:** the `qdrant` service holds latents, news and media embeddings (D-101; `[qdrant] vector_backend` in the platform tomls switches back to Helix), `http://qdrant:6333` inside compose and `127.0.0.1:16333` from the host; no shell tools in the image, so like helix no in-container healthcheck (`fa_dependency_up{dep="qdrant"}`, VictoriaMetrics scrapes its `/metrics`).
 - **HelixDB:** the `helix` service, reached at `http://helix:8080` inside compose and `127.0.0.1:6969` from the host. The image is distroless, so it has no in-container healthcheck; `control-api` only waits for it to start and probes it every 15 s (`fa_dependency_up`).
 - **UI:** the `ui` service is the only thing serving the frontend in compose; the control-api container has no `frontend/build`, so `:7700` is API only. Run outside compose (`just cargo run -p control-api`), control-api still serves `frontend/build` when it exists.
@@ -91,7 +102,7 @@ What is exported: `fa_heartbeat_counter{service,key}` (every heartbeat counter, 
 ## Logs (spec 60 §4, Q3)
 Every Rust binary initialises logging through `fa_core::logging::init` and every Go service through `bus.NewLogger`: `FA_LOG_FORMAT=json` writes one JSON object per line (Rust: `timestamp`, `level`, `target`, the event fields flattened, `span`; Go: slog's `time`, `level`, `msg`, `svc` and the attributes), anything else the human-readable text format (default). `RUST_LOG` filters the Rust side (directives on top of a global `info`), `FA_LOG_LEVEL` (`debug|info|warn|error`) the Go side. In compose `FA_LOG_FORMAT: ${FA_LOG_FORMAT:-text}` is set for every app service, so `FA_LOG_FORMAT=json` in `.env` switches the whole stack on the next `up -d`.
 
-**Log store (Q3, decided provisionally):** Docker's default `json-file` driver is the store — `docker compose logs [-f] <service>` (`just app-logs`, `just logs-json <service>` for the raw lines), `docker compose logs --since 1h | grep trace_id=<id>` to follow one trace across services. No VictoriaLogs/Loki service: a single-host stack gains little from it, and JSON lines can be shipped later without code changes. The daemon does not rotate `json-file` logs by default; bound them on the host in the daemon config (rootless: `~/.config/docker/daemon.json`, rootful: `/etc/docker/daemon.json`) with `{"log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "5"}}` and restart the daemon (applies to containers created afterwards).
+**Log store (Q3, decided provisionally):** Docker's default `json-file` driver is the store — `docker compose logs [-f] <service>` (`just logs`, `just logs-json <service>` for the raw lines), `docker compose logs --since 1h | grep trace_id=<id>` to follow one trace across services. No VictoriaLogs/Loki service: a single-host stack gains little from it, and JSON lines can be shipped later without code changes. The daemon does not rotate `json-file` logs by default; bound them on the host in the daemon config (rootless: `~/.config/docker/daemon.json`, rootful: `/etc/docker/daemon.json`) with `{"log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "5"}}` and restart the daemon (applies to containers created afterwards).
 
 ## Tracing (spec 60 §6.5)
 Trace ids travel in the W3C `traceparent` NATS header (`crates/fa-bus/src/trace.rs`, `go/pkg/bus/trace.go`): `fa_bus::Bus::publish` and Go `Publisher.Publish|PublishCtx|PublishWithID` add one, continuing the current trace (`fa_bus::trace::scope` / `bus.WithTrace`) or starting a new one; `md.*` and heartbeats are not traced (high rate, they start no chain worth correlating). Consumers log the trace id at `debug` (`Bus::subscribe`, `bus.Consumed`), `Bus::subscribe_traced` hands the context to a handler. control-api starts (or continues, from an HTTP `traceparent`) one trace per request, returns it in the response header, stores `trace_id` in the request's audit rows and sends it on its `ctl.*` requests and trading publishes; the ingestor and evo-orchestrator log their `ctl` handling with `trace_id`. **No OpenTelemetry exporter or collector (decided provisionally):** the ids are already W3C-shaped, so an exporter can be added later without a wire change; today the trace id is a log and audit field.
@@ -110,7 +121,7 @@ just restore backups/<ts> --postgres-db fa_restore_test   # drill: Postgres only
 ```
 `scripts/backup.sh` writes `postgres/fa.dump` (`pg_dump -Fc` through `docker compose exec -T postgres`) and `postgres/globals.sql`, `helix/helix-data.tar.gz` (the `helix-data` volume, tarred by a throwaway alpine container while `helix` is stopped for a few seconds; `--no-stop-helix` for a hot copy), `garage/<bucket>/` for `fa-models fa-ckpt fa-artifacts fa-backup` (rclone in a container against the compose network, credentials from `config/secrets.toml` `[garage]`; `FA_BACKUP_BUCKETS` overrides the list), optionally `nats/<stream>/` with `FA_BACKUP_NATS=1` (`nats stream backup` via nats-box; off by default because the streams are replayable limits-retention buffers), `qdrant/<collection>.snapshot` (one REST snapshot per collection, no service stop; `FA_QDRANT_HOST_URL`, restored by `scripts/restore.sh` through the snapshot upload API), and `manifest.json` with versions, sizes and sha256 of every file. `--skip postgres,helix,qdrant,garage` leaves parts out.
 
-`scripts/restore.sh DIR` verifies the checksums, asks for confirmation, stops the app services, recreates and `pg_restore`s the database, replaces the Helix volume contents, syncs the buckets back and prints the §6.4 recovery order; `just app-up` then applies migrations (control-api), reconciles the ledger (risk-engine) and waits for health. Nothing restores over the live databases without the prompt or `--yes`.
+`scripts/restore.sh DIR` verifies the checksums, asks for confirmation, stops the app services (every platform service of `compose.yaml`, derived — not a hand-written list that can go stale), recreates and `pg_restore`s the database, replaces the Helix volume contents, syncs the buckets back and prints the §6.4 recovery order; `just up` then applies migrations (control-api), reconciles the ledger (risk-engine) and waits for health. Nothing restores over the live databases without the prompt or `--yes`.
 
 **Scheduled backups, WAL archiving, drills (spec 60 §6.6):** `backup.schedule` runs inside compose. The `backup` sidecar (`docker/backup/`) runs `run.sh` at `FA_BACKUP_SCHEDULE` (default `0 3 * * *`, `FA_BACKUP_TZ` default UTC): a PITR base backup (`postgres/base/`), the dump, a hot Helix tar, Qdrant collection snapshots, the Garage buckets, an incremental `backups/raw-mirror/fa-raw`, then pruning (`FA_BACKUP_KEEP`=7 scheduled backups, WAL back to the oldest kept base). Postgres archives every WAL segment (gzip) into the `pg-wal-archive` volume (`docker/postgres/archive-wal.sh`, `archive_timeout` 300 s). Weekly (`FA_DRILL_SCHEDULE`) the sidecar restores the newest backup into scratch clusters (logical + PITR); `just restore-drill` does the same from the host plus a Helix boot check. `just backup-now` runs the sidecar backup immediately; PITR restore: `just restore backups/<ts> --pitr [--target …]` (runbook in `scripts/README.md`). Off-machine: `FA_BACKUP_OFFSITE_ENABLED=1` + `FA_BACKUP_OFFSITE_REMOTE=<rclone remote:path>` (disabled by default). `backups/` ignores itself.
 
@@ -148,7 +159,7 @@ All state lives in named volumes: `financial-auto_{nats-data,helix-data,qdrant-d
 ## Reference (spec 60 Ops, retired 2026-11-11)
 Spec 60 was retired once its acceptance criteria were met (or out of scope) and its open questions decided; its lasting content is here and in `scripts/README.md`. Code comments citing "spec 60 §n" refer to these sections.
 
-**§1–3 Purpose and decisions.** The platform runs on one workstation in Docker Compose (infrastructure: NATS JetStream, HelixDB, Qdrant, VictoriaMetrics, PostgreSQL, Garage; profile `app`: every service, D-026) and scales horizontally later through JetStream work queues: stateless workers pull jobs with explicit ack, artifacts go to Garage, results and lineage to Helix/Postgres. One GPU shared by priority class; observability = logs (stdout), metrics (VictoriaMetrics), trace ids in NATS headers; backups of Postgres, Helix and Garage; secrets only in git-ignored `config/secrets.toml` or env. Out of scope: cloud deployment, auth/TLS (ADR 0006), multi-machine tooling, cloud bursting.
+**§1–3 Purpose and decisions.** The platform runs on one workstation in Docker Compose (infrastructure: NATS JetStream, HelixDB, Qdrant, VictoriaMetrics, PostgreSQL, Garage; plus every platform service, D-026) and scales horizontally later through JetStream work queues: stateless workers pull jobs with explicit ack, artifacts go to Garage, results and lineage to Helix/Postgres. One GPU shared by priority class; observability = logs (stdout), metrics (VictoriaMetrics), trace ids in NATS headers; backups of Postgres, Helix and Garage; secrets only in git-ignored `config/secrets.toml` or env. Out of scope: cloud deployment, auth/TLS (ADR 0006), multi-machine tooling, cloud bursting.
 
 **§4 Interfaces.** Ports: table "Services" above and "Metrics"; control-api 7700, ui 8080, Vite 5173. Every service publishes `svc.heartbeat.<service>` every 5 s, serves `/metrics`, logs to stdout (format per "Logs"). Alerts: NATS `ops.alert` JSON `{status: firing|resolved, alertname, severity, summary, fingerprint, labels, annotations, starts_at, ends_at, generator_url, at, expired?}`, one message per transition; `GET /api/alerts` → `{active, recent, pipeline{ok, watchdog_seen_at, posts, last_post_at}}`. Work-queue envelope (spec 21): `Job{id, kind, priority_class, payload_ref|inline, budget, checkpoint_ref?, attempt}` → `JobResult{id, status, result_ref, metrics}`.
 

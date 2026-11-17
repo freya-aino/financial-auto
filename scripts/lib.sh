@@ -6,6 +6,19 @@ COMPOSE=(docker compose -f "$ROOT/compose.yaml")
 
 compose() { "${COMPOSE[@]}" "$@"; }
 
+# The infrastructure subset of compose.yaml: the data stores, metrics, object store and the backup
+# sidecar — everything that is not a platform service. compose.yaml has no profiles (D-123), so a
+# subset is named rather than selected; keep this in step with the file when a store is added.
+INFRA_SERVICES="nats postgres helix qdrant dgraph-zero dgraph-alpha victoriametrics vmalert garage nats-exporter postgres-exporter backup"
+
+# The platform services: every service of compose.yaml that is not infrastructure. Derived rather
+# than listed, because the hand-written list this replaced had gone stale — it still named the nine
+# services of D-026 and so left `llm-suite` and `trainer-worker` writing through a restore.
+app_services() {
+    # shellcheck disable=SC2086 # a word list of service names
+    compose config --services | grep -vxF -f <(printf '%s\n' $INFRA_SERVICES) | tr '\n' ' '
+}
+
 # Compose project name (top-level `name:` of compose.yaml) → volume/network prefixes.
 project_name() { compose config 2>/dev/null | sed -n 's/^name: *//p' | head -1; }
 

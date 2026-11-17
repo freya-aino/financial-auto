@@ -3,7 +3,7 @@
 # fresh volumes, a local-only connector set and its own backup directory; `down` deletes exactly
 # that project's containers, volumes and backups so test runs never accumulate on disk.
 #
-#   scripts/eph.sh up <run> [infra]   start (infra = without the app profile)
+#   scripts/eph.sh up <run> [all|infra]   start (infra = the data stores only, no platform services)
 #   scripts/eph.sh down <run>         remove containers, volumes and scratch/backups-<run>
 #   scripts/eph.sh ls                 list leftover fa-eph-* projects and volumes
 #
@@ -26,7 +26,7 @@ running_projects() { # compose projects of this repo with running containers
 }
 
 up() {
-    local run; run=$(run_name "${1:-}"); local mode=${2:-app}
+    local run; run=$(run_name "${1:-}"); local mode=${2:-all}
     local pct; pct=$(disk_pct)
     [ "$pct" -le "${FA_EPH_DISK_MAX:-85}" ] || die "disk at ${pct} % (limit ${FA_EPH_DISK_MAX:-85} %); free space first"
     local busy; busy=$(running_projects | grep -vx "fa-eph-$run" || true)
@@ -41,9 +41,10 @@ up() {
     compose up -d --wait garage
     "$ROOT/docker/garage-init.sh" >/dev/null
     if [ "$mode" = infra ]; then
-        compose up -d --wait
+        # shellcheck disable=SC2086 # a word list of service names
+        compose up -d --wait $INFRA_SERVICES
     else
-        compose --profile app up -d
+        compose up -d
         "$ROOT/scripts/healthwait.sh" "${FA_HEALTHWAIT_TIMEOUT:-300}"
     fi
     log "stack fa-eph-$run is up; tear down with: scripts/eph.sh down $run"
@@ -53,7 +54,7 @@ down() {
     local run; run=$(run_name "${1:-}")
     export COMPOSE_PROJECT_NAME="fa-eph-$run"
     log "down $COMPOSE_PROJECT_NAME: containers, volumes, scratch/backups-$run"
-    compose --profile app --profile tools down -v --remove-orphans
+    compose down -v --remove-orphans
     local dir="$ROOT/scratch/backups-$run"
     if [ -d "$dir" ]; then # files are written by root inside the backup container
         docker run --rm --name "fa-eph-rm-$run" -v "$ROOT/scratch":/scratch alpine:3.20 rm -rf "/scratch/backups-$run"

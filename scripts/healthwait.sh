@@ -28,23 +28,27 @@ wait_for "garage    :3903/health"    curl -fsS http://127.0.0.1:3903/health
 wait_for "victoria  :8428/health"    curl -fsS http://127.0.0.1:8428/health
 wait_for "helix     :6969/healthz"   curl -fsS http://127.0.0.1:6969/healthz
 wait_for "qdrant    :16333/readyz"    curl -fsS http://127.0.0.1:16333/readyz
-# The graph store is waited on only when it is the configured backend (D-112: the stack runs on
-# the Postgres `graph` schema again, and the dgraph services sit behind their own compose profile).
+# The graph store is waited on only when it is the configured backend: since the D-112 rollback the
+# stack runs on the Postgres `graph` schema, and the dgraph pair starts with everything else
+# (D-123) without anything reading it.
 [ "${FA_GRAPH_BACKEND:-postgres}" = dgraph ] &&
     wait_for "dgraph    :18180/health"     curl -fsS http://127.0.0.1:18180/health
 
 echo "step 2: migrations + control-api /api/health (nats connected, dependencies reachable)"
 health_ok() {
     local h; h=$(curl -fsS "$API/api/health") || return 1
+    # `dgraph` is not in this list although step 1 can wait for it: /api/health reports the
+    # dependencies control-api actually uses, and since D-112 the graph is the Postgres `graph`
+    # schema — requiring a key the route never emits made this step wait out its whole timeout.
     echo "$h" | grep -q '"connected":true' &&
-        for d in dgraph qdrant victoriametrics postgres garage; do echo "$h" | grep -q "\"$d\":true" || return 1; done
+        for d in helix qdrant victoriametrics postgres garage; do echo "$h" | grep -q "\"$d\":true" || return 1; done
 }
 wait_for "control-api $API/api/health all true" health_ok
 
 echo "step 3-6: service heartbeats (risk-engine gates trading; others reported as they appear)"
 svc_present() { curl -fsS "$API/api/services" | grep -q "\"service\":\"$1\""; }
 wait_for "risk-engine heartbeat (ledger loaded, reconciliation armed)" svc_present risk-engine
-for s in broker-gateway ingestor model-runtime strategy-runtime evo-orchestrator evo-worker; do
+for s in broker-gateway ingestor model-runtime strategy-runtime evo-orchestrator evo-worker trainer; do
     if svc_present "$s"; then echo "  ✓ $s heartbeat"; else echo "  … $s heartbeat not seen yet"; fi
 done
 echo "step 7: control-api up; UI at http://127.0.0.1:8080 (compose) — metrics: curl http://127.0.0.1:9101/metrics"

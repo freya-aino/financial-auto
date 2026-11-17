@@ -9,19 +9,41 @@ node_image := "node:22-alpine"
 buf_image := "bufbuild/buf:latest"
 database_url := env_var_or_default("DATABASE_URL", "postgres://fa:fa@127.0.0.1:5432/fa")
 
+# The `app-*` names from when compose had an `app` profile (D-123 removed it): there is one stack
+# now, so these are aliases of the plain recipes rather than a second set.
+alias app-build := build
+alias app-up := up
+alias app-down := down
+alias app-logs := logs
+alias app-ps := ps
+alias app-scale-workers := scale-workers
+
 default:
     @just --list
 
-# ── infrastructure ──────────────────────────────────────────────────────
+# ── the stack ───────────────────────────────────────────────────────────
 
-# Start NATS, Postgres, VictoriaMetrics, Garage
+# Compose has no profiles (D-123), so this is the whole stack; it then waits in the spec 60 §6.4
+# order (infra → control-api /api/health → risk-engine heartbeat).
+# Start everything and wait for health; UI at http://127.0.0.1:8080, API at :7700
 up:
     {{compose}} up -d
     {{compose}} ps
+    {{root}}/scripts/healthwait.sh
 
-# Stop infrastructure (keeps volumes)
+# Stop everything (keeps volumes)
 down:
     {{compose}} down
+
+# Named explicitly because there are no profiles to select a subset with (`INFRA_SERVICES` in
+# scripts/lib.sh).
+# The data stores only, for running services natively against them (see `just dev`)
+infra-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    . {{root}}/scripts/lib.sh
+    {{compose}} up -d $INFRA_SERVICES
+    {{compose}} ps $INFRA_SERVICES
 
 # One-time Garage layout, buckets and key
 garage-init:
@@ -36,7 +58,7 @@ migrate:
 # eph-down deletes that project's containers, volumes and backups. One stack at a time (shared ports).
 
 # Start an ephemeral stack: just eph-up t1 [infra]
-eph-up run mode="app":
+eph-up run mode="all":
     {{root}}/scripts/eph.sh up {{run}} {{mode}}
 
 # Remove an ephemeral stack with its volumes and backups
@@ -47,41 +69,31 @@ eph-down run:
 eph-ls:
     {{root}}/scripts/eph.sh ls
 
-# ── app stack in Docker (D-026) ─────────────────────────────────────────
+# ── images and the running stack (D-026) ────────────────────────────────
 
 # Build the Rust (incl. frontend) and Go service images
-app-build:
-    {{compose}} --profile app build
-
-# Start infrastructure + all platform services; UI at http://127.0.0.1:8080, API at :7700.
-# Then waits in the spec 60 §6.4 order (infra → control-api /api/health → risk-engine heartbeat).
-app-up:
-    {{compose}} --profile app up -d
-    {{compose}} --profile app ps
-    {{root}}/scripts/healthwait.sh
+build:
+    {{compose}} build
 
 # Wait for the running stack to be healthy, printing the §6.4 recovery steps: just healthwait [timeout]
 healthwait timeout="180":
     {{root}}/scripts/healthwait.sh {{timeout}}
 
-# Stop everything (keeps volumes)
-app-down:
-    {{compose}} --profile app --profile tools down
+# Follow logs: just logs [service]
+logs *services:
+    {{compose}} logs -f --tail 100 {{services}}
 
-# Follow logs: just app-logs [service]
-app-logs *services:
-    {{compose}} --profile app logs -f --tail 100 {{services}}
+ps:
+    {{compose}} ps
 
-app-ps:
-    {{compose}} --profile app ps
+# Run more evaluation workers: just scale-workers 4
+scale-workers n:
+    {{compose}} up -d --scale evo-worker={{n}}
 
-# Run more evaluation workers: just app-scale-workers 4
-app-scale-workers n:
-    {{compose}} --profile app up -d --scale evo-worker={{n}}
-
-# Run the trainer CLI in a container: just trainer pretrain --help
+# The `trainer-worker` service's image; `run` replaces its `serve` command (D-123).
+# Run a one-off trainer subcommand in a container: just trainer pretrain --help
 trainer *args:
-    {{compose}} --profile tools run --rm trainer {{args}}
+    {{compose}} run --rm -e FA_METRICS_BIND=off trainer-worker trainer {{args}}
 
 # ── observability (spec 60 §6.5, D-056) ────────────────────────────────
 
@@ -112,7 +124,7 @@ metrics-query query range="":
 
 # Follow one service's logs as JSON lines (needs FA_LOG_FORMAT=json in the service env): just logs-json risk-engine
 logs-json service:
-    {{compose}} --profile app logs -f --no-log-prefix --tail 100 {{service}}
+    {{compose}} logs -f --no-log-prefix --tail 100 {{service}}
 
 # evo-worker kill drill off the compose stack (scratch NATS, two native workers; ~2 min, spec 60 §9)
 worker-kill-drill *args:
@@ -245,13 +257,13 @@ fake-publisher: (cargo "run" "-p" "control-api" "--example" "fake_publisher")
 
 # How to run the system locally
 dev:
-    @echo "1. just up            # infrastructure (first time also: just garage-init && just migrate)"
+    @echo "1. just infra-up      # the data stores (first time also: just garage-init && just migrate)"
     @echo "2. just control-api   # http://127.0.0.1:7700 (serves frontend/build when present)"
     @echo "3. just fe-dev        # http://127.0.0.1:5173 with hot reload"
     @echo "4. go -C go run ./services/ingestor -catalog config/sources.yaml   # heartbeat feed"
     @echo "5. just cargo run -p model-runtime / strategy-runtime / risk-engine / evo-worker"
     @echo "   Go: go -C go run ./services/broker-gateway, ./services/evo-orchestrator"
-    @echo "   (or everything in compose: just app-up; synthetic data only: just fake-publisher)"
+    @echo "   (or everything in compose: just up; synthetic data only: just fake-publisher)"
 
 # Everything: Rust, Go, protos, frontend
 check: rust-check rust-test rust-clippy proto go-build go-test fe-install fe-build

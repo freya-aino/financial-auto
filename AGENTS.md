@@ -27,8 +27,9 @@ parallel agents grew `./target` past 200 GB and filled the disk.
   Don't run `go build -o` into the repo.
 - **Frontend:** `just pnpm <args>` / the `node:22-alpine` image. `frontend/node_modules`,
   `.svelte-kit` and `build` are tolerated (gitignored, small) but nothing else.
-- **Images:** `docker compose --profile app build` (or `just app-build`) — builds happen inside
-  BuildKit with cache mounts.
+- **Images:** `docker compose build` (or `just build`) — builds happen inside
+  BuildKit with cache mounts. Compose has no profiles (D-123): `up` starts every service, and a
+  subset is named (`just infra-up` for the data stores only).
 - Live-infrastructure tests need `--network host`, which `just cargo` already sets; `FA_*`,
   `DATABASE_URL`, `RUST_LOG` and `UPDATE_FIXTURE` are passed through.
 

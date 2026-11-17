@@ -14,7 +14,7 @@
 #   --pg-volume    with --pitr: restore into this volume instead of the live postgres-data volume and
 #                  verify it in a throwaway container (drills; the live stack is not touched)
 # Order: 1 stop app services (unless --postgres-db) → 2 postgres → 3 helix (stop, replace volume,
-# start) → 4 garage buckets (rclone sync) → 5 print the §6.4 order; `just app-up` (or `docker compose --profile app up -d &&
+# start) → 4 garage buckets (rclone sync) → 5 print the §6.4 order; `just up` (or `docker compose up -d &&
 # scripts/healthwait.sh` without just) then runs
 # migrations (control-api), reconciliation (risk-engine) and the health wait (scripts/healthwait.sh).
 set -euo pipefail
@@ -64,8 +64,11 @@ fi
 
 # 1. Stop the application services so nothing writes during the restore (infra stays up).
 if [ $SCRATCH = 0 ]; then
-    log "1/5 stopping app services (profile app)"
-    compose --profile app stop control-api ui model-runtime strategy-runtime risk-engine evo-worker ingestor broker-gateway evo-orchestrator >/dev/null 2>&1 || true
+    # Every platform service, derived from compose.yaml (`app_services`): a service missing from a
+    # hand-written list would keep writing to Postgres through the restore.
+    log "1/5 stopping app services"
+    # shellcheck disable=SC2046 # a word list of service names
+    compose stop $(app_services) >/dev/null 2>&1 || true
 fi
 
 # 2a. Postgres PITR: replace the data directory with the base backup, replay archived WAL, promote.
@@ -206,7 +209,7 @@ Recovery order (spec 60 §6.4) from here:
   5. ingestor resumes from ingest.backfill_cursor
   6. model-runtime, evo-orchestrator, evo-worker
   7. control-api, ui
-Run:  just app-up     (starts everything and waits via scripts/healthwait.sh)
-      without just: docker compose --profile app up -d && scripts/healthwait.sh
+Run:  just up         (starts everything and waits via scripts/healthwait.sh)
+      without just: docker compose up -d && scripts/healthwait.sh
 MSG
 fi

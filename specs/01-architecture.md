@@ -20,7 +20,7 @@ Defines the components, the boundary between Rust and Go, how data flows, and wh
 - Contracts: protobuf `fa.v1.*` ([21](21-bus-and-contracts.md)); the bus is NATS JetStream (live streams + work queues).
 - Stores: Qdrant (vectors, D-101), PostgreSQL (static records, ledger, audit, accounting `acct` D-104, model-state graph `graph` — the default `GraphStore` backend, D-108), VictoriaMetrics (time series), Garage S3 (blobs); HelixDB still holds genomes/fitness/lineage records, experts and the graph explorer until the full cutover (ADR 0010). All graph/vector access goes through `fa-hub`. See [20](20-storage.md).
 - Local-only, no auth.
-- Deployment: everything runs in `compose.yaml` (D-026): infra and ops services by default, the platform services under profile `app`, the `trainer` CLI under profile `tools`. control-api starts/stops/restarts app services through the Docker Engine API on the compose socket (D-060).
+- Deployment: everything runs in `compose.yaml` (D-026) with no profiles, so `docker compose up -d` starts every service — infra, ops and the platform (D-123); `just infra-up` names the stores alone. control-api starts/stops/restarts app services through the Docker Engine API on the compose socket (D-060).
 
 ## 4. Interfaces
 ```
